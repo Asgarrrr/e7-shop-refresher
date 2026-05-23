@@ -64,25 +64,25 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
         &mut doc,
         "shop",
         "max_refreshes",
-        config.shop.max_refreshes as i64,
+        i64::from(config.shop.max_refreshes),
     );
     set_scalar(
         &mut doc,
         "shop",
         "stop_after_minutes",
-        config.shop.stop_after_minutes as i64,
+        i64::from(config.shop.stop_after_minutes),
     );
     set_scalar(
         &mut doc,
         "shop",
         "stop_when_mystic_medals",
-        config.shop.stop_when_mystic_medals as i64,
+        i64::from(config.shop.stop_when_mystic_medals),
     );
     set_scalar(
         &mut doc,
         "shop",
         "stop_when_covenants",
-        config.shop.stop_when_covenants as i64,
+        i64::from(config.shop.stop_when_covenants),
     );
     set_scalar(
         &mut doc,
@@ -95,7 +95,7 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
         &mut doc,
         "shop",
         "buy_button_y_offset_ratio",
-        rounded3(config.shop.buy_button_y_offset_ratio as f64),
+        rounded3(f64::from(config.shop.buy_button_y_offset_ratio)),
     );
     set_scalar(
         &mut doc,
@@ -109,7 +109,7 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
         &mut doc,
         "matching",
         "threshold",
-        rounded3(config.matching.threshold as f64),
+        rounded3(f64::from(config.matching.threshold)),
     );
 
     // [regions]
@@ -145,7 +145,7 @@ fn set_region(table: &mut toml_edit::Table, key: &str, value: Option<[f32; 4]>) 
             let y = y.clamp(0.0, 1.0);
             let w = w.clamp(0.001, 1.0 - x);
             let h = h.clamp(0.001, 1.0 - y);
-            let rounded = [x, y, w, h].map(|v| ((v as f64) * 1000.0).round() / 1000.0);
+            let rounded = [x, y, w, h].map(|v| (f64::from(v) * 1000.0).round() / 1000.0);
 
             // Mutate the existing array in place — a fresh `value(...)`
             // call would drop surrounding decor (blank lines, comments).
@@ -195,8 +195,8 @@ fn rounded3(v: f64) -> f64 {
 
 fn pair_array(w: u32, h: u32) -> toml_edit::Array {
     let mut arr = toml_edit::Array::new();
-    arr.push(w as i64);
-    arr.push(h as i64);
+    arr.push(i64::from(w));
+    arr.push(i64::from(h));
     arr.fmt();
     arr
 }

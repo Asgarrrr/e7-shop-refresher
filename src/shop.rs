@@ -605,7 +605,7 @@ pub(crate) fn stop_condition_for(
     bought: impl Fn(&str) -> u32,
 ) -> Option<&'static str> {
     if shop.stop_after_minutes > 0
-        && elapsed >= Duration::from_secs(shop.stop_after_minutes as u64 * 60)
+        && elapsed >= Duration::from_secs(u64::from(shop.stop_after_minutes) * 60)
     {
         return Some("stop_after_minutes");
     }
@@ -951,7 +951,7 @@ mod tests {
         let r = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 0, 1000, 100, 1000, 0.0);
         assert!(r[1] >= 0);
         let r = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 1000, 1000, 100, 1000, 0.0);
-        assert!((r[1] + r[3]) as i64 <= 1000);
+        assert!(i64::from(r[1] + r[3]) <= 1000);
     }
 
     #[test]
