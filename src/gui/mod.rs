@@ -32,7 +32,8 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("E7 Shop Refresher"),
+            .with_title("E7 Shop Refresher")
+            .with_icon(load_window_icon()),
         ..Default::default()
     };
 
@@ -43,6 +44,21 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
         Box::new(move |cc| Ok(Box::new(ShopGui::new(cc, config, config_path, logs)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))
+}
+
+/// Decoded once at startup. The PNG is embedded at compile time so the
+/// binary stays self-contained.
+fn load_window_icon() -> egui::IconData {
+    let bytes = include_bytes!("../../assets/icon.png");
+    let img = image::load_from_memory(bytes)
+        .expect("embedded icon.png is valid")
+        .to_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    }
 }
 
 fn install_tracing(logs: &LogBuffer) {
