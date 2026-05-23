@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build Windows release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --bins
+
+      - name: Stage release artifacts
+        shell: pwsh
+        run: |
+          $stage = "release-stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage/templates/examples" | Out-Null
+
+          # Binaries
+          Copy-Item target/release/gui.exe                 "$stage/"
+          Copy-Item target/release/e7-shop-refresher.exe   "$stage/"
+          Copy-Item target/release/grab.exe                "$stage/"
+
+          # Bundled docs & config
+          Copy-Item README.md                              "$stage/"
+          Copy-Item LICENSE                                "$stage/"
+          Copy-Item config.toml                            "$stage/config.toml"
+          Copy-Item templates/README.md                    "$stage/templates/README.md"
+
+          # Example templates so users can see what good crops look like
+          Copy-Item templates/examples/*.png               "$stage/templates/examples/"
+
+          # Zip
+          $tag = "${{ github.ref_name }}"
+          $zipName = "e7-shop-refresher-$tag-windows-x64.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zipName
+          echo "ZIP_PATH=$zipName" >> $env:GITHUB_ENV
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_PATH }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
