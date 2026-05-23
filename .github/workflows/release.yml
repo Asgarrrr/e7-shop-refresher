@@ -31,8 +31,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stage/templates/examples" | Out-Null
 
           # Binaries
-          Copy-Item target/release/gui.exe                 "$stage/"
-          Copy-Item target/release/e7-shop-refresher.exe   "$stage/"
+          Copy-Item target/release/e7-shop-refresher.exe       "$stage/"
+          Copy-Item target/release/e7-shop-refresher-cli.exe   "$stage/"
 
           # Bundled docs & config
           Copy-Item README.md                              "$stage/"
@@ -54,11 +54,11 @@ jobs:
         with:
           # Downloads on the Releases page:
           # - the full zip (recommended — includes config, README, example templates)
-          # - gui.exe / e7-shop-refresher.exe as direct downloads for users
-          #   who already have a config.toml and templates set up.
+          # - e7-shop-refresher.exe (GUI) and -cli.exe as direct downloads
+          #   for users who already have a config.toml and templates set up.
           files: |
             ${{ env.ZIP_PATH }}
-            target/release/gui.exe
             target/release/e7-shop-refresher.exe
+            target/release/e7-shop-refresher-cli.exe
           generate_release_notes: true
           fail_on_unmatched_files: true

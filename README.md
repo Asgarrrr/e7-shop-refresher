@@ -78,7 +78,7 @@ cd e7-shop-refresher
 cargo build --release
 
 # Launch Epic Seven, open the secret shop, then:
-.\target\release\gui.exe
+.\target\release\e7-shop-refresher.exe
 ```
 
 On first launch the GUI reports what is missing (templates not
@@ -185,7 +185,7 @@ cleanly within roughly one second.
 After first-time setup:
 
 1. Open the shop in-game.
-2. Open `gui.exe`.
+2. Open `e7-shop-refresher.exe`.
 3. Click Start.
 4. Wait until rounds finish or a stop condition fires.
 
@@ -223,14 +223,15 @@ first one fires. All four at zero means run until manual Stop.
 
 Two binaries are produced by `cargo build --release`:
 
-- `gui.exe` — control panel. Primary entry point for normal use.
-- `e7-shop-refresher.exe` — headless CLI runner. Same behaviour as
+- `e7-shop-refresher.exe` — GUI control panel. Primary entry point for
+  normal use.
+- `e7-shop-refresher-cli.exe` — headless CLI runner. Same behaviour as
   the GUI without the window; for scripted or scheduled runs.
   `--dry-run` validates the config without clicking.
 
 ```powershell
-.\target\release\e7-shop-refresher.exe              # run with default config.toml
-.\target\release\e7-shop-refresher.exe --dry-run    # validate config, no clicks
+.\target\release\e7-shop-refresher-cli.exe              # run with default config.toml
+.\target\release\e7-shop-refresher-cli.exe --dry-run    # validate config, no clicks
 ```
 
 ## Troubleshooting
@@ -293,9 +294,9 @@ cargo test --all-targets
 
 ```
 src/
-├── lib.rs            init(): DPI awareness + rayon thread pool
-├── main.rs           CLI entry point
-├── bin/gui.rs        GUI entry point
+├── lib.rs                       init(): DPI awareness + rayon thread pool
+├── main.rs                      GUI entry point (e7-shop-refresher.exe)
+├── bin/e7-shop-refresher-cli.rs CLI entry point (e7-shop-refresher-cli.exe)
 ├── capture.rs        xcap WGC capture, Win32 foreground / resize
 ├── detector.rs       NCC pyramidal template matching
 ├── input.rs          Clicker: human-ish mouse motion, scroll, foreground guard
