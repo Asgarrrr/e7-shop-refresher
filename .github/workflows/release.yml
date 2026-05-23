@@ -9,6 +9,8 @@ jobs:
   build:
     name: Build Windows release
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +53,14 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ZIP_PATH }}
+          # Three downloads on the Releases page:
+          # - the full zip (recommended — includes config, README, example templates)
+          # - gui.exe / e7-shop-refresher.exe / grab.exe as direct downloads for
+          #   users who already have a config.toml and templates set up.
+          files: |
+            ${{ env.ZIP_PATH }}
+            target/release/gui.exe
+            target/release/e7-shop-refresher.exe
+            target/release/grab.exe
           generate_release_notes: true
           fail_on_unmatched_files: true
