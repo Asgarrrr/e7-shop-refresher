@@ -126,13 +126,23 @@ pub struct ShopGui {
     pub(super) active_tab: Tab,
 }
 
+/// Merges Phosphor regular into the default font set so icon constants
+/// from `egui_phosphor::regular` render as glyphs anywhere in the UI.
+fn install_icon_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+}
+
 impl ShopGui {
     pub fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         config: Config,
         config_path: PathBuf,
         logs: LogBuffer,
     ) -> Self {
+        install_icon_font(&cc.egui_ctx);
+
         let mut show_rois = BTreeMap::new();
         for (name, _) in ROI_LIST {
             show_rois.insert(*name, true);

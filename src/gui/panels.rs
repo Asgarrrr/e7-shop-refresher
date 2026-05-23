@@ -1,4 +1,5 @@
-use egui::{Color32, Context, Sense, Vec2};
+use egui::{Context, Sense, Vec2};
+use egui_phosphor::regular as icon;
 use tracing::error;
 
 use crate::config::Config;
@@ -16,22 +17,31 @@ fn draw_window_status(ui: &mut egui::Ui, gui: &mut ShopGui) {
     let window_title = gui.window_title.clone();
     if let Some(e) = window_error {
         ui.horizontal(|ui| {
-            ui.colored_label(palette::ERROR, format!("✗ {e}"));
-            if ui.button("Retry").clicked() {
-                gui.refresh_template_status();
-                gui.try_acquire_window();
-            }
+            ui.colored_label(palette::ERROR, icon::WARNING);
+            ui.colored_label(palette::ERROR, e);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(format!("{}  Retry", icon::ARROW_CLOCKWISE))
+                    .clicked()
+                {
+                    gui.refresh_template_status();
+                    gui.try_acquire_window();
+                }
+            });
         });
     } else if let Some((w, h)) = window_size {
-        ui.colored_label(
-            Color32::from_rgb(110, 200, 110),
-            format!(
-                "{} ({}×{})",
-                window_title.as_deref().unwrap_or("game"),
-                w,
-                h
-            ),
-        );
+        ui.horizontal(|ui| {
+            ui.colored_label(palette::OK, icon::CHECK_CIRCLE);
+            ui.colored_label(
+                palette::OK,
+                format!(
+                    "{} ({}×{})",
+                    window_title.as_deref().unwrap_or("game"),
+                    w,
+                    h
+                ),
+            );
+        });
     }
 }
 
@@ -134,35 +144,44 @@ pub(super) fn draw_run_tab(ui: &mut egui::Ui, gui: &mut ShopGui, _ctx: &Context)
         && !bot_active;
 
     draw_window_status(ui, gui);
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
         // Start is the primary action — larger + bolder than Stop.
-        let start_btn = egui::Button::new(egui::RichText::new("Start").size(14.0).strong());
+        let start_btn = egui::Button::new(
+            egui::RichText::new(format!("{}  Start", icon::PLAY))
+                .size(14.0)
+                .strong(),
+        );
         if ui.add_enabled(can_start, start_btn).clicked()
             && let Err(e) = gui.start_bot()
         {
             error!(error = %e, "start failed");
         }
         if ui
-            .add_enabled(bot_active, egui::Button::new("Stop"))
+            .add_enabled(
+                bot_active,
+                egui::Button::new(format!("{}  Stop", icon::STOP)),
+            )
             .clicked()
         {
             gui.stop_bot();
         }
-        ui.colored_label(
-            match effective {
-                BotStatus::Running => palette::OK,
-                BotStatus::Stopping => palette::WARN,
-                BotStatus::Failed => palette::ERROR,
-                _ => palette::TEXT_MUTED,
-            },
-            effective.label(),
-        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (color, status_icon) = match effective {
+                BotStatus::Running => (palette::OK, icon::PLAY_CIRCLE),
+                BotStatus::Stopping => (palette::WARN, icon::HOURGLASS),
+                BotStatus::Failed => (palette::ERROR, icon::WARNING_CIRCLE),
+                _ => (palette::TEXT_MUTED, icon::PAUSE_CIRCLE),
+            };
+            ui.colored_label(color, effective.label());
+            ui.colored_label(color, status_icon);
+        });
     });
 
-    if !can_start && !bot_active {
-        let reason = if gui.capture.is_none() {
-            "game window not found"
-        } else if !gui.template_status.is_empty() {
+    // Skip the window-not-found case — already surfaced by
+    // draw_window_status above with its own Retry button.
+    if !can_start && !bot_active && gui.capture.is_some() {
+        let reason = if !gui.template_status.is_empty() {
             "templates missing — see Setup tab"
         } else if !gui.zone_status.is_empty() {
             "zones not drawn — see Setup tab"
@@ -172,6 +191,7 @@ pub(super) fn draw_run_tab(ui: &mut egui::Ui, gui: &mut ShopGui, _ctx: &Context)
             ""
         };
         if !reason.is_empty() {
+            ui.add_space(2.0);
             ui.colored_label(palette::TEXT_MUTED, reason);
         }
     }
@@ -332,14 +352,20 @@ fn draw_snapshot_section(ui: &mut egui::Ui, gui: &mut ShopGui, ctx: &Context, bo
     let refresh_enabled = !bot_active;
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(refresh_enabled, primary_button("Refresh"))
+            .add_enabled(
+                refresh_enabled,
+                primary_button(&format!("{}  Refresh", icon::ARROWS_CLOCKWISE)),
+            )
             .on_hover_text("Capture the current game window into the central preview.")
             .clicked()
         {
             gui.refresh_snapshot(ctx);
         }
         if ui
-            .add_enabled(refresh_enabled, egui::Button::new("Run detection"))
+            .add_enabled(
+                refresh_enabled,
+                egui::Button::new(format!("{}  Run detection", icon::CROSSHAIR)),
+            )
             .on_hover_text(
                 "Snapshot + run NCC for each item template. Draws the match \
                  bounding box + the buy_column click band so you can see \
@@ -659,12 +685,16 @@ fn draw_detection_settings(ui: &mut egui::Ui, gui: &mut ShopGui) {
 fn draw_templates(ui: &mut egui::Ui, gui: &mut ShopGui) {
     if gui.template_status.is_empty() {
         ui.horizontal(|ui| {
+            ui.colored_label(palette::OK, icon::CHECK_CIRCLE);
             ui.colored_label(
                 palette::OK,
-                format!("✓ all {} templates present", TEMPLATE_ALIASES.len()),
+                format!("all {} templates present", TEMPLATE_ALIASES.len()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Recheck").clicked() {
+                if ui
+                    .small_button(format!("{}  Recheck", icon::ARROW_CLOCKWISE))
+                    .clicked()
+                {
                     gui.refresh_template_status();
                     gui.try_build_detector();
                 }
@@ -672,12 +702,16 @@ fn draw_templates(ui: &mut egui::Ui, gui: &mut ShopGui) {
         });
     } else {
         ui.horizontal(|ui| {
+            ui.colored_label(palette::WARN, icon::WARNING);
             ui.colored_label(
                 palette::WARN,
                 format!("{} missing — drop the PNGs at:", gui.template_status.len()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Recheck").clicked() {
+                if ui
+                    .small_button(format!("{}  Recheck", icon::ARROW_CLOCKWISE))
+                    .clicked()
+                {
                     gui.refresh_template_status();
                     gui.try_build_detector();
                 }

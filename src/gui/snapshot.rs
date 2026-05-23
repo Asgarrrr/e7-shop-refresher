@@ -1,4 +1,5 @@
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use egui_phosphor::regular as icon;
 use tracing::info;
 
 use crate::config::Config;
@@ -9,6 +10,14 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
         draw_onboarding(ui, gui);
         return;
     };
+
+    // Persistent stepper above the snapshot: hides itself when every
+    // calibration step is satisfied so it doesn't sit there as a
+    // permanent stripe once the bot is fully wired up.
+    if setup_incomplete(gui) {
+        draw_compact_stepper(ui, gui);
+        ui.add_space(6.0);
+    }
 
     let available = ui.available_size();
     let response = ui.add(
@@ -313,12 +322,12 @@ fn draw_onboarding_steps(ui: &mut egui::Ui, gui: &ShopGui) {
 fn onboarding_step(ui: &mut egui::Ui, done: bool, text: &str) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        let (icon, icon_color) = if done {
-            ("✓", palette::OK)
+        let (glyph, color) = if done {
+            (icon::CHECK_CIRCLE, palette::OK)
         } else {
-            ("○", palette::TEXT_MUTED)
+            (icon::CIRCLE, palette::TEXT_MUTED)
         };
-        ui.colored_label(icon_color, icon);
+        ui.colored_label(color, glyph);
         ui.add_space(4.0);
         if done {
             ui.colored_label(palette::TEXT_DIM, text);
@@ -326,6 +335,76 @@ fn onboarding_step(ui: &mut egui::Ui, done: bool, text: &str) {
             ui.label(text);
         }
     });
+}
+
+/// True while at least one calibration step (window, snapshot,
+/// templates, zones) is still missing. Drives the persistent stepper
+/// visibility — once everything is green the stepper goes away.
+fn setup_incomplete(gui: &ShopGui) -> bool {
+    gui.window_size.is_none()
+        || gui.snapshot_size.is_none()
+        || !gui.template_status.is_empty()
+        || !gui.zone_status.is_empty()
+}
+
+/// Compact horizontal stepper rendered above the snapshot when setup
+/// isn't finished. Shows each phase with an icon + label, dim if pending
+/// and green if done — the same vocabulary as the full onboarding so
+/// users transition smoothly from one to the other.
+fn draw_compact_stepper(ui: &mut egui::Ui, gui: &ShopGui) {
+    let window_ok = gui.window_size.is_some();
+    let snapshot_ok = gui.snapshot_size.is_some();
+    let templates_ok = gui.template_status.is_empty();
+    let zones_ok = gui.zone_status.is_empty();
+
+    let total = TEMPLATE_ALIASES.len();
+    let cropped = total.saturating_sub(gui.template_status.len());
+    let templates_label = if templates_ok {
+        "Templates".to_string()
+    } else {
+        format!("Templates ({cropped}/{total})")
+    };
+
+    let zone_total = 4;
+    let zones_drawn = zone_total - gui.zone_status.len();
+    let zones_label = if zones_ok {
+        "Zones".to_string()
+    } else {
+        format!("Zones ({zones_drawn}/{zone_total})")
+    };
+
+    ui.horizontal_wrapped(|ui| {
+        stepper_chip(ui, window_ok, "Window");
+        stepper_separator(ui);
+        stepper_chip(ui, snapshot_ok, "Snapshot");
+        stepper_separator(ui);
+        stepper_chip(ui, templates_ok, &templates_label);
+        stepper_separator(ui);
+        stepper_chip(ui, zones_ok, &zones_label);
+    });
+}
+
+fn stepper_chip(ui: &mut egui::Ui, done: bool, text: &str) {
+    let (glyph, color) = if done {
+        (icon::CHECK_CIRCLE, palette::OK)
+    } else {
+        (icon::CIRCLE, palette::TEXT_MUTED)
+    };
+    ui.colored_label(color, glyph);
+    ui.colored_label(
+        if done {
+            palette::TEXT_DIM
+        } else {
+            palette::TEXT_MUTED
+        },
+        text,
+    );
+}
+
+fn stepper_separator(ui: &mut egui::Ui) {
+    ui.add_space(4.0);
+    ui.colored_label(palette::TEXT_MUTED, "·");
+    ui.add_space(4.0);
 }
 
 fn pixel_to_ratio_rect(sel: CropRect, snap_size: [u32; 2]) -> [f32; 4] {
