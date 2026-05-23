@@ -473,7 +473,11 @@ impl App for ShopGui {
         self.poll_bot();
 
         // Repaint during active runs so progress + logs update.
-        if self.bot.as_ref().is_some_and(|b| b.is_running()) {
+        if self
+            .bot
+            .as_ref()
+            .is_some_and(super::bot::BotHandle::is_running)
+        {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 

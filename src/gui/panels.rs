@@ -427,7 +427,7 @@ fn draw_zones_editor(ui: &mut egui::Ui, gui: &mut ShopGui) {
             ui.label(name_text);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let has_value = gui.zone_mut(name).map(|s| s.is_some()).unwrap_or(false);
+                let has_value = gui.zone_mut(name).is_some_and(|s| s.is_some());
                 if has_value
                     && ui.small_button("clear").clicked()
                     && let Some(slot) = gui.zone_mut(name)

@@ -376,6 +376,7 @@ pub fn preflight_resize_if_enabled(window: &crate::config::WindowConfig) {
     }
 }
 
+#[derive(Copy, Clone)]
 enum TitleMatch {
     Contains,
     Exact,
@@ -430,7 +431,7 @@ fn enum_visible_windows_find(needle: &str, mode: TitleMatch) -> isize {
         BOOL(1)
     }
 
-    let lparam = LPARAM(&mut state as *mut _ as isize);
+    let lparam = LPARAM(&raw mut state as isize);
     unsafe {
         let _ = EnumWindows(Some(cb), lparam);
     }

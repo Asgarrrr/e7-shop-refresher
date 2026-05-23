@@ -969,7 +969,7 @@ mod tests {
         let mut img = GrayImage::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                let v = if ((x / tile) + (y / tile)) % 2 == 0 {
+                let v = if ((x / tile) + (y / tile)).is_multiple_of(2) {
                     0
                 } else {
                     255

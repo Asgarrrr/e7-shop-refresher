@@ -5,9 +5,9 @@
 pub fn suspend_to_sleep() {
     use windows::Win32::System::Power::SetSuspendState;
     let ok = unsafe { SetSuspendState(false, false, false) };
-    if !ok {
-        tracing::warn!("SetSuspendState returned false — system did not enter sleep");
-    } else {
+    if ok {
         tracing::info!("system suspended");
+    } else {
+        tracing::warn!("SetSuspendState returned false — system did not enter sleep");
     }
 }

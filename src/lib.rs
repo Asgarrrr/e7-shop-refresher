@@ -24,9 +24,7 @@ pub fn init() {
 /// is also playing the game. `build_global` only succeeds once; later
 /// calls are silently ignored.
 fn init_thread_pool() {
-    let n = std::thread::available_parallelism()
-        .map(|p| (p.get() / 2).clamp(2, 4))
-        .unwrap_or(2);
+    let n = std::thread::available_parallelism().map_or(2, |p| (p.get() / 2).clamp(2, 4));
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(n)
         .thread_name(|i| format!("e7-rayon-{i}"))

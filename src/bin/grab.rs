@@ -152,7 +152,6 @@ fn roi_to_pixels(roi: [f32; 4], w: u32, h: u32) -> Option<(i32, i32, u32, u32)> 
 fn timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     format!("{secs}")
 }
