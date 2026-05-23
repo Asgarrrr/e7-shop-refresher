@@ -450,8 +450,8 @@ impl ShopRunner {
             self.attempted_icons.insert(h);
         }
 
-        // Unchanged confirm-zone pixels = modal didn't open (greyed
-        // "0/1 Acheter" or NCC false positive). Bail before clicking
+        // Unchanged confirm-zone pixels = modal didn't open (greyed-out
+        // buy button or NCC false positive). Bail before clicking
         // confirm into who-knows-what.
         let after_gray = self.snapshot()?;
         let after = strip_hash(&after_gray, buy_confirm);
