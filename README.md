@@ -221,19 +221,16 @@ first one fires. All four at zero means run until manual Stop.
 
 ## Tools
 
-Three binaries are produced by `cargo build --release`:
+Two binaries are produced by `cargo build --release`:
 
 - `gui.exe` — control panel. Primary entry point for normal use.
 - `e7-shop-refresher.exe` — headless CLI runner. Same behaviour as
   the GUI without the window; for scripted or scheduled runs.
   `--dry-run` validates the config without clicking.
-- `grab.exe` — captures the game window to a PNG with the configured
-  ROIs drawn as overlays. Diagnostic aid for region calibration.
 
 ```powershell
-.\target\release\grab.exe                 # writes captures\snapshot_<ts>.png
-.\target\release\e7-shop-refresher.exe    # CLI runner
-.\target\release\e7-shop-refresher.exe --dry-run
+.\target\release\e7-shop-refresher.exe              # run with default config.toml
+.\target\release\e7-shop-refresher.exe --dry-run    # validate config, no clicks
 ```
 
 ## Troubleshooting
@@ -298,7 +295,6 @@ cargo test --all-targets
 src/
 ├── lib.rs            init(): DPI awareness + rayon thread pool
 ├── main.rs           CLI entry point
-├── bin/grab.rs       Standalone snapshot + overlay tool
 ├── bin/gui.rs        GUI entry point
 ├── capture.rs        xcap WGC capture, Win32 foreground / resize
 ├── detector.rs       NCC pyramidal template matching

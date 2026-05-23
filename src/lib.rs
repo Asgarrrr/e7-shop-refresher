@@ -14,7 +14,7 @@ pub mod power;
 pub mod shop;
 
 /// Per-monitor DPI awareness + capped rayon pool. Called by every entry
-/// point (CLI, GUI, grab).
+/// point (CLI, GUI).
 pub fn init() {
     enable_per_monitor_dpi();
     init_thread_pool();

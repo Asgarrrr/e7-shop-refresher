@@ -33,7 +33,6 @@ jobs:
           # Binaries
           Copy-Item target/release/gui.exe                 "$stage/"
           Copy-Item target/release/e7-shop-refresher.exe   "$stage/"
-          Copy-Item target/release/grab.exe                "$stage/"
 
           # Bundled docs & config
           Copy-Item README.md                              "$stage/"
@@ -53,14 +52,13 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          # Three downloads on the Releases page:
+          # Downloads on the Releases page:
           # - the full zip (recommended — includes config, README, example templates)
-          # - gui.exe / e7-shop-refresher.exe / grab.exe as direct downloads for
-          #   users who already have a config.toml and templates set up.
+          # - gui.exe / e7-shop-refresher.exe as direct downloads for users
+          #   who already have a config.toml and templates set up.
           files: |
             ${{ env.ZIP_PATH }}
             target/release/gui.exe
             target/release/e7-shop-refresher.exe
-            target/release/grab.exe
           generate_release_notes: true
           fail_on_unmatched_files: true
