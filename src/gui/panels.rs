@@ -925,13 +925,39 @@ fn draw_crop_workflow(ui: &mut egui::Ui, gui: &mut ShopGui) {
         }
     }
 
+    // Build a quick lookup of which aliases are still missing so each
+    // dropdown row can show its status inline (avoids a redundant
+    // checklist above the dropdown).
+    let missing_aliases: std::collections::HashSet<&str> = gui
+        .template_status
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+
     ui.horizontal(|ui| {
         ui.label("Save as:");
+        let selected_status = if missing_aliases.contains(gui.crop_target.as_str()) {
+            " · missing"
+        } else {
+            " · saved"
+        };
         egui::ComboBox::from_id_salt("crop_target")
-            .selected_text(gui.crop_target.as_str())
+            .selected_text(format!("{}{selected_status}", gui.crop_target))
             .show_ui(ui, |ui| {
                 for alias in TEMPLATE_ALIASES {
-                    ui.selectable_value(&mut gui.crop_target, (*alias).to_string(), *alias);
+                    let is_missing = missing_aliases.contains(*alias);
+                    let suffix = if is_missing {
+                        " · missing"
+                    } else {
+                        " · saved"
+                    };
+                    let color = if is_missing {
+                        palette::WARN
+                    } else {
+                        palette::OK
+                    };
+                    let label = egui::RichText::new(format!("{alias}{suffix}")).color(color);
+                    ui.selectable_value(&mut gui.crop_target, (*alias).to_string(), label);
                 }
             });
     });
@@ -1007,18 +1033,17 @@ fn draw_detection_settings(ui: &mut egui::Ui, gui: &mut ShopGui) {
         });
 }
 
-/// Merged Templates section: status hint + Recheck up top, missing
-/// list (when any), then the crop workflow. Recheck stays clickable
-/// while the bot runs; the crop workflow is gated by `bot_active`.
+/// Merged Templates section: short intro + Recheck on top, then the
+/// crop workflow. Per-alias status lives inside the workflow's
+/// dropdown so the missing list and the action share one widget —
+/// the user picks the alias they want to crop next, the suffix tells
+/// them whether it's already been saved.
 fn draw_templates_section(ui: &mut egui::Ui, gui: &mut ShopGui, bot_active: bool) {
     let missing = !gui.template_status.is_empty();
 
-    // Intro line + Recheck right-aligned. The intro doubles as
-    // context for both the missing list (when present) and the crop
-    // workflow below.
     ui.horizontal(|ui| {
         let intro = if missing {
-            "Drop the PNGs at the paths below, or crop them:"
+            "Crop each missing icon from the snapshot."
         } else {
             "Re-crop a template after a game patch if matches start failing."
         };
@@ -1033,26 +1058,7 @@ fn draw_templates_section(ui: &mut egui::Ui, gui: &mut ShopGui, bot_active: bool
             }
         });
     });
-
-    if missing {
-        ui.add_space(4.0);
-        egui::ScrollArea::vertical()
-            .max_height(110.0)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for missing in &gui.template_status {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("• {}", missing.name));
-                        path_label(ui, &missing.path);
-                    });
-                }
-            });
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
-    } else {
-        ui.add_space(8.0);
-    }
+    ui.add_space(8.0);
 
     ui.add_enabled_ui(!bot_active, |ui| {
         draw_crop_workflow(ui, gui);
