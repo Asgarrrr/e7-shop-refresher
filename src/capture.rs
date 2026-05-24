@@ -236,8 +236,20 @@ impl WindowCapture {
         if !self.hwnd_is_valid() {
             return false;
         }
-        let hwnd = HWND(self.hwnd_raw.load(Ordering::Relaxed) as *mut c_void);
-        unsafe { GetForegroundWindow() == hwnd }
+        let stored = HWND(self.hwnd_raw.load(Ordering::Relaxed) as *mut c_void);
+        let fg = unsafe { GetForegroundWindow() };
+        if fg == stored {
+            return true;
+        }
+        // Multi-window games (Epic Seven on STOVE wraps the game inside a
+        // launcher HWND) keep `stored` on the wrapper while the visible
+        // window is a child. Strict HWND comparison would mis-flag a
+        // genuinely foreground game as background. Same-process is the
+        // correct broadening — the focus-lock check still rejects
+        // unrelated apps.
+        let stored_pid = pid_of_hwnd(stored);
+        let fg_pid = pid_of_hwnd(fg);
+        stored_pid != 0 && stored_pid == fg_pid
     }
 
     /// `IsWindow` check distinguishes "game crashed" from "foreground
@@ -262,17 +274,14 @@ impl WindowCapture {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
         use windows::Win32::UI::WindowsAndMessaging::{
-            BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, SW_RESTORE,
-            SetForegroundWindow, ShowWindow,
+            BringWindowToTop, GetWindowThreadProcessId, IsIconic, SW_RESTORE, SetForegroundWindow,
+            ShowWindow,
         };
-        if !self.hwnd_is_valid() {
-            return false;
+        if self.is_foreground() {
+            return true;
         }
         let hwnd = HWND(self.hwnd_raw.load(Ordering::Relaxed) as *mut c_void);
         unsafe {
-            if GetForegroundWindow() == hwnd {
-                return true;
-            }
             if IsIconic(hwnd).as_bool() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
             }
@@ -286,9 +295,21 @@ impl WindowCapture {
             if attached {
                 let _ = AttachThreadInput(current_thread, target_thread, false);
             }
-            GetForegroundWindow() == hwnd
         }
+        // Re-check via the same PID-aware path is_foreground uses, so a
+        // child window of our process counts as success even if the OS
+        // brought a sibling HWND to the front instead of `stored`.
+        self.is_foreground()
     }
+}
+
+fn pid_of_hwnd(hwnd: windows::Win32::Foundation::HWND) -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let mut pid: u32 = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    pid
 }
 
 /// Shared lookup used by both `find` (boot) and `reattach` (recovery).

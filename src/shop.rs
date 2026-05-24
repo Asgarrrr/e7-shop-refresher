@@ -263,18 +263,34 @@ impl ShopRunner {
                     self.progress.round_finished(refreshes_done, outcome.bought);
                 }
                 Err(e) if is_recoverable(&e) => {
-                    consecutive_failures += 1;
-                    warn!(
-                        iteration,
-                        consecutive_failures,
-                        error = %e,
-                        "recoverable failure — attempting capture reattach"
-                    );
+                    // A failure raised AFTER the user already pressed Stop
+                    // is almost always a side-effect of the GUI grabbing
+                    // focus on that click — not a real fault. Don't count
+                    // it toward the consecutive-failure cap and downgrade
+                    // the log to debug so the shutdown stays quiet.
+                    let stop_in_flight = self.stop.load(Ordering::Relaxed);
+                    if stop_in_flight {
+                        debug!(
+                            iteration,
+                            error = %e,
+                            "recoverable failure during shutdown — ignoring"
+                        );
+                    } else {
+                        consecutive_failures += 1;
+                        warn!(
+                            iteration,
+                            consecutive_failures,
+                            error = %e,
+                            "recoverable failure — attempting capture reattach"
+                        );
+                    }
                     if let Err(reattach_err) = self.capture.reattach() {
                         warn!(error = %reattach_err, "reattach failed — bailing");
                         return Err(e);
                     }
-                    info!("capture reattached, retrying next round");
+                    if !stop_in_flight {
+                        info!("capture reattached, retrying next round");
+                    }
                     self.clicker.pause_ms(REATTACH_BACKOFF_MS);
                 }
                 Err(e) => return Err(e),
