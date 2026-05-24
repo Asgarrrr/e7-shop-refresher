@@ -170,6 +170,13 @@ fn install_icon_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// The palette in `app::palette` is tuned for a dark background — light
+/// greys for dim text, near-white headers. Pin the theme so a light-mode
+/// host OS doesn't render those on white and turn the UI illegible.
+fn force_dark_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+}
+
 impl ShopGui {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -178,6 +185,7 @@ impl ShopGui {
         logs: LogBuffer,
     ) -> Self {
         install_icon_font(&cc.egui_ctx);
+        force_dark_theme(&cc.egui_ctx);
 
         let mut show_rois = BTreeMap::new();
         for (name, _) in ROI_LIST {
