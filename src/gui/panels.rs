@@ -111,23 +111,68 @@ fn primary_button(label: &str) -> egui::Button<'_> {
     .fill(palette::ACCENT)
 }
 
+/// Linear/Vercel-style underline tabs: no background chrome on the
+/// labels, a hairline baseline rule spanning the full panel width, and
+/// the active tab marked by a thicker accent-coloured underline drawn
+/// on top of that baseline. Labels in muted grey when inactive, near-
+/// white and bold when active.
 pub(super) fn draw_tab_bar(ui: &mut egui::Ui, gui: &mut ShopGui) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+    ui.add_space(4.0);
+
+    let panel_rect = ui.max_rect();
+    let mut active_rect: Option<egui::Rect> = None;
+
+    let row = ui.horizontal(|ui| {
+        // Generous gap between labels — the underline reads as belonging
+        // to one tab only if neighbouring labels stay clearly separated.
+        ui.spacing_mut().item_spacing.x = 24.0;
         for (tab, label) in [(Tab::Run, "Run"), (Tab::Setup, "Setup")] {
             let selected = gui.active_tab == tab;
-            let mut text = egui::RichText::new(label).size(15.0);
+            let color = if selected {
+                palette::SECTION_HEADER
+            } else {
+                palette::TEXT_DIM
+            };
+            let mut text = egui::RichText::new(label).size(15.0).color(color);
             if selected {
                 text = text.strong();
-            } else {
-                text = text.color(palette::TEXT_DIM);
             }
-            if ui.selectable_label(selected, text).clicked() {
+            let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
                 gui.active_tab = tab;
+            }
+            if selected {
+                active_rect = Some(resp.rect);
             }
         }
     });
-    ui.separator();
+
+    // Baseline rule + active underline both sit on the same y so the
+    // active marker visually continues the rule rather than floating
+    // above it.
+    let baseline_y = row.response.rect.bottom() + 6.0;
+    let painter = ui.painter();
+    painter.line_segment(
+        [
+            egui::pos2(panel_rect.left(), baseline_y),
+            egui::pos2(panel_rect.right(), baseline_y),
+        ],
+        egui::Stroke::new(1.0, palette::SECTION_STROKE),
+    );
+    if let Some(rect) = active_rect {
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), baseline_y),
+                egui::pos2(rect.right(), baseline_y),
+            ],
+            egui::Stroke::new(2.0, palette::ACCENT),
+        );
+    }
+
+    ui.add_space(10.0);
 }
 
 /// Config widgets are disabled while the bot runs because the worker
@@ -197,18 +242,14 @@ pub(super) fn draw_run_tab(ui: &mut egui::Ui, gui: &mut ShopGui, _ctx: &Context)
     }
 
     if bot_active || stats.round > 0 {
-        let round_line = if stats.total_rounds > 0 {
-            format!(
-                "Round {} / {}   ·   {} mystic   ·   {} covenant",
-                stats.round, stats.total_rounds, stats.mystic_bought, stats.covenant_bought
-            )
-        } else {
-            format!(
-                "Round {}   ·   {} mystic   ·   {} covenant",
-                stats.round, stats.mystic_bought, stats.covenant_bought
-            )
-        };
-        ui.label(round_line);
+        ui.add_space(8.0);
+        draw_run_stats(
+            ui,
+            stats.round,
+            stats.total_rounds,
+            stats.mystic_bought,
+            stats.covenant_bought,
+        );
     }
     if let Some(err) = &stats.last_error {
         ui.colored_label(palette::ERROR, format!("Error: {err}"));
@@ -269,7 +310,9 @@ pub(super) fn draw_run_tab(ui: &mut egui::Ui, gui: &mut ShopGui, _ctx: &Context)
                 );
             });
 
-        ui.add_space(4.0);
+        section_separator(ui);
+
+        section_header(ui, "On completion");
         ui.checkbox(
             &mut gui.config.shop.sleep_when_done,
             "Sleep PC when goal reached",
@@ -297,10 +340,77 @@ fn stop_condition_row(
     range: std::ops::RangeInclusive<u32>,
     hover: &str,
 ) {
-    ui.label(label);
-    ui.add(egui::DragValue::new(value).speed(speed).range(range))
-        .on_hover_text(hover);
+    // Active (non-zero) limits are styled so the user can scan the
+    // section and immediately see what's actually configured to fire
+    // — zeroed-out rows fade to the same muted palette as disabled UI.
+    let active = *value > 0;
+    let label_color = if active {
+        palette::SECTION_HEADER
+    } else {
+        palette::TEXT_MUTED
+    };
+    let value_color = if active {
+        palette::ACCENT
+    } else {
+        palette::TEXT_MUTED
+    };
+    ui.label(egui::RichText::new(label).color(label_color));
+    // `override_text_color` is scoped to this nested ui, so the
+    // DragValue picks it up for both its display and edit modes
+    // without leaking to widgets rendered after this row.
+    ui.scope(|ui| {
+        ui.style_mut().visuals.override_text_color = Some(value_color);
+        ui.add(egui::DragValue::new(value).speed(speed).range(range))
+            .on_hover_text(hover);
+    });
     ui.end_row();
+}
+
+/// Three-column stat block shown when the bot is running (or has run
+/// during this session). Big numbers + small captions read faster than
+/// a single text line, especially at a glance from across the room.
+fn draw_run_stats(
+    ui: &mut egui::Ui,
+    round: u32,
+    total_rounds: u32,
+    mystic_bought: u32,
+    covenant_bought: u32,
+) {
+    let round_value = if total_rounds > 0 {
+        format!("{round} / {total_rounds}")
+    } else {
+        format!("{round}")
+    };
+    egui::Grid::new("run_stats_block")
+        .num_columns(3)
+        .spacing([24.0, 2.0])
+        .show(ui, |ui| {
+            stat_value(ui, &round_value);
+            stat_value(ui, &format!("{mystic_bought}"));
+            stat_value(ui, &format!("{covenant_bought}"));
+            ui.end_row();
+            stat_caption(ui, "round");
+            stat_caption(ui, "mystic");
+            stat_caption(ui, "covenant");
+            ui.end_row();
+        });
+}
+
+fn stat_value(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(20.0)
+            .strong()
+            .color(palette::SECTION_HEADER),
+    );
+}
+
+fn stat_caption(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(11.0)
+            .color(palette::TEXT_DIM),
+    );
 }
 
 pub(super) fn draw_setup_tab(ui: &mut egui::Ui, gui: &mut ShopGui, ctx: &Context) {
