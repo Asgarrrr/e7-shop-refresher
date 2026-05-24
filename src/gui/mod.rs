@@ -63,14 +63,10 @@ fn load_window_icon() -> egui::IconData {
 
 fn install_tracing(logs: &LogBuffer) {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let ui_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_target(false)
-        .with_writer(logs.clone());
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(ui_layer)
+        .with(logs.clone())
         .with(stderr_layer)
         .init();
 }

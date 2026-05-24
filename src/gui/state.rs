@@ -11,6 +11,10 @@ pub struct BotStats {
     pub mystic_bought: u32,
     pub covenant_bought: u32,
     pub last_error: Option<String>,
+    /// Set by the worker after `suspend_to_sleep()` returns; consumed
+    /// by the GUI to give `sleep_when_done` one-shot semantics.
+    pub sleep_consumed: bool,
+    pub sub_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -62,8 +66,8 @@ impl ProgressSink for SharedStats {
         self.update(|s| {
             s.round = round;
             s.total_rounds = total;
-            // Preserve Stopping across rounds — clobbering to Running
-            // would flip the UI back to Running for one extra round.
+            // Don't override Stopping — would flip the UI back to Running
+            // for the round-in-flight after the user clicked Stop.
             if s.status != BotStatus::Stopping {
                 s.status = BotStatus::Running;
             }
@@ -94,6 +98,7 @@ impl ProgressSink for SharedStats {
         self.update(|s| {
             s.status = BotStatus::Finished;
             s.last_error = None;
+            s.sub_status = None;
         });
     }
 
@@ -101,6 +106,16 @@ impl ProgressSink for SharedStats {
         self.update(|s| {
             s.status = BotStatus::Failed;
             s.last_error = Some(err.to_string());
+            s.sub_status = None;
         });
+    }
+
+    fn sleep_consumed(&self) {
+        self.update(|s| s.sleep_consumed = true);
+    }
+
+    fn sub_status(&self, text: Option<&str>) {
+        let text = text.map(str::to_string);
+        self.update(|s| s.sub_status = text);
     }
 }

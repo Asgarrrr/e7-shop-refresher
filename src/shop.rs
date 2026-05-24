@@ -61,6 +61,14 @@ pub trait ProgressSink: Send + Sync {
     fn finished(&self) {}
     fn failed(&self, _err: &str) {}
 
+    /// Fired after `power::suspend_to_sleep()` returns; lets the GUI
+    /// sink give `sleep_when_done` one-shot semantics.
+    fn sleep_consumed(&self) {}
+
+    /// Transient status under the main label (e.g. "Waiting for shop
+    /// screen…"). `None` clears it.
+    fn sub_status(&self, _text: Option<&str>) {}
+
     /// Default `0` means per-alias stop conditions never fire under
     /// sinks that don't track counters — fine for CLI/headless runs
     /// that rely on `max_refreshes`.
@@ -168,6 +176,7 @@ impl ShopRunner {
                 if *reached_goal && sleep_after {
                     info!("goal reached — suspending system");
                     crate::power::suspend_to_sleep();
+                    self.progress.sleep_consumed();
                 }
             }
             Err(e) => self.progress.failed(&e.to_string()),
@@ -312,15 +321,21 @@ impl ShopRunner {
             "waiting for shop anchor"
         );
 
+        // Cleared in every exit path below — stale text would bleed into
+        // the next round.
+        self.progress.sub_status(Some("Waiting for shop screen…"));
+
         let stop = Arc::clone(&self.stop);
-        let hit = self.detector.wait_for(
+        let result = self.detector.wait_for(
             &*self.capture,
             alias::ANCHOR_SHOP,
             roi,
             timeout,
             poll,
             &stop,
-        )?;
+        );
+        self.progress.sub_status(None);
+        let hit = result?;
         debug!(
             score = hit.score,
             margin = hit.margin,

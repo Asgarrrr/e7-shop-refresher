@@ -22,9 +22,9 @@ templates directory:
 | `mystic_medal.png` | The small green medal icon shown in a row when a mystic medal is on sale. |
 | `covenant.png` | The pink/red bookmark icon shown in a row when a covenant bookmark is on sale. |
 
-Make them via the GUI's **Crop & Save** panel — it captures the same
-WGC frames the bot sees at runtime, so colour reproduction and
-resolution are guaranteed to match.
+Make them via the GUI's **Templates** section (Setup tab) — it
+captures the same WGC frames the bot sees at runtime, so colour
+reproduction and resolution are guaranteed to match.
 
 ## Cropping rules of thumb
 
@@ -53,6 +53,6 @@ GUI.
 
 ## When the bot says "templates missing"
 
-The GUI's status surface lists exactly which files are expected and at
-which path. The Templates panel has a **Recheck** button that re-scans
-this folder without restarting.
+The Templates section title shows the count of missing aliases and the
+dropdown labels each row `missing` or `saved`. Saving a new crop or
+restarting the app picks up any file added by hand.

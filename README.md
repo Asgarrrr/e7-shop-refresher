@@ -57,9 +57,13 @@ fires, the PC is suspended afterwards. Manual Stop never suspends.
   driven by user-drawn click zones rather than template matching —
   faster and more robust for UI elements that do not move.
 - **GUI.** `eframe` / `egui`, organised into two tabs:
-  - **Run** — start / stop, live stats, stop-condition controls, logs.
-  - **Setup** — snapshot view, template cropping, zone editor, region
-    editor, detection tuning.
+  - **Run** — start / stop, live stats, stop-condition controls.
+  - **Setup** — snapshot view (with detection tuning folded in),
+    template cropping, search-region and click-target editors, and a
+    **Timing** section exposing the full `[timing]` block (click
+    delays, mouse path, round pacing, modal & scroll).
+  - A bottom log pane with a min-level filter (`TRACE`–`ERROR`) is
+    shared across both tabs.
 
 ## Requirements
 
@@ -110,11 +114,13 @@ Three pieces of calibration are required:
 
 1. **Templates** — small PNG crops of each item icon, captured once
    from a live snapshot via the GUI.
-2. **Zones** — rectangles around the buttons the bot needs to click
-   (refresh, both confirm modals, the buy column).
-3. **Regions** — optional search-area rectangles for the template
-   matcher. The shipped defaults target 1920×1080; tune via the GUI
-   if your window differs and detection misses.
+2. **Click targets** — rectangles around the buttons the bot needs to
+   click (refresh, both confirm modals, the buy column). Stored as
+   `[zones]` in `config.toml`.
+3. **Search regions** — optional search-area rectangles for the
+   template matcher. Stored as `[regions]` in `config.toml`. The
+   shipped defaults target 1920×1080; tune via the GUI if your window
+   differs and detection misses.
 
 All three live in the **Setup** tab.
 
@@ -138,10 +144,13 @@ Procedure:
    window.
 3. Drag a rectangle on the snapshot, tight around the icon to
    capture. Including background loosens the match.
-4. In **Crop & Save**, pick the target alias from the dropdown.
+4. In the **Templates** section, pick the target alias from the
+   dropdown (each row labels its current status — `missing` or
+   `saved`).
 5. Click **Save crop**. The PNG is written into the templates
    directory (`%APPDATA%\e7-shop-refresher\templates\<alias>.png` by
-   default).
+   default) and the section title flips from `Templates · X missing`
+   to `Templates · ready` once all three are cropped.
 
 `templates/examples/` contains visual references showing what a good
 crop looks like. They are not usable as defaults; copying them as-is
@@ -152,34 +161,36 @@ their resolution and language.
 > Refresh in-game until one is present before cropping. The shop
 > header is always visible and can be cropped at any time.
 
-### Step 2 — Zones
+### Step 2 — Click targets
 
-Zones mark where to click for buttons whose position does not change:
+Click targets mark where to click for buttons whose position does not
+change:
 
-| Zone | What it covers |
+| Target | What it covers |
 |---|---|
 | `refresh` | The Refresh button at the bottom-left of the shop screen. |
 | `refresh_confirm` | The Confirm button inside the refresh modal. |
 | `buy_confirm` | The large Buy button inside the buy modal. |
 | `buy_column` | The vertical column of per-row buy buttons. Only the X range is used — Y comes from the matched icon at click time. |
 
-To draw a zone:
+To draw one:
 
 1. Refresh the snapshot if needed.
-2. In the **Zones** panel, click **Draw** next to the zone name.
+2. In the **Click targets** panel, click **Draw** next to the target
+   name.
 3. Drag a rectangle on the snapshot around the button.
 4. The rect is auto-saved to `config.toml`. Coloured overlays on the
    snapshot show what is currently set.
 
 `refresh_confirm` and `buy_confirm` are not visible in the shop-screen
-snapshot. Draw their zones over the area where the modal appears at
-runtime (centred middle-bottom of the window for the buy modal, same
-general area for the refresh modal).
+snapshot. Draw them over the area where the modal appears at runtime
+(centred middle-bottom of the window for the buy modal, same general
+area for the refresh modal).
 
 For `buy_column`, draw a tall, narrow rectangle covering the column
 of per-row buy buttons on the right side of the grid.
 
-### Step 3 — Regions (optional)
+### Step 3 — Search regions (optional)
 
 If the bot reports missed anchor detection at a non-1080p window
 size, tune:
@@ -189,8 +200,12 @@ size, tune:
 - `anchor_shop` — a small rectangle around the shop header at the
   top-left.
 
-Use **Run detection** in the Snapshot panel to verify. The GUI draws
-boxes around what it matched inside these regions.
+The **Search regions** panel has the same Draw / Cancel / Clear
+workflow as Click targets, plus direct DragValue editing for fine
+tweaks. Use **Run detection** in the Snapshot panel to verify — the
+GUI draws boxes around what it matched inside these regions. Unset
+regions fall back to the full image, so leaving them empty is fine on
+1080p calibrations.
 
 ### Step 4 — Run
 
@@ -211,31 +226,43 @@ After first-time setup:
 4. Wait until rounds finish or a stop condition fires.
 
 `config.toml` is preserved across runs. Slider and toggle changes in
-the GUI auto-save with a short debounce.
+the GUI auto-save with a short debounce. Editing the file by hand is
+supported but rarely needed — every knob the bot exposes (including
+the full `[timing]` section under **Setup → Timing**) lives in the GUI.
 
 ## Configuration
 
-`config.toml` is documented inline. Key knobs:
+Almost every knob is editable in the GUI; `config.toml` is the
+persistent backing store, written automatically after each edit (250 ms
+debounce). Hand-editing the file is reserved for `[window]` and
+`[templates]` which the GUI does not expose.
+
+| Where to edit | What it covers |
+|---|---|
+| **Run** tab | Stop conditions, item targets, `sleep_when_done`. Live-editable mid-run. |
+| **Setup → Snapshot** | Snapshot capture, **Run detection**, and inline detection knobs: `matching.threshold`, `buy_button_y_offset_ratio` (hover the row to preview the click band over the last detected items). |
+| **Setup → Templates** | Crop each item icon. Card title surfaces `ready` / `N missing`. |
+| **Setup → Search regions** | Optional `[regions]` rectangles. Draw / Clear per row + direct DragValue tweaks. Unset = full image. |
+| **Setup → Click targets** | The four `[zones]` (refresh, refresh confirm, buy confirm, buy column). Draw on snapshot. |
+| **Setup → Timing** | The full `[timing]` section: click delays, mouse-path tuning, round pacing, anchor timeout, scroll, modal open pause, jitter (hover the jitter row + Run detection to preview the scatter on each matched item). |
+| `config.toml` only | `[window]` (`title_contains`, `process_name`, `auto_resize`, `resize_tolerance_px`), `[templates]` (PNG filenames + directory). |
+
+Key knobs at a glance:
 
 | Section | Key | Effect |
 |---|---|---|
 | `[shop]` | `max_refreshes` | Stop after N rounds. `0` disables. |
 | `[shop]` | `stop_after_minutes` | Stop after N elapsed minutes (checked at round boundaries; may overshoot by one round). `0` disables. |
-| `[shop]` | `stop_when_mystic_medals` | Stop once N mystic medals have been bought this run. `0` disables. |
-| `[shop]` | `stop_when_covenants` | Stop once N covenant bookmarks have been bought this run. `0` disables. |
-| `[shop]` | `sleep_when_done` | Suspend the PC after a configured stop condition fires. Never triggers on manual Stop. |
+| `[shop]` | `stop_when_mystic_medals` / `stop_when_covenants` | Per-alias buy caps. `0` disables. |
+| `[shop]` | `sleep_when_done` | Suspend the PC after a stop condition fires. One-shot: turns itself off once consumed, so the next run never sleeps silently. Never triggers on manual Stop. |
 | `[shop]` | `buy_mystic_medals` / `buy_covenant` | Toggle each item type. |
 | `[shop]` | `buy_button_y_offset_ratio` | Vertical offset (window-height fraction) from the icon centre to the row's buy button. |
-| `[shop]` | `max_scrolls_per_round` | Scroll-downs per round. Six items fit in two views, so one is usually sufficient. |
-| `[matching]` | `threshold` | NCC acceptance (default 0.90). Raise to reduce false matches; lower if real items are missed. |
-| `[matching]` | `margin` | Required gap between best and runner-up scores for an unambiguous match. |
-| `[timing]` | `click_delay_*` | Inter-click delays, log-normal distribution. |
-| `[timing]` | `modal_open_pause_ms` | Wait time after a click before hashing the confirm zone. |
-| `[timing]` | `scroll_amount` / `scroll_pause_ms` | Per-scroll lines and settle time. |
-| `[timing]` | `long_pause_every_n` | Take a longer pause every N rounds. `0` disables. |
-| `[window]` | `title_contains` | Window-title substring used to find the game. |
-| `[window]` | `process_name` | Optional executable-name filter to disambiguate when multiple windows share the title fragment. |
-| `[window]` | `auto_resize` | Force the window to `base_resolution` at startup. Off by default — calibrating at the native size avoids fighting Windows decorations and DPI rounding. |
+| `[shop]` | `max_scrolls_per_round` | Scroll-downs per round. Config-only. |
+| `[matching]` | `threshold` | NCC acceptance (default 0.90). |
+| `[matching]` | `margin` | Required gap between best and runner-up scores. Config-only. |
+| `[timing]` | `click_delay_*`, `move_*`, `jitter_radius_px`, `inter_round_*`, `long_pause_*`, `anchor_timeout_ms`, `poll_interval_ms`, `modal_open_pause_ms`, `scroll_*` | Anti-detection tuning. All exposed under **Setup → Timing**. |
+| `[window]` | `title_contains` / `process_name` | Find the game window. Config-only. |
+| `[window]` | `auto_resize` | Force the window to `base_resolution` at startup. Off by default — calibrating at the native size avoids fighting Windows decorations and DPI rounding. Config-only. |
 
 If at least one stop condition is non-zero, the bot stops when the
 first one fires. All four at zero means run until manual Stop.
@@ -261,17 +288,20 @@ Two binaries are produced by `cargo build --release`:
 window title contains the `[window].title_contains` substring (default
 `Epic Seven`).
 
-**"Templates missing"** — the GUI lists which files are expected and
-where. Re-crop them via Crop & Save, then click Recheck on the
-Templates panel.
+**"Templates missing"** — the section title shows which aliases are
+not yet cropped. Re-snapshot, drag a new rectangle, pick the alias
+in the dropdown, click **Save crop**. The status updates as soon as
+the file is written — no separate Recheck step.
 
-**"Zones not drawn"** — open the Zones panel and Draw each one. Start
-remains disabled until all four are set.
+**"Click targets not drawn"** — open the **Click targets** panel and
+Draw each one. Start remains disabled until all four are set.
 
-**Bot clicks just next to a button** — the `buy_column` zone is too
+**Bot clicks just next to a button** — the `buy_column` target is too
 wide, or `buy_button_y_offset_ratio` is off. Run detection from the
-Snapshot panel; a translucent red band shows where the click would
-land. Tune the zone or the ratio until the band sits on the button.
+Snapshot panel, then hover the **Button Y offset** row at the bottom
+of the same panel: a translucent red band shows where the click would
+land over the last detected items. Tune the target or the ratio until
+the band sits on the button.
 
 **Bot keeps trying to buy the same item across scrolls** — usually a
 template that is too loose (false matches):

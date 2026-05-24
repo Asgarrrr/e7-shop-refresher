@@ -23,6 +23,28 @@ pub(super) struct AutoSavedFields {
     pub z_refresh_confirm: Option<[f32; 4]>,
     pub z_buy_confirm: Option<[f32; 4]>,
     pub z_buy_column: Option<[f32; 4]>,
+    pub click_delay_mean_ms: f64,
+    pub click_delay_sigma: f64,
+    pub click_delay_min_ms: u64,
+    pub click_delay_max_ms: u64,
+    pub move_steps_min: u32,
+    pub move_steps_max: u32,
+    pub move_step_min_ms: u64,
+    pub move_step_max_ms: u64,
+    pub move_to_click_min_ms: u64,
+    pub move_to_click_max_ms: u64,
+    pub move_curve_amplitude_px: f32,
+    pub anchor_timeout_ms: u64,
+    pub poll_interval_ms: u64,
+    pub jitter_radius_px: f32,
+    pub inter_round_min_ms: u64,
+    pub inter_round_max_ms: u64,
+    pub long_pause_every_n: u32,
+    pub long_pause_min_ms: u64,
+    pub long_pause_max_ms: u64,
+    pub scroll_amount: i32,
+    pub scroll_pause_ms: u64,
+    pub modal_open_pause_ms: u64,
 }
 
 impl AutoSavedFields {
@@ -44,6 +66,28 @@ impl AutoSavedFields {
             z_refresh_confirm: cfg.zones.refresh_confirm,
             z_buy_confirm: cfg.zones.buy_confirm,
             z_buy_column: cfg.zones.buy_column,
+            click_delay_mean_ms: cfg.timing.click_delay_mean_ms,
+            click_delay_sigma: cfg.timing.click_delay_sigma,
+            click_delay_min_ms: cfg.timing.click_delay_min_ms,
+            click_delay_max_ms: cfg.timing.click_delay_max_ms,
+            move_steps_min: cfg.timing.move_steps_min,
+            move_steps_max: cfg.timing.move_steps_max,
+            move_step_min_ms: cfg.timing.move_step_min_ms,
+            move_step_max_ms: cfg.timing.move_step_max_ms,
+            move_to_click_min_ms: cfg.timing.move_to_click_min_ms,
+            move_to_click_max_ms: cfg.timing.move_to_click_max_ms,
+            move_curve_amplitude_px: cfg.timing.move_curve_amplitude_px,
+            anchor_timeout_ms: cfg.timing.anchor_timeout_ms,
+            poll_interval_ms: cfg.timing.poll_interval_ms,
+            jitter_radius_px: cfg.timing.jitter_radius_px,
+            inter_round_min_ms: cfg.timing.inter_round_min_ms,
+            inter_round_max_ms: cfg.timing.inter_round_max_ms,
+            long_pause_every_n: cfg.timing.long_pause_every_n,
+            long_pause_min_ms: cfg.timing.long_pause_min_ms,
+            long_pause_max_ms: cfg.timing.long_pause_max_ms,
+            scroll_amount: cfg.timing.scroll_amount,
+            scroll_pause_ms: cfg.timing.scroll_pause_ms,
+            modal_open_pause_ms: cfg.timing.modal_open_pause_ms,
         }
     }
 }
@@ -110,6 +154,140 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
         "matching",
         "threshold",
         rounded3(f64::from(config.matching.threshold)),
+    );
+
+    // [timing]
+    set_scalar(
+        &mut doc,
+        "timing",
+        "click_delay_mean_ms",
+        config.timing.click_delay_mean_ms,
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "click_delay_sigma",
+        rounded3(config.timing.click_delay_sigma),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "click_delay_min_ms",
+        i64::try_from(config.timing.click_delay_min_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "click_delay_max_ms",
+        i64::try_from(config.timing.click_delay_max_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "move_steps_min",
+        i64::from(config.timing.move_steps_min),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "move_steps_max",
+        i64::from(config.timing.move_steps_max),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "move_step_min_ms",
+        i64::try_from(config.timing.move_step_min_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "move_step_max_ms",
+        i64::try_from(config.timing.move_step_max_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "move_to_click_min_ms",
+        i64::try_from(config.timing.move_to_click_min_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "move_to_click_max_ms",
+        i64::try_from(config.timing.move_to_click_max_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "move_curve_amplitude_px",
+        rounded3(f64::from(config.timing.move_curve_amplitude_px)),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "anchor_timeout_ms",
+        i64::try_from(config.timing.anchor_timeout_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "poll_interval_ms",
+        i64::try_from(config.timing.poll_interval_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "jitter_radius_px",
+        rounded3(f64::from(config.timing.jitter_radius_px)),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "inter_round_min_ms",
+        i64::try_from(config.timing.inter_round_min_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "inter_round_max_ms",
+        i64::try_from(config.timing.inter_round_max_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "long_pause_every_n",
+        i64::from(config.timing.long_pause_every_n),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "long_pause_min_ms",
+        i64::try_from(config.timing.long_pause_min_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "long_pause_max_ms",
+        i64::try_from(config.timing.long_pause_max_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "scroll_amount",
+        i64::from(config.timing.scroll_amount),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "scroll_pause_ms",
+        i64::try_from(config.timing.scroll_pause_ms).unwrap_or(i64::MAX),
+    );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "modal_open_pause_ms",
+        i64::try_from(config.timing.modal_open_pause_ms).unwrap_or(i64::MAX),
     );
 
     // [regions]

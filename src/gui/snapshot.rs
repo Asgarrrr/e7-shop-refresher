@@ -11,9 +11,6 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
         return;
     };
 
-    // Persistent stepper above the snapshot: hides itself when every
-    // calibration step is satisfied so it doesn't sit there as a
-    // permanent stripe once the bot is fully wired up.
     if setup_incomplete(gui) {
         draw_compact_stepper(ui, gui);
         ui.add_space(6.0);
@@ -30,8 +27,10 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
     let image_rect = response.rect;
     let snap_size = gui.snapshot_size.unwrap_or([1, 1]);
 
-    // Drag is either a crop selection (default) or a zone capture when
-    // `zone_drag_target` is set — same drag handler for both.
+    // Same drag handler for crop, zone-draw, and region-draw; the active
+    // mode is disambiguated on release via `zone_drag_target` /
+    // `region_drag_target`. The two draw targets are mutually exclusive —
+    // setting one in the side panel clears the other.
     if response.drag_started()
         && let Some(pos) = response.interact_pointer_pos()
     {
@@ -51,9 +50,8 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
         }
         gui.crop_drag_start = None;
 
-        // In zone-draw mode, commit the rect to the zone and exit. Clear
-        // the crop selection so the zone renders as a normal overlay,
-        // not as a pending-crop highlight.
+        // Zone-draw mode: clear `crop_selection` so the new rect renders
+        // as a normal zone overlay rather than a pending-crop highlight.
         if let Some(zone_name) = gui.zone_drag_target.take()
             && let Some(sel) = gui.crop_selection.take()
             && sel.w > 0
@@ -64,6 +62,16 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
                 *slot = Some(rect);
                 gui.refresh_zone_status();
                 info!(zone = zone_name, "zone updated from drag");
+            }
+        } else if let Some(region_name) = gui.region_drag_target.take()
+            && let Some(sel) = gui.crop_selection.take()
+            && sel.w > 0
+            && sel.h > 0
+        {
+            let rect = pixel_to_ratio_rect(sel, snap_size);
+            if let Some(slot) = gui.region_mut(region_name) {
+                *slot = Some(rect);
+                info!(region = region_name, "region updated from drag");
             }
         }
     }
@@ -114,6 +122,9 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
     // Debug overlays drawn last so the ROI/Zone overlays don't obscure them.
     let snap_w = snap_size[0] as f32;
     let snap_h = snap_size[1] as f32;
+    let edit_focus = crate::gui::app::current_edit_focus(ui.ctx());
+    let show_buy_band = edit_focus == Some(crate::gui::app::EditFocus::BuyOffset);
+
     for m in &gui.debug_matches {
         let Some(hit) = m.hit.as_ref() else { continue };
         let label_color = palette::DEBUG_LABEL;
@@ -140,8 +151,10 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
             );
         }
 
-        // Same helper as the runner so the overlay matches the actual click.
-        if let Some(column) = gui.config.zones.buy_column {
+        // Buy band: only while the user is editing the slider that drives
+        // it — otherwise the snapshot would carry a permanent red overlay
+        // after each Run detection.
+        if show_buy_band && let Some(column) = gui.config.zones.buy_column {
             let [bx_px, by_px, bw_px, bh_px] = crate::shop::buy_column_row_rect_for(
                 column,
                 hit.y,
@@ -170,13 +183,44 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
         }
     }
 
-    // Current drag selection, tinted with the target zone's color in
-    // zone-draw mode.
+    // Jitter preview: a dotted circle around each detected match. Zone
+    // clicks (refresh, the confirm modals, buy_column) pick a uniform
+    // random point inside the zone and DON'T run Rayleigh jitter on top
+    // — only NCC-matched item clicks do — so drawing the radius around
+    // those is the only honest place for the preview.
+    if edit_focus == Some(crate::gui::app::EditFocus::Jitter) && snap_w > 0.0 && snap_h > 0.0 {
+        let radius_px = gui.config.timing.jitter_radius_px.max(0.0);
+        let radius_screen = radius_px * (image_rect.width() / snap_w);
+        let any_match = gui.debug_matches.iter().any(|m| m.hit.is_some());
+        if any_match && radius_px > 0.0 {
+            for m in &gui.debug_matches {
+                let Some(hit) = m.hit.as_ref() else { continue };
+                let center = Pos2::new(
+                    image_rect.min.x + (hit.x as f32 / snap_w) * image_rect.width(),
+                    image_rect.min.y + (hit.y as f32 / snap_h) * image_rect.height(),
+                );
+                draw_dotted_circle(&painter, center, radius_screen, palette::DEBUG_LABEL);
+            }
+        } else if !any_match {
+            painter.text(
+                image_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Click \"Run detection\" first to preview the jitter scatter on each matched item.",
+                egui::FontId::proportional(13.0),
+                palette::DEBUG_LABEL,
+            );
+        }
+    }
+
     if let Some(sel) = gui.crop_selection {
         let rect = crop_to_screen_rect(sel, image_rect, snap_size);
         let color = gui
             .zone_drag_target
             .and_then(|name| ZONE_LIST.iter().find(|(n, _)| *n == name).map(|(_, c)| *c))
+            .or_else(|| {
+                gui.region_drag_target
+                    .and_then(|name| ROI_LIST.iter().find(|(n, _)| *n == name).map(|(_, c)| *c))
+            })
             .unwrap_or(Color32::WHITE);
         painter.rect_filled(
             rect,
@@ -251,13 +295,33 @@ fn zone_for(cfg: &Config, name: &str) -> Option<[f32; 4]> {
     }
 }
 
-/// Empty-state shown in the central panel before any snapshot has been
-/// captured. Doubles as the first-run onboarding: with shipped defaults,
-/// the only thing left for a new user to do is crop the 3 icons.
+/// Approximates a dotted ring by sampling N short arcs around the circle.
+/// egui has no native dashed-stroke API for circles.
+fn draw_dotted_circle(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32) {
+    const SEGMENTS: usize = 24;
+    let stroke = Stroke::new(1.5, color);
+    let step = std::f32::consts::TAU / SEGMENTS as f32;
+    for i in 0..SEGMENTS {
+        // Every other segment skipped — that's the "dotted" look.
+        if i.is_multiple_of(2) {
+            continue;
+        }
+        let a0 = i as f32 * step;
+        let a1 = (i + 1) as f32 * step;
+        let p0 = center + Vec2::new(a0.cos(), a0.sin()) * radius;
+        let p1 = center + Vec2::new(a1.cos(), a1.sin()) * radius;
+        painter.line_segment([p0, p1], stroke);
+    }
+}
+
+/// First-run empty state — central panel before any snapshot exists.
 fn draw_onboarding(ui: &mut egui::Ui, gui: &ShopGui) {
-    // Vertical centering: pad the top with half the leftover space so
-    // the block sits roughly mid-screen on tall windows.
-    let estimated_h = 280.0;
+    if setup_incomplete(gui) {
+        draw_compact_stepper(ui, gui);
+        ui.add_space(20.0);
+    }
+
+    let estimated_h = 140.0;
     let pad_top = ((ui.available_height() - estimated_h) * 0.5).max(20.0);
     ui.add_space(pad_top);
 
@@ -265,93 +329,24 @@ fn draw_onboarding(ui: &mut egui::Ui, gui: &ShopGui) {
         ui.label(egui::RichText::new("E7 Shop Refresher").size(22.0).strong());
         ui.add_space(2.0);
         ui.colored_label(palette::TEXT_DIM, "Automated secret-shop refresh + buy.");
-
-        ui.add_space(22.0);
-
-        // Constrain the step column to ~440 px so each row stays on a
-        // comfortable reading width regardless of how wide the central
-        // panel gets.
-        ui.scope(|ui| {
-            ui.set_max_width(440.0);
-            ui.vertical(|ui| draw_onboarding_steps(ui, gui));
-        });
-    });
-}
-
-fn draw_onboarding_steps(ui: &mut egui::Ui, gui: &ShopGui) {
-    let window_ok = gui.window_size.is_some();
-    let window_label = match gui.window_size {
-        Some((w, h)) => format!("Game window detected ({w}×{h})"),
-        None => "Open Epic Seven (window not detected yet)".to_string(),
-    };
-    onboarding_step(ui, window_ok, &window_label);
-
-    onboarding_step(ui, false, "Click Refresh in the Snapshot panel");
-
-    let total = TEMPLATE_ALIASES.len();
-    let missing_n = gui.template_status.len();
-    let templates_done = missing_n == 0;
-    let tpl_label = if templates_done {
-        format!("All {total} templates cropped")
-    } else {
-        format!("Crop {missing_n} of {total} icons from your snapshot:")
-    };
-    onboarding_step(ui, templates_done, &tpl_label);
-
-    if !templates_done {
-        for tpl in &gui.template_status {
-            ui.horizontal(|ui| {
-                ui.add_space(28.0);
-                ui.colored_label(palette::TEXT_DIM, format!("• {}", tpl.name));
-            });
-        }
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add_space(28.0);
-            ui.colored_label(
-                palette::TEXT_MUTED,
-                "Drag a rect on the snapshot, pick the target in Setup → Crop & Save.",
-            );
-        });
-    }
-
-    ui.add_space(2.0);
-    onboarding_step(ui, false, "Switch to Run, click Start");
-}
-
-fn onboarding_step(ui: &mut egui::Ui, done: bool, text: &str) {
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        let (glyph, color) = if done {
-            (icon::CHECK_CIRCLE, palette::OK)
+        ui.add_space(18.0);
+        let hint = if gui.window_size.is_some() {
+            "Click Refresh in the Snapshot panel to capture the shop."
         } else {
-            (icon::CIRCLE, palette::TEXT_MUTED)
+            "Open Epic Seven, then click Refresh in the Snapshot panel."
         };
-        ui.colored_label(color, glyph);
-        ui.add_space(4.0);
-        if done {
-            ui.colored_label(palette::TEXT_DIM, text);
-        } else {
-            ui.label(text);
-        }
+        ui.colored_label(palette::TEXT_MUTED, hint);
     });
 }
 
-/// True while at least one calibration step (window, snapshot,
-/// templates, zones) is still missing. Drives the persistent stepper
-/// visibility — once everything is green the stepper goes away.
-fn setup_incomplete(gui: &ShopGui) -> bool {
+pub(super) fn setup_incomplete(gui: &ShopGui) -> bool {
     gui.window_size.is_none()
         || gui.snapshot_size.is_none()
         || !gui.template_status.is_empty()
         || !gui.zone_status.is_empty()
 }
 
-/// Compact horizontal stepper rendered above the snapshot when setup
-/// isn't finished. Shows each phase with an icon + label, dim if pending
-/// and green if done — the same vocabulary as the full onboarding so
-/// users transition smoothly from one to the other.
-fn draw_compact_stepper(ui: &mut egui::Ui, gui: &ShopGui) {
+pub(super) fn draw_compact_stepper(ui: &mut egui::Ui, gui: &ShopGui) {
     let window_ok = gui.window_size.is_some();
     let snapshot_ok = gui.snapshot_size.is_some();
     let templates_ok = gui.template_status.is_empty();
@@ -382,6 +377,30 @@ fn draw_compact_stepper(ui: &mut egui::Ui, gui: &ShopGui) {
         stepper_separator(ui);
         stepper_chip(ui, zones_ok, &zones_label);
     });
+
+    // Anchor the hairline to the sidebar tab-bar baseline so the two
+    // lines read as one rule across panels. Falls back to a local
+    // position the very first frame, before the tab bar has run.
+    let shared_y = ui
+        .ctx()
+        .data(|d| d.get_temp::<f32>(crate::gui::panels::tab_baseline_id()));
+    let clip = ui.clip_rect();
+    let local_cursor_top = {
+        ui.add_space(6.0);
+        ui.cursor().top()
+    };
+    let y = shared_y.unwrap_or(local_cursor_top);
+    ui.painter().hline(
+        clip.left()..=clip.right(),
+        y,
+        egui::Stroke::new(1.0, palette::SECTION_STROKE),
+    );
+    // Push the cursor below the painted line so following content
+    // (the snapshot image) doesn't overlap it.
+    let cur = ui.cursor().top();
+    if cur < y + 1.0 {
+        ui.add_space(y + 1.0 - cur);
+    }
 }
 
 fn stepper_chip(ui: &mut egui::Ui, done: bool, text: &str) {
