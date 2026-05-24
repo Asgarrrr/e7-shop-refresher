@@ -10,12 +10,17 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(version, about = "Graphical front-end for the E7 shop refresher")]
 struct Cli {
-    /// Path to the TOML config file
-    #[arg(short, long, default_value = "config.toml")]
-    config: PathBuf,
+    /// Path to the TOML config file. Defaults to a `config.toml` next to
+    /// the .exe (portable mode) if one exists, otherwise
+    /// `%APPDATA%\e7-shop-refresher\config.toml`.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    e7_shop_refresher::gui::run(&cli.config)
+    let config_path = cli
+        .config
+        .unwrap_or_else(e7_shop_refresher::config::default_config_path);
+    e7_shop_refresher::gui::run(&config_path)
 }

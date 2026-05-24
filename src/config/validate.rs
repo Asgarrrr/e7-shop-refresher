@@ -20,6 +20,7 @@ pub(super) fn validate_all(cfg: &Config) -> Result<()> {
 }
 
 pub(super) fn list_missing_templates(cfg: &Config) -> Vec<MissingTemplate> {
+    let dir = cfg.template_dir();
     let t = &cfg.templates;
     let required = [
         ("anchor_shop", &t.anchor_shop),
@@ -28,7 +29,7 @@ pub(super) fn list_missing_templates(cfg: &Config) -> Vec<MissingTemplate> {
     ];
     let mut missing = Vec::new();
     for (name, file) in required {
-        let path = t.dir.join(file);
+        let path = dir.join(file);
         if !path.exists() {
             missing.push(MissingTemplate {
                 name: name.to_string(),

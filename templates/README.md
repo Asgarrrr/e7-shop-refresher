@@ -5,9 +5,16 @@ Seven window. **No templates ship with the project on purpose** — each
 user must crop their own from their live client so the match accuracy
 stays high.
 
+At runtime the bot looks for these files in the templates directory
+that sits next to the active config (`%APPDATA%\e7-shop-refresher\templates\`
+by default — see the top-level README for portable-mode overrides).
+This in-repo `templates/` directory is only used during development
+and as a holder for the `examples/` reference crops.
+
 ## Required files
 
-The bot won't start until these three files exist in this folder:
+The bot won't start until these three files exist in the active
+templates directory:
 
 | File | What it is |
 |---|---|

@@ -89,6 +89,7 @@ impl Detector {
             "computing template scales"
         );
 
+        let dir = config.template_dir();
         let t = &config.templates;
         let entries = [
             (alias::ANCHOR_SHOP, &t.anchor_shop),
@@ -98,7 +99,7 @@ impl Detector {
 
         let mut templates = HashMap::with_capacity(entries.len());
         for (alias_name, file) in entries {
-            let path = t.dir.join(file);
+            let path = dir.join(file);
             let scaled = load_scaled(&path, global_scale, &config.matching.extra_scales)?;
             templates.insert(alias_name.to_string(), scaled);
         }

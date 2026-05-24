@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "e7-shop-refresher"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",

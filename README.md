@@ -85,6 +85,25 @@ On first launch the GUI reports what is missing (templates not
 cropped, zones not drawn) and refuses to start until calibration is
 complete. See **First-time setup** below.
 
+## Where the files live
+
+The .exe itself is self-contained — config and templates default to
+`%APPDATA%\e7-shop-refresher\`:
+
+| File | Path |
+|---|---|
+| Config | `%APPDATA%\e7-shop-refresher\config.toml` |
+| Templates | `%APPDATA%\e7-shop-refresher\templates\` |
+
+You can also run in **portable mode**: drop a `config.toml` in the
+same folder as the .exe and it takes priority over AppData. Useful
+for USB stick installs, CI artefacts, or any setup that needs to be
+fully self-contained. The templates directory then lives next to the
+config too, since the relative `templates.dir` value resolves against
+the config file's parent.
+
+Override either default with `-c <path>`.
+
 ## First-time setup
 
 Three pieces of calibration are required:
@@ -103,7 +122,8 @@ All three live in the **Setup** tab.
 
 No templates are bundled with the project by design — each user must
 crop their own so the NCC match stays tight against the live client
-(resolution and language). Crop three PNGs into `templates/`:
+(resolution and language). Crop three PNGs into the templates
+directory (see [Where the files live](#where-the-files-live)):
 
 - `shop_header.png` — the Secret Shop banner at the top-left.
 - `mystic_medal.png` — the small green medal icon shown in a row
@@ -119,8 +139,9 @@ Procedure:
 3. Drag a rectangle on the snapshot, tight around the icon to
    capture. Including background loosens the match.
 4. In **Crop & Save**, pick the target alias from the dropdown.
-5. Click **Save crop**. The PNG is written to
-   `templates/<alias>.png`.
+5. Click **Save crop**. The PNG is written into the templates
+   directory (`%APPDATA%\e7-shop-refresher\templates\<alias>.png` by
+   default).
 
 `templates/examples/` contains visual references showing what a good
 crop looks like. They are not usable as defaults; copying them as-is

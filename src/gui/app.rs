@@ -291,14 +291,7 @@ impl ShopGui {
     }
 
     pub(super) fn template_path_for(&self, alias: &str) -> Option<PathBuf> {
-        let t = &self.config.templates;
-        let file = match alias {
-            "anchor_shop" => &t.anchor_shop,
-            "mystic_medal" => &t.mystic_medal,
-            "covenant" => &t.covenant,
-            _ => return None,
-        };
-        Some(t.dir.join(file))
+        self.config.template_path(alias)
     }
 
     pub(super) fn save_crop(&mut self) {

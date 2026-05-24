@@ -45,6 +45,11 @@ pub struct Config {
     #[serde(default)]
     pub zones: ZonesConfig,
     pub templates: TemplatesConfig,
+    /// Absolute path the config was loaded from — drives where relative
+    /// `templates.dir` (and other file lookups) resolve to. Not part of
+    /// the on-disk schema; populated by `load_or_init`.
+    #[serde(skip)]
+    pub source_path: PathBuf,
 }
 
 impl Config {
@@ -59,6 +64,7 @@ impl Config {
         if cfg.version != CONFIG_VERSION {
             migrate(&mut cfg)?;
         }
+        cfg.source_path = path.to_path_buf();
         validate::validate_all(&cfg)?;
         Ok(cfg)
     }
@@ -72,7 +78,8 @@ impl Config {
 
         // Validate in memory first so a broken DEFAULT_TOML release fails
         // loudly instead of leaving a poisoned file behind.
-        let cfg: Self = toml::from_str(DEFAULT_TOML)?;
+        let mut cfg: Self = toml::from_str(DEFAULT_TOML)?;
+        cfg.source_path = path.to_path_buf();
         validate::validate_all(&cfg)?;
 
         if let Some(parent) = path.parent()
@@ -82,6 +89,33 @@ impl Config {
         }
         std::fs::write(path, DEFAULT_TOML)?;
         Ok((cfg, true))
+    }
+
+    /// Absolute templates directory, resolved against the config file's
+    /// parent when `templates.dir` is relative. Absolute values pass
+    /// through unchanged.
+    pub fn template_dir(&self) -> PathBuf {
+        let dir = &self.templates.dir;
+        if dir.is_absolute() {
+            return dir.clone();
+        }
+        self.source_path
+            .parent()
+            .map(|p| p.join(dir))
+            .unwrap_or_else(|| dir.clone())
+    }
+
+    /// Full path to a template alias, or `None` if the alias is unknown.
+    /// Helper for both detection (read) and the GUI's crop saver (write).
+    pub fn template_path(&self, alias: &str) -> Option<PathBuf> {
+        let t = &self.templates;
+        let file = match alias {
+            "anchor_shop" => &t.anchor_shop,
+            "mystic_medal" => &t.mystic_medal,
+            "covenant" => &t.covenant,
+            _ => return None,
+        };
+        Some(self.template_dir().join(file))
     }
 
     pub fn missing_templates(&self) -> Vec<MissingTemplate> {
@@ -126,6 +160,31 @@ impl Config {
 
 fn default_version() -> u32 {
     CONFIG_VERSION
+}
+
+/// Resolves the config path with no `-c` flag, in priority order:
+/// 1. A `config.toml` sitting next to the .exe (portable mode — USB
+///    sticks, CI artefacts, anyone who wants the install to be
+///    self-contained).
+/// 2. `%APPDATA%\e7-shop-refresher\config.toml` (the Windows-canonical
+///    location, where settings survive .exe replacements).
+/// 3. `./config.toml` (last-resort fallback if neither of the above can
+///    be resolved — only hits on broken environments).
+pub fn default_config_path() -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let portable = dir.join("config.toml");
+        if portable.exists() {
+            return portable;
+        }
+    }
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        return std::path::PathBuf::from(appdata)
+            .join("e7-shop-refresher")
+            .join("config.toml");
+    }
+    std::path::PathBuf::from("config.toml")
 }
 
 /// No real migrations exist yet. When v2 ships, replace this body with
@@ -205,6 +264,37 @@ mod tests {
         assert_eq!(cfg.version, CONFIG_VERSION);
         migrate(&mut cfg).expect("current version must noop");
         assert_eq!(cfg.version, CONFIG_VERSION);
+    }
+
+    #[test]
+    fn template_dir_resolves_relative_path_against_config_parent() {
+        let mut cfg: Config = toml::from_str(DEFAULT_TOML).unwrap();
+        cfg.source_path = std::path::PathBuf::from("/some/install/dir/config.toml");
+        cfg.templates.dir = std::path::PathBuf::from("templates");
+        assert_eq!(
+            cfg.template_dir(),
+            std::path::PathBuf::from("/some/install/dir/templates")
+        );
+    }
+
+    #[test]
+    fn template_dir_passes_absolute_through() {
+        let mut cfg: Config = toml::from_str(DEFAULT_TOML).unwrap();
+        cfg.source_path = std::path::PathBuf::from("/wherever/config.toml");
+        // Use a path that's absolute on both Windows (C:\...) and Unix (/...).
+        let abs = if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\custom\templates")
+        } else {
+            std::path::PathBuf::from("/custom/templates")
+        };
+        cfg.templates.dir = abs.clone();
+        assert_eq!(cfg.template_dir(), abs);
+    }
+
+    #[test]
+    fn template_path_returns_none_for_unknown_alias() {
+        let cfg: Config = toml::from_str(DEFAULT_TOML).unwrap();
+        assert!(cfg.template_path("not_a_real_alias").is_none());
     }
 
     #[test]

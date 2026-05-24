@@ -15,9 +15,11 @@ use e7_shop_refresher::shop::ShopRunner;
 #[derive(Parser, Debug)]
 #[command(version, about = "Epic Seven shop refresh automation (STOVE PC)")]
 struct Cli {
-    /// Path to the TOML config file
-    #[arg(short, long, default_value = "config.toml")]
-    config: PathBuf,
+    /// Path to the TOML config file. Defaults to a `config.toml` next to
+    /// the .exe (portable mode) if one exists, otherwise
+    /// `%APPDATA%\e7-shop-refresher\config.toml`.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 
     /// Locate window, load templates, but do not click
     #[arg(long)]
@@ -34,12 +36,15 @@ fn main() -> anyhow::Result<()> {
     e7_shop_refresher::init();
 
     let cli = Cli::parse();
-    let (cfg, created) = Config::load_or_init(&cli.config)?;
+    let config_path = cli
+        .config
+        .unwrap_or_else(e7_shop_refresher::config::default_config_path);
+    let (cfg, created) = Config::load_or_init(&config_path)?;
     if created {
-        info!(path = %cli.config.display(), "config not found — wrote defaults");
+        info!(path = %config_path.display(), "config not found — wrote defaults");
     }
     cfg.ensure_templates_exist()?;
-    info!(?cli.config, version = cfg.version, "config loaded");
+    info!(path = %config_path.display(), version = cfg.version, "config loaded");
 
     // Must run before WindowCapture spins up its WGC session —
     // resizing afterwards invalidates the frame pool.
