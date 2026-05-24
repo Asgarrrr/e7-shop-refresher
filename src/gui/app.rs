@@ -373,11 +373,33 @@ impl ShopGui {
                 self.crop_save_notice =
                     Some(format!("saved {} {}", icon::ARROW_RIGHT, path.display()));
                 // `base_resolution` records the window size at crop time
-                // so scaling stays correct across sessions.
-                if let Some((w, h)) = self.window_size
-                    && self.config.window.base_resolution != [w, h]
-                {
-                    self.config.window.base_resolution = [w, h];
+                // so scaling stays correct across sessions. If other
+                // templates already exist at a different size we warn —
+                // the bot needs all three cropped at the same resolution
+                // or the run will mis-scale. Last writer wins on the
+                // base_resolution itself so the user can deliberately
+                // re-calibrate the whole set at a new size.
+                if let Some((w, h)) = self.window_size {
+                    let old = self.config.window.base_resolution;
+                    if old != [w, h] {
+                        let other_saved = TEMPLATE_ALIASES.iter().any(|alias| {
+                            *alias != self.crop_target
+                                && !self.template_status.iter().any(|m| m.name == *alias)
+                        });
+                        if other_saved {
+                            self.crop_save_notice = Some(format!(
+                                "saved {} {} — but other templates were cropped at {}×{}; \
+                                 re-crop them at {}×{} or the run will mis-scale",
+                                icon::ARROW_RIGHT,
+                                path.display(),
+                                old[0],
+                                old[1],
+                                w,
+                                h
+                            ));
+                        }
+                        self.config.window.base_resolution = [w, h];
+                    }
                 }
                 self.refresh_template_status();
                 self.try_build_detector();
@@ -507,6 +529,35 @@ impl ShopGui {
             );
             return Ok(());
         };
+
+        // Force the window back to the resolution the templates were
+        // cropped against (recorded by `save_crop`). Avoids `templates
+        // would mis-scale` errors when the user resized the game between
+        // calibration and run. SetWindowPos lands within a few px of the
+        // request after Windows applies its DPI / border rounding; the
+        // capture rebaselines internally.
+        let target = self.config.window.base_resolution;
+        match capture.rect() {
+            Ok(r) if [r.width, r.height] != target => {
+                match capture.resize_to(target[0], target[1]) {
+                    Ok(true) => {
+                        if let Ok(now) = capture.rect() {
+                            info!(
+                                from = format!("{}x{}", r.width, r.height),
+                                to = format!("{}x{}", now.width, now.height),
+                                target = format!("{}x{}", target[0], target[1]),
+                                "window resized to crop-time resolution"
+                            );
+                            self.window_size = Some((now.width, now.height));
+                        }
+                    }
+                    Ok(false) => warn!("cannot resize: HWND not resolved"),
+                    Err(e) => warn!(error = %e, "resize to base_resolution failed — continuing"),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "cannot read window rect — skipping pre-flight resize"),
+        }
         self.stats.update(|s| {
             s.status = BotStatus::Running;
             s.round = 0;
