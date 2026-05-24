@@ -175,9 +175,10 @@ pub(super) fn draw_tab_bar(ui: &mut egui::Ui, gui: &mut ShopGui) {
     ui.add_space(10.0);
 }
 
-/// Config widgets are disabled while the bot runs because the worker
-/// thread captured `Config` by value at spawn — mid-run edits wouldn't
-/// take effect anyway.
+/// Renders the Run tab. Run-tab parameters (targets, stop conditions,
+/// sleep-on-done) are live-editable mid-run — UI edits ride through
+/// the shared `live_shop` handle and are picked up by the worker at
+/// every round boundary.
 pub(super) fn draw_run_tab(ui: &mut egui::Ui, gui: &mut ShopGui, _ctx: &Context) {
     let stats = gui.stats.snapshot();
     let effective = effective_status(gui.bot.as_ref(), stats.status.clone());
@@ -188,29 +189,10 @@ pub(super) fn draw_run_tab(ui: &mut egui::Ui, gui: &mut ShopGui, _ctx: &Context)
         && gui.zone_status.is_empty()
         && !bot_active;
 
-    draw_primary_toggle(ui, gui, &effective, can_start);
-
-    // Blocker reason — only shown when Start would be disabled and the
-    // bot isn't running. Skipped if no window (the footer surfaces that
-    // case with its own Retry button).
-    if !can_start && !bot_active && gui.capture.is_some() {
-        let reason = if !gui.template_status.is_empty() {
-            "Templates missing — see Setup tab"
-        } else if !gui.zone_status.is_empty() {
-            "Zones not drawn — see Setup tab"
-        } else if gui.detector.is_none() {
-            "Detector not ready"
-        } else {
-            ""
-        };
-        if !reason.is_empty() {
-            ui.add_space(4.0);
-            ui.colored_label(palette::TEXT_MUTED, reason);
-        }
-    }
+    draw_action_row(ui, gui, &effective, can_start);
 
     if bot_active || stats.round > 0 {
-        ui.add_space(8.0);
+        ui.add_space(6.0);
         draw_run_stats(
             ui,
             stats.round,
@@ -220,6 +202,7 @@ pub(super) fn draw_run_tab(ui: &mut egui::Ui, gui: &mut ShopGui, _ctx: &Context)
         );
     }
     if let Some(err) = &stats.last_error {
+        ui.add_space(4.0);
         ui.colored_label(palette::ERROR, format!("Error: {err}"));
     }
 
@@ -321,80 +304,109 @@ fn draw_demo_controls(ui: &mut egui::Ui, gui: &mut ShopGui) {
     });
 }
 
-/// Single morphing button that replaces the old Start/Stop pair + Idle
-/// chip. The button label, icon, fill colour, and action all switch
-/// based on the effective bot status:
-///
-/// - Idle / Finished / Failed + can_start → "Start" (accent fill)
-/// - Idle / Finished / Failed + !can_start → "Setup needed" (disabled)
-/// - Running → "Stop" (red fill)
-/// - Stopping → "Stopping…" (warn fill, disabled)
-///
-/// When clicked in Stop mode with no real bot handle (= demo state in
-/// debug builds), it resets the stats sink instead of crashing.
-fn draw_primary_toggle(
-    ui: &mut egui::Ui,
-    gui: &mut ShopGui,
-    effective: &BotStatus,
-    can_start: bool,
-) {
+/// Compact action header — replaces the previous big morphing button.
+/// Status text sits on the left (colored dot + label describing the
+/// current state), action button on the right (small, primary_button
+/// style — same visual weight as `Save crop` and `Refresh` elsewhere).
+/// Fits the rest of the panel's typography-driven aesthetic instead
+/// of dominating the top with a chunky filled rectangle.
+fn draw_action_row(ui: &mut egui::Ui, gui: &mut ShopGui, effective: &BotStatus, can_start: bool) {
     enum Action {
         Start,
         Stop,
+        OpenSetup,
         None,
     }
 
-    let (label, glyph, fill, action, enabled) = match effective {
-        BotStatus::Running => ("Stop", icon::STOP, Some(palette::ERROR), Action::Stop, true),
+    let no_window = gui.capture.is_none();
+    // (status_label, status_color, optional (button_label, button_fill), action, enabled)
+    let (status, status_color, btn, action, enabled) = match effective {
+        BotStatus::Running => (
+            "Running",
+            palette::OK,
+            Some(("Stop", palette::ERROR)),
+            Action::Stop,
+            true,
+        ),
         BotStatus::Stopping => (
             "Stopping…",
-            icon::HOURGLASS,
-            Some(palette::WARN),
+            palette::WARN,
+            Some(("Stopping…", palette::WARN)),
             Action::None,
             false,
         ),
-        // Idle, Finished, Failed all behave as "ready to start" from
-        // the button's POV — the stat block (when present) carries the
-        // post-run outcome separately.
         _ if can_start => (
-            "Start",
-            icon::PLAY,
-            Some(palette::ACCENT),
+            "Ready",
+            palette::OK,
+            Some(("Start", palette::ACCENT)),
             Action::Start,
             true,
         ),
-        _ => ("Setup needed", icon::WARNING, None, Action::None, false),
+        _ if no_window => (
+            "Waiting for game window",
+            palette::TEXT_MUTED,
+            None,
+            Action::None,
+            false,
+        ),
+        _ => {
+            // Templates / zones / detector missing — describe the
+            // specific blocker on the left, jump-to-Setup on the right.
+            let blocker = if !gui.template_status.is_empty() {
+                "Templates not cropped"
+            } else if !gui.zone_status.is_empty() {
+                "Zones not drawn"
+            } else {
+                "Setup incomplete"
+            };
+            (
+                blocker,
+                palette::WARN,
+                Some(("Setup", palette::ACCENT)),
+                Action::OpenSetup,
+                true,
+            )
+        }
     };
 
-    let text = egui::RichText::new(format!("{glyph}  {label}"))
-        .size(15.0)
-        .strong()
-        .color(palette::ACCENT_TEXT);
-    let mut button = egui::Button::new(text).min_size(egui::vec2(140.0, 32.0));
-    if let Some(c) = fill {
-        button = button.fill(c);
-    }
-
-    let resp = ui.add_enabled(enabled, button);
-    if resp.clicked() {
-        match action {
-            Action::Start => {
-                if let Err(e) = gui.start_bot() {
-                    error!(error = %e, "start failed");
+    ui.horizontal(|ui| {
+        ui.colored_label(status_color, icon::DOT);
+        ui.colored_label(status_color, status);
+        // Push the button to the right.
+        if let Some((label, fill)) = btn {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let button = egui::Button::new(
+                    egui::RichText::new(label)
+                        .strong()
+                        .color(palette::ACCENT_TEXT),
+                )
+                .fill(fill);
+                let resp = ui.add_enabled(enabled, button);
+                if resp.clicked() {
+                    match action {
+                        Action::Start => {
+                            if let Err(e) = gui.start_bot() {
+                                error!(error = %e, "start failed");
+                            }
+                        }
+                        Action::Stop => {
+                            if gui.bot.is_some() {
+                                gui.stop_bot();
+                            } else {
+                                // Demo / orphan-stats path: no worker
+                                // to signal — just clear the sink.
+                                gui.stats.update(|s| *s = Default::default());
+                            }
+                        }
+                        Action::OpenSetup => {
+                            gui.active_tab = Tab::Setup;
+                        }
+                        Action::None => {}
+                    }
                 }
-            }
-            Action::Stop => {
-                if gui.bot.is_some() {
-                    gui.stop_bot();
-                } else {
-                    // Demo / orphan-stats path: no worker to signal, so
-                    // just clear the sink back to Idle.
-                    gui.stats.update(|s| *s = Default::default());
-                }
-            }
-            Action::None => {}
+            });
         }
-    }
+    });
 }
 
 fn stop_condition_row(
