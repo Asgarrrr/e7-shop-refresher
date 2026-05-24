@@ -319,9 +319,11 @@ fn draw_action_row(ui: &mut egui::Ui, gui: &mut ShopGui, effective: &BotStatus, 
     }
 
     let no_window = gui.capture.is_none();
-    // (status_label, status_color, optional (button_label, button_fill), action, enabled)
-    let (status, status_color, btn, action, enabled) = match effective {
+    // (status_glyph, status_label, status_color,
+    //  optional (button_label, button_fill), action, enabled)
+    let (glyph, status, status_color, btn, action, enabled) = match effective {
         BotStatus::Running => (
+            icon::PLAY_CIRCLE,
             "Running",
             palette::OK,
             Some(("Stop", palette::ERROR)),
@@ -329,6 +331,7 @@ fn draw_action_row(ui: &mut egui::Ui, gui: &mut ShopGui, effective: &BotStatus, 
             true,
         ),
         BotStatus::Stopping => (
+            icon::HOURGLASS,
             "Stopping…",
             palette::WARN,
             Some(("Stopping…", palette::WARN)),
@@ -336,30 +339,36 @@ fn draw_action_row(ui: &mut egui::Ui, gui: &mut ShopGui, effective: &BotStatus, 
             false,
         ),
         _ if can_start => (
-            "Ready",
+            icon::CHECK_CIRCLE,
+            "Ready to run",
             palette::OK,
             Some(("Start", palette::ACCENT)),
             Action::Start,
             true,
         ),
         _ if no_window => (
-            "Waiting for game window",
-            palette::TEXT_MUTED,
+            icon::WARNING,
+            "Waiting for Epic Seven",
+            palette::WARN,
             None,
             Action::None,
             false,
         ),
         _ => {
-            // Templates / zones / detector missing — describe the
-            // specific blocker on the left, jump-to-Setup on the right.
+            // Short status + clear action verb on the button reads as
+            // "Templates missing → Setup": the user doesn't need a
+            // full sentence to know what to do. Earlier verbose copy
+            // ("Setup needed — crop your icon templates") clipped
+            // mid-word in the 310 px sidebar.
             let blocker = if !gui.template_status.is_empty() {
-                "Templates not cropped"
+                "Templates missing"
             } else if !gui.zone_status.is_empty() {
                 "Zones not drawn"
             } else {
                 "Setup incomplete"
             };
             (
+                icon::WARNING,
                 blocker,
                 palette::WARN,
                 Some(("Setup", palette::ACCENT)),
@@ -370,7 +379,10 @@ fn draw_action_row(ui: &mut egui::Ui, gui: &mut ShopGui, effective: &BotStatus, 
     };
 
     ui.horizontal(|ui| {
-        ui.colored_label(status_color, icon::DOT);
+        // Larger glyph so the status indicator actually registers —
+        // matches the body text size but bumped by a step so the eye
+        // lands on it first.
+        ui.colored_label(status_color, egui::RichText::new(glyph).size(14.0).strong());
         ui.colored_label(status_color, status);
         // Push the button to the right.
         if let Some((label, fill)) = btn {
