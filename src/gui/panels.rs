@@ -631,10 +631,13 @@ pub(super) fn draw_setup_tab(ui: &mut egui::Ui, gui: &mut ShopGui, ctx: &Context
         draw_snapshot_section(ui, gui, ctx, bot_active)
     });
 
-    section_card(ui, &templates_card_title(gui), |ui| draw_templates(ui, gui));
-
-    ui.add_enabled_ui(!bot_active, |ui| {
-        section_card(ui, "Crop & Save", |ui| draw_crop_panel(ui, gui));
+    // Templates merges what used to be two sections (Templates status
+    // + Crop & Save tool). They describe the same concern — the bot
+    // needs three icon crops to work — so splitting them only adds
+    // visual chrome. Status + Recheck stay enabled even while the
+    // bot runs; the crop workflow gates on !bot_active inside.
+    section_card(ui, &templates_card_title(gui), |ui| {
+        draw_templates_section(ui, gui, bot_active);
     });
 
     ui.add_enabled_ui(!bot_active, |ui| {
@@ -899,7 +902,11 @@ fn draw_regions_editor(ui: &mut egui::Ui, gui: &mut ShopGui) {
     }
 }
 
-fn draw_crop_panel(ui: &mut egui::Ui, gui: &mut ShopGui) {
+/// Internal crop workflow: instructional line + selection state +
+/// alias dropdown + target-path preview + Save / Clear buttons. Lives
+/// inside the Templates section now — the previous standalone "Crop &
+/// Save" card was the same concern under a different header.
+fn draw_crop_workflow(ui: &mut egui::Ui, gui: &mut ShopGui) {
     ui.colored_label(
         palette::TEXT_DIM,
         "Drag a rectangle on the snapshot, pick a target, click Save.",
@@ -1000,41 +1007,35 @@ fn draw_detection_settings(ui: &mut egui::Ui, gui: &mut ShopGui) {
         });
 }
 
-fn draw_templates(ui: &mut egui::Ui, gui: &mut ShopGui) {
-    if gui.template_status.is_empty() {
-        ui.horizontal(|ui| {
-            ui.colored_label(palette::OK, icon::CHECK_CIRCLE);
-            ui.colored_label(
-                palette::OK,
-                format!("all {} templates present", TEMPLATE_ALIASES.len()),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(format!("{}  Recheck", icon::ARROW_CLOCKWISE))
-                    .clicked()
-                {
-                    gui.refresh_template_status();
-                    gui.try_build_detector();
-                }
-            });
+/// Merged Templates section: status hint + Recheck up top, missing
+/// list (when any), then the crop workflow. Recheck stays clickable
+/// while the bot runs; the crop workflow is gated by `bot_active`.
+fn draw_templates_section(ui: &mut egui::Ui, gui: &mut ShopGui, bot_active: bool) {
+    let missing = !gui.template_status.is_empty();
+
+    // Intro line + Recheck right-aligned. The intro doubles as
+    // context for both the missing list (when present) and the crop
+    // workflow below.
+    ui.horizontal(|ui| {
+        let intro = if missing {
+            "Drop the PNGs at the paths below, or crop them:"
+        } else {
+            "Re-crop a template after a game patch if matches start failing."
+        };
+        ui.colored_label(palette::TEXT_DIM, intro);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button(format!("{}  Recheck", icon::ARROW_CLOCKWISE))
+                .clicked()
+            {
+                gui.refresh_template_status();
+                gui.try_build_detector();
+            }
         });
-    } else {
-        ui.horizontal(|ui| {
-            ui.colored_label(palette::WARN, icon::WARNING);
-            ui.colored_label(
-                palette::WARN,
-                format!("{} missing — drop the PNGs at:", gui.template_status.len()),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(format!("{}  Recheck", icon::ARROW_CLOCKWISE))
-                    .clicked()
-                {
-                    gui.refresh_template_status();
-                    gui.try_build_detector();
-                }
-            });
-        });
+    });
+
+    if missing {
+        ui.add_space(4.0);
         egui::ScrollArea::vertical()
             .max_height(110.0)
             .auto_shrink([false, true])
@@ -1046,7 +1047,16 @@ fn draw_templates(ui: &mut egui::Ui, gui: &mut ShopGui) {
                     });
                 }
             });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+    } else {
+        ui.add_space(8.0);
     }
+
+    ui.add_enabled_ui(!bot_active, |ui| {
+        draw_crop_workflow(ui, gui);
+    });
 }
 
 pub(super) fn draw_logs(ui: &mut egui::Ui, logs: &LogBuffer) {
