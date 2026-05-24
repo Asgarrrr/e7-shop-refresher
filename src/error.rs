@@ -49,6 +49,9 @@ pub enum Error {
     #[error("anchor `{0}` not seen within timeout — shop screen probably not open")]
     AnchorTimeout(String),
 
+    #[error("{0} consecutive rounds failed to refresh — bailing")]
+    TooManyFailures(u32),
+
     #[error("template `{0}` not registered")]
     UnknownTemplate(String),
 

@@ -190,11 +190,17 @@ impl ShopRunner {
     fn run_inner(&mut self) -> Result<bool> {
         let long_every = self.config.timing.long_pause_every_n;
         let started = Instant::now();
-        let mut round: u32 = 0;
+        // `iteration` is the loop counter used for logs and the
+        // consecutive-failure cap. `refreshes_done` is what the user
+        // sees and what `max_refreshes` is checked against — only a
+        // round that actually fired the confirm click bumps it.
+        let mut iteration: u32 = 0;
+        let mut refreshes_done: u32 = 0;
+        let mut consecutive_failures: u32 = 0;
         let mut reached_goal = false;
 
         loop {
-            round += 1;
+            iteration += 1;
             // Pull the latest live shop snapshot before reading any of
             // its fields — keeps the whole round consistent against one
             // version while still propagating UI edits at the boundary.
@@ -205,10 +211,17 @@ impl ShopRunner {
                 info!("stop signal received");
                 break;
             }
-            if max_refreshes > 0 && round > max_refreshes {
+            if max_refreshes > 0 && refreshes_done >= max_refreshes {
                 info!(max_refreshes, "max_refreshes reached — stopping");
                 reached_goal = true;
                 break;
+            }
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                warn!(
+                    consecutive_failures,
+                    "too many consecutive failures — bailing"
+                );
+                return Err(Error::TooManyFailures(MAX_CONSECUTIVE_FAILURES));
             }
             if let Some(reason) = self.stop_condition_reached(started) {
                 info!(stop_reason = reason, "stop condition reached");
@@ -237,15 +250,23 @@ impl ShopRunner {
                 }
             }
 
-            self.progress.round_started(round, max_refreshes);
+            self.progress.round_started(refreshes_done, max_refreshes);
 
-            match self.run_round(round) {
-                Ok(bought) => self.progress.round_finished(round, bought),
+            match self.run_round(iteration) {
+                Ok(outcome) => {
+                    if outcome.refreshed {
+                        refreshes_done += 1;
+                        consecutive_failures = 0;
+                    } else {
+                        consecutive_failures += 1;
+                    }
+                    self.progress.round_finished(refreshes_done, outcome.bought);
+                }
                 Err(e) if is_recoverable(&e) => {
-                    // Burn this round (do NOT decrement) so a stuck
-                    // unrecoverable state still hits max_refreshes.
+                    consecutive_failures += 1;
                     warn!(
-                        round,
+                        iteration,
+                        consecutive_failures,
                         error = %e,
                         "recoverable failure — attempting capture reattach"
                     );
@@ -263,11 +284,12 @@ impl ShopRunner {
             // immediately stop anyway (avoids overshooting wall-clock by
             // up to long_pause_max_ms).
             let next_round_would_stop = self.stop.load(Ordering::Relaxed)
-                || (max_refreshes > 0 && round + 1 > max_refreshes)
+                || (max_refreshes > 0 && refreshes_done >= max_refreshes)
+                || consecutive_failures >= MAX_CONSECUTIVE_FAILURES
                 || self.stop_condition_reached(started).is_some();
             if !next_round_would_stop {
-                if long_every > 0 && round.is_multiple_of(long_every) {
-                    debug!(round, "taking a long human pause");
+                if long_every > 0 && iteration.is_multiple_of(long_every) {
+                    debug!(iteration, "taking a long human pause");
                     self.clicker.long_human_pause();
                 } else {
                     self.clicker.inter_round_pause();
@@ -283,7 +305,7 @@ impl ShopRunner {
         })
     }
 
-    fn run_round(&mut self, round: u32) -> Result<u32> {
+    fn run_round(&mut self, round: u32) -> Result<RoundOutcome> {
         info!(round, "round starting");
 
         // Refresh re-rolls the inventory, so both dedupe sets reset.
@@ -300,7 +322,10 @@ impl ShopRunner {
                     round,
                     "shop anchor not seen — skipping round (IAP redirect possible)"
                 );
-                return Ok(0);
+                return Ok(RoundOutcome {
+                    bought: 0,
+                    refreshed: false,
+                });
             }
             Err(e) => return Err(e),
         }
@@ -308,8 +333,8 @@ impl ShopRunner {
         let bought = self.buy_round()?;
         info!(round, bought, "items bought");
 
-        self.refresh_shop()?;
-        Ok(bought)
+        let refreshed = self.refresh_shop()?;
+        Ok(RoundOutcome { bought, refreshed })
     }
 
     fn wait_anchor(&mut self) -> Result<()> {
@@ -578,7 +603,10 @@ impl ShopRunner {
         Ok(((cx * w).round() as i32, (cy * h).round() as i32))
     }
 
-    fn refresh_shop(&mut self) -> Result<()> {
+    /// Returns `true` when the refresh modal opened and the confirm
+    /// click was issued, `false` when the modal-open hash check
+    /// failed or `stop` interrupted before confirm.
+    fn refresh_shop(&mut self) -> Result<bool> {
         let refresh = self
             .config
             .zones
@@ -603,27 +631,27 @@ impl ShopRunner {
             .click_local_in_rect(&*self.capture, refresh_rect)?;
         self.clicker.human_pause();
         if self.stop.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(false);
         }
 
         self.clicker
             .pause_ms(self.config.timing.modal_open_pause_ms);
         if self.stop.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(false);
         }
 
         let after_gray = self.snapshot()?;
         let after = strip_hash(&after_gray, confirm);
         if before == after {
             warn!("refresh modal did not open — skipping confirm click (this round won't refresh)");
-            return Ok(());
+            return Ok(false);
         }
 
         let confirm_rect = self.zone_to_local_rect(confirm)?;
         self.clicker
             .click_local_in_rect(&*self.capture, confirm_rect)?;
         self.clicker.human_pause();
-        Ok(())
+        Ok(true)
     }
 
     fn snapshot(&self) -> Result<GrayImage> {
@@ -643,6 +671,22 @@ enum BuyOutcome {
     Bought,
     None,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct RoundOutcome {
+    bought: u32,
+    /// `true` only when the refresh modal actually opened and confirm
+    /// was clicked. False when the anchor wasn't seen, the modal-open
+    /// hash check failed, or stop interrupted before confirm.
+    refreshed: bool,
+}
+
+/// Bail-out threshold for the run loop: this many iterations in a
+/// row without a successful refresh stops the bot. Replaces the
+/// "every iteration counts toward max_refreshes" safety net so that
+/// max_refreshes can mean "actual refreshes" without risking an
+/// unbounded loop on a stuck state.
+const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
 /// Pure stop-condition check (testable without standing up real IO).
 /// Returns the first satisfied condition in fixed priority order
