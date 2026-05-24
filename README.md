@@ -24,6 +24,11 @@ no liability for losses. Use at your own risk.
 - Windows 10 / 11 (the WGC capture backend is Windows-only).
 - Epic Seven on STOVE PC. Emulators are not supported.
 - Rust toolchain (stable, 1.84+) — https://rustup.rs/
+- **Administrator privileges.** STOVE runs the game at an elevated
+  integrity level, and Windows UIPI silently drops synthetic input
+  from a lower-integrity process. The .exe ships with a manifest
+  that triggers UAC on launch; accept the prompt or the bot's
+  clicks won't reach the game.
 
 ## Quick start
 
