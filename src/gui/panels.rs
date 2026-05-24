@@ -1039,18 +1039,23 @@ fn draw_detection_settings(ui: &mut egui::Ui, gui: &mut ShopGui) {
 /// "Crop each missing icon" header to clip against the button.
 /// Per-alias status lives inside the workflow's dropdown.
 fn draw_templates_section(ui: &mut egui::Ui, gui: &mut ShopGui, bot_active: bool) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        if ui
-            .small_button(format!("{}  Recheck", icon::ARROW_CLOCKWISE))
-            .on_hover_text(
-                "Re-scan the templates folder. Useful if you've added \
-                 a PNG by hand or while the bot was running.",
-            )
-            .clicked()
-        {
-            gui.refresh_template_status();
-            gui.try_build_detector();
-        }
+    // `with_layout(right_to_left)` at the top level would claim the
+    // full remaining vertical space and float the button mid-panel.
+    // Wrapping it in `ui.horizontal` constrains it to a single row.
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button(format!("{}  Recheck", icon::ARROW_CLOCKWISE))
+                .on_hover_text(
+                    "Re-scan the templates folder. Useful if you've \
+                     added a PNG by hand or while the bot was running.",
+                )
+                .clicked()
+            {
+                gui.refresh_template_status();
+                gui.try_build_detector();
+            }
+        });
     });
     ui.add_space(4.0);
 
