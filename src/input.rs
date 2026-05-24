@@ -134,8 +134,27 @@ impl Clicker {
         self.ensure_foreground(capture)?;
         let (tx, ty) = capture.local_to_screen(local_x, local_y)?;
         let start = self.enigo.location().unwrap_or((tx, ty));
+        tracing::debug!(
+            local_x,
+            local_y,
+            screen_x = tx,
+            screen_y = ty,
+            start_x = start.0,
+            start_y = start.1,
+            "click path computed"
+        );
 
         self.move_human(start, (tx, ty))?;
+        let landed = self.enigo.location().unwrap_or((tx, ty));
+        tracing::debug!(
+            expected_x = tx,
+            expected_y = ty,
+            landed_x = landed.0,
+            landed_y = landed.1,
+            delta_x = landed.0 - tx,
+            delta_y = landed.1 - ty,
+            "move_human finished"
+        );
 
         let dwell = self.uniform_ms(
             self.timing.move_to_click_min_ms,
@@ -146,6 +165,7 @@ impl Clicker {
             return Ok(());
         }
         self.enigo.button(Button::Left, Direction::Click)?;
+        tracing::debug!("button click sent");
         Ok(())
     }
 

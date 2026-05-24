@@ -643,6 +643,11 @@ impl ShopRunner {
 
         info!("clicking refresh");
         let refresh_rect = self.zone_to_local_rect(refresh)?;
+        debug!(
+            zone = ?refresh,
+            local_rect = ?refresh_rect,
+            "refresh zone resolved"
+        );
         self.clicker
             .click_local_in_rect(&*self.capture, refresh_rect)?;
         self.clicker.human_pause();
@@ -658,6 +663,12 @@ impl ShopRunner {
 
         let after_gray = self.snapshot()?;
         let after = strip_hash(&after_gray, confirm);
+        debug!(
+            before_hash = before,
+            after_hash = after,
+            confirm_zone = ?confirm,
+            "refresh modal hash check"
+        );
         if before == after {
             warn!("refresh modal did not open — skipping confirm click (this round won't refresh)");
             return Ok(false);
