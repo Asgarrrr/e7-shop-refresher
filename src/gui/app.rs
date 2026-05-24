@@ -157,6 +157,11 @@ pub struct ShopGui {
     pub(super) active_tab: Tab,
 
     last_window_poll: Option<Instant>,
+
+    /// Flipped by the Win32 hotkey thread on Ctrl+7; consumed by
+    /// `update()` each frame so the same code path handles hotkey
+    /// Stop and click Stop.
+    stop_hotkey_pressed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn install_icon_font(ctx: &egui::Context) {
@@ -184,6 +189,7 @@ impl ShopGui {
         }
         let saved_snapshot = AutoSavedFields::from_config(&config);
         let live_shop = Arc::new(RwLock::new(config.shop.clone()));
+        let stop_hotkey_pressed = super::hotkey::spawn_stop_hotkey(cc.egui_ctx.clone());
         let mut gui = Self {
             config,
             config_path,
@@ -218,6 +224,7 @@ impl ShopGui {
             auto_save_error: None,
             active_tab: Tab::Run,
             last_window_poll: None,
+            stop_hotkey_pressed,
         };
         gui.refresh_template_status();
         gui.refresh_zone_status();
@@ -453,6 +460,22 @@ impl ShopGui {
         self.stats.update(|s| s.sleep_consumed = false);
     }
 
+    /// Polled each frame: if the Win32 hotkey thread flipped the flag,
+    /// route it through `stop_bot()` exactly like a Stop button click.
+    /// No-op when no run is in flight — the hotkey is harmless idle.
+    pub(super) fn consume_stop_hotkey(&mut self) {
+        if !self
+            .stop_hotkey_pressed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        if self.bot.is_some() {
+            info!("stop hotkey pressed");
+            self.stop_bot();
+        }
+    }
+
     pub(super) fn poll_bot(&mut self) {
         let Some(bot) = self.bot.as_mut() else { return };
         if let Some(join_result) = bot.poll() {
@@ -593,6 +616,7 @@ impl App for ShopGui {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll_bot();
         self.consume_sleep_flag();
+        self.consume_stop_hotkey();
         self.auto_refresh_window_status(ctx);
         // Cleared each frame so panels can re-register on hover; the
         // central snapshot renders AFTER the side panels, so it reads

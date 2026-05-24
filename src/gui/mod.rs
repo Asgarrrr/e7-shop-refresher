@@ -1,5 +1,6 @@
 pub mod app;
 pub mod bot;
+mod hotkey;
 pub mod logs;
 mod panels;
 mod persist;

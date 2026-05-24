@@ -342,7 +342,13 @@ fn draw_action_row(ui: &mut egui::Ui, gui: &mut ShopGui, effective: &BotStatus, 
                         .color(palette::ACCENT_TEXT),
                 )
                 .fill(fill);
-                let resp = ui.add_enabled(enabled, button);
+                let mut resp = ui.add_enabled(enabled, button);
+                if matches!(action, Action::Stop) {
+                    resp = resp.on_hover_text(
+                        "Stop the bot. Ctrl+7 works from anywhere — even when \
+                         Epic Seven has focus.",
+                    );
+                }
                 if resp.clicked() {
                     match action {
                         Action::Start => {
