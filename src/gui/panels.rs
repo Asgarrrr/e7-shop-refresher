@@ -9,19 +9,27 @@ use crate::gui::logs::LogBuffer;
 use crate::gui::persist::AutoSavedFields;
 use crate::gui::state::BotStatus;
 
-fn draw_window_status(ui: &mut egui::Ui, gui: &mut ShopGui) {
-    // Snapshot the fields the closure reads before it takes &mut gui to
-    // call methods.
+/// Ambient window status, intended for the panel footer. Single-line
+/// when the window is found (small dot + dim text — confirmation
+/// without grabbing attention). On error, the message is allowed to
+/// wrap and the Retry button sits below it so a long message never
+/// gets clipped against the panel edge.
+pub(super) fn draw_window_footer(ui: &mut egui::Ui, gui: &mut ShopGui) {
     let window_error = gui.window_error.clone();
     let window_size = gui.window_size;
     let window_title = gui.window_title.clone();
+    ui.add_space(6.0);
     if let Some(e) = window_error {
-        ui.horizontal(|ui| {
+        ui.horizontal_top(|ui| {
             ui.colored_label(palette::ERROR, icon::WARNING);
-            ui.colored_label(palette::ERROR, e);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.vertical(|ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&e).color(palette::ERROR))
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                );
+                ui.add_space(2.0);
                 if ui
-                    .button(format!("{}  Retry", icon::ARROW_CLOCKWISE))
+                    .small_button(format!("{}  Retry", icon::ARROW_CLOCKWISE))
                     .clicked()
                 {
                     gui.refresh_template_status();
@@ -31,18 +39,19 @@ fn draw_window_status(ui: &mut egui::Ui, gui: &mut ShopGui) {
         });
     } else if let Some((w, h)) = window_size {
         ui.horizontal(|ui| {
-            ui.colored_label(palette::OK, icon::CHECK_CIRCLE);
+            ui.colored_label(palette::OK, icon::DOT);
             ui.colored_label(
-                palette::OK,
-                format!(
-                    "{} ({}×{})",
-                    window_title.as_deref().unwrap_or("game"),
-                    w,
-                    h
-                ),
+                palette::TEXT_DIM,
+                format!("{}  {}×{}", window_title.as_deref().unwrap_or("game"), w, h),
             );
         });
+    } else {
+        ui.horizontal(|ui| {
+            ui.colored_label(palette::TEXT_MUTED, icon::DOT);
+            ui.colored_label(palette::TEXT_MUTED, "No window detected yet");
+        });
     }
+    ui.add_space(6.0);
 }
 
 /// Quieter alternative to `ui.heading()` (which renders at ~20 px and
@@ -188,55 +197,23 @@ pub(super) fn draw_run_tab(ui: &mut egui::Ui, gui: &mut ShopGui, _ctx: &Context)
         && gui.zone_status.is_empty()
         && !bot_active;
 
-    draw_window_status(ui, gui);
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        // Start is the primary action — larger + bolder than Stop.
-        let start_btn = egui::Button::new(
-            egui::RichText::new(format!("{}  Start", icon::PLAY))
-                .size(14.0)
-                .strong(),
-        );
-        if ui.add_enabled(can_start, start_btn).clicked()
-            && let Err(e) = gui.start_bot()
-        {
-            error!(error = %e, "start failed");
-        }
-        if ui
-            .add_enabled(
-                bot_active,
-                egui::Button::new(format!("{}  Stop", icon::STOP)),
-            )
-            .clicked()
-        {
-            gui.stop_bot();
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (color, status_icon) = match effective {
-                BotStatus::Running => (palette::OK, icon::PLAY_CIRCLE),
-                BotStatus::Stopping => (palette::WARN, icon::HOURGLASS),
-                BotStatus::Failed => (palette::ERROR, icon::WARNING_CIRCLE),
-                _ => (palette::TEXT_MUTED, icon::PAUSE_CIRCLE),
-            };
-            ui.colored_label(color, effective.label());
-            ui.colored_label(color, status_icon);
-        });
-    });
+    draw_primary_toggle(ui, gui, &effective, can_start);
 
-    // Skip the window-not-found case — already surfaced by
-    // draw_window_status above with its own Retry button.
+    // Blocker reason — only shown when Start would be disabled and the
+    // bot isn't running. Skipped if no window (the footer surfaces that
+    // case with its own Retry button).
     if !can_start && !bot_active && gui.capture.is_some() {
         let reason = if !gui.template_status.is_empty() {
-            "templates missing — see Setup tab"
+            "Templates missing — see Setup tab"
         } else if !gui.zone_status.is_empty() {
-            "zones not drawn — see Setup tab"
+            "Zones not drawn — see Setup tab"
         } else if gui.detector.is_none() {
-            "detector not ready"
+            "Detector not ready"
         } else {
             ""
         };
         if !reason.is_empty() {
-            ui.add_space(2.0);
+            ui.add_space(4.0);
             ui.colored_label(palette::TEXT_MUTED, reason);
         }
     }
@@ -257,78 +234,175 @@ pub(super) fn draw_run_tab(ui: &mut egui::Ui, gui: &mut ShopGui, _ctx: &Context)
 
     section_separator(ui);
 
-    ui.add_enabled_ui(!bot_active, |ui| {
-        section_header(ui, "Targets");
-        ui.checkbox(&mut gui.config.shop.buy_mystic_medals, "Buy mystic medals");
-        ui.checkbox(&mut gui.config.shop.buy_covenant, "Buy covenant bookmarks");
+    // Run-tab fields are live-editable mid-run: the GUI publishes them
+    // to `live_shop` every frame, the worker re-reads at every round
+    // boundary. No `add_enabled_ui` wrapper here — edits to targets /
+    // stop conditions / sleep-on-done take effect within ~1 round.
+    section_header(ui, "Targets");
+    ui.checkbox(&mut gui.config.shop.buy_mystic_medals, "Buy mystic medals");
+    ui.checkbox(&mut gui.config.shop.buy_covenant, "Buy covenant bookmarks");
 
-        section_separator(ui);
+    section_separator(ui);
 
-        section_header(ui, "Stop when…");
-        ui.label(
-            "Any limit set to 0 is disabled. The run halts at whichever \
-             is reached first. All zeros = no auto-stop (manual Stop only).",
-        );
-        ui.add_space(4.0);
+    section_header(ui, "Stop when…");
+    ui.label(
+        "Any limit set to 0 is disabled. The run halts at whichever \
+         is reached first. All zeros = no auto-stop (manual Stop only).",
+    );
+    ui.add_space(4.0);
 
-        // Grid aligns every DragValue at the same X regardless of label width.
-        egui::Grid::new("stop_when_grid")
-            .num_columns(2)
-            .spacing([10.0, 4.0])
-            .show(ui, |ui| {
-                stop_condition_row(
-                    ui,
-                    "refreshes done",
-                    &mut gui.config.shop.max_refreshes,
-                    1.0,
-                    0..=10_000,
-                    "Total refresh rounds before halting.",
-                );
-                stop_condition_row(
-                    ui,
-                    "minutes elapsed",
-                    &mut gui.config.shop.stop_after_minutes,
-                    0.5,
-                    0..=1440,
-                    "Wall-clock duration limit. Checked at every round boundary.",
-                );
-                stop_condition_row(
-                    ui,
-                    "mystic medals bought",
-                    &mut gui.config.shop.stop_when_mystic_medals,
-                    0.5,
-                    0..=10_000,
-                    "Halt after this many mystic medals have been bought this run.",
-                );
-                stop_condition_row(
-                    ui,
-                    "covenants bought",
-                    &mut gui.config.shop.stop_when_covenants,
-                    0.5,
-                    0..=10_000,
-                    "Halt after this many covenant bookmarks have been bought this run.",
-                );
+    // Grid aligns every DragValue at the same X regardless of label width.
+    egui::Grid::new("stop_when_grid")
+        .num_columns(2)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            stop_condition_row(
+                ui,
+                "Refreshes done",
+                &mut gui.config.shop.max_refreshes,
+                1.0,
+                0..=10_000,
+                "Total refresh rounds before halting.",
+            );
+            stop_duration_row(
+                ui,
+                "Minutes elapsed",
+                &mut gui.config.shop.stop_after_minutes,
+                "Wall-clock duration limit. Checked at every round boundary.",
+            );
+            stop_condition_row(
+                ui,
+                "Mystic medals bought",
+                &mut gui.config.shop.stop_when_mystic_medals,
+                0.5,
+                0..=10_000,
+                "Halt after this many mystic medals have been bought this run.",
+            );
+            stop_condition_row(
+                ui,
+                "Covenants bought",
+                &mut gui.config.shop.stop_when_covenants,
+                0.5,
+                0..=10_000,
+                "Halt after this many covenant bookmarks have been bought this run.",
+            );
+        });
+
+    section_separator(ui);
+
+    section_header(ui, "On completion");
+    ui.checkbox(
+        &mut gui.config.shop.sleep_when_done,
+        "Sleep PC when goal reached",
+    )
+    .on_hover_text(
+        "Suspends the system to sleep once a stop condition fires. \
+         Never triggers on manual Stop.",
+    );
+
+    #[cfg(debug_assertions)]
+    draw_demo_controls(ui, gui);
+}
+
+/// Debug-only helper: writes plausible "mid-run" values into the shared
+/// stats sink so developers without a live Epic Seven window can see
+/// the running-state UI (toggle button switching to Stop, stat block
+/// appearing, sections disabling). Clicking the main toggle button
+/// while in this state clears the stats back to Idle.
+#[cfg(debug_assertions)]
+fn draw_demo_controls(ui: &mut egui::Ui, gui: &mut ShopGui) {
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.colored_label(palette::TEXT_MUTED, "Debug:");
+        if ui.small_button("Inject demo stats").clicked() {
+            gui.stats.update(|s| {
+                s.status = BotStatus::Running;
+                s.round = 7;
+                s.total_rounds = 30;
+                s.mystic_bought = 2;
+                s.covenant_bought = 1;
+                s.items_bought = 3;
+                s.last_error = None;
             });
-
-        section_separator(ui);
-
-        section_header(ui, "On completion");
-        ui.checkbox(
-            &mut gui.config.shop.sleep_when_done,
-            "Sleep PC when goal reached",
-        )
-        .on_hover_text(
-            "Suspends the system to sleep once a stop condition fires. \
-             Never triggers on manual Stop.",
-        );
+        }
     });
+}
 
-    if bot_active {
-        ui.add_space(4.0);
-        ui.colored_label(
-            palette::TEXT_MUTED,
-            "Bot is running — stop it to edit these.",
-        );
+/// Single morphing button that replaces the old Start/Stop pair + Idle
+/// chip. The button label, icon, fill colour, and action all switch
+/// based on the effective bot status:
+///
+/// - Idle / Finished / Failed + can_start → "Start" (accent fill)
+/// - Idle / Finished / Failed + !can_start → "Setup needed" (disabled)
+/// - Running → "Stop" (red fill)
+/// - Stopping → "Stopping…" (warn fill, disabled)
+///
+/// When clicked in Stop mode with no real bot handle (= demo state in
+/// debug builds), it resets the stats sink instead of crashing.
+fn draw_primary_toggle(
+    ui: &mut egui::Ui,
+    gui: &mut ShopGui,
+    effective: &BotStatus,
+    can_start: bool,
+) {
+    enum Action {
+        Start,
+        Stop,
+        None,
+    }
+
+    let (label, glyph, fill, action, enabled) = match effective {
+        BotStatus::Running => ("Stop", icon::STOP, Some(palette::ERROR), Action::Stop, true),
+        BotStatus::Stopping => (
+            "Stopping…",
+            icon::HOURGLASS,
+            Some(palette::WARN),
+            Action::None,
+            false,
+        ),
+        // Idle, Finished, Failed all behave as "ready to start" from
+        // the button's POV — the stat block (when present) carries the
+        // post-run outcome separately.
+        _ if can_start => (
+            "Start",
+            icon::PLAY,
+            Some(palette::ACCENT),
+            Action::Start,
+            true,
+        ),
+        _ => ("Setup needed", icon::WARNING, None, Action::None, false),
+    };
+
+    let text = egui::RichText::new(format!("{glyph}  {label}"))
+        .size(15.0)
+        .strong()
+        .color(palette::ACCENT_TEXT);
+    let mut button = egui::Button::new(text).min_size(egui::vec2(140.0, 32.0));
+    if let Some(c) = fill {
+        button = button.fill(c);
+    }
+
+    let resp = ui.add_enabled(enabled, button);
+    if resp.clicked() {
+        match action {
+            Action::Start => {
+                if let Err(e) = gui.start_bot() {
+                    error!(error = %e, "start failed");
+                }
+            }
+            Action::Stop => {
+                if gui.bot.is_some() {
+                    gui.stop_bot();
+                } else {
+                    // Demo / orphan-stats path: no worker to signal, so
+                    // just clear the sink back to Idle.
+                    gui.stats.update(|s| *s = Default::default());
+                }
+            }
+            Action::None => {}
+        }
     }
 }
 
@@ -340,30 +414,108 @@ fn stop_condition_row(
     range: std::ops::RangeInclusive<u32>,
     hover: &str,
 ) {
-    // Active (non-zero) limits are styled so the user can scan the
-    // section and immediately see what's actually configured to fire
-    // — zeroed-out rows fade to the same muted palette as disabled UI.
-    let active = *value > 0;
-    let label_color = if active {
-        palette::SECTION_HEADER
-    } else {
-        palette::TEXT_MUTED
-    };
-    let value_color = if active {
-        palette::ACCENT
-    } else {
-        palette::TEXT_MUTED
-    };
-    ui.label(egui::RichText::new(label).color(label_color));
-    // `override_text_color` is scoped to this nested ui, so the
-    // DragValue picks it up for both its display and edit modes
-    // without leaking to widgets rendered after this row.
-    ui.scope(|ui| {
-        ui.style_mut().visuals.override_text_color = Some(value_color);
+    // When the surrounding ui is disabled (bot running), suppress the
+    // active-limit highlight so the row fades in step with the rest of
+    // the panel chrome — otherwise the blue values stay eye-poppingly
+    // bright while every neighbouring widget greys out.
+    let active = ui.is_enabled() && *value > 0;
+    stop_condition_label(ui, label, active);
+    scoped_value_color(ui, active, |ui| {
         ui.add(egui::DragValue::new(value).speed(speed).range(range))
             .on_hover_text(hover);
     });
     ui.end_row();
+}
+
+/// Same row layout as `stop_condition_row` but the value displays /
+/// parses as a duration: `0` for disabled, `45m` for under an hour,
+/// `1h30` for hours-plus-minutes, `2h` for round hours. Parsing
+/// accepts the same forms plus a bare integer (interpreted as
+/// minutes).
+fn stop_duration_row(ui: &mut egui::Ui, label: &str, value: &mut u32, hover: &str) {
+    let active = ui.is_enabled() && *value > 0;
+    stop_condition_label(ui, label, active);
+    scoped_value_color(ui, active, |ui| {
+        ui.add(
+            egui::DragValue::new(value)
+                .speed(0.5)
+                .range(0..=1440)
+                .custom_formatter(|n, _| format_minutes(n as u32))
+                .custom_parser(|s| parse_minutes(s).map(f64::from)),
+        )
+        .on_hover_text(hover);
+    });
+    ui.end_row();
+}
+
+fn stop_condition_label(ui: &mut egui::Ui, label: &str, active: bool) {
+    let color = if active {
+        palette::SECTION_HEADER
+    } else {
+        palette::TEXT_MUTED
+    };
+    ui.label(egui::RichText::new(label).color(color));
+}
+
+/// `override_text_color` is scoped to a nested ui so the inner
+/// DragValue picks it up in both display and edit modes without
+/// leaking to widgets rendered after this row.
+fn scoped_value_color(ui: &mut egui::Ui, active: bool, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let color = if active {
+        palette::ACCENT
+    } else {
+        palette::TEXT_MUTED
+    };
+    ui.scope(|ui| {
+        ui.style_mut().visuals.override_text_color = Some(color);
+        add_contents(ui);
+    });
+}
+
+fn format_minutes(total: u32) -> String {
+    // `0` mirrors the bare-integer "disabled" sentinel used by every
+    // other stop condition row — keeps the grid visually consistent
+    // and matches the section's intro text ("set to 0 to disable").
+    if total == 0 {
+        return "0".to_string();
+    }
+    let hours = total / 60;
+    let minutes = total % 60;
+    match (hours, minutes) {
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h{m:02}"),
+    }
+}
+
+/// Accepts an empty string, a bare integer (interpreted as minutes),
+/// `30m`, `30 min`, `2h`, `1h30`, `1h 30`, `1h30m`. Returns `None` for
+/// anything else so the DragValue keeps the previous value instead of
+/// silently zeroing out on a typo.
+fn parse_minutes(input: &str) -> Option<u32> {
+    let s = input.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return Some(0);
+    }
+    if let Some(h_pos) = s.find('h') {
+        let hours: u32 = s[..h_pos].trim().parse().ok()?;
+        let rest = strip_minute_suffix(s[h_pos + 1..].trim());
+        let minutes: u32 = if rest.is_empty() {
+            0
+        } else {
+            rest.parse().ok()?
+        };
+        return Some(hours * 60 + minutes);
+    }
+    strip_minute_suffix(&s).parse().ok()
+}
+
+fn strip_minute_suffix(s: &str) -> &str {
+    let s = s
+        .strip_suffix("min")
+        .or_else(|| s.strip_suffix('m'))
+        .unwrap_or(s);
+    s.trim()
 }
 
 /// Three-column stat block shown when the bot is running (or has run
@@ -389,7 +541,7 @@ fn draw_run_stats(
             stat_value(ui, &format!("{mystic_bought}"));
             stat_value(ui, &format!("{covenant_bought}"));
             ui.end_row();
-            stat_caption(ui, "round");
+            stat_caption(ui, "rounds");
             stat_caption(ui, "mystic");
             stat_caption(ui, "covenant");
             ui.end_row();
@@ -565,7 +717,7 @@ fn draw_zones_editor(ui: &mut egui::Ui, gui: &mut ShopGui) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let has_value = gui.zone_mut(name).is_some_and(|s| s.is_some());
                 if has_value
-                    && ui.small_button("clear").clicked()
+                    && ui.small_button("Clear").clicked()
                     && let Some(slot) = gui.zone_mut(name)
                 {
                     *slot = None;
@@ -706,7 +858,7 @@ fn draw_crop_panel(ui: &mut egui::Ui, gui: &mut ShopGui) {
             ));
         }
         _ => {
-            ui.colored_label(palette::TEXT_MUTED, "no selection");
+            ui.colored_label(palette::TEXT_MUTED, "No selection");
         }
     }
 
@@ -854,4 +1006,50 @@ pub(super) fn draw_logs(ui: &mut egui::Ui, logs: &LogBuffer) {
                 ui.label(line);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_minutes, parse_minutes};
+
+    #[test]
+    fn format_minutes_handles_canonical_cases() {
+        assert_eq!(format_minutes(0), "0");
+        assert_eq!(format_minutes(1), "1m");
+        assert_eq!(format_minutes(45), "45m");
+        assert_eq!(format_minutes(60), "1h");
+        assert_eq!(format_minutes(90), "1h30");
+        assert_eq!(format_minutes(125), "2h05"); // zero-padded minutes
+        assert_eq!(format_minutes(1440), "24h");
+    }
+
+    #[test]
+    fn parse_minutes_accepts_canonical_forms() {
+        assert_eq!(parse_minutes(""), Some(0));
+        assert_eq!(parse_minutes("0"), Some(0));
+        assert_eq!(parse_minutes("45"), Some(45));
+        assert_eq!(parse_minutes("45m"), Some(45));
+        assert_eq!(parse_minutes("45 min"), Some(45));
+        assert_eq!(parse_minutes("2h"), Some(120));
+        assert_eq!(parse_minutes("1h30"), Some(90));
+        assert_eq!(parse_minutes("1h 30"), Some(90));
+        assert_eq!(parse_minutes("1h30m"), Some(90));
+        assert_eq!(parse_minutes("1h05"), Some(65));
+    }
+
+    #[test]
+    fn parse_minutes_rejects_garbage() {
+        assert_eq!(parse_minutes("abc"), None);
+        assert_eq!(parse_minutes("h30"), None); // hours empty
+        assert_eq!(parse_minutes("1h xyz"), None);
+    }
+
+    #[test]
+    fn format_and_parse_round_trip_for_typical_values() {
+        for &n in &[0u32, 5, 30, 60, 75, 120, 240, 1439] {
+            let formatted = format_minutes(n);
+            let parsed = parse_minutes(&formatted).expect("formatted output must parse back");
+            assert_eq!(parsed, n, "round-trip failed for {n} via {formatted:?}");
+        }
+    }
 }

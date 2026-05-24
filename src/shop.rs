@@ -1,13 +1,13 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use image::GrayImage;
 use tracing::{debug, info, warn};
 
 use crate::capture::Capture;
-use crate::config::{Config, RegionsConfig};
+use crate::config::{Config, RegionsConfig, ShopConfig};
 use crate::detector::{Detector, alias};
 use crate::error::{Error, Result};
 use crate::input::Input;
@@ -77,6 +77,14 @@ pub struct ShopRunner {
     detector: Arc<Detector>,
     clicker: Box<dyn Input>,
     config: Config,
+    /// Shared, live-editable view of `[shop]`. The GUI mutates the
+    /// matching fields and pushes them here on every frame; the runner
+    /// pulls a fresh snapshot at the start of every round so mid-run
+    /// edits to stop conditions, targets, and sleep-on-done take effect
+    /// at the next boundary. Setup-tab fields (timing / matching /
+    /// templates / zones) stay captured by value in `config` since the
+    /// bot is in the middle of using them.
+    live_shop: Arc<RwLock<ShopConfig>>,
     stop: Arc<AtomicBool>,
     progress: Arc<dyn ProgressSink>,
     enabled_targets: Vec<&'static str>,
@@ -96,6 +104,7 @@ impl ShopRunner {
         detector: Arc<Detector>,
         clicker: Box<dyn Input>,
         config: Config,
+        live_shop: Arc<RwLock<ShopConfig>>,
         stop: Arc<AtomicBool>,
     ) -> Self {
         let enabled_targets = config.enabled_targets();
@@ -104,11 +113,27 @@ impl ShopRunner {
             detector,
             clicker,
             config,
+            live_shop,
             stop,
             progress: Arc::new(NullSink),
             enabled_targets,
             bought_types: HashSet::new(),
             attempted_icons: HashSet::new(),
+        }
+    }
+
+    /// Pulls the latest `[shop]` section from `live_shop` into the
+    /// owned `Config` snapshot the rest of the runner reads from. Also
+    /// recomputes `enabled_targets` so a toggle of `buy_mystic_medals`
+    /// / `buy_covenant` propagates without other bookkeeping.
+    ///
+    /// Called once per round at the iteration boundary — keeps every
+    /// decision inside a round consistent against a single snapshot,
+    /// even if the user is dragging a slider while the round runs.
+    fn refresh_live_shop(&mut self) {
+        if let Ok(latest) = self.live_shop.read() {
+            self.config.shop = latest.clone();
+            self.enabled_targets = self.config.enabled_targets();
         }
     }
 
@@ -130,8 +155,12 @@ impl ShopRunner {
             "starting shop refresh loop"
         );
 
-        let sleep_after = self.config.shop.sleep_when_done;
         let result = self.run_inner();
+        // Read sleep_when_done AFTER the loop so a toggle made mid-run
+        // (e.g. user clicked "Sleep PC" right before going to bed) is
+        // honoured. Matches the user's intuition that this is a final-
+        // step decision, not a "must be set at start" config.
+        let sleep_after = self.config.shop.sleep_when_done;
         match &result {
             Ok(reached_goal) => {
                 self.progress.finished();
@@ -151,13 +180,17 @@ impl ShopRunner {
     /// `Ok(false)` on manual Stop, `Err` on real failures.
     fn run_inner(&mut self) -> Result<bool> {
         let long_every = self.config.timing.long_pause_every_n;
-        let max_refreshes = self.config.shop.max_refreshes;
         let started = Instant::now();
         let mut round: u32 = 0;
         let mut reached_goal = false;
 
         loop {
             round += 1;
+            // Pull the latest live shop snapshot before reading any of
+            // its fields — keeps the whole round consistent against one
+            // version while still propagating UI edits at the boundary.
+            self.refresh_live_shop();
+            let max_refreshes = self.config.shop.max_refreshes;
 
             if self.stop.load(Ordering::Relaxed) {
                 info!("stop signal received");
@@ -846,11 +879,79 @@ mod tests {
         let input: Box<dyn Input> = Box::new(fake_input);
         let stop = Arc::new(AtomicBool::new(true));
 
-        let mut runner = ShopRunner::new(capture, detector, input, config, stop);
+        let live_shop = Arc::new(RwLock::new(config.shop.clone()));
+        let mut runner = ShopRunner::new(capture, detector, input, config, live_shop, stop);
         runner.run().expect("run with stop=true should be Ok");
         assert!(
             events.lock().unwrap().is_empty(),
             "no clicks/scrolls/pauses should fire when stop is set before round 1"
+        );
+    }
+
+    #[test]
+    fn refresh_live_shop_picks_up_external_mutation() {
+        let mut config: Config = toml::from_str(crate::config::DEFAULT_TOML).unwrap();
+        config.zones.refresh = Some([0.1, 0.8, 0.1, 0.1]);
+        config.zones.refresh_confirm = Some([0.4, 0.5, 0.1, 0.1]);
+        config.zones.buy_confirm = Some([0.4, 0.5, 0.1, 0.1]);
+        config.zones.buy_column = Some([0.8, 0.0, 0.1, 1.0]);
+        config.shop.max_refreshes = 1;
+        config.shop.buy_mystic_medals = true;
+        config.shop.buy_covenant = false;
+
+        let capture: Arc<dyn Capture> = Arc::new(FakeCapture::new(
+            vec![],
+            WindowRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        ));
+        let detector = Arc::new(Detector::from_test_images(std::collections::HashMap::new()));
+        let input: Box<dyn Input> = Box::new(FakeInput::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let live_shop = Arc::new(RwLock::new(config.shop.clone()));
+        let mut runner = ShopRunner::new(
+            capture,
+            detector,
+            input,
+            config,
+            Arc::clone(&live_shop),
+            stop,
+        );
+
+        // Sanity: starting state matches the seed config.
+        assert_eq!(runner.config.shop.max_refreshes, 1);
+        assert!(runner.config.shop.buy_mystic_medals);
+        assert!(!runner.config.shop.buy_covenant);
+        assert_eq!(
+            runner.enabled_targets,
+            vec![crate::detector::alias::MYSTIC_MEDAL]
+        );
+
+        // Simulate the GUI mutating live_shop mid-run.
+        {
+            let mut shop = live_shop.write().unwrap();
+            shop.max_refreshes = 42;
+            shop.buy_mystic_medals = false;
+            shop.buy_covenant = true;
+            shop.stop_after_minutes = 30;
+        }
+
+        runner.refresh_live_shop();
+
+        // All four fields propagated and enabled_targets was recomputed
+        // from the new buy_* flags — this is the whole point of the
+        // shared handle: ui edits visible to the worker without a
+        // restart.
+        assert_eq!(runner.config.shop.max_refreshes, 42);
+        assert!(!runner.config.shop.buy_mystic_medals);
+        assert!(runner.config.shop.buy_covenant);
+        assert_eq!(runner.config.shop.stop_after_minutes, 30);
+        assert_eq!(
+            runner.enabled_targets,
+            vec![crate::detector::alias::COVENANT]
         );
     }
 

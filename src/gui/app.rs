@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ use image::RgbaImage;
 use tracing::{debug, error, info, warn};
 
 use crate::capture::WindowCapture;
-use crate::config::{Config, MissingTemplate, MissingZone};
+use crate::config::{Config, MissingTemplate, MissingZone, ShopConfig};
 use crate::detector::{Detector, Hit};
 use crate::error::Result;
 use crate::gui::bot::BotHandle;
@@ -93,6 +93,11 @@ pub struct ShopGui {
     pub(super) template_status: Vec<MissingTemplate>,
 
     pub(super) bot: Option<BotHandle>,
+    /// Live mirror of `config.shop` published every frame. Cloned and
+    /// handed to the worker on spawn — the worker re-reads it at every
+    /// round boundary so UI edits (stop conditions, targets, sleep-on-
+    /// done) take effect mid-run without restarting the bot.
+    pub(super) live_shop: Arc<RwLock<ShopConfig>>,
 
     pub(super) snapshot_texture: Option<TextureHandle>,
     pub(super) snapshot_size: Option<[u32; 2]>,
@@ -152,6 +157,7 @@ impl ShopGui {
             show_zones.insert(*name, true);
         }
         let saved_snapshot = AutoSavedFields::from_config(&config);
+        let live_shop = Arc::new(RwLock::new(config.shop.clone()));
         let mut gui = Self {
             config,
             config_path,
@@ -164,6 +170,7 @@ impl ShopGui {
             window_error: None,
             template_status: Vec::new(),
             bot: None,
+            live_shop,
             snapshot_texture: None,
             snapshot_size: None,
             snapshot_rgba: None,
@@ -385,7 +392,18 @@ impl ShopGui {
             s.items_bought = 0;
             s.last_error = None;
         });
-        let handle = BotHandle::spawn(self.config.clone(), capture, detector, self.stats.clone())?;
+        // Make sure the live snapshot reflects the latest UI state
+        // before the worker starts pulling from it.
+        if let Ok(mut shop) = self.live_shop.write() {
+            *shop = self.config.shop.clone();
+        }
+        let handle = BotHandle::spawn(
+            self.config.clone(),
+            Arc::clone(&self.live_shop),
+            capture,
+            detector,
+            self.stats.clone(),
+        )?;
         self.bot = Some(handle);
         Ok(())
     }
@@ -493,6 +511,17 @@ impl App for ShopGui {
             .min_width(280.0)
             .default_width(310.0)
             .show(ctx, |ui| {
+                // Footer pinned to the bottom of the side panel — must
+                // be added before the scroll area so it claims its row
+                // first. Shows the window detection status (compact
+                // when OK, loud + Retry when not).
+                egui::TopBottomPanel::bottom("window_status_footer")
+                    .resizable(false)
+                    .show_separator_line(true)
+                    .show_inside(ui, |ui| {
+                        crate::gui::panels::draw_window_footer(ui, self);
+                    });
+
                 // Above the tabs so an edit on Setup that failed to
                 // persist isn't hidden when the user switches to Run.
                 if let Some(err) = &self.auto_save_error {
@@ -512,6 +541,15 @@ impl App for ShopGui {
                     });
             });
         egui::CentralPanel::default().show(ctx, |ui| crate::gui::snapshot::draw_snapshot(ui, self));
+
+        // Publish the latest `[shop]` section to the running worker.
+        // Cheap: ShopConfig is ~10 primitive fields and the write lock
+        // is uncontended (only this thread writes, only the worker
+        // reads). Done unconditionally — equality-checking the struct
+        // would cost the same as the clone we'd skip.
+        if let Ok(mut shop) = self.live_shop.write() {
+            *shop = self.config.shop.clone();
+        }
 
         // Must run AFTER the panels so their mutations are observed in
         // the same frame.

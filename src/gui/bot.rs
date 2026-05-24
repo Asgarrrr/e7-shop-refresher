@@ -1,11 +1,11 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 
 use tracing::info;
 
 use crate::capture::WindowCapture;
-use crate::config::Config;
+use crate::config::{Config, ShopConfig};
 use crate::detector::Detector;
 use crate::error::Result;
 use crate::gui::state::{BotStatus, SharedStats};
@@ -20,6 +20,7 @@ pub struct BotHandle {
 impl BotHandle {
     pub fn spawn(
         config: Config,
+        live_shop: Arc<RwLock<ShopConfig>>,
         capture: Arc<WindowCapture>,
         detector: Arc<Detector>,
         stats: SharedStats,
@@ -35,6 +36,7 @@ impl BotHandle {
                 detector,
                 Box::new(clicker),
                 config,
+                live_shop,
                 stop_for_worker,
             )
             .with_progress(Arc::new(stats));

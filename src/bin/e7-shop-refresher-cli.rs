@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use clap::Parser;
 use tracing::{error, info};
@@ -85,11 +85,16 @@ fn main() -> anyhow::Result<()> {
 
     let clicker = Clicker::new(cfg.timing.clone(), Arc::clone(&stop))?;
 
+    // Headless: live_shop just mirrors the loaded config and never
+    // changes. The runner still re-reads it each round (cheap) — same
+    // code path the GUI uses.
+    let live_shop = Arc::new(RwLock::new(cfg.shop.clone()));
     let mut runner = ShopRunner::new(
         Arc::new(capture),
         Arc::new(detector),
         Box::new(clicker),
         cfg,
+        live_shop,
         stop,
     );
     if let Err(e) = runner.run() {
