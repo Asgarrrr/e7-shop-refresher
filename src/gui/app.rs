@@ -511,16 +511,20 @@ impl App for ShopGui {
             .min_width(280.0)
             .default_width(310.0)
             .show(ctx, |ui| {
-                // Footer pinned to the bottom of the side panel — must
-                // be added before the scroll area so it claims its row
-                // first. Shows the window detection status (compact
-                // when OK, loud + Retry when not).
-                egui::TopBottomPanel::bottom("window_status_footer")
-                    .resizable(false)
-                    .show_separator_line(true)
-                    .show_inside(ui, |ui| {
-                        crate::gui::panels::draw_window_footer(ui, self);
-                    });
+                // Footer pinned to the bottom — only rendered when the
+                // window isn't healthy (error, or not detected yet at
+                // first boot). When the window IS found, the Start
+                // button being enabled is already the signal that
+                // detection worked; the green chip was redundant noise.
+                let show_footer = self.window_error.is_some() || self.window_size.is_none();
+                if show_footer {
+                    egui::TopBottomPanel::bottom("window_status_footer")
+                        .resizable(false)
+                        .show_separator_line(true)
+                        .show_inside(ui, |ui| {
+                            crate::gui::panels::draw_window_footer(ui, self);
+                        });
+                }
 
                 // Above the tabs so an edit on Setup that failed to
                 // persist isn't hidden when the user switches to Run.

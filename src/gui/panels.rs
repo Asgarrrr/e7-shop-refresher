@@ -9,15 +9,12 @@ use crate::gui::logs::LogBuffer;
 use crate::gui::persist::AutoSavedFields;
 use crate::gui::state::BotStatus;
 
-/// Ambient window status, intended for the panel footer. Single-line
-/// when the window is found (small dot + dim text — confirmation
-/// without grabbing attention). On error, the message is allowed to
-/// wrap and the Retry button sits below it so a long message never
-/// gets clipped against the panel edge.
+/// Footer surfacing window-detection problems. Only invoked when
+/// something is off (no detection yet at boot, or detection failed) —
+/// the healthy state is signalled by the Start button being enabled,
+/// so a permanent green chip would be redundant.
 pub(super) fn draw_window_footer(ui: &mut egui::Ui, gui: &mut ShopGui) {
     let window_error = gui.window_error.clone();
-    let window_size = gui.window_size;
-    let window_title = gui.window_title.clone();
     ui.add_space(6.0);
     if let Some(e) = window_error {
         ui.horizontal_top(|ui| {
@@ -37,15 +34,9 @@ pub(super) fn draw_window_footer(ui: &mut egui::Ui, gui: &mut ShopGui) {
                 }
             });
         });
-    } else if let Some((w, h)) = window_size {
-        ui.horizontal(|ui| {
-            ui.colored_label(palette::OK, icon::DOT);
-            ui.colored_label(
-                palette::TEXT_DIM,
-                format!("{}  {}×{}", window_title.as_deref().unwrap_or("game"), w, h),
-            );
-        });
     } else {
+        // Reachable transiently between ShopGui construction and the
+        // first `try_acquire_window` call.
         ui.horizontal(|ui| {
             ui.colored_label(palette::TEXT_MUTED, icon::DOT);
             ui.colored_label(palette::TEXT_MUTED, "No window detected yet");
