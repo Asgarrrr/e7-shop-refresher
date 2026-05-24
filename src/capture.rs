@@ -271,6 +271,8 @@ impl WindowCapture {
     /// the current foreground OR the user has interacted recently).
     pub fn try_bring_foreground(&self) -> bool {
         use std::ffi::c_void;
+        use std::thread;
+        use std::time::{Duration, Instant};
         use windows::Win32::Foundation::HWND;
         use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
         use windows::Win32::UI::WindowsAndMessaging::{
@@ -296,11 +298,56 @@ impl WindowCapture {
                 let _ = AttachThreadInput(current_thread, target_thread, false);
             }
         }
-        // Re-check via the same PID-aware path is_foreground uses, so a
-        // child window of our process counts as success even if the OS
-        // brought a sibling HWND to the front instead of `stored`.
-        self.is_foreground()
+        // SetForegroundWindow is asynchronous: the OS schedules the
+        // focus change but the immediate GetForegroundWindow may still
+        // report the old window. Poll for up to 200 ms before declaring
+        // the bring failed — covers the common race where the focus
+        // does land on `hwnd` a few ms after the call. is_foreground()
+        // already handles same-process matches, so a sibling-HWND
+        // transition still counts as success.
+        const POLL_DEADLINE_MS: u64 = 200;
+        const POLL_TICK_MS: u64 = 15;
+        let deadline = Instant::now() + Duration::from_millis(POLL_DEADLINE_MS);
+        while Instant::now() < deadline {
+            if self.is_foreground() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(POLL_TICK_MS));
+        }
+        // Last gasp + diagnostic capture: log what's actually foreground
+        // so a user reproducing this can paste the WHAT-vs-EXPECTED.
+        let now_foreground = self.is_foreground();
+        if !now_foreground {
+            log_foreground_mismatch(self.hwnd_raw.load(Ordering::Relaxed));
+        }
+        now_foreground
     }
+}
+
+fn log_foreground_mismatch(stored_raw: isize) {
+    use std::ffi::c_void;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
+    let fg = unsafe { GetForegroundWindow() };
+    let fg_raw = fg.0 as isize;
+    let stored_hwnd = HWND(stored_raw as *mut c_void);
+    let stored_pid = pid_of_hwnd(stored_hwnd);
+    let fg_pid = pid_of_hwnd(fg);
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetWindowTextW(fg, &mut buf) };
+    let fg_title = if len > 0 {
+        String::from_utf16_lossy(&buf[..len as usize])
+    } else {
+        String::new()
+    };
+    tracing::debug!(
+        stored_hwnd = stored_raw,
+        stored_pid,
+        foreground_hwnd = fg_raw,
+        foreground_pid = fg_pid,
+        foreground_title = %fg_title,
+        "foreground bring failed — diagnostic snapshot"
+    );
 }
 
 fn pid_of_hwnd(hwnd: windows::Win32::Foundation::HWND) -> u32 {
