@@ -62,6 +62,9 @@ pub struct ShopConfig {
     /// 0 = no cap.
     #[serde(default)]
     pub stop_when_covenants: u32,
+    /// 0 = no cap.
+    #[serde(default)]
+    pub stop_when_gold_spent: u32,
     /// Suspend the PC when a stop condition fires. Never on manual Stop
     /// — pressing the button means the user is at the machine.
     #[serde(default)]
@@ -83,6 +86,7 @@ impl Default for ShopConfig {
             stop_after_minutes: 0,
             stop_when_mystic_medals: 0,
             stop_when_covenants: 0,
+            stop_when_gold_spent: 0,
             sleep_when_done: false,
         }
     }

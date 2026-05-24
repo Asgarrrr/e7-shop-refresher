@@ -12,6 +12,7 @@ pub(super) struct AutoSavedFields {
     pub stop_after_minutes: u32,
     pub stop_when_mystic_medals: u32,
     pub stop_when_covenants: u32,
+    pub stop_when_gold_spent: u32,
     pub buy_mystic_medals: bool,
     pub buy_covenant: bool,
     pub buy_button_y_offset_ratio: f32,
@@ -55,6 +56,7 @@ impl AutoSavedFields {
             stop_after_minutes: cfg.shop.stop_after_minutes,
             stop_when_mystic_medals: cfg.shop.stop_when_mystic_medals,
             stop_when_covenants: cfg.shop.stop_when_covenants,
+            stop_when_gold_spent: cfg.shop.stop_when_gold_spent,
             buy_mystic_medals: cfg.shop.buy_mystic_medals,
             buy_covenant: cfg.shop.buy_covenant,
             buy_button_y_offset_ratio: cfg.shop.buy_button_y_offset_ratio,
@@ -127,6 +129,12 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
         "shop",
         "stop_when_covenants",
         i64::from(config.shop.stop_when_covenants),
+    );
+    set_scalar(
+        &mut doc,
+        "shop",
+        "stop_when_gold_spent",
+        i64::from(config.shop.stop_when_gold_spent),
     );
     set_scalar(
         &mut doc,

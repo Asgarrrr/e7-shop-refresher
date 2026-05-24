@@ -101,6 +101,13 @@ fn validate_shop(s: &ShopConfig) -> Result<()> {
                 .into(),
         ));
     }
+    if s.stop_when_gold_spent > 0 && !s.buy_mystic_medals && !s.buy_covenant {
+        return Err(Error::ConfigInvalid(
+            "shop.stop_when_gold_spent > 0 but no buy flag is on \
+             — no gold can ever be spent"
+                .into(),
+        ));
+    }
     Ok(())
 }
 

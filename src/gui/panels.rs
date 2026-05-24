@@ -252,6 +252,13 @@ pub(super) fn draw_run_tab(ui: &mut egui::Ui, gui: &mut ShopGui, _ctx: &Context)
                 0..=10_000,
                 "Halt after this many covenant bookmarks have been bought this run.",
             );
+            stop_gold_row(
+                ui,
+                "Gold spent",
+                &mut gui.config.shop.stop_when_gold_spent,
+                "Halt after this much gold has been spent on shop items. \
+                 Mystic medals = 280,000g, covenant bookmarks = 185,000g.",
+            );
         });
 
     section_separator(ui);
@@ -404,6 +411,22 @@ fn stop_condition_row(
     ui.end_row();
 }
 
+fn stop_gold_row(ui: &mut egui::Ui, label: &str, value: &mut u32, hover: &str) {
+    let active = ui.is_enabled() && *value > 0;
+    stop_condition_label(ui, label, active);
+    scoped_value_color(ui, active, |ui| {
+        ui.add(
+            egui::DragValue::new(value)
+                .speed(1000.0)
+                .range(0..=100_000_000u32)
+                .custom_formatter(|n, _| format_gold(n as u32))
+                .custom_parser(|s| parse_gold(s).map(f64::from)),
+        )
+        .on_hover_text(hover);
+    });
+    ui.end_row();
+}
+
 /// Like `stop_condition_row` but the value formats/parses as a duration
 /// (`45m`, `1h30`, `2h`); `0` = disabled.
 fn stop_duration_row(ui: &mut egui::Ui, label: &str, value: &mut u32, hover: &str) {
@@ -458,6 +481,9 @@ fn stop_conditions_summary(shop: &crate::config::ShopConfig) -> String {
     if shop.stop_when_covenants > 0 {
         parts.push(format!("{} covenant", shop.stop_when_covenants));
     }
+    if shop.stop_when_gold_spent > 0 {
+        parts.push(format_gold(shop.stop_when_gold_spent));
+    }
     parts.join(", ")
 }
 
@@ -503,6 +529,37 @@ fn strip_minute_suffix(s: &str) -> &str {
         .or_else(|| s.strip_suffix('m'))
         .unwrap_or(s);
     s.trim()
+}
+
+fn format_gold(n: u32) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out.push('g');
+    out
+}
+
+fn parse_gold(input: &str) -> Option<u32> {
+    let s: String = input
+        .trim()
+        .trim_end_matches('g')
+        .trim_end_matches('G')
+        .chars()
+        .filter(|c| *c != ',' && *c != ' ' && *c != '_')
+        .collect();
+    if s.is_empty() {
+        return Some(0);
+    }
+    s.parse().ok()
 }
 
 /// Renders an ms value as the shortest readable form: bare ms under 1 s,

@@ -715,9 +715,20 @@ struct RoundOutcome {
 /// unbounded loop on a stuck state.
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
+pub mod prices {
+    pub const MYSTIC_MEDAL: u32 = 280_000;
+    pub const COVENANT_BOOKMARK: u32 = 185_000;
+}
+
+pub(crate) fn gold_spent_for(bought: impl Fn(&str) -> u32) -> u64 {
+    u64::from(bought(alias::MYSTIC_MEDAL)) * u64::from(prices::MYSTIC_MEDAL)
+        + u64::from(bought(alias::COVENANT)) * u64::from(prices::COVENANT_BOOKMARK)
+}
+
 /// Pure stop-condition check (testable without standing up real IO).
 /// Returns the first satisfied condition in fixed priority order
-/// (duration → mystic → covenant) so the reason string is deterministic.
+/// (duration → mystic → covenant → gold spent) so the reason string
+/// is deterministic.
 pub(crate) fn stop_condition_for(
     shop: &crate::config::ShopConfig,
     elapsed: Duration,
@@ -735,6 +746,11 @@ pub(crate) fn stop_condition_for(
     }
     if shop.stop_when_covenants > 0 && bought(alias::COVENANT) >= shop.stop_when_covenants {
         return Some("stop_when_covenants");
+    }
+    if shop.stop_when_gold_spent > 0
+        && gold_spent_for(&bought) >= u64::from(shop.stop_when_gold_spent)
+    {
+        return Some("stop_when_gold_spent");
     }
     None
 }
@@ -1051,6 +1067,7 @@ mod tests {
             stop_after_minutes: minutes,
             stop_when_mystic_medals: mystic,
             stop_when_covenants: covenants,
+            stop_when_gold_spent: 0,
             sleep_when_done: false,
         }
     }
@@ -1101,6 +1118,33 @@ mod tests {
         let cfg = shop_with(0, 0, 0, 0);
         let reason = stop_condition_for(&cfg, Duration::from_secs(0), |_| 100);
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn stop_condition_fires_when_gold_spent_target_reached() {
+        let mut cfg = shop_with(0, 0, 0, 0);
+        cfg.stop_when_gold_spent = 1_000_000;
+        // 3 mystic × 280k + 1 covenant × 185k = 1_025_000 ≥ 1_000_000.
+        let count = |a: &str| match a {
+            "mystic_medal" => 3,
+            "covenant" => 1,
+            _ => 0,
+        };
+        assert_eq!(
+            stop_condition_for(&cfg, Duration::from_secs(0), count),
+            Some("stop_when_gold_spent")
+        );
+    }
+
+    #[test]
+    fn stop_condition_gold_does_not_fire_below_threshold() {
+        let mut cfg = shop_with(0, 0, 0, 0);
+        cfg.stop_when_gold_spent = 1_000_000;
+        let count = |a: &str| if a == "mystic_medal" { 3 } else { 0 }; // 840k
+        assert_eq!(
+            stop_condition_for(&cfg, Duration::from_secs(0), count),
+            None
+        );
     }
 
     #[test]

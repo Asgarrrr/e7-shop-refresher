@@ -23,6 +23,7 @@ max_refreshes              = 0
 stop_after_minutes         = 0
 stop_when_mystic_medals    = 0
 stop_when_covenants        = 0
+stop_when_gold_spent       = 0
 
 buy_mystic_medals     = true
 buy_covenant          = true
