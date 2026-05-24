@@ -111,6 +111,47 @@ fn primary_button(label: &str) -> egui::Button<'_> {
     .fill(palette::ACCENT)
 }
 
+/// Renders a filesystem path as a compact, clickable label:
+///
+/// - Display is truncated to the trailing two components prefixed
+///   with `…` (e.g. `…\templates\shop_header.png`) so long AppData
+///   paths don't blow out the 310 px sidebar.
+/// - Hover shows the full path in a tooltip with a "click to copy"
+///   hint, and switches the cursor to a pointing hand.
+/// - Click writes the full path to the system clipboard so the user
+///   can paste it straight into Explorer's address bar.
+fn path_label(ui: &mut egui::Ui, path: &std::path::Path) {
+    let full = path.display().to_string();
+    let short = format_short_path(path);
+    let resp = ui.add(
+        egui::Label::new(egui::RichText::new(&short).color(palette::TEXT_DIM))
+            .sense(egui::Sense::click()),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if resp.clicked() {
+        ui.ctx().copy_text(full.clone());
+    }
+    resp.on_hover_text(format!("{full}\n\nClick to copy"));
+}
+
+/// `…<sep><parent><sep><filename>` when the path has 3+ components,
+/// otherwise the original display form. Uses the OS-native separator
+/// so Windows paths render with backslashes.
+fn format_short_path(path: &std::path::Path) -> String {
+    let sep = std::path::MAIN_SEPARATOR_STR;
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    if components.len() <= 2 {
+        return path.display().to_string();
+    }
+    let n = components.len();
+    format!("…{sep}{}{sep}{}", components[n - 2], components[n - 1])
+}
+
 /// Linear/Vercel-style underline tabs: no background chrome on the
 /// labels, a hairline baseline rule spanning the full panel width, and
 /// the active tab marked by a thicker accent-coloured underline drawn
@@ -889,7 +930,7 @@ fn draw_crop_panel(ui: &mut egui::Ui, gui: &mut ShopGui) {
     });
 
     if let Some(path) = gui.template_path_for(&gui.crop_target.clone()) {
-        ui.colored_label(palette::TEXT_DIM, format!("→ {}", path.display()));
+        path_label(ui, &path);
     }
 
     ui.add_space(2.0);
@@ -999,7 +1040,10 @@ fn draw_templates(ui: &mut egui::Ui, gui: &mut ShopGui) {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for missing in &gui.template_status {
-                    ui.label(format!("• {} → {}", missing.name, missing.path.display()));
+                    ui.horizontal(|ui| {
+                        ui.label(format!("• {}", missing.name));
+                        path_label(ui, &missing.path);
+                    });
                 }
             });
     }
