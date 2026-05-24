@@ -1,6 +1,6 @@
 [package]
 name = "e7-shop-refresher"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 authors = ["Asgarrrr"]
 description = "Epic Seven shop refresh automation tool for the STOVE PC client"
