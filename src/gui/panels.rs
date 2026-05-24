@@ -1033,32 +1033,26 @@ fn draw_detection_settings(ui: &mut egui::Ui, gui: &mut ShopGui) {
         });
 }
 
-/// Merged Templates section: short intro + Recheck on top, then the
-/// crop workflow. Per-alias status lives inside the workflow's
-/// dropdown so the missing list and the action share one widget —
-/// the user picks the alias they want to crop next, the suffix tells
-/// them whether it's already been saved.
+/// Merged Templates section: Recheck pinned top-right, then the
+/// crop workflow. The workflow's own intro line carries the
+/// instructions, so this wrapper stays nearly empty — no redundant
+/// "Crop each missing icon" header to clip against the button.
+/// Per-alias status lives inside the workflow's dropdown.
 fn draw_templates_section(ui: &mut egui::Ui, gui: &mut ShopGui, bot_active: bool) {
-    let missing = !gui.template_status.is_empty();
-
-    ui.horizontal(|ui| {
-        let intro = if missing {
-            "Crop each missing icon from the snapshot."
-        } else {
-            "Re-crop a template after a game patch if matches start failing."
-        };
-        ui.colored_label(palette::TEXT_DIM, intro);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button(format!("{}  Recheck", icon::ARROW_CLOCKWISE))
-                .clicked()
-            {
-                gui.refresh_template_status();
-                gui.try_build_detector();
-            }
-        });
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui
+            .small_button(format!("{}  Recheck", icon::ARROW_CLOCKWISE))
+            .on_hover_text(
+                "Re-scan the templates folder. Useful if you've added \
+                 a PNG by hand or while the bot was running.",
+            )
+            .clicked()
+        {
+            gui.refresh_template_status();
+            gui.try_build_detector();
+        }
     });
-    ui.add_space(8.0);
+    ui.add_space(4.0);
 
     ui.add_enabled_ui(!bot_active, |ui| {
         draw_crop_workflow(ui, gui);
