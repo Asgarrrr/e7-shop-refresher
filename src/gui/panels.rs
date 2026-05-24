@@ -5,7 +5,7 @@ use tracing::error;
 use crate::gui::app::{ROI_LIST, SECTION_GAP, ShopGui, TEMPLATE_ALIASES, Tab, ZONE_LIST, palette};
 use crate::gui::bot::effective_status;
 use crate::gui::logs::LogBuffer;
-use crate::gui::state::{BotStats, BotStatus};
+use crate::gui::state::BotStatus;
 
 /// Only rendered when window detection has an issue — the healthy state
 /// is signalled by the Start button being enabled.
@@ -265,48 +265,6 @@ pub(super) fn draw_run_tab(ui: &mut egui::Ui, gui: &mut ShopGui, _ctx: &Context)
         "Suspends the system to sleep once a stop condition fires. \
          Never triggers on manual Stop.",
     );
-
-    #[cfg(debug_assertions)]
-    draw_demo_controls(ui, gui);
-}
-
-/// Debug helper: toggles fake "mid-run" stats so the running-state UI
-/// can be exercised without a live Epic Seven window.
-#[cfg(debug_assertions)]
-fn draw_demo_controls(ui: &mut egui::Ui, gui: &mut ShopGui) {
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.colored_label(palette::TEXT_MUTED, "Debug:");
-        // Demo state = Running + non-zero round + no live worker. The
-        // worker check is what prevents this toggle from clobbering a
-        // real session.
-        let snap = gui.stats.snapshot();
-        let demo_active = gui.bot.is_none() && snap.status == BotStatus::Running && snap.round > 0;
-        let label = if demo_active {
-            "Clear demo"
-        } else {
-            "Inject demo stats"
-        };
-        if ui.small_button(label).clicked() {
-            if demo_active {
-                gui.stats.update(|s| {
-                    *s = BotStats::default();
-                });
-            } else {
-                gui.stats.update(|s| {
-                    s.status = BotStatus::Running;
-                    s.round = 7;
-                    s.total_rounds = 30;
-                    s.mystic_bought = 2;
-                    s.covenant_bought = 1;
-                    s.items_bought = 3;
-                    s.last_error = None;
-                });
-            }
-        }
-    });
 }
 
 fn draw_action_row(ui: &mut egui::Ui, gui: &mut ShopGui, effective: &BotStatus, can_start: bool) {
