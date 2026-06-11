@@ -103,6 +103,15 @@ impl WindowCapture {
         })
     }
 
+    /// Poison means an earlier panic mid-FFI, not corrupt state — the slot
+    /// only ever holds a whole `Window`, so the last value is safe to reuse.
+    fn window_lock(&self) -> std::sync::MutexGuard<'_, Window> {
+        self.window.lock().unwrap_or_else(|e| {
+            tracing::debug!("window mutex poisoned by an earlier panic — recovering");
+            e.into_inner()
+        })
+    }
+
     /// Caller (runner) catches `WindowNotFound` and retries with backoff.
     pub fn reattach(&self) -> Result<()> {
         let window = locate_window(&self.title_contains, self.process_name.as_deref())?;
@@ -118,7 +127,7 @@ impl WindowCapture {
         // see a consistent pair — otherwise an old WGC frame could be
         // cropped against the new window's client rect. Release pairs
         // with the Acquire load in client_offset_and_size.
-        let mut slot = self.window.lock().expect("window mutex poisoned");
+        let mut slot = self.window_lock();
         *slot = window;
         self.hwnd_raw.store(raw, Ordering::Release);
         Ok(())
@@ -130,7 +139,7 @@ impl WindowCapture {
     /// height, not a fixed proportion. Falls back to the raw window
     /// rect if Win32 client-rect query fails.
     pub fn rect(&self) -> Result<WindowRect> {
-        let window = self.window.lock().expect("window mutex poisoned");
+        let window = self.window_lock();
         if window.is_minimized().unwrap_or(false) {
             return Err(Error::WindowGone);
         }
@@ -160,7 +169,7 @@ impl WindowCapture {
     /// `check_size_stable` and `restore_to_baseline` because `SetWindowPos`
     /// takes window dims, not client dims.
     fn window_rect(&self) -> Result<WindowRect> {
-        let window = self.window.lock().expect("window mutex poisoned");
+        let window = self.window_lock();
         if window.is_minimized().unwrap_or(false) {
             return Err(Error::WindowGone);
         }
@@ -211,7 +220,7 @@ impl WindowCapture {
     }
 
     pub fn title(&self) -> Result<String> {
-        let window = self.window.lock().expect("window mutex poisoned");
+        let window = self.window_lock();
         Ok(window.title()?)
     }
 
@@ -240,7 +249,7 @@ impl WindowCapture {
     /// `rect()` reports. Falls back to the uncropped frame if Win32
     /// client-rect query fails.
     pub fn snapshot(&self) -> Result<RgbaImage> {
-        let window = self.window.lock().expect("window mutex poisoned");
+        let window = self.window_lock();
         let full = window.capture_image()?;
         let client = self.client_offset_and_size();
         drop(window);
@@ -526,7 +535,7 @@ fn locate_window(title_contains: &str, process_name: Option<&str>) -> Result<Win
         return Err(Error::WindowNotFound(title_contains.into()));
     }
 
-    scored.sort_by(|a, b| b.2.cmp(&a.2));
+    scored.sort_by_key(|c| std::cmp::Reverse(c.2));
     let top_score = scored[0].2;
     let tied_count = scored.iter().filter(|(_, _, s)| *s == top_score).count();
 
