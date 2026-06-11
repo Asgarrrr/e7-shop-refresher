@@ -210,11 +210,7 @@ impl ShopRunner {
                         // Detached — BotHandle::Drop joins the worker,
                         // so a slow webhook would freeze the GUI close
                         // for up to ~20 s.
-                        self.spawn_completion_webhook(
-                            reason,
-                            outcome.refreshes,
-                            started.elapsed(),
-                        );
+                        self.spawn_completion_webhook(reason, outcome.refreshes, started.elapsed());
                     }
                 }
                 // Manual Stop = user is at the keyboard, never sleep.
@@ -235,7 +231,10 @@ impl ShopRunner {
         if url.is_empty() {
             return;
         }
-        crate::notifications::deliver_summary_blocking(url, self.build_summary(reason, refreshes, elapsed));
+        crate::notifications::deliver_summary_blocking(
+            url,
+            self.build_summary(reason, refreshes, elapsed),
+        );
     }
 
     fn spawn_completion_webhook(&self, reason: &str, refreshes: u32, elapsed: Duration) {
@@ -255,7 +254,12 @@ impl ShopRunner {
         }
     }
 
-    fn build_summary(&self, reason: &str, refreshes: u32, elapsed: Duration) -> crate::notifications::RunSummary {
+    fn build_summary(
+        &self,
+        reason: &str,
+        refreshes: u32,
+        elapsed: Duration,
+    ) -> crate::notifications::RunSummary {
         crate::notifications::RunSummary {
             reason: reason.to_string(),
             elapsed,
@@ -567,11 +571,7 @@ impl ShopRunner {
         icon_y_px: i32,
         frame_h: u32,
     ) -> Result<bool> {
-        let buy_confirm = self
-            .config
-            .zones
-            .buy_confirm
-            .unwrap_or(layout::BUY_CONFIRM);
+        let buy_confirm = self.config.zones.buy_confirm.unwrap_or(layout::BUY_CONFIRM);
 
         let before_gray = self.snapshot()?;
         let before = strip_hash(&before_gray, buy_confirm);
@@ -620,11 +620,12 @@ impl ShopRunner {
     fn buy_button_local_rect(&self, icon_y_px: i32, frame_h: u32) -> Result<[i32; 4]> {
         let r = self.capture.rect()?;
         // Only column[0] / column[2] (X / W) are used at click time.
-        let column = self
-            .config
-            .zones
-            .buy_column
-            .unwrap_or([layout::BUY_COLUMN_X, 0.0, layout::BUY_COLUMN_W, 0.0]);
+        let column = self.config.zones.buy_column.unwrap_or([
+            layout::BUY_COLUMN_X,
+            0.0,
+            layout::BUY_COLUMN_W,
+            0.0,
+        ]);
         Ok(buy_column_row_rect_for(
             column,
             icon_y_px,
@@ -734,9 +735,7 @@ impl ShopRunner {
         let post_gray = self.snapshot()?;
         let post_grid = strip_hash(&post_gray, shop_grid);
         if post_grid == before_grid {
-            warn!(
-                "shop items unchanged after refresh — counting round as failed"
-            );
+            warn!("shop items unchanged after refresh — counting round as failed");
             return Ok(false);
         }
         Ok(true)
@@ -798,7 +797,6 @@ pub(crate) fn crop_icon_patch(rgba: &RgbaImage, hit: &crate::detector::Hit) -> R
     let ch = h.min(img_h - y0);
     rgba.view(x0, y0, cw, ch).to_image()
 }
-
 
 #[derive(Debug, Clone, Copy)]
 struct RoundOutcome {
@@ -1302,5 +1300,164 @@ mod tests {
     fn strip_hash_clamps_out_of_bounds_ratios() {
         let img = solid_gray(100, 100, 64);
         let _ = strip_hash(&img, [0.5, 0.5, 5.0, 5.0]);
+    }
+
+    // --- loop-test helpers ---
+
+    fn gray_frame(w: u32, h: u32, base: u8) -> GrayImage {
+        GrayImage::from_pixel(w, h, image::Luma([base]))
+    }
+
+    fn paint_zone(img: &mut GrayImage, [zx, zy, zw, zh]: [f32; 4], value: u8) {
+        let (w, h) = (img.width() as f32, img.height() as f32);
+        let x0 = (zx * w) as u32;
+        let y0 = (zy * h) as u32;
+        let x1 = ((zx + zw) * w).min(w) as u32;
+        let y1 = ((zy + zh) * h).min(h) as u32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                img.put_pixel(x, y, image::Luma([value]));
+            }
+        }
+    }
+
+    const REFRESH: [f32; 4] = [0.1, 0.8, 0.1, 0.1];
+    const REFRESH_CONFIRM: [f32; 4] = [0.4, 0.5, 0.1, 0.1];
+    const SHOP_GRID: [f32; 4] = [0.1, 0.1, 0.6, 0.6];
+
+    fn runner_for_loop_tests(
+        frames: Vec<GrayImage>,
+    ) -> (ShopRunner, Arc<StdMutex<Vec<FakeEvent>>>) {
+        let mut config: Config = toml::from_str(crate::config::DEFAULT_TOML).unwrap();
+        config.zones.refresh = Some(REFRESH);
+        config.zones.refresh_confirm = Some(REFRESH_CONFIRM);
+        config.zones.buy_confirm = Some([0.4, 0.5, 0.1, 0.1]);
+        config.zones.buy_column = Some([0.8, 0.0, 0.1, 1.0]);
+        config.regions.shop_grid = Some(SHOP_GRID);
+        config.shop.buy_mystic_medals = false;
+        config.shop.buy_covenant = false;
+        config.shop.max_scrolls_per_round = 0;
+        config.shop.sleep_when_done = false;
+
+        let capture: Arc<dyn Capture> = Arc::new(FakeCapture::new(
+            frames,
+            WindowRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        ));
+        let detector = Arc::new(Detector::from_test_images(std::collections::HashMap::new()));
+        let fake_input = FakeInput::default();
+        let events = fake_input.events.clone();
+        let input: Box<dyn Input> = Box::new(fake_input);
+        let stop = Arc::new(AtomicBool::new(false));
+        let live_shop = Arc::new(RwLock::new(config.shop.clone()));
+        (
+            ShopRunner::new(capture, detector, input, config, live_shop, stop),
+            events,
+        )
+    }
+
+    // --- refresh_shop branch tests ---
+
+    #[test]
+    fn refresh_shop_returns_false_when_modal_does_not_open() {
+        let a = gray_frame(200, 200, 100);
+        let b = a.clone();
+        let (mut runner, events) = runner_for_loop_tests(vec![a, b]);
+        let result = runner.refresh_shop().unwrap();
+        assert!(!result);
+        let clicks = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, FakeEvent::Click(_)))
+            .count();
+        assert_eq!(clicks, 1);
+    }
+
+    #[test]
+    fn refresh_shop_returns_false_when_grid_does_not_reroll() {
+        let a = gray_frame(200, 200, 100);
+        let mut b = a.clone();
+        paint_zone(&mut b, REFRESH_CONFIRM, 200);
+        let c = a.clone();
+        let (mut runner, events) = runner_for_loop_tests(vec![a, b, c]);
+        let result = runner.refresh_shop().unwrap();
+        assert!(!result);
+        let clicks = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, FakeEvent::Click(_)))
+            .count();
+        assert_eq!(clicks, 2);
+    }
+
+    #[test]
+    fn refresh_shop_returns_true_when_modal_opens_and_grid_changes() {
+        let a = gray_frame(200, 200, 100);
+        let mut b = a.clone();
+        paint_zone(&mut b, REFRESH_CONFIRM, 200);
+        let mut c = a.clone();
+        paint_zone(&mut c, SHOP_GRID, 30);
+        let (mut runner, events) = runner_for_loop_tests(vec![a, b, c]);
+        let result = runner.refresh_shop().unwrap();
+        assert!(result);
+        let clicks = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, FakeEvent::Click(_)))
+            .count();
+        assert_eq!(clicks, 2);
+    }
+
+    // --- run_inner failure-cap test ---
+
+    #[test]
+    fn run_inner_bails_with_too_many_failures_when_capture_keeps_dying() {
+        let (mut runner, _events) = runner_for_loop_tests(vec![]);
+        let err = runner.run_inner(std::time::Instant::now()).unwrap_err();
+        assert!(matches!(err, Error::TooManyFailures(n) if n == 5));
+    }
+
+    // --- run_inner max_refreshes test ---
+
+    #[test]
+    fn run_inner_stops_with_max_refreshes_reason_after_successful_round() {
+        let base = gray_frame(200, 200, 100);
+        // Frame order for one full round:
+        // 1. buy_round bottom-strip snapshot
+        // 2. refresh_shop frame A
+        // 3. refresh_shop frame B (modal opened)
+        // 4. refresh_shop frame C (grid changed)
+        let buy_strip = base.clone();
+        let frame_a = base.clone();
+        let mut frame_b = base.clone();
+        paint_zone(&mut frame_b, REFRESH_CONFIRM, 200);
+        let mut frame_c = base.clone();
+        paint_zone(&mut frame_c, SHOP_GRID, 30);
+
+        let (mut runner, events) =
+            runner_for_loop_tests(vec![buy_strip, frame_a, frame_b, frame_c]);
+        runner.config.shop.max_refreshes = 1;
+        {
+            let mut ls = runner.live_shop.write().unwrap();
+            ls.max_refreshes = 1;
+        }
+
+        let outcome = runner.run_inner(std::time::Instant::now()).unwrap();
+        assert_eq!(outcome.reason, Some("max_refreshes"));
+        assert_eq!(outcome.refreshes, 1);
+        let clicks = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, FakeEvent::Click(_)))
+            .count();
+        assert_eq!(clicks, 2);
     }
 }
