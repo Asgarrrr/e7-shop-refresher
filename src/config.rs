@@ -2,8 +2,8 @@ mod sections;
 mod validate;
 
 pub use sections::{
-    MatchingConfig, RegionsConfig, ShopConfig, TemplatesConfig, TimingConfig, WindowConfig,
-    ZonesConfig,
+    MatchingConfig, NotificationsConfig, RegionsConfig, ShopConfig, TemplatesConfig, TimingConfig,
+    WindowConfig, ZonesConfig,
 };
 
 use std::path::{Path, PathBuf};
@@ -16,17 +16,6 @@ const CONFIG_VERSION: u32 = 1;
 
 /// Defaults embedded at compile time, written to disk on first run.
 pub const DEFAULT_TOML: &str = include_str!("../config.toml");
-
-#[derive(Debug, Clone)]
-pub struct MissingTemplate {
-    pub name: String,
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub struct MissingZone {
-    pub name: &'static str,
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -44,7 +33,10 @@ pub struct Config {
     pub regions: RegionsConfig,
     #[serde(default)]
     pub zones: ZonesConfig,
+    #[serde(default)]
     pub templates: TemplatesConfig,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
     /// Absolute path the config was loaded from — drives where relative
     /// `templates.dir` (and other file lookups) resolve to. Not part of
     /// the on-disk schema; populated by `load_or_init`.
@@ -53,8 +45,10 @@ pub struct Config {
 }
 
 impl Config {
-    /// Template file existence is NOT checked here — call
-    /// [`Config::ensure_templates_exist`] before running the bot.
+    /// Templates and zones have bundled fallbacks (see `crate::layout`
+    /// and `Detector::new`), so missing values are not fatal — there's
+    /// nothing for `load` to "ensure" beyond the schema validation in
+    /// [`validate::validate_all`].
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Err(Error::ConfigNotFound(path.to_path_buf()));
@@ -103,44 +97,6 @@ impl Config {
             .parent()
             .map(|p| p.join(dir))
             .unwrap_or_else(|| dir.clone())
-    }
-
-    /// Full path to a template alias, or `None` if the alias is unknown.
-    /// Helper for both detection (read) and the GUI's crop saver (write).
-    pub fn template_path(&self, alias: &str) -> Option<PathBuf> {
-        let t = &self.templates;
-        let file = match alias {
-            "anchor_shop" => &t.anchor_shop,
-            "mystic_medal" => &t.mystic_medal,
-            "covenant" => &t.covenant,
-            _ => return None,
-        };
-        Some(self.template_dir().join(file))
-    }
-
-    pub fn missing_templates(&self) -> Vec<MissingTemplate> {
-        validate::list_missing_templates(self)
-    }
-
-    pub fn ensure_templates_exist(&self) -> Result<()> {
-        if let Some(first) = self.missing_templates().into_iter().next() {
-            return Err(Error::TemplateMissing {
-                name: first.name,
-                path: first.path,
-            });
-        }
-        Ok(())
-    }
-
-    pub fn missing_zones(&self) -> Vec<MissingZone> {
-        validate::list_missing_zones(self)
-    }
-
-    pub fn ensure_zones_set(&self) -> Result<()> {
-        if let Some(first) = self.missing_zones().into_iter().next() {
-            return Err(Error::ZoneMissing { name: first.name });
-        }
-        Ok(())
     }
 
     /// Aliases the bot tries to buy this run. Single source of truth for
@@ -292,26 +248,23 @@ mod tests {
     }
 
     #[test]
-    fn template_path_returns_none_for_unknown_alias() {
-        let cfg: Config = toml::from_str(DEFAULT_TOML).unwrap();
-        assert!(cfg.template_path("not_a_real_alias").is_none());
-    }
-
-    #[test]
-    fn missing_zones_drops_buy_zones_when_no_buy_targets() {
-        let mut cfg: Config = toml::from_str(DEFAULT_TOML).unwrap();
-        cfg.zones.refresh = Some([0.1, 0.8, 0.2, 0.1]);
-        cfg.zones.refresh_confirm = Some([0.4, 0.5, 0.2, 0.1]);
-        cfg.zones.buy_column = None;
-        cfg.zones.buy_confirm = None;
-
-        cfg.shop.buy_mystic_medals = false;
-        cfg.shop.buy_covenant = false;
-        assert!(cfg.missing_zones().is_empty());
-
-        cfg.shop.buy_mystic_medals = true;
-        let names: Vec<&str> = cfg.missing_zones().iter().map(|z| z.name).collect();
-        assert!(names.contains(&"buy_column"));
-        assert!(names.contains(&"buy_confirm"));
+    fn zones_default_to_none_so_runtime_falls_back_to_bundled_layout() {
+        // Empty zones table in TOML should leave every field unset —
+        // the runtime resolves `cfg.zones.X.unwrap_or(layout::X)` per
+        // field, so `None` is the signal "use bundled default".
+        let toml = "version = 1\n\
+            [templates]\n\
+            dir = \"templates\"\n\
+            back_arrow = \"b.png\"\n\
+            refresh_pill = \"r.png\"\n\
+            buy_pill = \"p.png\"\n\
+            mystic_medal = \"m.png\"\n\
+            covenant = \"c.png\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.zones.refresh.is_none());
+        assert!(cfg.zones.refresh_confirm.is_none());
+        assert!(cfg.zones.buy_confirm.is_none());
+        assert!(cfg.zones.buy_column.is_none());
+        assert!(cfg.regions.shop_grid.is_none());
     }
 }

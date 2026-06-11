@@ -28,7 +28,7 @@ jobs:
         run: |
           $stage = "release-stage"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          New-Item -ItemType Directory -Force -Path "$stage/templates/examples" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage/templates" | Out-Null
 
           # Binaries
           Copy-Item target/release/e7-shop-refresher.exe       "$stage/"
@@ -40,14 +40,36 @@ jobs:
           Copy-Item config.toml                            "$stage/config.toml"
           Copy-Item templates/README.md                    "$stage/templates/README.md"
 
-          # Example templates so users can see what good crops look like
-          Copy-Item templates/examples/*.png               "$stage/templates/examples/"
+          # Example templates are optional — users may have cleaned them
+          # locally. Skip gracefully instead of failing the release.
+          if (Test-Path templates/examples) {
+              New-Item -ItemType Directory -Force -Path "$stage/templates/examples" | Out-Null
+              Copy-Item templates/examples/*.png           "$stage/templates/examples/" -ErrorAction SilentlyContinue
+          }
 
           # Zip
           $tag = "${{ github.ref_name }}"
           $zipName = "e7-shop-refresher-$tag-windows-x64.zip"
           Compress-Archive -Path "$stage/*" -DestinationPath $zipName
           echo "ZIP_PATH=$zipName" >> $env:GITHUB_ENV
+
+      - name: Generate SHA256 checksums
+        shell: pwsh
+        run: |
+          # One checksum file covers every artifact attached to the
+          # release. Users / package managers verify a single file
+          # instead of N detached signatures.
+          $files = @(
+              $env:ZIP_PATH,
+              "target/release/e7-shop-refresher.exe",
+              "target/release/e7-shop-refresher-cli.exe"
+          )
+          $lines = foreach ($f in $files) {
+              $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+              $name = Split-Path $f -Leaf
+              "$h  $name"
+          }
+          $lines -join "`n" | Out-File -FilePath SHA256SUMS.txt -Encoding ascii
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -56,9 +78,11 @@ jobs:
           # - the full zip (recommended — includes config, README, example templates)
           # - e7-shop-refresher.exe (GUI) and -cli.exe as direct downloads
           #   for users who already have a config.toml and templates set up.
+          # - SHA256SUMS.txt for verification.
           files: |
             ${{ env.ZIP_PATH }}
             target/release/e7-shop-refresher.exe
             target/release/e7-shop-refresher-cli.exe
+            SHA256SUMS.txt
           generate_release_notes: true
           fail_on_unmatched_files: true

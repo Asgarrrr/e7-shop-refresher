@@ -1,11 +1,14 @@
 //! Cross-field validation. `validate_all` is the entry point used by
-//! `Config::load`. Template file existence is checked separately so the
-//! GUI can load a partial config to help the user prepare templates.
+//! `Config::load`. Regions / zones are user overrides for the bundled
+//! `crate::layout` defaults — when present they're validated as proper
+//! ratio rects, when absent the runtime falls back to the bundled
+//! constants so nothing else needs to check.
 
 use super::sections::{
-    MatchingConfig, RegionsConfig, ShopConfig, TimingConfig, WindowConfig, ZonesConfig,
+    MatchingConfig, NotificationsConfig, RegionsConfig, ShopConfig, TimingConfig, WindowConfig,
+    ZonesConfig,
 };
-use super::{CONFIG_VERSION, Config, MissingTemplate, MissingZone};
+use super::{CONFIG_VERSION, Config};
 use crate::error::{Error, Result};
 
 pub(super) fn validate_all(cfg: &Config) -> Result<()> {
@@ -16,48 +19,8 @@ pub(super) fn validate_all(cfg: &Config) -> Result<()> {
     validate_timing(&cfg.timing)?;
     validate_regions(&cfg.regions)?;
     validate_zones(&cfg.zones)?;
+    validate_notifications(&cfg.notifications)?;
     Ok(())
-}
-
-pub(super) fn list_missing_templates(cfg: &Config) -> Vec<MissingTemplate> {
-    let dir = cfg.template_dir();
-    let t = &cfg.templates;
-    let required = [
-        ("anchor_shop", &t.anchor_shop),
-        ("mystic_medal", &t.mystic_medal),
-        ("covenant", &t.covenant),
-    ];
-    let mut missing = Vec::new();
-    for (name, file) in required {
-        let path = dir.join(file);
-        if !path.exists() {
-            missing.push(MissingTemplate {
-                name: name.to_string(),
-                path,
-            });
-        }
-    }
-    missing
-}
-
-/// `buy_column` / `buy_confirm` are only required if any buy flag is on
-/// — otherwise they'd block startup for users who only want to refresh.
-pub(super) fn list_missing_zones(cfg: &Config) -> Vec<MissingZone> {
-    let z = &cfg.zones;
-    let mut missing = Vec::new();
-    let mut add_if_unset = |name, value: &Option<[f32; 4]>| {
-        if value.is_none() {
-            missing.push(MissingZone { name });
-        }
-    };
-    add_if_unset("refresh", &z.refresh);
-    add_if_unset("refresh_confirm", &z.refresh_confirm);
-    let any_buy = cfg.shop.buy_mystic_medals || cfg.shop.buy_covenant;
-    if any_buy {
-        add_if_unset("buy_column", &z.buy_column);
-        add_if_unset("buy_confirm", &z.buy_confirm);
-    }
-    missing
 }
 
 fn validate_version(version: u32) -> Result<()> {
@@ -85,28 +48,32 @@ fn validate_window(w: &WindowConfig) -> Result<()> {
 }
 
 fn validate_shop(s: &ShopConfig) -> Result<()> {
-    // Per-alias stop counts with the matching buy flag off would loop
-    // forever without ever reaching the target — catch that at load.
-    if s.stop_when_mystic_medals > 0 && !s.buy_mystic_medals {
+    if !(0.0..=1.0).contains(&s.buy_calibration_line_y_ratio) {
         return Err(Error::ConfigInvalid(
-            "shop.stop_when_mystic_medals > 0 but shop.buy_mystic_medals \
-             is false — the count can never be reached"
-                .into(),
+            "shop.buy_calibration_line_y_ratio must be in [0, 1]".into(),
         ));
+    }
+    // Per-alias stop counts paired with the matching buy flag off can
+    // never trip — warn but don't fail, otherwise the GUI (which can
+    // toggle the Buy checkbox without resetting the stop count) bricks
+    // its own next launch.
+    if s.stop_when_mystic_medals > 0 && !s.buy_mystic_medals {
+        tracing::warn!(
+            "shop.stop_when_mystic_medals > 0 but shop.buy_mystic_medals is false \
+             — the count will never trip"
+        );
     }
     if s.stop_when_covenants > 0 && !s.buy_covenant {
-        return Err(Error::ConfigInvalid(
+        tracing::warn!(
             "shop.stop_when_covenants > 0 but shop.buy_covenant is false \
-             — the count can never be reached"
-                .into(),
-        ));
+             — the count will never trip"
+        );
     }
     if s.stop_when_gold_spent > 0 && !s.buy_mystic_medals && !s.buy_covenant {
-        return Err(Error::ConfigInvalid(
+        tracing::warn!(
             "shop.stop_when_gold_spent > 0 but no buy flag is on \
-             — no gold can ever be spent"
-                .into(),
-        ));
+             — no gold will ever be spent"
+        );
     }
     Ok(())
 }
@@ -130,6 +97,11 @@ fn validate_matching(m: &MatchingConfig) -> Result<()> {
     if m.extra_scales.iter().any(|s| !s.is_finite() || *s <= 0.0) {
         return Err(Error::ConfigInvalid(
             "matching.extra_scales must all be finite and positive".into(),
+        ));
+    }
+    if !(100..=5000).contains(&m.preview_refresh_ms) {
+        return Err(Error::ConfigInvalid(
+            "matching.preview_refresh_ms must be in [100, 5000]".into(),
         ));
     }
     Ok(())
@@ -167,11 +139,6 @@ fn validate_timing(t: &TimingConfig) -> Result<()> {
             "timing.click_delay_mean_ms must be > 0".into(),
         ));
     }
-    if t.poll_interval_ms == 0 || t.poll_interval_ms >= t.anchor_timeout_ms {
-        return Err(Error::ConfigInvalid(
-            "timing.poll_interval_ms must be in 1..anchor_timeout_ms".into(),
-        ));
-    }
     if t.jitter_radius_px < 0.0 || !t.jitter_radius_px.is_finite() {
         return Err(Error::ConfigInvalid(
             "timing.jitter_radius_px must be >= 0".into(),
@@ -186,13 +153,8 @@ fn validate_timing(t: &TimingConfig) -> Result<()> {
 }
 
 fn validate_regions(r: &RegionsConfig) -> Result<()> {
-    for (name, region) in [
-        ("regions.shop_grid", r.shop_grid),
-        ("regions.anchor_shop", r.anchor_shop),
-    ] {
-        if let Some(rect) = region {
-            validate_rect(name, rect)?;
-        }
+    if let Some(rect) = r.shop_grid {
+        validate_rect("regions.shop_grid", rect)?;
     }
     Ok(())
 }
@@ -207,6 +169,44 @@ fn validate_zones(z: &ZonesConfig) -> Result<()> {
         if let Some(rect) = zone {
             validate_rect(name, rect)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_notifications(n: &NotificationsConfig) -> Result<()> {
+    let url = n.webhook_url();
+    if url.is_empty() {
+        return Ok(());
+    }
+    if !url.starts_with("https://") {
+        return Err(Error::ConfigInvalid(
+            "notifications.discord_webhook_url must start with https://".into(),
+        ));
+    }
+    // Real Discord webhooks live under discord.com or discordapp.com.
+    // Catches the obvious typo (http, paste-of-something-else); a hostile
+    // URL still goes through, but that's a "user owns their config" thing.
+    let host_ok = url.starts_with("https://discord.com/")
+        || url.starts_with("https://discordapp.com/")
+        || url.starts_with("https://canary.discord.com/")
+        || url.starts_with("https://ptb.discord.com/");
+    if !host_ok {
+        return Err(Error::ConfigInvalid(
+            "notifications.discord_webhook_url must point at discord.com (got something else — \
+             check you copied the full webhook URL)"
+                .into(),
+        ));
+    }
+    // Webhook URLs always contain `/api/webhooks/`. Rejecting invite links,
+    // channel URLs, etc. at load time means the user sees the mistake
+    // immediately instead of a silent 404 after the next run.
+    if !url.contains("/api/webhooks/") {
+        return Err(Error::ConfigInvalid(
+            "notifications.discord_webhook_url is missing the /api/webhooks/ path — looks like \
+             a channel or invite link, not a webhook. In Discord: Server Settings → \
+             Integrations → Webhooks → Copy Webhook URL."
+                .into(),
+        ));
     }
     Ok(())
 }

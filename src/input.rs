@@ -38,11 +38,24 @@ const SLEEP_CHUNK_MS: u64 = 60;
 /// activation and land in dead time.
 const FOREGROUND_SETTLE_MS: u64 = 150;
 
+/// Cooperative mode poll cadence. Tight enough that resume feels
+/// immediate; loose enough not to burn CPU when the user is typing.
+const COOPERATIVE_POLL_MS: u64 = 100;
+
+/// Tolerance between `GetLastInputInfo` (GetTickCount domain) and the
+/// bot's own Instant readings. Without it, our own SendInput can look
+/// like user activity due to clock-source jitter.
+const BOT_INPUT_CLASSIFY_MARGIN_MS: u64 = 30;
+
 pub struct Clicker {
     enigo: Enigo,
     timing: TimingConfig,
     rng: SmallRng,
     stop: Arc<AtomicBool>,
+    /// Last time the bot itself called into enigo. Lets us tell apart
+    /// "user moved the mouse" from "we moved the mouse" when reading
+    /// `GetLastInputInfo`.
+    last_bot_input_at: Instant,
 }
 
 impl Clicker {
@@ -54,7 +67,74 @@ impl Clicker {
             timing,
             rng: SmallRng::seed_from_u64(seed),
             stop,
+            last_bot_input_at: Instant::now(),
         })
+    }
+
+    /// Update right after every SendInput so the user-activity check
+    /// can subtract out our own actions.
+    fn mark_bot_input(&mut self) {
+        self.last_bot_input_at = Instant::now();
+    }
+
+    /// `Some(ms)` if the last OS-level input is more recent than our own
+    /// last enigo call (user moved/typed). `None` if the last input was
+    /// the bot itself.
+    fn ms_since_user_input(&self) -> Option<u64> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+        use windows::Win32::System::SystemInformation::GetTickCount;
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+            return None;
+        }
+        let now_tick = unsafe { GetTickCount() };
+        let since_input_ms = now_tick.wrapping_sub(info.dwTime) as u64;
+        let since_bot_ms = self.last_bot_input_at.elapsed().as_millis() as u64;
+        // User input is more recent than our own last action.
+        if since_input_ms + BOT_INPUT_CLASSIFY_MARGIN_MS < since_bot_ms {
+            Some(since_input_ms)
+        } else {
+            None
+        }
+    }
+
+    /// Cooperative pause: block until the user has been idle for at
+    /// least `cooperative_idle_ms`. No-op if disabled (0) or already
+    /// idle. Respects Stop so the user can abort.
+    fn wait_for_user_idle(&self) {
+        let threshold_ms = self.timing.cooperative_idle_ms;
+        if threshold_ms == 0 {
+            return;
+        }
+        let chunk = Duration::from_millis(COOPERATIVE_POLL_MS);
+        let mut waited_for_user = false;
+        loop {
+            if self.stopped() {
+                return;
+            }
+            match self.ms_since_user_input() {
+                Some(ms) if ms < threshold_ms => {
+                    if !waited_for_user {
+                        tracing::debug!(
+                            since_user_input_ms = ms,
+                            threshold_ms,
+                            "user is active — pausing"
+                        );
+                        waited_for_user = true;
+                    }
+                    thread::sleep(chunk);
+                }
+                _ => {
+                    if waited_for_user {
+                        tracing::debug!("user idle — resuming");
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// Checked every click — no TTL cache. Paid currency is on the line
@@ -131,6 +211,9 @@ impl Clicker {
         local_x: i32,
         local_y: i32,
     ) -> Result<()> {
+        // Before foreground steal — yanking focus while the user types
+        // would feel just as bad as yanking the mouse.
+        self.wait_for_user_idle();
         self.ensure_foreground(capture)?;
         let (tx, ty) = capture.local_to_screen(local_x, local_y)?;
         let start = self.enigo.location().unwrap_or((tx, ty));
@@ -165,6 +248,7 @@ impl Clicker {
             return Ok(());
         }
         self.enigo.button(Button::Left, Direction::Click)?;
+        self.mark_bot_input();
         tracing::debug!("button click sent");
         Ok(())
     }
@@ -186,14 +270,17 @@ impl Clicker {
         local_y: i32,
         lines: i32,
     ) -> Result<()> {
+        self.wait_for_user_idle();
         self.ensure_foreground(capture)?;
         let (sx, sy) = capture.local_to_screen(local_x, local_y)?;
         self.enigo.move_mouse(sx, sy, Coordinate::Abs)?;
+        self.mark_bot_input();
         self.sleep_interruptible(Duration::from_millis(40));
         if self.stopped() {
             return Ok(());
         }
         self.enigo.scroll(lines, Axis::Vertical)?;
+        self.mark_bot_input();
         Ok(())
     }
 
@@ -249,6 +336,7 @@ impl Clicker {
             let y = sy + dy * eased + py * arc * bump;
             self.enigo
                 .move_mouse(x.round() as i32, y.round() as i32, Coordinate::Abs)?;
+            self.mark_bot_input();
             let step_ms =
                 self.uniform_ms(self.timing.move_step_min_ms, self.timing.move_step_max_ms);
             self.sleep_interruptible(step_ms);

@@ -4,14 +4,20 @@ compile_error!(
      have no portable equivalent. See README."
 );
 
+pub mod auto_update;
 pub mod capture;
+pub mod color_check;
 pub mod config;
 pub mod detector;
 pub mod error;
 pub mod gui;
+pub mod http;
 pub mod input;
+pub mod layout;
+pub mod notifications;
 pub mod power;
 pub mod shop;
+pub mod update_check;
 
 /// Per-monitor DPI awareness + capped rayon pool. Called by every entry
 /// point (CLI, GUI).

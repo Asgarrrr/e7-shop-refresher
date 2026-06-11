@@ -8,7 +8,7 @@ title_contains      = "Epic Seven"
 # Auto-updated when you save a crop via the GUI. The detector uses this
 # as the scaling reference; if the live window is at a different size,
 # templates are resampled to match.
-base_resolution     = [1495, 872]
+base_resolution     = [1433, 837]
 resize_tolerance_px = 4
 # Force the window to base_resolution via SetWindowPos at startup.
 # Off by default: fighting Windows decorations + DPI rounding (you ask
@@ -28,9 +28,18 @@ stop_when_gold_spent       = 0
 buy_mystic_medals     = true
 buy_covenant          = true
 # Window-height fraction from the icon centre down to the row's buy
-# button. E7 puts the button under the icon, not next to it. Tune via
-# Run detection until the red band lands on it.
-buy_button_y_offset_ratio = 0.045
+# button. E7 puts the button under the icon, not next to it. Calibrate
+# on the Setup tab: drag the red line to an item centre, then drag the
+# red box onto that row's Buy button — this value updates live.
+buy_button_y_offset_ratio = 0.09
+# Vertical extent of the click band around the offset, as a window-height
+# fraction. Each click is randomised inside this band — wider absorbs
+# Y-drift between resolutions, narrower keeps clicks on the button itself.
+buy_button_band_h_ratio = 0.063
+# User-placed reference Y on the Setup-tab snapshot (fraction of window
+# height). Drives where the calibration line and box render; the bot
+# itself uses live detection, not this value.
+buy_calibration_line_y_ratio = 0.65
 # 6 items per refresh, 4 visible at once — 1 scroll reveals the last 2.
 # Set to 2 if your setup undershoots; bottom_strip_hash stops early anyway.
 max_scrolls_per_round = 1
@@ -53,9 +62,6 @@ move_to_click_min_ms    = 20
 move_to_click_max_ms    = 55
 move_curve_amplitude_px = 3.0
 
-anchor_timeout_ms = 5000
-poll_interval_ms  = 150
-
 # Rayleigh-distributed click target jitter (px).
 jitter_radius_px = 3.0
 
@@ -74,34 +80,47 @@ scroll_pause_ms    = 250
 # beyond is dead time.
 modal_open_pause_ms = 220
 
+# Cooperative mode — pause the bot when you touch the mouse/keyboard,
+# resume after this many ms of idle. 0 disables (bot fights you for the
+# cursor, original behaviour). 1500 ms ≈ send a Discord message without
+# losing a click mid-sentence.
+cooperative_idle_ms = 1500
+
 [matching]
-# 0.85 lets bookmark-ish icons cross-match; 0.90 keeps legit hits while
-# dropping most false positives. Lower only if real items get missed.
-threshold    = 0.9
+# 0.85 lets bookmark-ish icons cross-match; 0.92 plus the color_check
+# verification keeps legit hits while dropping the small-template
+# cross-colour FPs (orange medal hashing similarly to green friendship
+# bookmark at grayscale). Lower only if real items get missed.
+threshold    = 0.92
 # Required gap between best and runner-up score. Larger = stricter.
 margin       = 0.05
-# Native scale only. Expand to [0.97, 1.0, 1.03] if DPI quirks or post-
-# update UI tweaks start missing matches.
-extra_scales = [1.0]
-
-# Window-relative ROIs as [x, y, w, h] ratios in [0, 1]. Defaults tuned
-# for 1920×1080 — fine-tune via the GUI's Regions panel.
-[regions]
-shop_grid   = [0.425, 0.085, 0.09, 0.915]
-anchor_shop = [0.02, 0.04, 0.25, 0.09]
+# Pre-built template scales — the runner picks the best-fitting one per
+# match. The ±5% spread absorbs the title-bar-included-vs-client-area
+# drift you see when the user resizes the game window mid-session
+# without having to rebuild the Detector.
+extra_scales = [0.95, 1.0, 1.05]
+# Setup-tab live preview cadence in milliseconds (100–5000). Drives
+# capture + NCC frequency for the preview only — the bot loop is not
+# gated by this. Lower = more responsive zone drag, higher CPU.
+preview_refresh_ms = 500
 
 [templates]
+# Override directory for the bundled item templates. Leave the defaults
+# — every template name listed here has a binary-embedded fallback, so
+# missing files are not an error.
 dir          = "templates"
-anchor_shop  = "shop_header.png"
 mystic_medal = "mystic_medal.png"
 covenant     = "covenant.png"
 
-# Click zones — bot picks a uniformly random point inside each zone.
-# Faster + more robust than template-matching for fixed-position buttons.
-# Draw them in the GUI's Zones panel. [x, y, w, h] ratios in [0, 1].
-[zones]
-refresh = [0.065, 0.892, 0.215, 0.061]
-refresh_confirm = [0.529, 0.621, 0.121, 0.057]
-buy_confirm = [0.488, 0.686, 0.198, 0.059]
-# buy_column: only x/w are used (Y comes from the matched icon at click time).
-buy_column = [0.83, 0.115, 0.142, 0.885]
+# `[regions]` and `[zones]` are intentionally omitted from defaults: all
+# click positions and search regions are now compile-time constants in
+# `src/layout.rs`, derived geometrically from the fixed E7 Secret Shop
+# layout. The schema still parses these sections for back-compat with
+# pre-auto-calibration configs — the runtime just ignores whatever's
+# there.
+
+# Optional outbound pings. Empty webhook URL = disabled.
+# Paste a Discord webhook ("Server Settings → Integrations → Webhooks") to
+# receive a one-line summary when a stop condition fires.
+[notifications]
+discord_webhook_url = ""

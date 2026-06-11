@@ -3,26 +3,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use image::GrayImage;
+use image::{GenericImageView, GrayImage, RgbaImage};
 use tracing::{debug, info, warn};
 
 use crate::capture::Capture;
-use crate::config::{Config, RegionsConfig, ShopConfig};
+use crate::color_check::ColorVerifier;
+use crate::config::{Config, ShopConfig};
 use crate::detector::{Detector, alias};
 use crate::error::{Error, Result};
 use crate::input::Input;
+use crate::layout;
 
 /// 4% of window height ≈ one row at 1080p — wide enough for sub-pixel
 /// scroll drift, narrow enough to never leak into the adjacent row.
 pub const BUY_COLUMN_ROW_BAND_RATIO: f32 = 0.04;
 
+/// 4 visible at once + 2 unlocked by the single in-bot scroll. Drop
+/// rates below are per-slot; multiply by this for per-refresh.
+pub const SHOP_SLOTS_PER_REFRESH: u32 = 6;
+
+pub const MYSTIC_DROP_PER_SLOT: f64 = 0.001_700_646;
+pub const COVENANT_DROP_PER_SLOT: f64 = 0.006_602_509;
+
 /// Lets the freshly re-located game window finish painting before the
-/// next anchor wait starts polling.
+/// next round resumes.
 const REATTACH_BACKOFF_MS: u64 = 800;
 
 /// Errors recoverable by re-finding the game window: crash + relaunch,
-/// alt-F4, minimize. Unrecoverable errors (bad config, missing template,
-/// unset zone) propagate up.
+/// alt-F4, minimize. Other errors propagate up.
 fn is_recoverable(err: &Error) -> bool {
     matches!(
         err,
@@ -33,9 +41,7 @@ fn is_recoverable(err: &Error) -> bool {
     )
 }
 
-/// Pure version of `ShopRunner::buy_column_row_rect` so the GUI debug
-/// overlay can render the exact rect the runner would click. Only x/w of
-/// `column` are used; the row Y comes from the matched icon.
+/// Only x/w of `column` are used; the row Y comes from the icon match.
 pub fn buy_column_row_rect_for(
     column: [f32; 4],
     item_y: i32,
@@ -43,11 +49,12 @@ pub fn buy_column_row_rect_for(
     window_w: u32,
     window_h: u32,
     y_offset_ratio: f32,
+    band_h_ratio: f32,
 ) -> [i32; 4] {
     let (w, h) = (window_w as i32, window_h as i32);
     let bx = (column[0] * w as f32).round() as i32;
     let bw = (column[2] * w as f32).round() as i32;
-    let band_h = ((frame_h as f32) * BUY_COLUMN_ROW_BAND_RATIO).round() as i32;
+    let band_h = ((frame_h as f32) * band_h_ratio).round() as i32;
     let y_offset = ((frame_h as f32) * y_offset_ratio).round() as i32;
     let by = (item_y + y_offset - band_h / 2).clamp(0, (h - band_h.max(1)).max(0));
     [bx.max(0), by, bw.max(1), band_h.max(1)]
@@ -58,20 +65,18 @@ pub trait ProgressSink: Send + Sync {
     fn round_started(&self, _round: u32, _total: u32) {}
     fn round_finished(&self, _round: u32, _bought: u32) {}
     fn item_bought(&self, _alias: &str) {}
-    fn finished(&self) {}
+    /// `reason = Some("stop_when_…")` when a goal fired, `None` on
+    /// manual Stop or clean exit.
+    fn finished(&self, _reason: Option<&str>) {}
     fn failed(&self, _err: &str) {}
 
-    /// Fired after `power::suspend_to_sleep()` returns; lets the GUI
-    /// sink give `sleep_when_done` one-shot semantics.
+    /// Lets the GUI sink give `sleep_when_done` one-shot semantics.
     fn sleep_consumed(&self) {}
 
-    /// Transient status under the main label (e.g. "Waiting for shop
-    /// screen…"). `None` clears it.
     fn sub_status(&self, _text: Option<&str>) {}
 
-    /// Default `0` means per-alias stop conditions never fire under
-    /// sinks that don't track counters — fine for CLI/headless runs
-    /// that rely on `max_refreshes`.
+    /// Default `0` means per-alias stop conditions never fire — fine
+    /// for CLI/headless runs that rely on `max_refreshes`.
     fn bought_count(&self, _alias: &str) -> u32 {
         0
     }
@@ -83,27 +88,21 @@ impl ProgressSink for NullSink {}
 pub struct ShopRunner {
     capture: Arc<dyn Capture>,
     detector: Arc<Detector>,
+    color_check: ColorVerifier,
     clicker: Box<dyn Input>,
     config: Config,
-    /// Shared, live-editable view of `[shop]`. The GUI mutates the
-    /// matching fields and pushes them here on every frame; the runner
-    /// pulls a fresh snapshot at the start of every round so mid-run
-    /// edits to stop conditions, targets, and sleep-on-done take effect
-    /// at the next boundary. Setup-tab fields (timing / matching /
-    /// templates / zones) stay captured by value in `config` since the
-    /// bot is in the middle of using them.
+    /// Runner re-reads at every round boundary so mid-run UI edits to
+    /// `[shop]` apply at the next boundary. Timing/matching stay
+    /// captured by value in `config` since they're in use right now.
     live_shop: Arc<RwLock<ShopConfig>>,
     stop: Arc<AtomicBool>,
     progress: Arc<dyn ProgressSink>,
     enabled_targets: Vec<&'static str>,
-    /// Item types bought this round. The shop holds at most one of each
-    /// per refresh, so any later match for the same alias is a re-detection
-    /// of the now-sold-out item across scroll positions. Cleared per round.
+    /// Shop holds one of each per refresh — a later match for the same
+    /// alias is a re-detection of the sold-out item. Also dedupes a
+    /// failed buy attempt (modal didn't open) so subsequent scroll
+    /// views don't re-click an inactive button. Cleared per round.
     bought_types: HashSet<&'static str>,
-    /// Icon-area hashes already clicked this round (success OR fail). A
-    /// false NCC match that didn't open a modal at view N is skipped at
-    /// views N+1, N+2. Cleared per round.
-    attempted_icons: HashSet<u64>,
 }
 
 impl ShopRunner {
@@ -119,6 +118,7 @@ impl ShopRunner {
         Self {
             capture,
             detector,
+            color_check: ColorVerifier::new(),
             clicker,
             config,
             live_shop,
@@ -126,18 +126,11 @@ impl ShopRunner {
             progress: Arc::new(NullSink),
             enabled_targets,
             bought_types: HashSet::new(),
-            attempted_icons: HashSet::new(),
         }
     }
 
-    /// Pulls the latest `[shop]` section from `live_shop` into the
-    /// owned `Config` snapshot the rest of the runner reads from. Also
-    /// recomputes `enabled_targets` so a toggle of `buy_mystic_medals`
-    /// / `buy_covenant` propagates without other bookkeeping.
-    ///
-    /// Called once per round at the iteration boundary — keeps every
-    /// decision inside a round consistent against a single snapshot,
-    /// even if the user is dragging a slider while the round runs.
+    /// Called at the round boundary so the round reads one consistent
+    /// snapshot even if the user is dragging a slider mid-round.
     fn refresh_live_shop(&mut self) {
         if let Ok(latest) = self.live_shop.read() {
             self.config.shop = latest.clone();
@@ -150,9 +143,33 @@ impl ShopRunner {
         self
     }
 
-    pub fn run(&mut self) -> Result<()> {
-        self.config.ensure_zones_set()?;
+    /// Bundled fallbacks are calibrated for `BUNDLED_TEMPLATE_NATIVE_HEIGHT`
+    /// — surfacing which ones are in use lets the user correlate a missed
+    /// click with "ah, I never set that zone in Setup".
+    fn log_bundled_zones(&self) {
+        let z = &self.config.zones;
+        let mut bundled: Vec<&str> = Vec::new();
+        if self.config.regions.shop_grid.is_none() {
+            bundled.push("shop_grid");
+        }
+        if z.refresh.is_none() {
+            bundled.push("refresh");
+        }
+        if z.refresh_confirm.is_none() {
+            bundled.push("refresh_confirm");
+        }
+        if z.buy_confirm.is_none() {
+            bundled.push("buy_confirm");
+        }
+        if z.buy_column.is_none() {
+            bundled.push("buy_column");
+        }
+        if !bundled.is_empty() {
+            info!(zones = ?bundled, "using bundled layout fallback for these zones");
+        }
+    }
 
+    pub fn run(&mut self) -> Result<()> {
         let s = &self.config.shop;
         info!(
             max_refreshes = s.max_refreshes,
@@ -162,18 +179,46 @@ impl ShopRunner {
             sleep_when_done = s.sleep_when_done,
             "starting shop refresh loop"
         );
+        self.log_bundled_zones();
 
-        let result = self.run_inner();
+        let started = Instant::now();
+        let result = self.run_inner(started);
         // Read sleep_when_done AFTER the loop so a toggle made mid-run
-        // (e.g. user clicked "Sleep PC" right before going to bed) is
-        // honoured. Matches the user's intuition that this is a final-
-        // step decision, not a "must be set at start" config.
+        // (clicked "Sleep PC" right before bed) is honoured.
         let sleep_after = self.config.shop.sleep_when_done;
         match &result {
-            Ok(reached_goal) => {
-                self.progress.finished();
-                // Manual Stop means the user is at the keyboard; never sleep on them.
-                if *reached_goal && sleep_after {
+            Ok(outcome) => {
+                // Finished FIRST so the UI shows "Finished · Sending
+                // Discord notification…" rather than "Running" for the
+                // duration of the network round-trip.
+                self.progress.finished(outcome.reason);
+                if let Some(reason) = outcome.reason {
+                    if sleep_after {
+                        // Sync — fire-and-forget would race the OS
+                        // suspending the network stack right after.
+                        // WinHTTP has 5 s per-phase timeouts so worst
+                        // case is bounded.
+                        self.progress
+                            .sub_status(Some("Sending Discord notification…"));
+                        self.dispatch_completion_webhook(
+                            reason,
+                            outcome.refreshes,
+                            started.elapsed(),
+                        );
+                        self.progress.sub_status(None);
+                    } else {
+                        // Detached — BotHandle::Drop joins the worker,
+                        // so a slow webhook would freeze the GUI close
+                        // for up to ~20 s.
+                        self.spawn_completion_webhook(
+                            reason,
+                            outcome.refreshes,
+                            started.elapsed(),
+                        );
+                    }
+                }
+                // Manual Stop = user is at the keyboard, never sleep.
+                if outcome.reason.is_some() && sleep_after {
                     info!("goal reached — suspending system");
                     crate::power::suspend_to_sleep();
                     self.progress.sleep_consumed();
@@ -185,25 +230,53 @@ impl ShopRunner {
         result.map(|_| ())
     }
 
-    /// `Ok(true)` when stopped via a configured goal (drives sleep-on-finish),
-    /// `Ok(false)` on manual Stop, `Err` on real failures.
-    fn run_inner(&mut self) -> Result<bool> {
+    fn dispatch_completion_webhook(&self, reason: &str, refreshes: u32, elapsed: Duration) {
+        let url = self.config.notifications.webhook_url();
+        if url.is_empty() {
+            return;
+        }
+        crate::notifications::deliver_summary_blocking(url, self.build_summary(reason, refreshes, elapsed));
+    }
+
+    fn spawn_completion_webhook(&self, reason: &str, refreshes: u32, elapsed: Duration) {
+        let url = self.config.notifications.webhook_url();
+        if url.is_empty() {
+            return;
+        }
+        let url = url.to_string();
+        let summary = self.build_summary(reason, refreshes, elapsed);
+        let spawn = std::thread::Builder::new()
+            .name("discord-webhook-completion".into())
+            .spawn(move || {
+                crate::notifications::deliver_summary_blocking(&url, summary);
+            });
+        if let Err(e) = spawn {
+            warn!(error = %e, "failed to spawn completion webhook thread");
+        }
+    }
+
+    fn build_summary(&self, reason: &str, refreshes: u32, elapsed: Duration) -> crate::notifications::RunSummary {
+        crate::notifications::RunSummary {
+            reason: reason.to_string(),
+            elapsed,
+            refreshes,
+            mystic_bought: self.progress.bought_count(alias::MYSTIC_MEDAL),
+            covenant_bought: self.progress.bought_count(alias::COVENANT),
+            gold_spent: gold_spent_for(|a| self.progress.bought_count(a)),
+        }
+    }
+
+    fn run_inner(&mut self, started: Instant) -> Result<RunInnerOutcome> {
         let long_every = self.config.timing.long_pause_every_n;
-        let started = Instant::now();
-        // `iteration` is the loop counter used for logs and the
-        // consecutive-failure cap. `refreshes_done` is what the user
-        // sees and what `max_refreshes` is checked against — only a
-        // round that actually fired the confirm click bumps it.
+        // `refreshes_done` is user-facing — only a round that actually
+        // fired the confirm click bumps it.
         let mut iteration: u32 = 0;
         let mut refreshes_done: u32 = 0;
         let mut consecutive_failures: u32 = 0;
-        let mut reached_goal = false;
+        let mut goal_reason: Option<&'static str> = None;
 
         loop {
             iteration += 1;
-            // Pull the latest live shop snapshot before reading any of
-            // its fields — keeps the whole round consistent against one
-            // version while still propagating UI edits at the boundary.
             self.refresh_live_shop();
             let max_refreshes = self.config.shop.max_refreshes;
 
@@ -213,7 +286,7 @@ impl ShopRunner {
             }
             if max_refreshes > 0 && refreshes_done >= max_refreshes {
                 info!(max_refreshes, "max_refreshes reached — stopping");
-                reached_goal = true;
+                goal_reason = Some("max_refreshes");
                 break;
             }
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
@@ -225,29 +298,19 @@ impl ShopRunner {
             }
             if let Some(reason) = self.stop_condition_reached(started) {
                 info!(stop_reason = reason, "stop condition reached");
-                reached_goal = true;
+                goal_reason = Some(reason);
                 break;
             }
 
+            // Drift is non-fatal — click positions resolve per-round
+            // against `Capture::rect()`, the Detector carries ±5% scale
+            // templates. Beyond that NCC misses and consecutive-failure
+            // cap trips, so surface at warn so the GUI log panel shows it.
             if let Err(e) = self
                 .capture
                 .check_size_stable(self.config.window.resize_tolerance_px)
             {
-                warn!(error = %e, "window drifted — attempting to restore baseline size");
-                match self.capture.restore_to_baseline() {
-                    Ok(true)
-                        if self
-                            .capture
-                            .check_size_stable(self.config.window.resize_tolerance_px)
-                            .is_ok() =>
-                    {
-                        info!("window restored to baseline");
-                    }
-                    _ => {
-                        warn!("restore did not bring window back to baseline — stopping");
-                        return Err(e);
-                    }
-                }
+                warn!(error = %e, "window size drifted — adapting in place");
             }
 
             self.progress.round_started(refreshes_done, max_refreshes);
@@ -263,11 +326,10 @@ impl ShopRunner {
                     self.progress.round_finished(refreshes_done, outcome.bought);
                 }
                 Err(e) if is_recoverable(&e) => {
-                    // A failure raised AFTER the user already pressed Stop
-                    // is almost always a side-effect of the GUI grabbing
-                    // focus on that click — not a real fault. Don't count
-                    // it toward the consecutive-failure cap and downgrade
-                    // the log to debug so the shutdown stays quiet.
+                    // A failure raised after Stop is almost always a
+                    // side-effect of the GUI grabbing focus, not a real
+                    // fault — don't count it toward the failure cap and
+                    // keep the shutdown log quiet.
                     let stop_in_flight = self.stop.load(Ordering::Relaxed);
                     if stop_in_flight {
                         debug!(
@@ -296,9 +358,9 @@ impl ShopRunner {
                 Err(e) => return Err(e),
             }
 
-            // Skip the inter-round pause if the next iteration would
-            // immediately stop anyway (avoids overshooting wall-clock by
-            // up to long_pause_max_ms).
+            // Skip the inter-round pause when we know the next iteration
+            // will stop — avoids overshooting wall-clock by up to
+            // long_pause_max_ms past the stop condition.
             let next_round_would_stop = self.stop.load(Ordering::Relaxed)
                 || (max_refreshes > 0 && refreshes_done >= max_refreshes)
                 || consecutive_failures >= MAX_CONSECUTIVE_FAILURES
@@ -312,7 +374,10 @@ impl ShopRunner {
                 }
             }
         }
-        Ok(reached_goal)
+        Ok(RunInnerOutcome {
+            reason: goal_reason,
+            refreshes: refreshes_done,
+        })
     }
 
     fn stop_condition_reached(&self, started: Instant) -> Option<&'static str> {
@@ -324,65 +389,19 @@ impl ShopRunner {
     fn run_round(&mut self, round: u32) -> Result<RoundOutcome> {
         info!(round, "round starting");
 
-        // Refresh re-rolls the inventory, so both dedupe sets reset.
+        // Refresh re-rolls the inventory, so the per-round dedup set resets.
         self.bought_types.clear();
-        self.attempted_icons.clear();
 
-        // Anchor check is the safety net against the IAP redirect: if the
-        // previous refresh ran out of skystones, the game opens a paid-pack
-        // store. Anchor template doesn't match → bail without clicking.
-        match self.wait_anchor() {
-            Ok(()) => info!(round, "shop anchor confirmed"),
-            Err(Error::AnchorTimeout(_)) => {
-                warn!(
-                    round,
-                    "shop anchor not seen — skipping round (IAP redirect possible)"
-                );
-                return Ok(RoundOutcome {
-                    bought: 0,
-                    refreshed: false,
-                });
-            }
-            Err(e) => return Err(e),
-        }
-
+        // No "are we in the shop?" pre-check — too brittle across
+        // languages/resolutions. IAP-redirect safety is covered downstream
+        // by the modal-open hash checks in `refresh_shop` and
+        // `try_buy_at_pixel_y` (a mis-clicked first click never triggers
+        // a follow-up on a stale confirm zone).
         let bought = self.buy_round()?;
         info!(round, bought, "items bought");
 
         let refreshed = self.refresh_shop()?;
         Ok(RoundOutcome { bought, refreshed })
-    }
-
-    fn wait_anchor(&mut self) -> Result<()> {
-        let timeout = Duration::from_millis(self.config.timing.anchor_timeout_ms);
-        let poll = Duration::from_millis(self.config.timing.poll_interval_ms);
-        let roi = self.config.regions.anchor_shop;
-        info!(
-            timeout_ms = self.config.timing.anchor_timeout_ms,
-            "waiting for shop anchor"
-        );
-
-        // Cleared in every exit path below — stale text would bleed into
-        // the next round.
-        self.progress.sub_status(Some("Waiting for shop screen…"));
-
-        let stop = Arc::clone(&self.stop);
-        let result = self.detector.wait_for(
-            &*self.capture,
-            alias::ANCHOR_SHOP,
-            roi,
-            timeout,
-            poll,
-            &stop,
-        );
-        self.progress.sub_status(None);
-        let hit = result?;
-        debug!(
-            score = hit.score,
-            margin = hit.margin,
-            "shop anchor confirmed"
-        );
-        Ok(())
     }
 
     fn buy_round(&mut self) -> Result<u32> {
@@ -400,7 +419,7 @@ impl ShopRunner {
                 return Ok(bought);
             }
 
-            let (view_bought, last_gray) = self.process_current_view()?;
+            let view_bought = self.process_current_view()?;
             bought += view_bought;
             if view_bought > 0 {
                 info!(scroll_iter, view_bought, "items found in this view");
@@ -408,13 +427,9 @@ impl ShopRunner {
                 debug!(scroll_iter, "scroll position scanned, no targets");
             }
 
-            // Two identical bottom-strip hashes in a row = scroll didn't
-            // reveal new content. Reuse the snapshot if process_current_view
-            // already took one.
-            let strip = match last_gray {
-                Some(gray) => self.bottom_strip_hash(&gray),
-                None => self.bottom_strip_hash(&self.snapshot()?),
-            };
+            // Two identical bottom-strip hashes = scroll didn't reveal
+            // new content (at the bottom, or the scroll click missed).
+            let strip = self.bottom_strip_hash(&self.snapshot()?);
             if let Some(prev) = prev_strip_hash
                 && prev == strip
             {
@@ -430,118 +445,152 @@ impl ShopRunner {
         Ok(bought)
     }
 
+    /// Hashes the bottom quarter of the item grid to detect "scroll
+    /// didn't move anything".
     fn bottom_strip_hash(&self, gray: &GrayImage) -> u64 {
-        let [gx, gy, gw, gh] = self.regions().shop_grid.unwrap_or([0.0, 0.0, 1.0, 1.0]);
+        let [gx, gy, gw, gh] = self.config.regions.shop_grid.unwrap_or(layout::SHOP_GRID);
         let strip = [gx, gy + gh * 0.75, gw, gh * 0.25];
         strip_hash(gray, strip)
     }
 
-    /// Returns `(items_bought, last_detection_snapshot)`. The snapshot is
-    /// threaded across aliases: if alias N didn't buy, alias N+1 reuses
-    /// the same pixels. After a buy, the buffer is dropped (modal in the way).
-    fn process_current_view(&mut self) -> Result<(u32, Option<GrayImage>)> {
+    /// Searching the full column rather than a fixed slot patch absorbs
+    /// Y-drift across resolutions and patches.
+    fn process_current_view(&mut self) -> Result<u32> {
         let mut bought = 0u32;
-        let mut cached_gray: Option<GrayImage> = None;
-        // Clone to release the borrow on self.enabled_targets — the loop
-        // body needs &mut self for try_buy_visible.
-        let targets: Vec<&'static str> = self.enabled_targets.clone();
-        for alias_name in targets {
+        let shop_grid = self.config.regions.shop_grid.unwrap_or(layout::SHOP_GRID);
+
+        let mut pending: Vec<&'static str> = self
+            .enabled_targets
+            .iter()
+            .copied()
+            .filter(|a| !self.bought_types.contains(a))
+            .collect();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        // After a buy the sold overlay / row relayout makes the previous
+        // hit.y stale, so refresh the frame before evaluating remaining
+        // aliases. Each iteration shares one capture between NCC and the
+        // colour verify so they sample the same pixels.
+        while !pending.is_empty() {
             if self.stop.load(Ordering::Relaxed) {
-                return Ok((bought, cached_gray));
+                return Ok(bought);
             }
-            let (outcome, gray) = self.try_buy_visible(alias_name, cached_gray.take())?;
-            cached_gray = match outcome {
-                BuyOutcome::Bought => {
+
+            let scan = scan_shop_raw(&*self.capture, &self.detector, &pending, shop_grid)?;
+
+            let mut any_bought = false;
+            let mut still_pending: Vec<&'static str> = Vec::with_capacity(pending.len());
+
+            for (alias_name, hit) in scan.hits {
+                if self.stop.load(Ordering::Relaxed) {
+                    return Ok(bought);
+                }
+                let Some(hit) = hit else {
+                    continue;
+                };
+                debug!(
+                    alias = alias_name,
+                    score = hit.score,
+                    margin = hit.margin,
+                    x = hit.x,
+                    y = hit.y,
+                    "item matched in shop_grid"
+                );
+
+                if !self.verify_colour(alias_name, &hit, &scan.rgba) {
+                    continue;
+                }
+
+                // Already bought one this frame — defer remaining buys
+                // to the next iteration with a fresh snapshot so the
+                // click Y isn't computed against pre-buy pixels.
+                if any_bought {
+                    still_pending.push(alias_name);
+                    continue;
+                }
+
+                let success = self.try_buy_at_pixel_y(alias_name, hit.y, scan.rgba.height())?;
+                // Mark regardless: a failed click (modal didn't open)
+                // shouldn't re-fire on the next scroll view in the same
+                // round either — the button isn't going to wake up.
+                self.bought_types.insert(alias_name);
+                if success {
                     bought += 1;
                     self.progress.item_bought(alias_name);
-                    None
+                    any_bought = true;
                 }
-                BuyOutcome::None => gray,
-            };
+            }
+
+            if !any_bought {
+                break;
+            }
+            pending = still_pending;
         }
-        Ok((bought, cached_gray))
+        Ok(bought)
     }
 
-    /// Locate the alias's icon, click its row's buy button, verify the
-    /// modal opened (hash of `buy_confirm` zone before/after), click the
-    /// confirm pill. Pre/post hash gates the second click so a missed
-    /// first click can't blindly trigger an unrelated buy.
-    fn try_buy_visible(
+    /// Returns `false` on colour mismatch — caller treats it as "no
+    /// match". `rgba` MUST be the frame the NCC hit was computed from
+    /// so the patch sampled here matches the matched pixels.
+    fn verify_colour(
+        &self,
+        alias_name: &'static str,
+        hit: &crate::detector::Hit,
+        rgba: &RgbaImage,
+    ) -> bool {
+        let patch = crop_icon_patch(rgba, hit);
+        let Some(report) = self.color_check.evaluate(alias_name, &patch) else {
+            return true;
+        };
+        if report.passed {
+            return true;
+        }
+        warn!(
+            alias = alias_name,
+            score = hit.score,
+            x = hit.x,
+            y = hit.y,
+            colour_distance = report.distance,
+            coloured_fraction = report.coloured_fraction,
+            "NCC hit rejected by colour check — likely cross-colour false positive"
+        );
+        false
+    }
+
+    /// Pre/post hash on `buy_confirm` gates the confirm click so a
+    /// missed first click can't blindly trigger an unrelated buy.
+    fn try_buy_at_pixel_y(
         &mut self,
         alias_name: &'static str,
-        cached_gray: Option<GrayImage>,
-    ) -> Result<(BuyOutcome, Option<GrayImage>)> {
-        if self.stop.load(Ordering::Relaxed) {
-            return Ok((BuyOutcome::None, cached_gray));
-        }
-        // At most one of each type per refresh — skip cheaply without snapshotting.
-        if self.bought_types.contains(alias_name) {
-            debug!(
-                alias = alias_name,
-                "type already bought this round, skipping"
-            );
-            return Ok((BuyOutcome::None, cached_gray));
-        }
-        let gray = match cached_gray {
-            Some(g) => g,
-            None => self.snapshot()?,
-        };
-        let Some(item) = self
-            .detector
-            .find(&gray, alias_name, self.regions().shop_grid)?
-        else {
-            return Ok((BuyOutcome::None, Some(gray)));
-        };
-
-        // Same physical item at a different scroll position has the same
-        // icon-area hash. Computed from the snapshot we already have.
-        let icon_hash_val = self
-            .detector
-            .template_dimensions(alias_name)
-            .map(|(tw, th)| icon_hash(&gray, item.x, item.y, tw, th));
-        if let Some(h) = icon_hash_val
-            && self.attempted_icons.contains(&h)
-        {
-            debug!(
-                alias = alias_name,
-                "icon already attempted this round, skipping"
-            );
-            return Ok((BuyOutcome::None, Some(gray)));
-        }
-
-        // buy_column: only X range is used — Y comes from the icon match.
-        let buy_column = self
+        icon_y_px: i32,
+        frame_h: u32,
+    ) -> Result<bool> {
+        let buy_confirm = self
             .config
             .zones
-            .buy_column
-            .ok_or(Error::ZoneMissing { name: "buy_column" })?;
-        let buy_confirm = self.config.zones.buy_confirm.ok_or(Error::ZoneMissing {
-            name: "buy_confirm",
-        })?;
+            .buy_confirm
+            .unwrap_or(layout::BUY_CONFIRM);
 
-        let before = strip_hash(&gray, buy_confirm);
-        let row_rect = self.buy_column_row_rect(buy_column, item.y, gray.height())?;
+        let before_gray = self.snapshot()?;
+        let before = strip_hash(&before_gray, buy_confirm);
+
+        let row_rect = self.buy_button_local_rect(icon_y_px, frame_h)?;
         self.clicker.click_local_in_rect(&*self.capture, row_rect)?;
         self.clicker.human_pause();
         if self.stop.load(Ordering::Relaxed) {
-            return Ok((BuyOutcome::None, Some(gray)));
+            return Ok(false);
         }
 
         self.clicker
             .pause_ms(self.config.timing.modal_open_pause_ms);
         if self.stop.load(Ordering::Relaxed) {
-            return Ok((BuyOutcome::None, Some(gray)));
+            return Ok(false);
         }
 
-        // Record before checking the modal: success OR fail, never retry
-        // this icon in this round.
-        if let Some(h) = icon_hash_val {
-            self.attempted_icons.insert(h);
-        }
-
-        // Unchanged confirm-zone pixels = modal didn't open (greyed-out
-        // buy button or NCC false positive). Bail before clicking
-        // confirm into who-knows-what.
+        // Unchanged confirm-zone = modal didn't open (greyed-out buy
+        // button, animation hiccup). Bail before clicking blind.
         let after_gray = self.snapshot()?;
         let after = strip_hash(&after_gray, buy_confirm);
         if before == after {
@@ -549,32 +598,45 @@ impl ShopRunner {
                 alias = alias_name,
                 "buy modal did not open — skipping confirm click"
             );
-            return Ok((BuyOutcome::None, Some(after_gray)));
+            return Ok(false);
         }
 
-        let confirm_rect = self.zone_to_local_rect(buy_confirm)?;
+        let confirm_rect = self.ratio_rect_to_local(buy_confirm)?;
         self.clicker
             .click_local_in_rect(&*self.capture, confirm_rect)?;
         self.clicker.human_pause();
-        self.bought_types.insert(alias_name);
-        // Returned None: the modal is still on-screen, useless for the
-        // next bottom-strip hash.
-        Ok((BuyOutcome::Bought, None))
+        // Symmetric to `refresh_shop`: let the close animation finish
+        // before subsequent input. Skipping this lets `scroll_one_step`
+        // fire while the modal still has focus, the scroll event gets
+        // eaten, and the next iteration sees the unchanged top view —
+        // round buys one item then refreshes without scanning the rest.
+        self.clicker
+            .pause_ms(self.config.timing.modal_open_pause_ms);
+        Ok(true)
     }
 
-    fn buy_column_row_rect(&self, column: [f32; 4], item_y: i32, frame_h: u32) -> Result<[i32; 4]> {
+    /// Delegates to the pure `buy_column_row_rect_for` helper — also
+    /// used by the GUI debug overlay so both stay in lockstep.
+    fn buy_button_local_rect(&self, icon_y_px: i32, frame_h: u32) -> Result<[i32; 4]> {
         let r = self.capture.rect()?;
+        // Only column[0] / column[2] (X / W) are used at click time.
+        let column = self
+            .config
+            .zones
+            .buy_column
+            .unwrap_or([layout::BUY_COLUMN_X, 0.0, layout::BUY_COLUMN_W, 0.0]);
         Ok(buy_column_row_rect_for(
             column,
-            item_y,
+            icon_y_px,
             frame_h,
             r.width,
             r.height,
             self.config.shop.buy_button_y_offset_ratio,
+            self.config.shop.buy_button_band_h_ratio,
         ))
     }
 
-    fn zone_to_local_rect(&self, zone: [f32; 4]) -> Result<[i32; 4]> {
+    fn ratio_rect_to_local(&self, zone: [f32; 4]) -> Result<[i32; 4]> {
         let r = self.capture.rect()?;
         let (w, h) = (r.width as i32, r.height as i32);
         let x = (zone[0] * w as f32).round() as i32;
@@ -606,48 +668,34 @@ impl ShopRunner {
         Ok(())
     }
 
-    /// Scroll wheel target = center of `regions.shop_grid` so the wheel
-    /// event lands inside the scrollable list. Falls back to window
-    /// center if no grid ROI is set.
     fn scroll_point(&self) -> Result<(i32, i32)> {
         let r = self.capture.rect()?;
         let (w, h) = (r.width as f32, r.height as f32);
-        let (cx, cy) = match self.config.regions.shop_grid {
-            Some([gx, gy, gw, gh]) => (gx + gw / 2.0, gy + gh / 2.0),
-            None => (0.5, 0.5),
-        };
+        let [gx, gy, gw, gh] = self.config.regions.shop_grid.unwrap_or(layout::SHOP_GRID);
+        let cx = gx + gw / 2.0;
+        let cy = gy + gh / 2.0;
         Ok(((cx * w).round() as i32, (cy * h).round() as i32))
     }
 
-    /// Returns `true` when the refresh modal opened and the confirm
-    /// click was issued, `false` when the modal-open hash check
-    /// failed or `stop` interrupted before confirm.
+    /// `true` only when the refresh modal opened, confirm was clicked,
+    /// AND the items rerolled. Failed rounds count toward
+    /// `consecutive_failures` so the bot eventually bails.
     fn refresh_shop(&mut self) -> Result<bool> {
-        let refresh = self
-            .config
-            .zones
-            .refresh
-            .ok_or(Error::ZoneMissing { name: "refresh" })?;
-        let confirm = self
+        let refresh = self.config.zones.refresh.unwrap_or(layout::REFRESH);
+        let refresh_confirm = self
             .config
             .zones
             .refresh_confirm
-            .ok_or(Error::ZoneMissing {
-                name: "refresh_confirm",
-            })?;
+            .unwrap_or(layout::REFRESH_CONFIRM);
+        let shop_grid = self.config.regions.shop_grid.unwrap_or(layout::SHOP_GRID);
 
-        // Same modal verification as try_buy_visible: a missed refresh
-        // click would otherwise have refresh_confirm hit a random item.
         let before_gray = self.snapshot()?;
-        let before = strip_hash(&before_gray, confirm);
+        let before_confirm = strip_hash(&before_gray, refresh_confirm);
+        let before_grid = strip_hash(&before_gray, shop_grid);
 
         info!("clicking refresh");
-        let refresh_rect = self.zone_to_local_rect(refresh)?;
-        debug!(
-            zone = ?refresh,
-            local_rect = ?refresh_rect,
-            "refresh zone resolved"
-        );
+        let refresh_rect = self.ratio_rect_to_local(refresh)?;
+        debug!(local_rect = ?refresh_rect, "refresh zone resolved");
         self.clicker
             .click_local_in_rect(&*self.capture, refresh_rect)?;
         self.clicker.human_pause();
@@ -662,57 +710,109 @@ impl ShopRunner {
         }
 
         let after_gray = self.snapshot()?;
-        let after = strip_hash(&after_gray, confirm);
+        let after_confirm = strip_hash(&after_gray, refresh_confirm);
         debug!(
-            before_hash = before,
-            after_hash = after,
-            confirm_zone = ?confirm,
+            before_hash = before_confirm,
+            after_hash = after_confirm,
             "refresh modal hash check"
         );
-        if before == after {
+        if before_confirm == after_confirm {
             warn!("refresh modal did not open — skipping confirm click (this round won't refresh)");
             return Ok(false);
         }
 
-        let confirm_rect = self.zone_to_local_rect(confirm)?;
+        let confirm_rect = self.ratio_rect_to_local(refresh_confirm)?;
         self.clicker
             .click_local_in_rect(&*self.capture, confirm_rect)?;
         self.clicker.human_pause();
+
+        // After modal close + items re-render, verify the items grid
+        // actually changed — catches confirm-click missed / game lagged
+        // / never on a real shop modal in the first place.
+        self.clicker
+            .pause_ms(self.config.timing.modal_open_pause_ms);
+        let post_gray = self.snapshot()?;
+        let post_grid = strip_hash(&post_gray, shop_grid);
+        if post_grid == before_grid {
+            warn!(
+                "shop items unchanged after refresh — counting round as failed"
+            );
+            return Ok(false);
+        }
         Ok(true)
     }
 
     fn snapshot(&self) -> Result<GrayImage> {
-        // WGC captures are atomic, so we don't need to bracket every
-        // snapshot with a rect() check — drift is caught up-front by
-        // check_size_stable in run_inner.
         self.capture.snapshot_gray()
     }
-
-    fn regions(&self) -> &RegionsConfig {
-        &self.config.regions
-    }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum BuyOutcome {
-    Bought,
-    None,
+/// One capture + parallel NCC pass against `targets`. Single source of
+/// truth for "what's on screen in the shop right now" — used both by the
+/// bot loop and the Setup-tab live preview worker. The colour check is
+/// kept at the call site so the bot can `warn!` on rejections while the
+/// Setup preview drops them silently.
+pub(crate) fn scan_shop_raw(
+    capture: &dyn Capture,
+    detector: &Detector,
+    targets: &[&'static str],
+    shop_grid: [f32; 4],
+) -> Result<ShopScanRaw> {
+    use rayon::prelude::*;
+
+    let rgba = capture.snapshot_rgba()?;
+    let gray = image::imageops::grayscale(&rgba);
+    let ctx = detector.prepare_search(&gray, Some(shop_grid));
+    let raw: Vec<(&'static str, Result<Option<crate::detector::Hit>>)> = targets
+        .par_iter()
+        .map(|alias_name| (*alias_name, detector.find_in(&ctx, alias_name)))
+        .collect();
+    // Propagate the first NCC error rather than masking it — matches the
+    // bot's prior behaviour where a `find_in` failure stops the round.
+    let hits: Vec<(&'static str, Option<crate::detector::Hit>)> = raw
+        .into_iter()
+        .map(|(alias, r)| r.map(|h| (alias, h)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ShopScanRaw { rgba, hits })
 }
+
+pub(crate) struct ShopScanRaw {
+    pub rgba: RgbaImage,
+    /// `None` = template not found by NCC. The colour-check pass that
+    /// turns a "raw" hit into an actionable one stays at the call site.
+    pub hits: Vec<(&'static str, Option<crate::detector::Hit>)>,
+}
+
+/// Patch grows with `hit.scale` so the hue histogram covers the whole
+/// rendered icon at non-native scales.
+pub(crate) fn crop_icon_patch(rgba: &RgbaImage, hit: &crate::detector::Hit) -> RgbaImage {
+    // 40×40 covers the largest bundled icon (covenant 47×45).
+    const FALLBACK_SIDE: u32 = 40;
+    let scale = hit.scale.max(0.1);
+    let w = ((FALLBACK_SIDE as f32) * scale).round().max(8.0) as u32;
+    let h = w;
+    let (img_w, img_h) = rgba.dimensions();
+    let x0 = (hit.x - (w / 2) as i32).clamp(0, (img_w.saturating_sub(1)) as i32) as u32;
+    let y0 = (hit.y - (h / 2) as i32).clamp(0, (img_h.saturating_sub(1)) as i32) as u32;
+    let cw = w.min(img_w - x0);
+    let ch = h.min(img_h - y0);
+    rgba.view(x0, y0, cw, ch).to_image()
+}
+
 
 #[derive(Debug, Clone, Copy)]
 struct RoundOutcome {
     bought: u32,
-    /// `true` only when the refresh modal actually opened and confirm
-    /// was clicked. False when the anchor wasn't seen, the modal-open
-    /// hash check failed, or stop interrupted before confirm.
     refreshed: bool,
 }
 
-/// Bail-out threshold for the run loop: this many iterations in a
-/// row without a successful refresh stops the bot. Replaces the
-/// "every iteration counts toward max_refreshes" safety net so that
-/// max_refreshes can mean "actual refreshes" without risking an
-/// unbounded loop on a stuck state.
+#[derive(Debug, Clone, Copy)]
+struct RunInnerOutcome {
+    /// `None` = clean exit, `Some(_)` = stop condition fired.
+    reason: Option<&'static str>,
+    refreshes: u32,
+}
+
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
 pub mod prices {
@@ -725,10 +825,8 @@ pub(crate) fn gold_spent_for(bought: impl Fn(&str) -> u32) -> u64 {
         + u64::from(bought(alias::COVENANT)) * u64::from(prices::COVENANT_BOOKMARK)
 }
 
-/// Pure stop-condition check (testable without standing up real IO).
-/// Returns the first satisfied condition in fixed priority order
-/// (duration → mystic → covenant → gold spent) so the reason string
-/// is deterministic.
+/// First condition in fixed priority order
+/// (duration → mystic → covenant → gold) so the reason is deterministic.
 pub(crate) fn stop_condition_for(
     shop: &crate::config::ShopConfig,
     elapsed: Duration,
@@ -755,35 +853,8 @@ pub(crate) fn stop_condition_for(
     None
 }
 
-/// Hash a region around a matched item icon, used to recognise the same
-/// physical item across scroll positions. Region: 3× template width, 1×
-/// template height, centred around the icon. Sampled every 4 px so
-/// sub-pixel scroll drift doesn't flip the hash.
-///
-/// FxHasher instead of std SipHash: same equality semantics on our
-/// non-adversarial pixel data, ~2–3× faster on inputs this small.
-fn icon_hash(gray: &GrayImage, cx: i32, cy: i32, tw: u32, th: u32) -> u64 {
-    use std::hash::Hasher;
-    let (sw, sh) = (gray.width(), gray.height());
-    let region_w = (tw as i32) * 3;
-    let region_h = th as i32;
-    let anchor_x = cx - (tw as i32);
-    let x0 = (anchor_x - region_w / 2).max(0) as u32;
-    let y0 = (cy - region_h / 2).max(0) as u32;
-    let x1 = x0.saturating_add(region_w as u32).min(sw);
-    let y1 = y0.saturating_add(region_h as u32).min(sh);
-    let mut hasher = rustc_hash::FxHasher::default();
-    for yy in (y0..y1).step_by(4) {
-        for xx in (x0..x1).step_by(4) {
-            hasher.write_u8(gray.get_pixel(xx, yy)[0]);
-        }
-    }
-    hasher.finish()
-}
-
-/// Hash a sub-rectangle of a gray frame, sampled every 4th pixel.
-/// Detects "frame didn't move" (top/bottom of scroll, modal settle).
-/// Same hasher rationale as [`icon_hash`].
+/// FxHasher because pixel data is non-adversarial — 2-3× faster than
+/// std's SipHash on these tiny inputs.
 fn strip_hash(gray: &GrayImage, [x, y, w, h]: [f32; 4]) -> u64 {
     use std::hash::Hasher;
     let (sw, sh) = (gray.width(), gray.height());
@@ -816,9 +887,8 @@ mod tests {
     use image::GrayImage;
     use std::sync::Mutex as StdMutex;
 
-    /// Scripts gray frames + a fixed window rect. Returns `WindowGone`
-    /// once the queue empties so tests can observe reattach or graceful
-    /// exit.
+    /// Returns `WindowGone` once frames empty so tests can observe
+    /// reattach / graceful exit.
     pub(super) struct FakeCapture {
         frames: StdMutex<Vec<GrayImage>>,
         rect: WindowRect,
@@ -879,8 +949,8 @@ mod tests {
         LongPause,
     }
 
-    /// Event log exposed via Arc<Mutex<…>> so tests can inspect after
-    /// the boxed input has been moved into a runner.
+    /// Event log behind Arc<Mutex<…>> so tests can inspect after the
+    /// boxed input has been moved into a runner.
     #[derive(Default, Clone)]
     pub(super) struct FakeInput {
         pub events: Arc<StdMutex<Vec<FakeEvent>>>,
@@ -1064,6 +1134,8 @@ mod tests {
             buy_covenant: true,
             max_scrolls_per_round: 3,
             buy_button_y_offset_ratio: 0.04,
+            buy_button_band_h_ratio: 0.04,
+            buy_calibration_line_y_ratio: 0.55,
             stop_after_minutes: minutes,
             stop_when_mystic_medals: mystic,
             stop_when_covenants: covenants,
@@ -1163,7 +1235,7 @@ mod tests {
     #[test]
     fn buy_column_rect_centers_band_on_item_y_with_offset() {
         // 100×1000 window, item at y=500, band ratio 0.04 → 40 px band centred on 500.
-        let r = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.0);
+        let r = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.0, 0.04);
         assert_eq!(r[0], 80);
         assert!(r[1] >= 478 && r[1] <= 482);
         assert_eq!(r[2], 10);
@@ -1172,24 +1244,33 @@ mod tests {
 
     #[test]
     fn buy_column_rect_shifts_down_by_y_offset_ratio() {
-        let no_off = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.0);
-        let with_off = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.04);
+        let no_off = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.0, 0.04);
+        let with_off =
+            buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.04, 0.04);
         assert_eq!(with_off[1] - no_off[1], 40);
     }
 
     #[test]
     fn buy_column_rect_clamps_band_to_window_bounds() {
-        let r = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 0, 1000, 100, 1000, 0.0);
+        let r = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 0, 1000, 100, 1000, 0.0, 0.04);
         assert!(r[1] >= 0);
-        let r = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 1000, 1000, 100, 1000, 0.0);
+        let r = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 1000, 1000, 100, 1000, 0.0, 0.04);
         assert!(i64::from(r[1] + r[3]) <= 1000);
     }
 
     #[test]
     fn buy_column_rect_y_h_of_zone_are_ignored() {
-        let a = buy_column_row_rect_for([0.8, 0.1, 0.1, 0.2], 500, 1000, 100, 1000, 0.0);
-        let b = buy_column_row_rect_for([0.8, 0.9, 0.1, 0.05], 500, 1000, 100, 1000, 0.0);
+        let a = buy_column_row_rect_for([0.8, 0.1, 0.1, 0.2], 500, 1000, 100, 1000, 0.0, 0.04);
+        let b = buy_column_row_rect_for([0.8, 0.9, 0.1, 0.05], 500, 1000, 100, 1000, 0.0, 0.04);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn buy_column_rect_band_height_scales_with_ratio() {
+        let thin = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.0, 0.02);
+        let thick = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.0, 0.08);
+        assert_eq!(thin[3], 20);
+        assert_eq!(thick[3], 80);
     }
 
     fn solid_gray(w: u32, h: u32, value: u8) -> GrayImage {
@@ -1209,31 +1290,6 @@ mod tests {
             }
         }
         img
-    }
-
-    #[test]
-    fn icon_hash_deterministic() {
-        let img = checker(200, 200, 8);
-        let a = icon_hash(&img, 100, 100, 50, 50);
-        let b = icon_hash(&img, 100, 100, 50, 50);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn icon_hash_differs_for_different_content() {
-        let a_img = checker(200, 200, 8);
-        let b_img = solid_gray(200, 200, 128);
-        let a = icon_hash(&a_img, 100, 100, 50, 50);
-        let b = icon_hash(&b_img, 100, 100, 50, 50);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn icon_hash_handles_clamped_region_near_frame_edge() {
-        // Match centre near left edge: 3×template region would extend negative.
-        let img = checker(50, 50, 4);
-        let h = icon_hash(&img, 5, 25, 30, 30);
-        assert_eq!(h, icon_hash(&img, 5, 25, 30, 30));
     }
 
     #[test]

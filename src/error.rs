@@ -34,20 +34,11 @@ pub enum Error {
     #[error("game window could not be brought to the foreground — another app is blocking focus")]
     WindowNotForeground,
 
-    #[error("template `{name}` missing at {path}")]
-    TemplateMissing { name: String, path: PathBuf },
-
-    #[error("click zone `{name}` not set — draw it in the GUI's Zones panel")]
-    ZoneMissing { name: &'static str },
-
     #[error("config file not found at {0}")]
     ConfigNotFound(PathBuf),
 
     #[error("config invalid: {0}")]
     ConfigInvalid(String),
-
-    #[error("anchor `{0}` not seen within timeout — shop screen probably not open")]
-    AnchorTimeout(String),
 
     #[error("{0} consecutive rounds failed to refresh — bailing")]
     TooManyFailures(u32),

@@ -16,10 +16,12 @@ pub(super) struct AutoSavedFields {
     pub buy_mystic_medals: bool,
     pub buy_covenant: bool,
     pub buy_button_y_offset_ratio: f32,
+    pub buy_button_band_h_ratio: f32,
+    pub buy_calibration_line_y_ratio: f32,
     pub threshold: f32,
+    pub preview_refresh_ms: u32,
     pub sleep_when_done: bool,
     pub shop_grid: Option<[f32; 4]>,
-    pub anchor_shop: Option<[f32; 4]>,
     pub z_refresh: Option<[f32; 4]>,
     pub z_refresh_confirm: Option<[f32; 4]>,
     pub z_buy_confirm: Option<[f32; 4]>,
@@ -35,8 +37,6 @@ pub(super) struct AutoSavedFields {
     pub move_to_click_min_ms: u64,
     pub move_to_click_max_ms: u64,
     pub move_curve_amplitude_px: f32,
-    pub anchor_timeout_ms: u64,
-    pub poll_interval_ms: u64,
     pub jitter_radius_px: f32,
     pub inter_round_min_ms: u64,
     pub inter_round_max_ms: u64,
@@ -46,6 +46,8 @@ pub(super) struct AutoSavedFields {
     pub scroll_amount: i32,
     pub scroll_pause_ms: u64,
     pub modal_open_pause_ms: u64,
+    pub cooperative_idle_ms: u64,
+    pub discord_webhook_url: String,
 }
 
 impl AutoSavedFields {
@@ -60,10 +62,12 @@ impl AutoSavedFields {
             buy_mystic_medals: cfg.shop.buy_mystic_medals,
             buy_covenant: cfg.shop.buy_covenant,
             buy_button_y_offset_ratio: cfg.shop.buy_button_y_offset_ratio,
+            buy_button_band_h_ratio: cfg.shop.buy_button_band_h_ratio,
+            buy_calibration_line_y_ratio: cfg.shop.buy_calibration_line_y_ratio,
             threshold: cfg.matching.threshold,
+            preview_refresh_ms: cfg.matching.preview_refresh_ms,
             sleep_when_done: cfg.shop.sleep_when_done,
             shop_grid: cfg.regions.shop_grid,
-            anchor_shop: cfg.regions.anchor_shop,
             z_refresh: cfg.zones.refresh,
             z_refresh_confirm: cfg.zones.refresh_confirm,
             z_buy_confirm: cfg.zones.buy_confirm,
@@ -79,8 +83,6 @@ impl AutoSavedFields {
             move_to_click_min_ms: cfg.timing.move_to_click_min_ms,
             move_to_click_max_ms: cfg.timing.move_to_click_max_ms,
             move_curve_amplitude_px: cfg.timing.move_curve_amplitude_px,
-            anchor_timeout_ms: cfg.timing.anchor_timeout_ms,
-            poll_interval_ms: cfg.timing.poll_interval_ms,
             jitter_radius_px: cfg.timing.jitter_radius_px,
             inter_round_min_ms: cfg.timing.inter_round_min_ms,
             inter_round_max_ms: cfg.timing.inter_round_max_ms,
@@ -90,6 +92,8 @@ impl AutoSavedFields {
             scroll_amount: cfg.timing.scroll_amount,
             scroll_pause_ms: cfg.timing.scroll_pause_ms,
             modal_open_pause_ms: cfg.timing.modal_open_pause_ms,
+            cooperative_idle_ms: cfg.timing.cooperative_idle_ms,
+            discord_webhook_url: cfg.notifications.discord_webhook_url.clone(),
         }
     }
 }
@@ -152,6 +156,18 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
     set_scalar(
         &mut doc,
         "shop",
+        "buy_button_band_h_ratio",
+        rounded3(f64::from(config.shop.buy_button_band_h_ratio)),
+    );
+    set_scalar(
+        &mut doc,
+        "shop",
+        "buy_calibration_line_y_ratio",
+        rounded3(f64::from(config.shop.buy_calibration_line_y_ratio)),
+    );
+    set_scalar(
+        &mut doc,
+        "shop",
         "sleep_when_done",
         config.shop.sleep_when_done,
     );
@@ -162,6 +178,12 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
         "matching",
         "threshold",
         rounded3(f64::from(config.matching.threshold)),
+    );
+    set_scalar(
+        &mut doc,
+        "matching",
+        "preview_refresh_ms",
+        i64::from(config.matching.preview_refresh_ms),
     );
 
     // [timing]
@@ -234,18 +256,6 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
     set_scalar(
         &mut doc,
         "timing",
-        "anchor_timeout_ms",
-        i64::try_from(config.timing.anchor_timeout_ms).unwrap_or(i64::MAX),
-    );
-    set_scalar(
-        &mut doc,
-        "timing",
-        "poll_interval_ms",
-        i64::try_from(config.timing.poll_interval_ms).unwrap_or(i64::MAX),
-    );
-    set_scalar(
-        &mut doc,
-        "timing",
         "jitter_radius_px",
         rounded3(f64::from(config.timing.jitter_radius_px)),
     );
@@ -297,15 +307,15 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
         "modal_open_pause_ms",
         i64::try_from(config.timing.modal_open_pause_ms).unwrap_or(i64::MAX),
     );
+    set_scalar(
+        &mut doc,
+        "timing",
+        "cooperative_idle_ms",
+        i64::try_from(config.timing.cooperative_idle_ms).unwrap_or(i64::MAX),
+    );
 
     // [regions]
     set_rect_in(&mut doc, "regions", "shop_grid", config.regions.shop_grid);
-    set_rect_in(
-        &mut doc,
-        "regions",
-        "anchor_shop",
-        config.regions.anchor_shop,
-    );
 
     // [zones]
     set_rect_in(&mut doc, "zones", "refresh", config.zones.refresh);
@@ -318,7 +328,26 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
     set_rect_in(&mut doc, "zones", "buy_confirm", config.zones.buy_confirm);
     set_rect_in(&mut doc, "zones", "buy_column", config.zones.buy_column);
 
-    std::fs::write(path, doc.to_string())?;
+    // [notifications]
+    set_scalar(
+        &mut doc,
+        "notifications",
+        "discord_webhook_url",
+        config.notifications.discord_webhook_url.clone(),
+    );
+
+    // Write-then-rename so an interrupted write (power loss, AV holding
+    // a handle, std::fs::write killed mid-flight) can't truncate the
+    // live config.toml. std::fs::rename on Windows uses MoveFileEx with
+    // REPLACE_EXISTING|WRITE_THROUGH so the swap is atomic.
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, doc.to_string())?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -326,11 +355,13 @@ fn set_region(table: &mut toml_edit::Table, key: &str, value: Option<[f32; 4]>) 
     match value {
         Some([x, y, w, h]) => {
             // Clamp before writing so a reload doesn't trip the validator
-            // on rectangles like x+w > 1.0.
-            let x = x.clamp(0.0, 1.0);
-            let y = y.clamp(0.0, 1.0);
-            let w = w.clamp(0.001, 1.0 - x);
-            let h = h.clamp(0.001, 1.0 - y);
+            // on rectangles like x+w > 1.0. Width takes priority over X
+            // so a user-set width near the right edge keeps its size and
+            // X slides left instead of being silently truncated.
+            let w = w.clamp(0.001, 1.0);
+            let h = h.clamp(0.001, 1.0);
+            let x = x.clamp(0.0, 1.0 - w);
+            let y = y.clamp(0.0, 1.0 - h);
             let rounded = [x, y, w, h].map(|v| (f64::from(v) * 1000.0).round() / 1000.0);
 
             // Mutate the existing array in place — a fresh `value(...)`

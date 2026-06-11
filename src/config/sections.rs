@@ -12,17 +12,15 @@ pub struct WindowConfig {
     /// multiple windows share a title fragment.
     #[serde(default)]
     pub process_name: Option<String>,
-    /// Window size at which the templates were cropped. Auto-written by
-    /// the GUI's Crop & Save. The detector uses this as the scaling
-    /// reference: if the live window is at a different size, templates
-    /// are resampled to match.
+    /// Window size at which the user's templates were cropped (auto-
+    /// written by the GUI's Crop & Save). Detector resamples when the
+    /// live window has a different size.
     pub base_resolution: [u32; 2],
-    /// Pixels of size drift tolerated before erroring out. Absorbs
-    /// taskbar visibility / DPI rounding jitter.
+    /// Drift tolerated before erroring out — absorbs taskbar visibility
+    /// / DPI rounding jitter.
     pub resize_tolerance_px: u32,
-    /// Force the window to `base_resolution` at startup via `SetWindowPos`.
-    /// Off by default: the user calibrates at their native size, no
-    /// resampling, and we don't fight Windows decorations / DPI rounding.
+    /// Off by default — user calibrates at native size, no resampling,
+    /// no fighting Windows decorations / DPI rounding.
     pub auto_resize: bool,
 }
 
@@ -48,12 +46,22 @@ pub struct ShopConfig {
     /// last 2. Bump to 2 if your setup undershoots.
     pub max_scrolls_per_round: u32,
     /// Fraction of window height between an item icon's centre and its
-    /// row's buy button. E7's layout puts the button below the icon.
-    /// 0.04 ≈ 44 px at 1080p.
+    /// row's buy button. 0.04 ≈ 44 px at 1080p.
     #[serde(default = "default_buy_button_y_offset_ratio")]
     pub buy_button_y_offset_ratio: f32,
-    /// 0 = no time limit. Checked at every round boundary, so may
-    /// overshoot by up to one round.
+    /// Vertical thickness of the buy-button click band as a fraction of
+    /// window height. Sets the click target's height; X is taken from
+    /// `zones.buy_column`.
+    #[serde(default = "default_buy_button_band_h_ratio")]
+    pub buy_button_band_h_ratio: f32,
+    /// User-placed reference Y for Buy-click calibration, as a fraction of
+    /// window height. Pure UI affordance — the runtime uses the detected
+    /// icon Y, never this — but it persists the user's "this is what a
+    /// row looks like" so the box (line + offset) renders on the same
+    /// spot every session. Default ≈ shop-grid centre.
+    #[serde(default = "default_buy_calibration_line_y_ratio")]
+    pub buy_calibration_line_y_ratio: f32,
+    /// 0 = no limit. Checked at round boundary — may overshoot by one round.
     #[serde(default)]
     pub stop_after_minutes: u32,
     /// 0 = no cap.
@@ -65,14 +73,25 @@ pub struct ShopConfig {
     /// 0 = no cap.
     #[serde(default)]
     pub stop_when_gold_spent: u32,
-    /// Suspend the PC when a stop condition fires. Never on manual Stop
-    /// — pressing the button means the user is at the machine.
+    /// Never fires on manual Stop — pressing the button means the user
+    /// is at the machine.
     #[serde(default)]
     pub sleep_when_done: bool,
 }
 
 fn default_buy_button_y_offset_ratio() -> f32 {
-    0.04
+    crate::layout::BUY_BUTTON_Y_OFFSET
+}
+
+fn default_buy_button_band_h_ratio() -> f32 {
+    crate::shop::BUY_COLUMN_ROW_BAND_RATIO
+}
+
+fn default_buy_calibration_line_y_ratio() -> f32 {
+    // Kept in sync with the bundled config.toml — picked empirically
+    // so a fresh-from-source run and a config-file run land in the
+    // same place.
+    0.65
 }
 
 impl Default for ShopConfig {
@@ -83,6 +102,8 @@ impl Default for ShopConfig {
             buy_covenant: true,
             max_scrolls_per_round: 1,
             buy_button_y_offset_ratio: default_buy_button_y_offset_ratio(),
+            buy_button_band_h_ratio: default_buy_button_band_h_ratio(),
+            buy_calibration_line_y_ratio: default_buy_calibration_line_y_ratio(),
             stop_after_minutes: 0,
             stop_when_mystic_medals: 0,
             stop_when_covenants: 0,
@@ -111,9 +132,6 @@ pub struct TimingConfig {
     /// Perpendicular arc strength of the mouse path (px).
     pub move_curve_amplitude_px: f32,
 
-    pub anchor_timeout_ms: u64,
-    pub poll_interval_ms: u64,
-
     /// Rayleigh-distributed click jitter.
     pub jitter_radius_px: f32,
 
@@ -128,14 +146,25 @@ pub struct TimingConfig {
     pub scroll_amount: i32,
     pub scroll_pause_ms: u64,
 
-    /// Pause after click before hashing the confirm zone. Must outlast
-    /// the modal slide-in animation; anything beyond is dead time.
+    /// Must outlast the modal slide-in animation; anything beyond is
+    /// dead time.
     #[serde(default = "default_modal_open_pause_ms")]
     pub modal_open_pause_ms: u64,
+
+    /// Cooperative mode: pause the bot when the user touches mouse /
+    /// keyboard, resume after this many ms of idle. 0 disables — bot
+    /// fights the user for the cursor. 1500 ms ≈ enough to send a
+    /// Discord message without the bot stealing input mid-sentence.
+    #[serde(default = "default_cooperative_idle_ms")]
+    pub cooperative_idle_ms: u64,
 }
 
 fn default_modal_open_pause_ms() -> u64 {
     220
+}
+
+fn default_cooperative_idle_ms() -> u64 {
+    1500
 }
 
 impl Default for TimingConfig {
@@ -154,9 +183,6 @@ impl Default for TimingConfig {
             move_to_click_max_ms: 55,
             move_curve_amplitude_px: 3.0,
 
-            anchor_timeout_ms: 5000,
-            poll_interval_ms: 150,
-
             jitter_radius_px: 3.0,
 
             inter_round_min_ms: 600,
@@ -168,6 +194,7 @@ impl Default for TimingConfig {
             scroll_amount: 8,
             scroll_pause_ms: 250,
             modal_open_pause_ms: default_modal_open_pause_ms(),
+            cooperative_idle_ms: default_cooperative_idle_ms(),
         }
     }
 }
@@ -180,6 +207,14 @@ pub struct MatchingConfig {
     pub margin: f32,
     /// Multipliers applied on top of the global window-size scale.
     pub extra_scales: Vec<f32>,
+    /// Setup-tab live preview cadence in milliseconds. Drives capture +
+    /// NCC frequency only — the bot loop is not gated by this field.
+    #[serde(default = "default_preview_refresh_ms")]
+    pub preview_refresh_ms: u32,
+}
+
+fn default_preview_refresh_ms() -> u32 {
+    500
 }
 
 impl Default for MatchingConfig {
@@ -187,40 +222,81 @@ impl Default for MatchingConfig {
         Self {
             threshold: 0.90,
             margin: 0.05,
-            // Native scale only. With auto_resize=false (default), the
-            // global scale collapses to 1.0 and adding 0.97/1.03 just
-            // burns NCC time for no benefit.
+            // Native scale only — with auto_resize=false, global_scale
+            // collapses to 1.0 and 0.97/1.03 just burn NCC time.
             extra_scales: vec![1.0],
+            preview_refresh_ms: default_preview_refresh_ms(),
         }
     }
 }
 
-/// `[x, y, w, h]` ratios in [0, 1]. `None` = search the whole window.
-/// Only the two areas the bot still template-matches need a ROI;
-/// buttons are handled via `[zones]`.
+/// `None` = use the bundled value from `crate::layout`. Setting a
+/// value shadows the bundled default — useful when the bundled layout
+/// misses on an unusual resolution / UI mod.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RegionsConfig {
     pub shop_grid: Option<[f32; 4]>,
-    pub anchor_shop: Option<[f32; 4]>,
 }
 
-/// Click targets for fixed-position buttons. The bot picks a uniform
-/// random point inside the zone — faster and more robust than NCC for
-/// things that don't move. `[x, y, w, h]` ratios in [0, 1].
+/// `None` = bundled default. Runner picks a uniform random point
+/// inside the resolved zone — built-in jitter without the Rayleigh
+/// radius the NCC-matched clicks use.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ZonesConfig {
     pub refresh: Option<[f32; 4]>,
     pub refresh_confirm: Option<[f32; 4]>,
     pub buy_confirm: Option<[f32; 4]>,
-    /// Only the X range is used — Y is supplied at click time from the
-    /// matched item icon.
+    /// Only the X range is honoured at click time — Y comes from the
+    /// matched item icon's Y + `shop.buy_button_y_offset_ratio`.
     pub buy_column: Option<[f32; 4]>,
 }
 
+/// All-`#[serde(default)]` so stale on-disk configs (e.g. listing
+/// legacy `anchor_shop` / `back_arrow` / `refresh_pill` / `buy_pill`
+/// from before the shop-detection removal) load cleanly — serde
+/// ignores the extras, fills in defaults for whatever's missing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TemplatesConfig {
+    #[serde(default = "default_templates_dir")]
     pub dir: PathBuf,
-    pub anchor_shop: String,
+    #[serde(default = "default_mystic_medal")]
     pub mystic_medal: String,
+    #[serde(default = "default_covenant")]
     pub covenant: String,
+}
+
+impl Default for TemplatesConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_templates_dir(),
+            mystic_medal: default_mystic_medal(),
+            covenant: default_covenant(),
+        }
+    }
+}
+
+fn default_templates_dir() -> PathBuf {
+    "templates".into()
+}
+fn default_mystic_medal() -> String {
+    "mystic_medal.png".into()
+}
+fn default_covenant() -> String {
+    "covenant.png".into()
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct NotificationsConfig {
+    /// Raw on-disk value — use [`Self::webhook_url`] when consuming it
+    /// so whitespace trim happens in one place.
+    #[serde(default)]
+    pub discord_webhook_url: String,
+}
+
+impl NotificationsConfig {
+    /// Trimmed view — empty = disabled. Single source of truth for the
+    /// three callers (validation, test button, post-run dispatch).
+    pub fn webhook_url(&self) -> &str {
+        self.discord_webhook_url.trim()
+    }
 }

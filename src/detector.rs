@@ -1,9 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use image::imageops::FilterType;
 use image::{GrayImage, Luma};
@@ -11,14 +8,12 @@ use imageproc::definitions::Image;
 use imageproc::template_matching::{MatchTemplateMethod, match_template_parallel};
 use tracing::{debug, trace, warn};
 
-use crate::capture::Capture;
 use crate::config::Config;
 use crate::error::{Error, Result};
 
 /// Compile-time alias constants for `Detector::find`. Fixed-position
-/// buttons are clicked via `zones`, not matched, so they have no aliases.
+/// buttons are clicked via `zones`, not matched.
 pub mod alias {
-    pub const ANCHOR_SHOP: &str = "anchor_shop";
     pub const MYSTIC_MEDAL: &str = "mystic_medal";
     pub const COVENANT: &str = "covenant";
 }
@@ -35,18 +30,33 @@ pub struct Hit {
     pub margin: f32,
 }
 
+/// Pre-cropped + pre-downsampled search frame shared across templates
+/// in one snapshot. Built by `prepare_search`, consumed by `find_in`.
+/// Saves the Lanczos3 build_coarse from running per-template.
+pub struct SearchContext<'a> {
+    ox: i32,
+    oy: i32,
+    search: Cow<'a, GrayImage>,
+    coarse_search: GrayImage,
+}
+
 /// 4× downsample for the coarse pyramid level: NCC at 1/16 the pixel
 /// count, refined later at full res over a small window.
 const PYRAMID_FACTOR: u32 = 4;
 
 /// Coarse-pixel slack on each side of the coarse peak when cropping the
-/// refine window. 2 × PYRAMID_FACTOR = 8 full-res pixels of wiggle room
-/// per side, enough to absorb downsample-induced peak drift.
+/// refine window. 2 × PYRAMID_FACTOR = 8 full-res px of wiggle room per
+/// side — absorbs downsample-induced peak drift.
 const REFINE_SLACK_COARSE_PX: u32 = 2;
 
-/// `coarse_threshold = threshold × ratio`. Downsampling smears the
+/// `coarse_threshold = threshold × ratio` — downsampling smears the
 /// correlation peak so the coarse score is always lower than full-res.
 const COARSE_THRESHOLD_RATIO: f32 = 0.70;
+
+/// Window height (px) at which `assets/*.png` were cropped. Bundled
+/// templates scale against this rather than `config.window.base_resolution`
+/// — that field tracks the user's OWN crops (if any), not ours.
+const BUNDLED_TEMPLATE_NATIVE_HEIGHT: u32 = 837;
 
 struct ScaledTemplate {
     image: GrayImage,
@@ -74,10 +84,9 @@ pub struct Detector {
 
 impl Detector {
     pub fn new(config: &Config, current_size: (u32, u32)) -> Result<Self> {
-        // base_resolution = size the templates were last cropped against
-        // (auto-written by the GUI's Crop & Save). The live window may be
-        // at a different size, in which case templates are resampled to
-        // match — without this, resize-then-reopen silently breaks NCC.
+        // base_resolution = size the user's OWN templates were cropped
+        // at (auto-written by the GUI's Crop & Save). Templates resample
+        // when the live window has a different size.
         let base = config.window.base_resolution;
         let global_scale = current_size.1 as f32 / base[1].max(1) as f32;
         debug!(
@@ -91,16 +100,28 @@ impl Detector {
 
         let dir = config.template_dir();
         let t = &config.templates;
+        // Bundled fallbacks let a fresh install with no `templates/`
+        // dir still classify correctly.
         let entries = [
-            (alias::ANCHOR_SHOP, &t.anchor_shop),
-            (alias::MYSTIC_MEDAL, &t.mystic_medal),
-            (alias::COVENANT, &t.covenant),
+            (alias::MYSTIC_MEDAL, &t.mystic_medal, MYSTIC_MEDAL_FALLBACK),
+            (alias::COVENANT, &t.covenant, COVENANT_FALLBACK),
         ];
 
+        // Bundled fallbacks scale against their own crop height, not
+        // the user's base_resolution — see BUNDLED_TEMPLATE_NATIVE_HEIGHT.
+        let bundled_scale =
+            current_size.1 as f32 / BUNDLED_TEMPLATE_NATIVE_HEIGHT.max(1) as f32;
+
         let mut templates = HashMap::with_capacity(entries.len());
-        for (alias_name, file) in entries {
+        for (alias_name, file, fallback) in entries {
             let path = dir.join(file);
-            let scaled = load_scaled(&path, global_scale, &config.matching.extra_scales)?;
+            let scaled = load_scaled_or_fallback(
+                &path,
+                fallback,
+                global_scale,
+                bundled_scale,
+                &config.matching.extra_scales,
+            )?;
             templates.insert(alias_name.to_string(), scaled);
         }
 
@@ -136,38 +157,51 @@ impl Detector {
         }
     }
 
-    /// Native-scale `(w, h)`. Used by the GUI overlay to draw an accurate
-    /// bbox around each match.
+    /// Native-scale `(w, h)`.
     pub fn template_dimensions(&self, alias: &str) -> Option<(u32, u32)> {
         let templates = self.templates.get(alias)?;
         let first = templates.first()?;
         Some((first.image.width(), first.image.height()))
     }
 
-    /// Best hit for `alias` inside `roi` (ratios in [0, 1]).
-    ///
-    /// 2-level coarse-to-fine pyramid:
-    /// 1. NCC at 1/4 resolution to locate a candidate peak (16× cheaper).
-    /// 2. NCC at full resolution over a small window to refine to pixel
-    ///    precision.
-    ///
-    /// Returns `None` below threshold or on an ambiguous match (low margin).
+    /// Shared across templates for one frame — saves redoing the
+    /// Lanczos3 downsample per template.
+    pub fn prepare_search<'a>(
+        &self,
+        frame: &'a GrayImage,
+        roi: Option<[f32; 4]>,
+    ) -> SearchContext<'a> {
+        let (ox, oy, search) = crop_for_search(frame, roi);
+        let coarse_search = build_coarse(&search);
+        SearchContext {
+            ox,
+            oy,
+            search,
+            coarse_search,
+        }
+    }
+
+    /// 2-level coarse-to-fine pyramid: 1/4-res NCC for a candidate peak,
+    /// full-res NCC over a small refine window. `None` below threshold
+    /// or on an ambiguous match (low margin).
     pub fn find(
         &self,
         frame: &GrayImage,
         alias: &str,
         roi: Option<[f32; 4]>,
     ) -> Result<Option<Hit>> {
+        let ctx = self.prepare_search(frame, roi);
+        self.find_in(&ctx, alias)
+    }
+
+    pub fn find_in(&self, ctx: &SearchContext<'_>, alias: &str) -> Result<Option<Hit>> {
         let templates = self
             .templates
             .get(alias)
             .ok_or_else(|| Error::UnknownTemplate(alias.into()))?;
 
-        let (ox, oy, search) = crop_for_search(frame, roi);
-        let search_ref: &GrayImage = &search;
-
-        // Built once per find(), reused across all template scales.
-        let coarse_search = build_coarse(search_ref);
+        let search_ref: &GrayImage = &ctx.search;
+        let coarse_search = &ctx.coarse_search;
         let coarse_threshold = self.threshold * COARSE_THRESHOLD_RATIO;
 
         let mut best: Option<Hit> = None;
@@ -186,7 +220,7 @@ impl Detector {
             }
 
             let coarse_scores = match_template_parallel(
-                &coarse_search,
+                coarse_search,
                 &tpl.coarse,
                 MatchTemplateMethod::CrossCorrelationNormalized,
             );
@@ -226,8 +260,8 @@ impl Detector {
                 continue;
             }
 
-            // Edge check is against the FULL search area, not the refine
-            // window — only the full frame has meaningful boundaries.
+            // Against the FULL search area — only the frame has
+            // meaningful boundaries, not the refine window.
             let abs_loc = (refine_ox + max_loc.0, refine_oy + max_loc.1);
             if hit_touches_edge(abs_loc, tpl.image.dimensions(), search_ref.dimensions()) {
                 trace!(alias, "hit at search-area edge, likely partial — rejecting");
@@ -238,8 +272,8 @@ impl Detector {
                 continue;
             }
 
-            let center_x = ox + abs_loc.0 as i32 + (tpl.image.width() / 2) as i32;
-            let center_y = oy + abs_loc.1 as i32 + (tpl.image.height() / 2) as i32;
+            let center_x = ctx.ox + abs_loc.0 as i32 + (tpl.image.width() / 2) as i32;
+            let center_y = ctx.oy + abs_loc.1 as i32 + (tpl.image.height() / 2) as i32;
             trace!(
                 alias,
                 x = center_x,
@@ -267,48 +301,42 @@ impl Detector {
         Ok(best)
     }
 
-    /// Block until `alias` is found inside `roi`, polling every `poll`.
-    /// `stop` is polled at every snapshot and every ~60 ms inside the
-    /// poll sleep, so Stop is responsive even mid-wait.
-    pub fn wait_for(
-        &self,
-        capture: &dyn Capture,
-        alias: &str,
-        roi: Option<[f32; 4]>,
-        timeout: Duration,
-        poll: Duration,
-        stop: &AtomicBool,
-    ) -> Result<Hit> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                return Err(Error::AnchorTimeout(alias.into()));
-            }
-            let gray = capture.snapshot_gray()?;
-            if let Some(hit) = self.find(&gray, alias, roi)? {
-                return Ok(hit);
-            }
-            if Instant::now() >= deadline {
-                return Err(Error::AnchorTimeout(alias.into()));
-            }
-            let chunk = Duration::from_millis(60);
-            let until = Instant::now() + poll;
-            while Instant::now() < until {
-                if stop.load(Ordering::Relaxed) {
-                    return Err(Error::AnchorTimeout(alias.into()));
-                }
-                let remaining = until.saturating_duration_since(Instant::now());
-                thread::sleep(chunk.min(remaining));
-            }
-        }
+}
+
+const MYSTIC_MEDAL_FALLBACK: &[u8] = include_bytes!("../assets/mystic_medal.png");
+const COVENANT_FALLBACK: &[u8] = include_bytes!("../assets/covenant.png");
+
+fn load_scaled_or_fallback(
+    path: &Path,
+    fallback: &[u8],
+    user_global_scale: f32,
+    bundled_scale: f32,
+    extra: &[f32],
+) -> Result<Vec<ScaledTemplate>> {
+    if path.exists() {
+        load_scaled(path, user_global_scale, extra)
+    } else {
+        tracing::debug!(
+            path = %path.display(),
+            "template missing on disk — falling back to bundled asset"
+        );
+        let raw = image::load_from_memory(fallback)?;
+        load_scaled_from_image(raw.into_luma8(), bundled_scale, extra)
     }
 }
 
 fn load_scaled(path: &Path, global_scale: f32, extra: &[f32]) -> Result<Vec<ScaledTemplate>> {
     let raw = image::open(path)?;
-    let gray = raw.into_luma8();
-    // Try scale=1.0 first so the threshold-comfortable early-out fires
-    // on the most likely match. Cuts ~1/3 of the work on the fast path.
+    load_scaled_from_image(raw.into_luma8(), global_scale, extra)
+}
+
+fn load_scaled_from_image(
+    gray: image::GrayImage,
+    global_scale: f32,
+    extra: &[f32],
+) -> Result<Vec<ScaledTemplate>> {
+    // Closest-to-1.0 first so the comfortable-hit early-out fires on
+    // the likely match — cuts ~1/3 of the work on the fast path.
     let mut sorted_extra: Vec<f32> = extra.to_vec();
     sorted_extra.sort_by(|a, b| {
         (a - 1.0)
@@ -335,13 +363,12 @@ fn load_scaled(path: &Path, global_scale: f32, extra: &[f32]) -> Result<Vec<Scal
         });
     }
     if scaled.is_empty() {
-        warn!(?path, "no scales produced for template");
+        warn!("no scales produced for template");
     }
     Ok(scaled)
 }
 
-/// Lanczos3 to limit aliasing: NCC at low resolution already smears the
-/// peak, aliasing would smear it further.
+/// Lanczos3 limits aliasing — low-res NCC already smears the peak.
 fn build_coarse(full: &GrayImage) -> GrayImage {
     let cw = (full.width() / PYRAMID_FACTOR).max(2);
     let ch = (full.height() / PYRAMID_FACTOR).max(2);
@@ -362,8 +389,7 @@ fn refine_crop(
     let refine_y = cy_full.saturating_sub(slack);
     let refine_w = (tw + 2 * slack).min(sw.saturating_sub(refine_x));
     let refine_h = (th + 2 * slack).min(sh.saturating_sub(refine_y));
-    // match_template requires search > template strictly — anything
-    // smaller would panic.
+    // match_template requires search > template strictly.
     if refine_w <= tw || refine_h <= th {
         return None;
     }
@@ -387,8 +413,8 @@ fn crop_for_search(frame: &GrayImage, roi: Option<[f32; 4]>) -> (i32, i32, Cow<'
     (x as i32, y as i32, Cow::Owned(cropped))
 }
 
-/// Single-pass max + runner-up with a `sep × sep` exclusion zone around
-/// the top peak (so adjacent pixels of the same peak aren't picked).
+/// Runner-up excludes a `sep × sep` zone around the top peak so
+/// adjacent pixels of the same peak aren't picked.
 fn top_with_separation(scores: &Image<Luma<f32>>, sep: u32) -> (f32, (u32, u32), f32) {
     let mut top_val = f32::NEG_INFINITY;
     let mut top_loc = (0u32, 0u32);
