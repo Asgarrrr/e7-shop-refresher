@@ -257,7 +257,13 @@ impl WindowCapture {
         if x >= img_w || y >= img_h {
             // Offset outside the captured frame (DPI mismatch?). Full
             // frame is a safer fallback than a 1×1 crop.
-            tracing::warn!(off_x, off_y, img_w, img_h, "client offset outside frame, using full");
+            tracing::warn!(
+                off_x,
+                off_y,
+                img_w,
+                img_h,
+                "client offset outside frame, using full"
+            );
             return Ok(full);
         }
         let w = cw.min(img_w - x);

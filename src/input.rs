@@ -81,8 +81,8 @@ impl Clicker {
     /// last enigo call (user moved/typed). `None` if the last input was
     /// the bot itself.
     fn ms_since_user_input(&self) -> Option<u64> {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
         use windows::Win32::System::SystemInformation::GetTickCount;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
         let mut info = LASTINPUTINFO {
             cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
             dwTime: 0,

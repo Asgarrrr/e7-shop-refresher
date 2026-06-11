@@ -187,7 +187,9 @@ mod tests {
     #[test]
     fn reference_matches_itself() {
         let v = ColorVerifier::new();
-        let mystic = image::load_from_memory(MYSTIC_MEDAL_PNG).unwrap().into_rgba8();
+        let mystic = image::load_from_memory(MYSTIC_MEDAL_PNG)
+            .unwrap()
+            .into_rgba8();
         assert!(v.accepts(alias::MYSTIC_MEDAL, &mystic));
         let covenant = image::load_from_memory(COVENANT_PNG).unwrap().into_rgba8();
         assert!(v.accepts(alias::COVENANT, &covenant));

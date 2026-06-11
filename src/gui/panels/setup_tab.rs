@@ -127,7 +127,9 @@ fn draw_layout_card(ui: &mut egui::Ui, gui: &mut ShopGui) {
 // Must match the runner's fallback when the override is `None` — the
 // inputs read what the bot will actually use.
 fn bundled_rect(name: &str) -> [f32; 4] {
-    use crate::layout::{BUY_CONFIRM, REFRESH, REFRESH_CONFIRM, SHOP_GRID, buy_column_overlay_rect};
+    use crate::layout::{
+        BUY_CONFIRM, REFRESH, REFRESH_CONFIRM, SHOP_GRID, buy_column_overlay_rect,
+    };
     match name {
         "shop_grid" => SHOP_GRID,
         "refresh" => REFRESH,

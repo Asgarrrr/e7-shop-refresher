@@ -29,8 +29,8 @@ pub struct ReleaseTarget {
 impl ReleaseTarget {
     pub fn for_running_binary(tag: impl Into<String>) -> Result<Self> {
         let tag = tag.into();
-        let exe_path = std::env::current_exe()
-            .map_err(|e| anyhow!("cannot resolve current_exe: {e}"))?;
+        let exe_path =
+            std::env::current_exe().map_err(|e| anyhow!("cannot resolve current_exe: {e}"))?;
         let exe_name = exe_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -39,9 +39,7 @@ impl ReleaseTarget {
         // `tag` may or may not carry the `v` prefix — passed through
         // unchanged to match whatever GitHub's `tag_name` returned.
         Ok(Self {
-            exe_url: format!(
-                "https://github.com/{REPO}/releases/download/{tag}/{exe_name}"
-            ),
+            exe_url: format!("https://github.com/{REPO}/releases/download/{tag}/{exe_name}"),
             checksums_url: format!(
                 "https://github.com/{REPO}/releases/download/{tag}/SHA256SUMS.txt"
             ),
@@ -78,9 +76,7 @@ pub fn spawn_install(target: ReleaseTarget, tx: Sender<UpdateEvent>) {
         });
     if let Err(e) = spawn {
         warn!(error = %e, "failed to spawn auto-update thread");
-        let _ = tx.send(UpdateEvent::Failed(format!(
-            "could not spawn worker: {e}"
-        )));
+        let _ = tx.send(UpdateEvent::Failed(format!("could not spawn worker: {e}")));
     }
 }
 
@@ -126,8 +122,7 @@ fn download_path_for(exe_name: &str) -> Result<PathBuf> {
     // `std::fs::rename` returns ERROR_NOT_SAME_DEVICE across drives,
     // which would happen if we staged in %TEMP% (C:) while the user
     // installed on D:.
-    let current = std::env::current_exe()
-        .map_err(|e| anyhow!("resolve current_exe: {e}"))?;
+    let current = std::env::current_exe().map_err(|e| anyhow!("resolve current_exe: {e}"))?;
     let parent = current
         .parent()
         .ok_or_else(|| anyhow!("current_exe has no parent dir"))?;
@@ -135,13 +130,13 @@ fn download_path_for(exe_name: &str) -> Result<PathBuf> {
 }
 
 fn verify_sha256(path: &Path, exe_name: &str, checksums_url: &str) -> Result<()> {
-    let body = crate::http::get_text(checksums_url)
-        .map_err(|e| anyhow!("fetch SHA256SUMS: {e}"))?;
+    let body =
+        crate::http::get_text(checksums_url).map_err(|e| anyhow!("fetch SHA256SUMS: {e}"))?;
     let expected = parse_expected_checksum(&body, exe_name)
         .ok_or_else(|| anyhow!("{exe_name} not listed in SHA256SUMS"))?;
 
-    let mut file = File::open(path)
-        .map_err(|e| anyhow!("open {} for verify: {e}", path.display()))?;
+    let mut file =
+        File::open(path).map_err(|e| anyhow!("open {} for verify: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -187,8 +182,7 @@ fn parse_expected_checksum(body: &str, exe_name: &str) -> Option<String> {
 }
 
 fn install_and_restart(downloaded: &Path) -> Result<()> {
-    let current = std::env::current_exe()
-        .map_err(|e| anyhow!("resolve current_exe: {e}"))?;
+    let current = std::env::current_exe().map_err(|e| anyhow!("resolve current_exe: {e}"))?;
     let bak = current.with_extension("exe.bak");
 
     // Leftover .bak deletes freely once the previous process exited.
@@ -265,7 +259,9 @@ pub fn cleanup_previous_bak() {
         }
         match std::fs::remove_file(&stale) {
             Ok(()) => debug!(path = %stale.display(), "removed leftover update artefact"),
-            Err(e) => debug!(error = %e, path = %stale.display(), "could not clean leftover update artefact"),
+            Err(e) => {
+                debug!(error = %e, path = %stale.display(), "could not clean leftover update artefact")
+            }
         }
     }
 }

@@ -99,7 +99,6 @@ pub(super) enum BuyDragHandle {
     Box,
 }
 
-
 pub(super) fn edit_focus_id() -> egui::Id {
     egui::Id::new("active_edit_focus")
 }
@@ -410,11 +409,7 @@ impl ShopGui {
         Some(self.config.template_dir().join(file))
     }
 
-    pub(super) fn save_template_from_patch(
-        &mut self,
-        alias: &'static str,
-        patch: RgbaImage,
-    ) {
+    pub(super) fn save_template_from_patch(&mut self, alias: &'static str, patch: RgbaImage) {
         let Some(path) = self.template_path_for(alias) else {
             warn!(alias, "unknown template alias — drop");
             return;
@@ -688,7 +683,6 @@ impl ShopGui {
             }
         }
     }
-
 }
 
 impl App for ShopGui {

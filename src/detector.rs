@@ -109,8 +109,7 @@ impl Detector {
 
         // Bundled fallbacks scale against their own crop height, not
         // the user's base_resolution — see BUNDLED_TEMPLATE_NATIVE_HEIGHT.
-        let bundled_scale =
-            current_size.1 as f32 / BUNDLED_TEMPLATE_NATIVE_HEIGHT.max(1) as f32;
+        let bundled_scale = current_size.1 as f32 / BUNDLED_TEMPLATE_NATIVE_HEIGHT.max(1) as f32;
 
         let mut templates = HashMap::with_capacity(entries.len());
         for (alias_name, file, fallback) in entries {
@@ -300,7 +299,6 @@ impl Detector {
 
         Ok(best)
     }
-
 }
 
 const MYSTIC_MEDAL_FALLBACK: &[u8] = include_bytes!("../assets/mystic_medal.png");

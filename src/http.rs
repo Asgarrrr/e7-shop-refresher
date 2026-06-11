@@ -191,9 +191,7 @@ pub fn download_to(
     if let Some(len) = content_length
         && len > MAX_DOWNLOAD_BYTES
     {
-        bail!(
-            "refusing download: Content-Length {len} > {MAX_DOWNLOAD_BYTES} cap"
-        );
+        bail!("refusing download: Content-Length {len} > {MAX_DOWNLOAD_BYTES} cap");
     }
 
     let mut total: u64 = 0;

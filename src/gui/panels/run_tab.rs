@@ -508,8 +508,7 @@ fn draw_progress_graph(ui: &mut egui::Ui, history: &[RunHistoryPoint], current_r
     }
     let avail_w = ui.available_width();
     let height = 80.0;
-    let (rect, _resp) =
-        ui.allocate_exact_size(egui::vec2(avail_w, height), egui::Sense::hover());
+    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(avail_w, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
     painter.rect_filled(
@@ -541,7 +540,8 @@ fn draw_progress_graph(ui: &mut egui::Ui, history: &[RunHistoryPoint], current_r
     let mystic = MYSTIC_COLOR;
     let covenant = COVENANT_COLOR;
     let exp_alpha = 70;
-    let exp_mystic = egui::Color32::from_rgba_unmultiplied(mystic.r(), mystic.g(), mystic.b(), exp_alpha);
+    let exp_mystic =
+        egui::Color32::from_rgba_unmultiplied(mystic.r(), mystic.g(), mystic.b(), exp_alpha);
     let exp_covenant =
         egui::Color32::from_rgba_unmultiplied(covenant.r(), covenant.g(), covenant.b(), exp_alpha);
 
@@ -556,14 +556,15 @@ fn draw_progress_graph(ui: &mut egui::Ui, history: &[RunHistoryPoint], current_r
         egui::Stroke::new(1.5, exp_covenant),
     );
 
-    let actual_line = |painter: &egui::Painter, color: egui::Color32, pick: fn(&RunHistoryPoint) -> u32| {
-        let mut prev = to_screen(0.0, 0.0);
-        for pt in history {
-            let next = to_screen(pt.round as f32, pick(pt) as f32);
-            painter.line_segment([prev, next], egui::Stroke::new(2.0, color));
-            prev = next;
-        }
-    };
+    let actual_line =
+        |painter: &egui::Painter, color: egui::Color32, pick: fn(&RunHistoryPoint) -> u32| {
+            let mut prev = to_screen(0.0, 0.0);
+            for pt in history {
+                let next = to_screen(pt.round as f32, pick(pt) as f32);
+                painter.line_segment([prev, next], egui::Stroke::new(2.0, color));
+                prev = next;
+            }
+        };
     actual_line(&painter, mystic, |p| p.mystic);
     actual_line(&painter, covenant, |p| p.covenant);
 }

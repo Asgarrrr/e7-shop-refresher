@@ -6,7 +6,9 @@ use egui_phosphor::regular as icon;
 use image::RgbaImage;
 use tracing::{info, warn};
 
-use crate::gui::app::{BuyDragHandle, DebugMatch, DragRect, SetupPreviewResult, ShopGui, Tab, palette};
+use crate::gui::app::{
+    BuyDragHandle, DebugMatch, DragRect, SetupPreviewResult, ShopGui, Tab, palette,
+};
 use crate::gui::bot::effective_status;
 
 pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
@@ -68,12 +70,14 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
             // Mirror BuyClick: hover/drag of the row's x/y/w/h inputs
             // thickens the stroke + deepens the fill so the user sees
             // which rect they're about to nudge.
-            let focused = matches!(edit_focus, Some(crate::gui::app::EditFocus::Rect(n)) if n == name);
+            let focused =
+                matches!(edit_focus, Some(crate::gui::app::EditFocus::Rect(n)) if n == name);
             let (fill_alpha, stroke_w) = if focused { (70, 2.5) } else { (30, 1.5) };
             // Click zones get a faint fill so they read as "target",
             // search regions stay stroke-only so they read as "look here".
             if kind == crate::layout::OverlayKind::Click {
-                let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), fill_alpha);
+                let fill =
+                    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), fill_alpha);
                 painter.rect_filled(rect, 0.0, fill);
             }
             painter.rect_stroke(rect, 0.0, Stroke::new(stroke_w, color), StrokeKind::Inside);
@@ -202,8 +206,17 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
     // so the user sees what they're about to commit.
     if let Some(sel) = gui.override_drag_rect {
         let rect = drag_to_screen_rect(sel, image_rect, snap_size);
-        painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30));
-        painter.rect_stroke(rect, 0.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
+        painter.rect_filled(
+            rect,
+            0.0,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+        );
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(2.0, Color32::WHITE),
+            StrokeKind::Inside,
+        );
     }
 }
 
@@ -319,7 +332,8 @@ fn handle_buy_click_drag(
 
 fn commit_template_crop(gui: &mut ShopGui, alias: &'static str, rect: DragRect) {
     let Some(rgba) = gui.snapshot_rgba.clone() else {
-        gui.snapshot_error = Some("no snapshot to crop from — wait for the live preview to load".into());
+        gui.snapshot_error =
+            Some("no snapshot to crop from — wait for the live preview to load".into());
         return;
     };
     let (img_w, img_h) = (rgba.width(), rgba.height());
@@ -610,8 +624,7 @@ fn spawn_setup_preview(gui: &mut ShopGui, ctx: &egui::Context) {
         // sends *something* down the channel — otherwise `in_flight` would
         // never clear and auto-refresh would silently die.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_setup_preview(capture, detector, targets, shop_grid)
-                .map_err(|e| e.to_string())
+            run_setup_preview(capture, detector, targets, shop_grid).map_err(|e| e.to_string())
         }))
         .unwrap_or_else(|payload| Err(panic_payload_message(payload)));
         if let Err(e) = &outcome {
@@ -732,4 +745,3 @@ fn stepper_separator(ui: &mut egui::Ui) {
     ui.colored_label(palette::TEXT_MUTED, "·");
     ui.add_space(4.0);
 }
-
