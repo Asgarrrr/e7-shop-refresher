@@ -256,6 +256,9 @@ impl WindowCapture {
         let Some((off_x, off_y, cw, ch)) = client else {
             return Ok(full);
         };
+        if cw == 0 || ch == 0 {
+            return Ok(full);
+        }
         match client_crop_rect(full.width(), full.height(), off_x, off_y, cw, ch) {
             None => {
                 tracing::warn!(
