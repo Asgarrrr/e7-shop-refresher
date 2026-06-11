@@ -1460,4 +1460,60 @@ mod tests {
             .count();
         assert_eq!(clicks, 2);
     }
+
+    // --- try_buy_at_pixel_y (buy-click modal guard) tests ---
+
+    #[test]
+    fn try_buy_at_pixel_y_confirms_when_modal_opens() {
+        let before = gray_frame(200, 200, 100);
+        let mut after = before.clone();
+        paint_zone(&mut after, [0.4, 0.5, 0.1, 0.1], 200);
+        let (mut runner, events) = runner_for_loop_tests(vec![before, after]);
+
+        let result = runner
+            .try_buy_at_pixel_y(alias::MYSTIC_MEDAL, 100, 200)
+            .unwrap();
+
+        assert!(result, "modal opened — should report a successful buy");
+        let clicks = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, FakeEvent::Click(_)))
+            .count();
+        assert_eq!(clicks, 2, "buy-button click + confirm click");
+    }
+
+    #[test]
+    fn try_buy_at_pixel_y_skips_confirm_when_modal_stays_shut() {
+        let before = gray_frame(200, 200, 100);
+        let after = before.clone();
+        let (mut runner, events) = runner_for_loop_tests(vec![before, after]);
+
+        let result = runner
+            .try_buy_at_pixel_y(alias::MYSTIC_MEDAL, 100, 200)
+            .unwrap();
+
+        assert!(!result, "modal never opened — must not report a buy");
+        let clicks = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, FakeEvent::Click(_)))
+            .count();
+        assert_eq!(clicks, 1, "only the buy-button click; confirm suppressed");
+    }
+
+    // --- buy_round scroll-stop test ---
+
+    #[test]
+    fn buy_round_breaks_early_when_bottom_strip_repeats() {
+        let a = gray_frame(200, 200, 100);
+        let b = a.clone();
+        let (mut runner, _events) = runner_for_loop_tests(vec![a, b]);
+        runner.config.shop.max_scrolls_per_round = 5;
+
+        let bought = runner.buy_round().unwrap();
+        assert_eq!(bought, 0, "no targets enabled — nothing bought");
+    }
 }
