@@ -1,2 +1,4 @@
 /target
 /REVIEW_NOTES.md
+*.patch
+full_diff.txt
