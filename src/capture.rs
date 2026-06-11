@@ -256,28 +256,19 @@ impl WindowCapture {
         let Some((off_x, off_y, cw, ch)) = client else {
             return Ok(full);
         };
-        if cw == 0 || ch == 0 {
-            return Ok(full);
+        match client_crop_rect(full.width(), full.height(), off_x, off_y, cw, ch) {
+            None => {
+                tracing::warn!(
+                    off_x,
+                    off_y,
+                    img_w = full.width(),
+                    img_h = full.height(),
+                    "client offset outside frame, using full"
+                );
+                Ok(full)
+            }
+            Some((x, y, w, h)) => Ok(image::imageops::crop_imm(&full, x, y, w, h).to_image()),
         }
-        let img_w = full.width();
-        let img_h = full.height();
-        let x = off_x.max(0) as u32;
-        let y = off_y.max(0) as u32;
-        if x >= img_w || y >= img_h {
-            // Offset outside the captured frame (DPI mismatch?). Full
-            // frame is a safer fallback than a 1×1 crop.
-            tracing::warn!(
-                off_x,
-                off_y,
-                img_w,
-                img_h,
-                "client offset outside frame, using full"
-            );
-            return Ok(full);
-        }
-        let w = cw.min(img_w - x);
-        let h = ch.min(img_h - y);
-        Ok(image::imageops::crop_imm(&full, x, y, w, h).to_image())
     }
 
     pub fn snapshot_gray(&self) -> Result<GrayImage> {
@@ -705,4 +696,66 @@ fn find_hwnd_raw_for_title_contains(needle: &str) -> isize {
 
 fn find_hwnd_raw_for_title(needle: &str) -> isize {
     enum_visible_windows_find(needle, TitleMatch::Exact)
+}
+
+/// Crop rect for the client area within a captured frame; `None` = use the
+/// full frame (degenerate client dims or offset outside the frame).
+fn client_crop_rect(
+    img_w: u32,
+    img_h: u32,
+    off_x: i32,
+    off_y: i32,
+    cw: u32,
+    ch: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if cw == 0 || ch == 0 {
+        return None;
+    }
+    let x = off_x.max(0) as u32;
+    let y = off_y.max(0) as u32;
+    if x >= img_w || y >= img_h {
+        return None;
+    }
+    Some((x, y, cw.min(img_w - x), ch.min(img_h - y)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_crop_rect;
+
+    #[test]
+    fn crop_rect_normal_case() {
+        assert_eq!(
+            client_crop_rect(1920, 1080, 8, 31, 1904, 1041),
+            Some((8, 31, 1904, 1041))
+        );
+    }
+
+    #[test]
+    fn crop_rect_negative_offsets_clamp_to_zero() {
+        assert_eq!(
+            client_crop_rect(1920, 1080, -5, -3, 1920, 1080),
+            Some((0, 0, 1920, 1080))
+        );
+    }
+
+    #[test]
+    fn crop_rect_offset_outside_frame_returns_none() {
+        assert_eq!(client_crop_rect(800, 600, 800, 0, 100, 100), None);
+        assert_eq!(client_crop_rect(800, 600, 0, 600, 100, 100), None);
+    }
+
+    #[test]
+    fn crop_rect_zero_client_dims_return_none() {
+        assert_eq!(client_crop_rect(1920, 1080, 8, 31, 0, 1041), None);
+        assert_eq!(client_crop_rect(1920, 1080, 8, 31, 1904, 0), None);
+    }
+
+    #[test]
+    fn crop_rect_clips_to_frame_bounds() {
+        assert_eq!(
+            client_crop_rect(800, 600, 700, 500, 400, 400),
+            Some((700, 500, 100, 100))
+        );
+    }
 }
