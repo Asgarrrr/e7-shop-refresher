@@ -43,7 +43,6 @@ fn main() -> anyhow::Result<()> {
     if created {
         info!(path = %config_path.display(), "config not found — wrote defaults");
     }
-    cfg.ensure_templates_exist()?;
     info!(path = %config_path.display(), version = cfg.version, "config loaded");
 
     // Must run before WindowCapture spins up its WGC session —

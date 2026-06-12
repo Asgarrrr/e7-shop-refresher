@@ -1,185 +1,158 @@
 # E7 Shop Refresher
 
-Automation for Epic Seven's Secret Shop on the STOVE PC client.
-Detects mystic medals and covenant bookmarks, buys them, refreshes
-the shop, repeats.
+[![CI](https://github.com/Asgarrrr/e7-shop-refresher/actions/workflows/ci.yml/badge.svg)](https://github.com/Asgarrrr/e7-shop-refresher/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Asgarrrr/e7-shop-refresher)](https://github.com/Asgarrrr/e7-shop-refresher/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Asgarrrr/e7-shop-refresher/total)](https://github.com/Asgarrrr/e7-shop-refresher/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows-blue.svg)](#download--run)
 
-Rust · egui GUI · no installer · no telemetry · Windows only.
+Automate Epic Seven's Secret Shop on the STOVE PC client. The bot
+watches for mystic medals and covenant bookmarks, buys them, refreshes
+the shop, repeats — until a stop condition fires or you hit Stop.
+
+Windows only. No installer, no telemetry, no account credentials.
+
+![Run tab in the ready state](docs/screenshots/run-tab-ready.png)
 
 ---
 
-## Important — read before use
+## Read this first
 
 Epic Seven's [Terms of Service](https://page.onstove.com/epicseven/global)
 prohibit third-party automation. Using this software risks an account
-ban from Smilegate / STOVE. The author makes no warranty and accepts
-no liability for losses. Use at your own risk.
+ban from Smilegate / STOVE. No warranty, no liability — use at your
+own risk.
 
-- Captures stay local — nothing is uploaded.
-- The mouse moves on its own. Don't use the PC while a run is active.
+- Captures stay on your machine. Nothing leaves the PC.
+- The mouse moves on its own while a run is active. Don't use the PC
+  during a run.
 - The game window is brought to the foreground before every click.
 
-## Requirements
+## Download & run
 
-- Windows 10 / 11 (the WGC capture backend is Windows-only).
-- Epic Seven on STOVE PC. Emulators are not supported.
-- Rust toolchain (stable, 1.84+) — https://rustup.rs/
-- **Administrator privileges.** STOVE runs the game at an elevated
-  integrity level, and Windows UIPI silently drops synthetic input
-  from a lower-integrity process. The .exe ships with a manifest
-  that triggers UAC on launch; accept the prompt or the bot's
-  clicks won't reach the game.
+1. Grab the latest `e7-shop-refresher-vX.Y.Z-windows-x64.zip` from the
+   [Releases page](../../releases/latest). `SHA256SUMS.txt` is published
+   next to it for integrity verification.
+2. Unzip anywhere (e.g. `Desktop\e7-shop-refresher\`).
+3. Open Epic Seven on the STOVE client. Emulators aren't supported.
+4. Double-click `e7-shop-refresher.exe`. Windows will prompt for admin
+   rights — accept, otherwise the bot's clicks won't reach the game.
+5. Click **Start** on the Run tab.
 
-## Quick start
-
-```powershell
-git clone <repo-url> e7-shop-refresher
-cd e7-shop-refresher
-cargo build --release
-.\target\release\e7-shop-refresher.exe
-```
-
-Config and templates default to `%APPDATA%\e7-shop-refresher\`. Drop
-a `config.toml` next to the .exe for portable mode. Override either
-with `-c <path>`.
-
-On first launch the GUI lists what's missing and refuses to start
-until calibration is complete.
-
-## First-time setup
-
-Calibration is a one-time, ~5 minute job in the **Setup** tab.
-
-### 1. Templates
-
-Crop three PNGs from a live snapshot:
-
-- `shop_header.png` — the Secret Shop banner.
-- `mystic_medal.png` — the green medal icon. Only visible when one
-  is in stock; refresh in-game until it appears before cropping.
-- `covenant.png` — the pink / red bookmark icon. Same caveat.
-
-In the **Templates** card: drag a tight rectangle on the snapshot,
-pick the alias, click **Save crop**. The card title flips to
-`Templates · ready` once all three are saved. `templates/examples/`
-shows reference crops — visual guides, not usable as defaults
-(resolution / language mismatch will fail NCC).
-
-### 2. Click targets
-
-Four buttons whose position doesn't change. In the **Click targets**
-card, click **Draw** next to each name, then drag a rectangle:
-
-| Target | Where |
-|---|---|
-| `refresh` | Refresh button, bottom-left of the shop. |
-| `refresh_confirm` | Confirm button inside the refresh modal. |
-| `buy_confirm` | Buy button inside the buy modal. |
-| `buy_column` | The vertical column of per-row buy buttons. Only the X range is used — Y comes from the matched icon. |
-
-`refresh_confirm` and `buy_confirm` aren't visible on the shop
-screen; draw them over the area where the modal appears at runtime.
-For `buy_column`, draw a tall narrow rectangle covering the column
-of per-row buy buttons.
-
-### 3. Search regions (optional)
-
-Tune `shop_grid` and `anchor_shop` if your window isn't 1080p and
-detection misses. The **Search regions** card has the same Draw
-workflow. Unset = full image, which is fine on 1080p.
-
-### 4. Run
-
-Switch to the **Run** tab. Start unlocks once Window · Snapshot ·
-Templates · Click targets are all green. Stop is one click and exits
-within ~200 ms.
+That's it. Click positions, the item-grid search region, and the two
+item icon templates ship inside the binary, so the bot runs on a stock
+STOVE client without any setup.
 
 ## Daily use
 
-1. Open the shop in-game.
+1. Open the Secret Shop in Epic Seven.
 2. Launch `e7-shop-refresher.exe`.
 3. Click **Start**.
 
-Stop conditions and item toggles are live-editable mid-run — the
-worker re-reads at every round boundary. `sleep_when_done` suspends
-the PC after a stop condition fires (one-shot; manual Stop never
-suspends).
+Stop conditions and item toggles are live-editable while the bot is
+running — changes apply at the next round.
 
-## Configuration
+The **On completion** section on the Run tab decides what happens when a
+stop condition fires: sleep the PC (one-shot; a manual Stop never
+suspends) and/or POST a one-line summary to a Discord webhook.
 
-Every knob the bot exposes is editable in the GUI. `config.toml` is
-the backing store, written automatically (250 ms debounce). Only
-`[window]` and `[templates]` need hand-editing.
+**Emergency stop:** `Ctrl+7` from anywhere — works even when Epic Seven
+has focus.
 
-| Where | Covers |
-|---|---|
-| **Run** tab | Stop conditions, item targets, `sleep_when_done`. Live-editable mid-run. |
-| **Setup → Snapshot** | Capture, **Run detection**, inline NCC threshold + buy-button Y offset (hover the row to preview the click band over last-detected items). |
-| **Setup → Templates** | Crop per item icon. |
-| **Setup → Search regions** | `[regions]` rectangles. |
-| **Setup → Click targets** | `[zones]` rectangles. |
-| **Setup → Timing** | `[timing]` — click delays, mouse path, round pacing, jitter, modal & scroll. |
-| `config.toml` only | `[window]` (`title_contains`, `process_name`, `auto_resize`), `[templates]` (filenames + directory). |
+## Stop conditions
 
-Stop conditions: any of `max_refreshes`, `stop_after_minutes`,
-`stop_when_mystic_medals`, `stop_when_covenants`. Zero disables.
-All zero = run until manual Stop.
+Any one of these triggers a clean stop at the next round boundary:
+
+- `max_refreshes` — number of refresh cycles.
+- `stop_after_minutes` — wall-clock duration.
+- `stop_when_mystic_medals` — total mystic medals bought.
+- `stop_when_covenants` — total covenant bookmarks bought.
+- `stop_when_gold_spent` — gold budget.
+
+Zero = disabled. All zero = run until manual Stop.
+
+## Auto-updates
+
+On launch the app checks GitHub for a newer release (cached for 6 h so
+the anonymous rate limit stays clear). When one's available, a small
+banner appears at the bottom of the side panel with a **Download &
+restart** button. It downloads the new binary, verifies it against the
+release's `SHA256SUMS.txt`, swaps the current `.exe` in place, and
+relaunches. Config and templates are untouched.
+
+## Discord notifications
+
+Paste a webhook URL into **Run → On completion → Notify Discord**. When
+a stop condition fires, the bot POSTs a short summary (reason, duration,
+counts, gold spent). Manual Stop and Failed runs never trigger it. The
+*Send test* button below the field gives immediate feedback so you can
+confirm the URL works without waiting for a real run.
+
+Webhook URL: Discord → *Server Settings → Integrations → Webhooks → New
+Webhook → Copy Webhook URL*. The URL is stored locally in `config.toml`
+and never sent anywhere except Discord.
+
+## When the bundled defaults miss
+
+The bundled layout works on the stock STOVE client. If detection misses
+on your resolution or after a game patch:
+
+- **Item detection misses.** Open Setup → Snapshot, click *Refresh*,
+  then drag a tight rectangle around the mystic medal or covenant icon
+  on the snapshot. Pick the alias in **Advanced overrides → Reference
+  templates → Edit**, click *Save crop*. The Detector reloads immediately.
+- **Click lands next to a button.** Tune the **Button Y offset** slider
+  in Setup → Snapshot (hover preview shows the red click band over the
+  last detected items).
+- **Click zones drift.** Setup → Advanced overrides → Click zones lets
+  you redraw the *Refresh* button, the two modal confirms, and the
+  buy-column X strip.
+
+The **[full setup walkthrough](docs/setup.md)** has screenshots for
+each step. 99% of users won't need it.
 
 ## Troubleshooting
 
-**Game window not found** — Epic Seven not running, or its title
-doesn't contain `[window].title_contains` (default `Epic Seven`).
+**Game window not found.** Epic Seven isn't running, or its title
+doesn't match `[window].title_contains` (default `Epic Seven`).
 
-**Templates missing** — the Templates card title lists how many.
-Re-snapshot, drag, pick alias, **Save crop**. No Recheck step.
+**False matches across scrolls.** Re-crop the offending template tighter
+on the icon centre and raise `[matching].threshold` to 0.92–0.93. The
+*Run detection* button on the Setup tab shows the NCC score per match;
+anything below ~0.95 on a real item means the template needs work.
 
-**Click targets not drawn** — open the panel and **Draw** each.
-Start stays disabled until all four are set.
+**Bot freezes for several seconds.** Keep `auto_resize` off (the
+default). Forcing a resize at startup can wedge the capture backend.
 
-**Bot clicks next to a button** — `buy_column` too wide, or
-`buy_button_y_offset_ratio` off. Run detection, then hover **Button
-Y offset** in the Snapshot card — the red band shows where clicks
-would land. Tune until the band sits on the button.
-
-**False matches across scrolls** — re-crop tighter on the icon
-centre; raise `[matching].threshold` to 0.92–0.93. Run detection
-shows the NCC score per match; a real item below ~0.95 means the
-template needs work.
-
-**Bot freezes for several seconds** — keep `auto_resize` off (the
-default). Forcing a resize at startup can hose the WGC frame pool.
-
-**Stop unresponsive** — worst case ~200 ms; longer means a click
+**Stop unresponsive.** Worst case ~200 ms; longer means a click
 animation is in flight. The GUI join is best-effort.
 
-## How it works
+## Configuration
 
-- **Capture** — Windows Graphics Capture via `xcap`. No desktop
-  recording, no overlay.
-- **Detection** — NCC pyramidal template matching via `imageproc`.
-  User-supplied crops, two-stage coarse-to-fine.
-- **Clicks** — `enigo` synthesises curved, eased, jittered motion at
-  the OS level. The window is brought to the foreground first via
-  `SetForegroundWindow`.
-- **Fixed positions** (refresh, modal confirms, buy column) use
-  user-drawn zones rather than template matching — faster and more
-  robust for UI chrome.
+Every knob is editable in the GUI. `config.toml` is the backing store
+(auto-saved with a 250 ms debounce). Only `[window]` and `[templates]`
+ever need hand-editing.
 
-`e7-shop-refresher-cli.exe` is the headless CLI sibling.
-`--dry-run` validates config without clicking.
+Config and templates default to `%APPDATA%\e7-shop-refresher\`. Drop a
+`config.toml` next to the .exe for portable mode. Override either with
+`-c <path>`.
 
-## Building from source
+## CLI
+
+`e7-shop-refresher-cli.exe` is the headless sibling. `--dry-run`
+validates config without clicking.
+
+## For developers
 
 ```powershell
+git clone https://github.com/Asgarrrr/e7-shop-refresher
+cd e7-shop-refresher
 cargo build --release
-
-# CI-equivalent
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the code map and invariants.
+Rust 1.85+ stable. CI runs `cargo fmt --check`, `cargo clippy -D warnings`,
+and `cargo test`. See [ARCHITECTURE.md](ARCHITECTURE.md) for the code map
+and invariants, and [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ## License
 

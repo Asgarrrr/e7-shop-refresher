@@ -38,11 +38,24 @@ const SLEEP_CHUNK_MS: u64 = 60;
 /// activation and land in dead time.
 const FOREGROUND_SETTLE_MS: u64 = 150;
 
+/// Cooperative mode poll cadence. Tight enough that resume feels
+/// immediate; loose enough not to burn CPU when the user is typing.
+const COOPERATIVE_POLL_MS: u64 = 100;
+
+/// Tolerance between `GetLastInputInfo` (GetTickCount domain) and the
+/// bot's own Instant readings. Without it, our own SendInput can look
+/// like user activity due to clock-source jitter.
+const BOT_INPUT_CLASSIFY_MARGIN_MS: u64 = 30;
+
 pub struct Clicker {
     enigo: Enigo,
     timing: TimingConfig,
     rng: SmallRng,
     stop: Arc<AtomicBool>,
+    /// Last time the bot itself called into enigo. Lets us tell apart
+    /// "user moved the mouse" from "we moved the mouse" when reading
+    /// `GetLastInputInfo`.
+    last_bot_input_at: Instant,
 }
 
 impl Clicker {
@@ -54,7 +67,74 @@ impl Clicker {
             timing,
             rng: SmallRng::seed_from_u64(seed),
             stop,
+            last_bot_input_at: Instant::now(),
         })
+    }
+
+    /// Update right after every SendInput so the user-activity check
+    /// can subtract out our own actions.
+    fn mark_bot_input(&mut self) {
+        self.last_bot_input_at = Instant::now();
+    }
+
+    /// `Some(ms)` if the last OS-level input is more recent than our own
+    /// last enigo call (user moved/typed). `None` if the last input was
+    /// the bot itself.
+    fn ms_since_user_input(&self) -> Option<u64> {
+        use windows::Win32::System::SystemInformation::GetTickCount;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+            return None;
+        }
+        let now_tick = unsafe { GetTickCount() };
+        let since_input_ms = now_tick.wrapping_sub(info.dwTime) as u64;
+        let since_bot_ms = self.last_bot_input_at.elapsed().as_millis() as u64;
+        // User input is more recent than our own last action.
+        if since_input_ms + BOT_INPUT_CLASSIFY_MARGIN_MS < since_bot_ms {
+            Some(since_input_ms)
+        } else {
+            None
+        }
+    }
+
+    /// Cooperative pause: block until the user has been idle for at
+    /// least `cooperative_idle_ms`. No-op if disabled (0) or already
+    /// idle. Respects Stop so the user can abort.
+    fn wait_for_user_idle(&self) {
+        let threshold_ms = self.timing.cooperative_idle_ms;
+        if threshold_ms == 0 {
+            return;
+        }
+        let chunk = Duration::from_millis(COOPERATIVE_POLL_MS);
+        let mut waited_for_user = false;
+        loop {
+            if self.stopped() {
+                return;
+            }
+            match self.ms_since_user_input() {
+                Some(ms) if ms < threshold_ms => {
+                    if !waited_for_user {
+                        tracing::debug!(
+                            since_user_input_ms = ms,
+                            threshold_ms,
+                            "user is active — pausing"
+                        );
+                        waited_for_user = true;
+                    }
+                    thread::sleep(chunk);
+                }
+                _ => {
+                    if waited_for_user {
+                        tracing::debug!("user idle — resuming");
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// Checked every click — no TTL cache. Paid currency is on the line
@@ -131,6 +211,9 @@ impl Clicker {
         local_x: i32,
         local_y: i32,
     ) -> Result<()> {
+        // Before foreground steal — yanking focus while the user types
+        // would feel just as bad as yanking the mouse.
+        self.wait_for_user_idle();
         self.ensure_foreground(capture)?;
         let (tx, ty) = capture.local_to_screen(local_x, local_y)?;
         let start = self.enigo.location().unwrap_or((tx, ty));
@@ -165,6 +248,7 @@ impl Clicker {
             return Ok(());
         }
         self.enigo.button(Button::Left, Direction::Click)?;
+        self.mark_bot_input();
         tracing::debug!("button click sent");
         Ok(())
     }
@@ -186,14 +270,17 @@ impl Clicker {
         local_y: i32,
         lines: i32,
     ) -> Result<()> {
+        self.wait_for_user_idle();
         self.ensure_foreground(capture)?;
         let (sx, sy) = capture.local_to_screen(local_x, local_y)?;
         self.enigo.move_mouse(sx, sy, Coordinate::Abs)?;
+        self.mark_bot_input();
         self.sleep_interruptible(Duration::from_millis(40));
         if self.stopped() {
             return Ok(());
         }
         self.enigo.scroll(lines, Axis::Vertical)?;
+        self.mark_bot_input();
         Ok(())
     }
 
@@ -243,12 +330,10 @@ impl Clicker {
             let t = i as f32 / steps as f32;
             // Ease-out cubic + sin bump on the perpendicular: faster start,
             // gentle landing, max arc in the middle.
-            let eased = 1.0 - (1.0 - t).powi(3);
-            let bump = (eased * std::f32::consts::PI).sin();
-            let x = sx + dx * eased + px * arc * bump;
-            let y = sy + dy * eased + py * arc * bump;
+            let (x, y) = trajectory_point((sx, sy), (dx, dy), (px, py), arc, t);
             self.enigo
                 .move_mouse(x.round() as i32, y.round() as i32, Coordinate::Abs)?;
+            self.mark_bot_input();
             let step_ms =
                 self.uniform_ms(self.timing.move_step_min_ms, self.timing.move_step_max_ms);
             self.sleep_interruptible(step_ms);
@@ -256,19 +341,14 @@ impl Clicker {
         Ok(())
     }
 
-    /// Rayleigh jitter around the target: σ = r/√2 so 95% of points fall
-    /// inside r×2. Soft circular blob instead of a hard square grid.
     fn jitter_target(&mut self, x: i32, y: i32) -> (i32, i32) {
         let r = self.timing.jitter_radius_px;
         if r <= 0.0 {
             return (x, y);
         }
-        let sigma = r / std::f32::consts::SQRT_2;
         let u: f32 = self.rng.random_range(1e-6..1.0);
-        let radius = sigma * (-2.0 * u.ln()).sqrt();
         let angle: f32 = self.rng.random_range(0.0..std::f32::consts::TAU);
-        let dx = (radius * angle.cos()).round() as i32;
-        let dy = (radius * angle.sin()).round() as i32;
+        let (dx, dy) = rayleigh_offset(r, u, angle);
         (x + dx, y + dy)
     }
 
@@ -309,6 +389,34 @@ impl Input for Clicker {
     }
 }
 
+/// Point at progress `t` ∈ (0, 1] on the eased, arced path from `start`
+/// toward `start + delta`; `perp` is the unit perpendicular, `arc` the bump
+/// amplitude in px.
+fn trajectory_point(
+    start: (f32, f32),
+    delta: (f32, f32),
+    perp: (f32, f32),
+    arc: f32,
+    t: f32,
+) -> (f32, f32) {
+    let eased = 1.0 - (1.0 - t).powi(3);
+    let bump = (eased * std::f32::consts::PI).sin();
+    (
+        start.0 + delta.0 * eased + perp.0 * arc * bump,
+        start.1 + delta.1 * eased + perp.1 * arc * bump,
+    )
+}
+
+/// Rayleigh-distributed offset: σ = r/√2 so ~95% of points fall inside r×2.
+fn rayleigh_offset(r: f32, u: f32, angle: f32) -> (i32, i32) {
+    let sigma = r / std::f32::consts::SQRT_2;
+    let radius = sigma * (-2.0 * u.ln()).sqrt();
+    (
+        (radius * angle.cos()).round() as i32,
+        (radius * angle.sin()).round() as i32,
+    )
+}
+
 /// Log-normal sample whose *real* mean matches `mean_ms`. The config's
 /// `click_delay_sigma` is the dispersion of the underlying normal; we
 /// solve for log-space mu so the natural-space mean lines up:
@@ -318,4 +426,131 @@ fn log_normal_ms(rng: &mut SmallRng, mean_ms: f64, log_sigma: f64) -> f64 {
     LogNormal::new(mu, log_sigma)
         .expect("validated: click_delay_sigma is finite and > 0")
         .sample(rng)
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+
+    use super::{log_normal_ms, rayleigh_offset, trajectory_point};
+
+    #[test]
+    fn trajectory_lands_exactly_on_target_at_t_one() {
+        let cases = [
+            (
+                (0.0f32, 0.0f32),
+                (100.0f32, 200.0f32),
+                (0.0f32, 0.0f32),
+                0.0f32,
+            ),
+            ((50.0, 80.0), (300.0, 400.0), (0.6, 0.8), 40.0),
+            ((10.0, 10.0), (-200.0, 150.0), (0.5, -0.5), 40.0),
+        ];
+        for (start, delta, perp, arc) in cases {
+            let (x, y) = trajectory_point(start, delta, perp, arc, 1.0);
+            assert!(
+                (x - (start.0 + delta.0)).abs() < 1e-3,
+                "x mismatch: got {x}, expected {}",
+                start.0 + delta.0
+            );
+            assert!(
+                (y - (start.1 + delta.1)).abs() < 1e-3,
+                "y mismatch: got {y}, expected {}",
+                start.1 + delta.1
+            );
+        }
+    }
+
+    #[test]
+    fn trajectory_starts_at_start_for_t_zero() {
+        let start = (123.0f32, 456.0f32);
+        let delta = (200.0, -150.0);
+        let perp = (-0.6, 0.8);
+        let (x, y) = trajectory_point(start, delta, perp, 30.0, 0.0);
+        assert_eq!(x, start.0);
+        assert_eq!(y, start.1);
+    }
+
+    #[test]
+    fn trajectory_with_zero_arc_stays_on_segment() {
+        let start = (0.0f32, 0.0f32);
+        let delta = (300.0f32, 400.0f32);
+        let perp = (-0.8, 0.6);
+        for i in 1..=9 {
+            let t = i as f32 * 0.1;
+            let (px, py) = trajectory_point(start, delta, perp, 0.0, t);
+            // cross product of (point - start) and delta should be ~0
+            let cross = (px - start.0) * delta.1 - (py - start.1) * delta.0;
+            assert!(
+                cross.abs() < 1e-2,
+                "cross product {cross} at t={t} indicates point off segment"
+            );
+        }
+    }
+
+    #[test]
+    fn trajectory_progress_is_monotonic() {
+        let start = (0.0f32, 0.0f32);
+        let delta = (500.0f32, 300.0f32);
+        let perp = (-0.5, 0.5);
+        let dot_norm = delta.0 * delta.0 + delta.1 * delta.1;
+        let mut prev_proj = f32::NEG_INFINITY;
+        for i in 1..=10 {
+            let t = i as f32 * 0.1;
+            let (px, py) = trajectory_point(start, delta, perp, 0.0, t);
+            let proj = ((px - start.0) * delta.0 + (py - start.1) * delta.1) / dot_norm;
+            assert!(
+                proj > prev_proj,
+                "projection not strictly increasing at t={t}: {proj} <= {prev_proj}"
+            );
+            prev_proj = proj;
+        }
+    }
+
+    #[test]
+    fn rayleigh_offset_radius_is_bounded_for_u_range() {
+        let r = 6.0f32;
+        let sigma = r / std::f32::consts::SQRT_2;
+        let max_radius = sigma * (-2.0f32 * (1e-6f32).ln()).sqrt();
+
+        for &u in &[1e-6f32, 0.999_999f32] {
+            let (dx, dy) = rayleigh_offset(r, u, 0.0);
+            let mag = ((dx * dx + dy * dy) as f32).sqrt();
+            assert!(
+                mag <= max_radius + 1.0,
+                "magnitude {mag} exceeds bound {} at u={u}",
+                max_radius + 1.0
+            );
+            assert!(mag >= 0.0);
+        }
+
+        // Smaller u → larger radius (monotone decreasing in u)
+        let (dx_small, dy_small) = rayleigh_offset(r, 1e-6, 0.0);
+        let (dx_large, dy_large) = rayleigh_offset(r, 0.9, 0.0);
+        let mag_small = ((dx_small * dx_small + dy_small * dy_small) as f32).sqrt();
+        let mag_large = ((dx_large * dx_large + dy_large * dy_large) as f32).sqrt();
+        assert!(
+            mag_small > mag_large,
+            "expected small u={} to give larger radius than u=0.9: {mag_small} vs {mag_large}",
+            1e-6
+        );
+    }
+
+    #[test]
+    fn log_normal_mean_tracks_requested_mean() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let n = 10_000;
+        let mean_ms = 180.0f64;
+        let sigma = 0.35f64;
+        let sum: f64 = (0..n)
+            .map(|_| log_normal_ms(&mut rng, mean_ms, sigma))
+            .sum();
+        let observed = sum / n as f64;
+        let tolerance = mean_ms * 0.15;
+        assert!(
+            (observed - mean_ms).abs() < tolerance,
+            "observed mean {observed:.2} not within 15% of {mean_ms}"
+        );
+    }
 }
