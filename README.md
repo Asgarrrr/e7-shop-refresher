@@ -114,6 +114,9 @@ and never sent anywhere except Discord.
 
 ## When the bundled defaults miss
 
+![The Setup tab with the layout overlay on — every search region (green)
+and click zone (orange) drawn over the snapshot](docs/screenshots/setup-tab.png)
+
 The bundled layout works on the stock STOVE client. The Setup tab runs
 detection live on the central snapshot — each match shows its NCC score
 and margin as you watch, so there's nothing to trigger by hand. If
