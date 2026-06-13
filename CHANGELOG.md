@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-06-13
+
+### Added
+
+- Click-zone editors carry a tooltip with the sizing rule: a zone may be
+  smaller than its button but must not overflow it, or a randomised click
+  can land off-target and the round fails.
+
 ## [0.7.0] — 2026-06-13
 
 ### Added
