@@ -129,6 +129,8 @@ detection misses on your resolution or after a game patch:
   y/h ratios.
 - **Click zones drift.** Setup → Layout → Click zones lets you redraw the
   *Refresh* button, the two modal confirms, and the buy-column X strip.
+  Keep each box inside its real button — smaller is fine, overflowing the
+  edge isn't. Tick **Show layout overlay** to check before a run.
 
 The **[full setup walkthrough](docs/setup.md)** has screenshots for
 each step. 99% of users won't need it.
