@@ -52,8 +52,11 @@ src/
 ## Invariants
 
 - **`Detector::find` / `find_in` is the only template-matching path.**
-  Buy buttons are never template-matched at runtime; they're click
-  zones with pre/post hash checks to verify the modal opened.
+  Every NCC hit is then colour-gated through `ColorVerifier` (hue
+  histogram) before the runner acts, so a cross-colour false positive
+  never triggers a buy. Buy buttons are never template-matched at
+  runtime; they're click zones with pre/post hash checks to verify the
+  modal opened.
 - **`bought_types` HashSet caps each round to one buy per item type** —
   the shop carries at most one of each per refresh. Cleared at round
   start.

@@ -19,6 +19,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reroll the shop is now counted as failed, so the
   `consecutive_failures` cap eventually trips instead of hammering a
   non-shop screen.
+- **Cooperative mode.** The bot yields the cursor the moment you touch
+  the mouse or keyboard and resumes only after an idle window
+  (*Yield to user (idle ms)*, default 1.5 s; `0` disables). Tune it
+  under Setup → Timing.
 
 ### Changed
 
