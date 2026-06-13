@@ -14,6 +14,12 @@ Windows only. No installer, no telemetry, no account credentials.
 
 ![E7 Shop Refresher mid-run on the Secret Shop](docs/screenshots/run-tab-active.png)
 
+Day to day, it's three clicks:
+
+1. Open the Secret Shop in Epic Seven.
+2. Launch `e7-shop-refresher.exe`.
+3. Click **Start**.
+
 ---
 
 ## Read this first
@@ -44,11 +50,7 @@ That's it. Click positions, the item-grid search region, and the two
 item icon templates ship inside the binary, so the bot runs on a stock
 STOVE client without any setup.
 
-## Daily use
-
-1. Open the Secret Shop in Epic Seven.
-2. Launch `e7-shop-refresher.exe`.
-3. Click **Start**.
+## During a run
 
 While a run is active the Run tab shows live counts per item plus a luck
 ratio (`×2.47` = bought ÷ expected from the shop drop rates; `×1.00` is
