@@ -862,8 +862,8 @@ fn strip_hash(gray: &GrayImage, [x, y, w, h]: [f32; 4]) -> u64 {
     let y0 = (y * sh as f32)
         .round()
         .clamp(0.0, sh.saturating_sub(1) as f32) as u32;
-    let w_px = (w * sw as f32).round().clamp(1.0, sw as f32) as u32;
-    let h_px = (h * sh as f32).round().clamp(1.0, sh as f32) as u32;
+    let w_px = (w * sw as f32).round().clamp(1.0, (sw as f32).max(1.0)) as u32;
+    let h_px = (h * sh as f32).round().clamp(1.0, (sh as f32).max(1.0)) as u32;
     let x1 = x0.saturating_add(w_px).min(sw);
     let y1 = y0.saturating_add(h_px).min(sh);
 
@@ -1300,6 +1300,18 @@ mod tests {
     fn strip_hash_clamps_out_of_bounds_ratios() {
         let img = solid_gray(100, 100, 64);
         let _ = strip_hash(&img, [0.5, 0.5, 5.0, 5.0]);
+    }
+
+    #[test]
+    fn strip_hash_does_not_panic_on_zero_dimension_frame() {
+        // A degenerate 0×0 capture (minimized/occluded window) must not crash
+        // the bot worker — strip_hash returns a stable hash instead of panicking.
+        let zero_w = GrayImage::new(0, 10);
+        let zero_h = GrayImage::new(10, 0);
+        let zero_both = GrayImage::new(0, 0);
+        let _ = strip_hash(&zero_w, [0.0, 0.0, 1.0, 1.0]);
+        let _ = strip_hash(&zero_h, [0.0, 0.0, 1.0, 1.0]);
+        let _ = strip_hash(&zero_both, [0.5, 0.5, 0.25, 0.25]);
     }
 
     // --- loop-test helpers ---
