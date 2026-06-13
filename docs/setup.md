@@ -8,6 +8,9 @@ tab's **Layout** card.
 
 If detection works on your first Start, you can skip this whole page.
 
+![The Setup tab with the layout overlay on, showing the search region,
+click zones, and reference templates beside the live snapshot](screenshots/setup-tab.png)
+
 ---
 
 ## Before you start
@@ -25,9 +28,6 @@ region, click zones, and reference templates you can override), and
 cooperative mode pauses the bot when you touch the mouse/keyboard and
 resumes after that idle window; `0` disables it). Every override below
 lives in the **Layout** card.
-
-![The Setup tab with the layout overlay on, showing the search region,
-click zones, and reference templates beside the live snapshot](screenshots/setup-tab.png)
 
 With **Show layout overlay on snapshot** ticked, every region the bot
 looks in and every point it clicks is drawn over the central snapshot —
@@ -129,6 +129,14 @@ Same drag-on-snapshot flow as templates. `refresh_confirm` and
 `buy_confirm` aren't visible on the shop screen — draw them over the
 area *where the modal will appear* at runtime (centre of the screen,
 on the modal buttons).
+
+**Keep each zone inside its real button.** Smaller than the button is
+fine — every click picks a random point inside the zone, so a snug box
+just tightens the spread. Spilling past the button's edge is not: a
+click can then land on dead space or the wrong control and the round
+fails. Turn the overlay on and check that no orange click zone pokes
+outside its button face, and that the green search regions sit squarely
+over the right area before you start a run.
 
 ### Search regions
 
