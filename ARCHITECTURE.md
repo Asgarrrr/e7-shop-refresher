@@ -17,7 +17,11 @@ src/
 ├── color_check.rs   Hue-histogram FP filter on top of NCC hits
 ├── input.rs         Clicker: human-ish mouse motion, scroll, foreground guard
 ├── layout.rs        Bundled click positions + search ROIs (window-relative ratios)
-├── shop.rs          Main loop: buy, refresh, modal-open hash checks
+├── shop/
+│   ├── mod.rs       ShopRunner lifecycle: run loop, failure cap, webhooks
+│   ├── round.rs     Per-round actions: buy, scroll, refresh + hash checks
+│   ├── scan.rs      scan_shop_raw + strip_hash capture helpers
+│   └── stop.rs      Stop conditions + shop price/drop-rate constants
 ├── power.rs         Suspend-to-sleep on completion
 ├── error.rs         Typed errors (thiserror)
 ├── http.rs          Minimal WinHTTP wrapper (Discord webhook, GitHub API)

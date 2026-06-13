@@ -49,7 +49,7 @@ Adding one `ShopConfig` field touches these files in order:
    it is `src/gui/panels/timing.rs`.
 
 5. **The runtime consumer** — for shop-loop stop conditions this is
-   `src/shop.rs`; for window/capture behaviour check `src/capture.rs` and
+   `src/shop/stop.rs`; for window/capture behaviour check `src/capture.rs` and
    `src/detector.rs`.
 
 To see every touch-point for an existing field, grep the codebase for it:
@@ -65,12 +65,12 @@ grep -r stop_when_gold_spent src/
 1. Add a `ShopConfig` field in `src/config/sections.rs` (convention: `0` means
    disabled).
 
-2. Add the check to `stop_condition_for` in `src/shop.rs`. The function uses a
+2. Add the check to `stop_condition_for` in `src/shop/stop.rs`. The function uses a
    fixed priority order: **duration → mystic → covenant → gold**. Pick a
    position in that chain deliberately — the first condition that fires wins
    and the reason string is what gets logged.
 
-3. Add unit tests next to the existing `stop_condition_*` tests in `src/shop.rs`
+3. Add unit tests next to the existing `stop_condition_*` tests in `src/shop/stop.rs`
    using the `shop_with` helper. Cover: fires at threshold, does not fire below
    threshold, respects priority when multiple conditions are set.
 
@@ -87,7 +87,7 @@ grep -r stop_when_gold_spent src/
 Tests live in `#[cfg(test)] mod tests` at the bottom of each source file.
 There is no `tests/` directory.
 
-For shop-loop behaviour use the doubles already in `src/shop.rs`'s test module:
+For shop-loop behaviour use the doubles already in `src/shop/test_support.rs`:
 - `FakeCapture` / `FakeInput` — trait doubles for capture and input.
 - `gray_frame` / `paint_zone` — helpers to build synthetic grayscale frames.
 - `runner_for_loop_tests` — constructs a fully-wired `Runner` from a frame
