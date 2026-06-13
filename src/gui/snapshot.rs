@@ -429,7 +429,7 @@ fn draw_onboarding(ui: &mut egui::Ui, gui: &ShopGui) {
             ui.add_space(18.0);
             ui.colored_label(
                 palette::TEXT_MUTED,
-                "Open Epic Seven, then click Refresh in the Snapshot panel.",
+                "Open Epic Seven — its window is detected automatically.",
             );
             return;
         }
@@ -449,9 +449,9 @@ fn draw_onboarding(ui: &mut egui::Ui, gui: &ShopGui) {
                 ui.add_space(10.0);
                 let steps: &[&str] = &[
                     "Open the secret shop in Epic Seven.",
-                    "Open the Setup tab and click Refresh — it captures a frame and runs detection.",
+                    "Open the Setup tab — it captures the shop live and runs detection on its own.",
                     "Tick \"Show layout overlay\" and check the green (scan) / orange (click) zones line up with the shop UI.",
-                    "Refresh a few times until a mystic medal or covenant bookmark spawns — the match box and score appear under the Refresh button.",
+                    "Switch to the Run tab and hit Start — watch the first few rounds; the bot refreshes and buys on its own.",
                 ];
                 egui::Grid::new("onboarding_checklist")
                     .num_columns(2)
@@ -487,7 +487,7 @@ fn draw_onboarding(ui: &mut egui::Ui, gui: &ShopGui) {
                 ui.add_space(10.0);
                 let tips: &[&str] = &[
                     "Hover any input, checkbox, or button for a tooltip with details.",
-                    "Once running, keep an eye on the first few rounds. Ctrl+7 stops the bot from anywhere — even with Epic Seven focused. If it looks right, let it run.",
+                    "Ctrl+7 stops the bot from anywhere — even when Epic Seven has focus. If the first rounds look right, let it run.",
                 ];
                 egui::Grid::new("onboarding_tips")
                     .num_columns(2)

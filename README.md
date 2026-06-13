@@ -24,8 +24,9 @@ ban from Smilegate / STOVE. No warranty, no liability — use at your
 own risk.
 
 - Captures stay on your machine. Nothing leaves the PC.
-- The mouse moves on its own while a run is active. Don't use the PC
-  during a run.
+- The mouse moves on its own while a run is active. Touch the mouse or
+  keyboard and the bot yields — it pauses and resumes only once you've
+  been idle for a moment (cooperative mode, on by default).
 - The game window is brought to the foreground before every click.
 
 ## Download & run
@@ -49,6 +50,15 @@ STOVE client without any setup.
 2. Launch `e7-shop-refresher.exe`.
 3. Click **Start**.
 
+![Run tab during an active session — live counts and the actual-vs-expected
+acquisition chart](docs/screenshots/run-tab-active.png)
+
+While a run is active the Run tab shows live counts per item plus a luck
+ratio (`×2.47` = bought ÷ expected from the shop drop rates; `×1.00` is
+average, higher is luckier) and a chart tracking actual pulls against
+that expected rate — bold is actual, faint is expected, so a run
+trending below the drop rate is obvious at a glance.
+
 Stop conditions and item toggles are live-editable while the bot is
 running — changes apply at the next round.
 
@@ -58,6 +68,17 @@ suspends) and/or POST a one-line summary to a Discord webhook.
 
 **Emergency stop:** `Ctrl+7` from anywhere — works even when Epic Seven
 has focus.
+
+## Sharing the mouse
+
+You don't have to surrender the PC for a whole run. **Cooperative mode**
+(on by default) pauses the bot the instant you touch the mouse or
+keyboard and resumes only after you've been idle for **Yield to user
+(idle ms)** — 1.5 s by default. Tune it under Setup → Timing; set it to
+`0` to disable, after which the bot fights you for the cursor.
+
+It's a courtesy pause, not the emergency brake — for a hard stop use
+`Ctrl+7` or the Stop button.
 
 ## Stop conditions
 
@@ -94,19 +115,21 @@ and never sent anywhere except Discord.
 
 ## When the bundled defaults miss
 
-The bundled layout works on the stock STOVE client. If detection misses
-on your resolution or after a game patch:
+The bundled layout works on the stock STOVE client. The Setup tab runs
+detection live on the central snapshot — each match shows its NCC score
+and margin as you watch, so there's nothing to trigger by hand. If
+detection misses on your resolution or after a game patch:
 
-- **Item detection misses.** Open Setup → Snapshot, click *Refresh*,
-  then drag a tight rectangle around the mystic medal or covenant icon
-  on the snapshot. Pick the alias in **Advanced overrides → Reference
-  templates → Edit**, click *Save crop*. The Detector reloads immediately.
-- **Click lands next to a button.** Tune the **Button Y offset** slider
-  in Setup → Snapshot (hover preview shows the red click band over the
-  last detected items).
-- **Click zones drift.** Setup → Advanced overrides → Click zones lets
-  you redraw the *Refresh* button, the two modal confirms, and the
-  buy-column X strip.
+- **Item detection misses.** In **Setup → Layout → Reference templates**,
+  click *Edit* next to the alias, then drag a tight rectangle around the
+  mystic medal or covenant icon on the snapshot. The Detector reloads on
+  release.
+- **Click lands next to a button.** Drag the red **Buy reference** line
+  onto any item row, then drag the **Buy click** box down onto that row's
+  Buy button (Setup → Layout → Click zones). Both are also typeable as
+  y/h ratios.
+- **Click zones drift.** Setup → Layout → Click zones lets you redraw the
+  *Refresh* button, the two modal confirms, and the buy-column X strip.
 
 The **[full setup walkthrough](docs/setup.md)** has screenshots for
 each step. 99% of users won't need it.
@@ -117,9 +140,11 @@ each step. 99% of users won't need it.
 doesn't match `[window].title_contains` (default `Epic Seven`).
 
 **False matches across scrolls.** Re-crop the offending template tighter
-on the icon centre and raise `[matching].threshold` to 0.92–0.93. The
-*Run detection* button on the Setup tab shows the NCC score per match;
-anything below ~0.95 on a real item means the template needs work.
+on the icon centre and raise the **NCC threshold** on the Setup tab to
+0.92–0.93. The live match list there shows the score per item; anything
+below ~0.95 on a real item means the template needs work. A built-in
+hue-histogram check already drops cross-colour false positives (orange
+medal correlating with the green bookmark) on its own.
 
 **Bot freezes for several seconds.** Keep `auto_resize` off (the
 default). Forcing a resize at startup can wedge the capture backend.
