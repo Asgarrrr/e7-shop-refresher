@@ -437,3 +437,175 @@ where
         table.insert(key, toml_edit::Item::Value(v));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// Unique per test so parallel runs don't collide. Caller cleans up.
+    fn temp_config(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "e7-persist-test-{}-{name}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("write temp config");
+        path
+    }
+
+    fn non_default_config() -> Config {
+        let mut cfg: Config = toml::from_str(crate::config::DEFAULT_TOML).unwrap();
+        cfg.window.base_resolution = [1600, 900];
+        cfg.shop.max_refreshes = 7;
+        cfg.shop.stop_after_minutes = 90;
+        cfg.shop.stop_when_mystic_medals = 5;
+        cfg.shop.stop_when_covenants = 6;
+        cfg.shop.stop_when_gold_spent = 500_000;
+        cfg.shop.buy_mystic_medals = false;
+        cfg.shop.buy_covenant = false;
+        cfg.shop.buy_button_y_offset_ratio = 0.11;
+        cfg.shop.buy_button_band_h_ratio = 0.05;
+        cfg.shop.buy_calibration_line_y_ratio = 0.4;
+        cfg.shop.sleep_when_done = true;
+        cfg.matching.threshold = 0.88;
+        cfg.matching.preview_refresh_ms = 750;
+        cfg.regions.shop_grid = Some([0.05, 0.1, 0.9, 0.8]);
+        cfg.zones.refresh = Some([0.1, 0.2, 0.15, 0.1]);
+        cfg.zones.refresh_confirm = Some([0.3, 0.4, 0.2, 0.1]);
+        cfg.zones.buy_confirm = Some([0.5, 0.6, 0.2, 0.1]);
+        cfg.zones.buy_column = Some([0.7, 0.1, 0.2, 0.5]);
+        cfg.timing.click_delay_mean_ms = 300.0;
+        cfg.timing.click_delay_sigma = 0.45;
+        cfg.timing.click_delay_min_ms = 100;
+        cfg.timing.click_delay_max_ms = 800;
+        cfg.timing.move_steps_min = 4;
+        cfg.timing.move_steps_max = 12;
+        cfg.timing.move_step_min_ms = 2;
+        cfg.timing.move_step_max_ms = 9;
+        cfg.timing.move_to_click_min_ms = 25;
+        cfg.timing.move_to_click_max_ms = 60;
+        cfg.timing.move_curve_amplitude_px = 4.5;
+        cfg.timing.jitter_radius_px = 2.5;
+        cfg.timing.inter_round_min_ms = 700;
+        cfg.timing.inter_round_max_ms = 1900;
+        cfg.timing.long_pause_every_n = 8;
+        cfg.timing.long_pause_min_ms = 4000;
+        cfg.timing.long_pause_max_ms = 11_000;
+        cfg.timing.scroll_amount = 6;
+        cfg.timing.scroll_pause_ms = 300;
+        cfg.timing.modal_open_pause_ms = 240;
+        cfg.timing.cooperative_idle_ms = 2000;
+        cfg.notifications.discord_webhook_url =
+            "https://discord.com/api/webhooks/1/round-trip-test".into();
+        cfg
+    }
+
+    /// The repo's documented #1 failure mode: a field present in
+    /// AutoSavedFields but missing its write site in write_all_back means
+    /// GUI edits are silently discarded. Every field here carries a
+    /// non-default, 3-decimal-clean value; if write_all_back misses one,
+    /// the reloaded side differs and the assert names the field.
+    #[test]
+    fn every_auto_saved_field_survives_write_and_reload() {
+        let cfg = non_default_config();
+        let path = temp_config("round-trip", crate::config::DEFAULT_TOML);
+        write_all_back(&path, &cfg).expect("write_all_back");
+        let reloaded = Config::load(&path).expect("reload after write_all_back");
+        assert_eq!(
+            AutoSavedFields::from_config(&cfg),
+            AutoSavedFields::from_config(&reloaded)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Exhaustive on purpose — no `..` rest pattern. Adding a field to
+    /// AutoSavedFields breaks this build, which is the point: give the new
+    /// field a non-default value in non_default_config() above so the
+    /// round-trip test covers its write site too.
+    #[test]
+    fn auto_saved_fields_is_exhaustively_covered() {
+        let AutoSavedFields {
+            base_resolution: _,
+            max_refreshes: _,
+            stop_after_minutes: _,
+            stop_when_mystic_medals: _,
+            stop_when_covenants: _,
+            stop_when_gold_spent: _,
+            buy_mystic_medals: _,
+            buy_covenant: _,
+            buy_button_y_offset_ratio: _,
+            buy_button_band_h_ratio: _,
+            buy_calibration_line_y_ratio: _,
+            threshold: _,
+            preview_refresh_ms: _,
+            sleep_when_done: _,
+            shop_grid: _,
+            z_refresh: _,
+            z_refresh_confirm: _,
+            z_buy_confirm: _,
+            z_buy_column: _,
+            click_delay_mean_ms: _,
+            click_delay_sigma: _,
+            click_delay_min_ms: _,
+            click_delay_max_ms: _,
+            move_steps_min: _,
+            move_steps_max: _,
+            move_step_min_ms: _,
+            move_step_max_ms: _,
+            move_to_click_min_ms: _,
+            move_to_click_max_ms: _,
+            move_curve_amplitude_px: _,
+            jitter_radius_px: _,
+            inter_round_min_ms: _,
+            inter_round_max_ms: _,
+            long_pause_every_n: _,
+            long_pause_min_ms: _,
+            long_pause_max_ms: _,
+            scroll_amount: _,
+            scroll_pause_ms: _,
+            modal_open_pause_ms: _,
+            cooperative_idle_ms: _,
+            discord_webhook_url: _,
+        } = AutoSavedFields::from_config(&non_default_config());
+    }
+
+    #[test]
+    fn write_all_back_preserves_comments_and_unknown_keys() {
+        let path = temp_config("decor", crate::config::DEFAULT_TOML);
+        write_all_back(&path, &non_default_config()).expect("write_all_back");
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            raw.contains("# Inter-click delay: log-normal sample clamped to [min, max]."),
+            "inline comment was lost"
+        );
+        assert!(
+            raw.contains("max_scrolls_per_round"),
+            "unknown key was dropped"
+        );
+        assert!(
+            raw.contains("resize_tolerance_px"),
+            "unknown key was dropped"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_all_back_removes_zone_keys_when_none() {
+        let base = format!(
+            "{}\n[zones]\nrefresh = [0.1, 0.2, 0.15, 0.1]\n",
+            crate::config::DEFAULT_TOML
+        );
+        let path = temp_config("zone-removal", &base);
+        let mut cfg: Config = toml::from_str(crate::config::DEFAULT_TOML).unwrap();
+        cfg.zones.refresh = None;
+        write_all_back(&path, &cfg).expect("write_all_back");
+        let reloaded = Config::load(&path).expect("reload");
+        assert!(reloaded.zones.refresh.is_none(), "zone was not removed");
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !raw.contains("refresh = ["),
+            "zone key still present in raw text"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}
