@@ -354,19 +354,36 @@ fn draw_detection_status(ui: &mut egui::Ui, gui: &mut ShopGui, bot_active: bool)
 }
 
 fn draw_detection_matches(ui: &mut egui::Ui, gui: &ShopGui) {
-    // `no match` rows are silent on purpose — the overlay shows nothing
-    // when nothing is found, so a sidebar list of negatives is just noise.
+    // Pure "not on screen" rows stay silent — the overlay already shows
+    // nothing. But a colour-rejected near-miss IS surfaced: it's the one
+    // case where calibration looks like "nothing found" yet NCC actually
+    // matched, so the user needs the distance/colour numbers to tell a
+    // bad template apart from a colour-margin problem.
     let mut printed = 0;
     for m in &gui.debug_matches {
-        let Some(hit) = m.hit.as_ref() else { continue };
-        ui.horizontal(|ui| {
-            ui.colored_label(palette::OK, m.alias);
-            ui.colored_label(
-                palette::TEXT_MUTED,
-                format!("score {:.3} · margin {:.3}", hit.score, hit.margin),
-            );
-        });
-        printed += 1;
+        if let Some(hit) = m.hit.as_ref() {
+            ui.horizontal(|ui| {
+                ui.colored_label(palette::OK, m.alias);
+                ui.colored_label(
+                    palette::TEXT_MUTED,
+                    format!("score {:.3} · margin {:.3}", hit.score, hit.margin),
+                );
+            });
+            printed += 1;
+        } else if let Some(rej) = m.colour_reject.as_ref() {
+            ui.horizontal(|ui| {
+                ui.colored_label(palette::WARN, m.alias);
+                ui.colored_label(
+                    palette::TEXT_MUTED,
+                    format!(
+                        "colour reject · dist {:.3} · colour {:.0}%",
+                        rej.distance,
+                        rej.coloured_fraction * 100.0
+                    ),
+                );
+            });
+            printed += 1;
+        }
     }
     if printed == 0 && !gui.debug_matches.is_empty() {
         ui.colored_label(
