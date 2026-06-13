@@ -12,7 +12,7 @@ the shop, repeats — until a stop condition fires or you hit Stop.
 
 Windows only. No installer, no telemetry, no account credentials.
 
-![Run tab in the ready state](docs/screenshots/run-tab-ready.png)
+![E7 Shop Refresher mid-run on the Secret Shop](docs/screenshots/run-tab-active.png)
 
 ---
 
@@ -49,9 +49,6 @@ STOVE client without any setup.
 1. Open the Secret Shop in Epic Seven.
 2. Launch `e7-shop-refresher.exe`.
 3. Click **Start**.
-
-![Run tab during an active session — live counts and the actual-vs-expected
-acquisition chart](docs/screenshots/run-tab-active.png)
 
 While a run is active the Run tab shows live counts per item plus a luck
 ratio (`×2.47` = bought ÷ expected from the shop drop rates; `×1.00` is
