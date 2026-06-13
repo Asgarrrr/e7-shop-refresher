@@ -52,6 +52,11 @@ const LAYOUT_LABEL_W: f32 = 140.0;
 // grow unpredictably and break `add_space` alignment in `buy_click_row`.
 const LAYOUT_RECT_INPUT_W: f32 = 58.0;
 
+// Hover for click-zone rows. A zone smaller than its button just tightens
+// the random-click spread; one that overflows can land off-target.
+const ZONE_FIT_HINT: &str = "Keep the box inside the real button — smaller is fine, \
+     but if it spills past the edge a click can miss and the round fails.";
+
 fn draw_layout_card(ui: &mut egui::Ui, gui: &mut ShopGui) {
     ui.checkbox(
         &mut gui.show_layout_overlay,
@@ -73,7 +78,7 @@ fn draw_layout_card(ui: &mut egui::Ui, gui: &mut ShopGui) {
             for (name, label) in LAYOUT_REGIONS {
                 let bundled = bundled_rect(name);
                 if let Some(slot) = gui.region_mut(name) {
-                    rect_row(ui, label, name, bundled, slot);
+                    rect_row(ui, label, name, bundled, slot, "");
                 }
                 ui.end_row();
             }
@@ -89,7 +94,7 @@ fn draw_layout_card(ui: &mut egui::Ui, gui: &mut ShopGui) {
             for (name, label) in LAYOUT_ZONES {
                 let bundled = bundled_rect(name);
                 if let Some(slot) = gui.zone_mut(name) {
-                    rect_row(ui, label, name, bundled, slot);
+                    rect_row(ui, label, name, bundled, slot, ZONE_FIT_HINT);
                 }
                 ui.end_row();
             }
@@ -146,8 +151,12 @@ fn rect_row(
     name: &'static str,
     bundled: [f32; 4],
     slot: &mut Option<[f32; 4]>,
+    hover: &str,
 ) {
-    ui.label(label);
+    let lbl = ui.label(label);
+    if !hover.is_empty() {
+        lbl.on_hover_text(hover);
+    }
 
     // Promote to `Some(...)` only on actual edit — keeps the bundled
     // default in play until the user touches a field.
