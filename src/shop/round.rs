@@ -174,6 +174,11 @@ impl ShopRunner {
         if report.passed {
             return true;
         }
+        // A strong NCC hit whose patch is almost entirely saturated is the
+        // signature of a global screen tint (Night Light / ICC / HDR)
+        // rather than a genuine wrong-colour icon — flag it so the log
+        // points at the display, not the detector.
+        let likely_screen_tint = hit.score > 0.95 && report.coloured_fraction > 0.6;
         warn!(
             alias = alias_name,
             score = hit.score,
@@ -181,7 +186,10 @@ impl ShopRunner {
             y = hit.y,
             colour_distance = report.distance,
             coloured_fraction = report.coloured_fraction,
-            "NCC hit rejected by colour check — likely cross-colour false positive"
+            likely_screen_tint,
+            "NCC hit rejected by colour check — likely cross-colour false positive \
+             (if this fires on real items, suspect a screen colour cast such as \
+             Windows Night Light and raise matching.colour_match_threshold)"
         );
         false
     }

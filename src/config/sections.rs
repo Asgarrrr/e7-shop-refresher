@@ -211,10 +211,28 @@ pub struct MatchingConfig {
     /// NCC frequency only — the bot loop is not gated by this field.
     #[serde(default = "default_preview_refresh_ms")]
     pub preview_refresh_ms: u32,
+    /// Post-NCC hue-histogram ceiling on the distance to the claimed
+    /// icon reference. Raise if a warm screen cast (Night Light, ICC
+    /// profile, HDR) makes the check reject real items.
+    #[serde(default = "default_colour_match_threshold")]
+    pub colour_match_threshold: f32,
+    /// How far the claimed icon must beat the next-closest reference in
+    /// hue distance. Guards cross-colour false positives independently
+    /// of the absolute ceiling.
+    #[serde(default = "default_colour_match_margin")]
+    pub colour_match_margin: f32,
 }
 
 fn default_preview_refresh_ms() -> u32 {
     500
+}
+
+fn default_colour_match_threshold() -> f32 {
+    crate::color_check::DEFAULT_MATCH_THRESHOLD
+}
+
+fn default_colour_match_margin() -> f32 {
+    crate::color_check::DEFAULT_MATCH_MARGIN
 }
 
 impl Default for MatchingConfig {
@@ -226,6 +244,8 @@ impl Default for MatchingConfig {
             // collapses to 1.0 and 0.97/1.03 just burn NCC time.
             extra_scales: vec![1.0],
             preview_refresh_ms: default_preview_refresh_ms(),
+            colour_match_threshold: default_colour_match_threshold(),
+            colour_match_margin: default_colour_match_margin(),
         }
     }
 }

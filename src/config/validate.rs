@@ -104,6 +104,16 @@ fn validate_matching(m: &MatchingConfig) -> Result<()> {
             "matching.preview_refresh_ms must be in [100, 5000]".into(),
         ));
     }
+    if !(0.0 < m.colour_match_threshold && m.colour_match_threshold <= 1.0) {
+        return Err(Error::ConfigInvalid(
+            "matching.colour_match_threshold must be in (0, 1]".into(),
+        ));
+    }
+    if !(0.0 <= m.colour_match_margin && m.colour_match_margin < 1.0) {
+        return Err(Error::ConfigInvalid(
+            "matching.colour_match_margin must be in [0, 1)".into(),
+        ));
+    }
     Ok(())
 }
 

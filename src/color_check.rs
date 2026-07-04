@@ -25,9 +25,25 @@ const MIN_SATURATION: f32 = 0.25;
 /// Reference PNGs with masked corners, or live slot backgrounds.
 const MIN_ALPHA: u8 = 32;
 
-/// Same-icon variation typically 0.05–0.15, cross-colour > 0.4 — 0.30
-/// leaves a comfortable margin on both sides.
-const MATCH_THRESHOLD: f32 = 0.30;
+/// Absolute ceiling on the distance to the claimed reference. Kept
+/// generous because a global screen tint (Windows Night Light, an ICC
+/// profile, HDR) inflates *every* distance uniformly — same-icon
+/// variation is 0.05–0.15 untinted but climbs past 0.5 under a strong
+/// warm cast. The nearest-reference margin below does the real
+/// cross-colour discrimination; this only drops near-grayscale or
+/// wildly-off patches.
+pub(crate) const DEFAULT_MATCH_THRESHOLD: f32 = 0.60;
+
+/// The claimed reference must beat every other reference by at least
+/// this much. A uniform tint moves all distances together, so the
+/// *ranking* survives even when absolute values don't — this is what
+/// keeps a green bookmark from passing as an orange medal.
+pub(crate) const DEFAULT_MATCH_MARGIN: f32 = 0.05;
+
+/// 0.05 lets a small icon-on-dark-background through (icon contributes
+/// ~15-30% of the patch in practice) while still rejecting an empty
+/// grayscale region.
+const MIN_COLOURED_FRACTION: f32 = 0.05;
 
 const MYSTIC_MEDAL_PNG: &[u8] = include_bytes!("../assets/mystic_medal.png");
 const COVENANT_PNG: &[u8] = include_bytes!("../assets/covenant.png");
@@ -93,6 +109,8 @@ impl HueSig {
 /// single histogram + distance op (~50 µs on a 64×64 patch).
 pub struct ColorVerifier {
     refs: Vec<(&'static str, HueSig)>,
+    threshold: f32,
+    margin: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,10 +128,16 @@ impl Default for ColorVerifier {
 
 impl ColorVerifier {
     pub fn new() -> Self {
+        Self::with_thresholds(DEFAULT_MATCH_THRESHOLD, DEFAULT_MATCH_MARGIN)
+    }
+
+    pub fn with_thresholds(threshold: f32, margin: f32) -> Self {
         let mystic = decode_sig(MYSTIC_MEDAL_PNG);
         let covenant = decode_sig(COVENANT_PNG);
         Self {
             refs: vec![(alias::MYSTIC_MEDAL, mystic), (alias::COVENANT, covenant)],
+            threshold,
+            margin,
         }
     }
 
@@ -124,10 +148,18 @@ impl ColorVerifier {
         let reference = self.ref_for(alias)?;
         let sig = HueSig::from_rgba(patch);
         let distance = sig.distance(reference);
-        // 0.05 lets a small icon-on-dark-background through (icon
-        // contributes ~15-30% of the patch in practice) while still
-        // rejecting an empty grayscale region.
-        let passed = sig.coloured_fraction >= 0.05 && distance <= MATCH_THRESHOLD;
+        // Nearest competing reference. INFINITY when the claimed alias is
+        // the only one — the margin test then reduces to the ceiling.
+        let nearest_other = self
+            .refs
+            .iter()
+            .filter(|(n, _)| *n != alias)
+            .map(|(_, s)| sig.distance(s))
+            .fold(f32::INFINITY, f32::min);
+        let wins_by_margin = distance + self.margin <= nearest_other;
+        let passed = sig.coloured_fraction >= MIN_COLOURED_FRACTION
+            && distance <= self.threshold
+            && wins_by_margin;
         Some(ColourReport {
             passed,
             distance,
@@ -204,6 +236,41 @@ mod tests {
         // Pure orange patch — should NOT match the pink-ish covenant.
         let orange = solid(64, 64, [220, 130, 30, 255]);
         assert!(!v.accepts(alias::COVENANT, &orange));
+    }
+
+    /// Approximates a warm screen cast (Night Light / warm ICC profile):
+    /// boost red, crush blue, uniformly across the patch.
+    fn warm_tint(img: &RgbaImage) -> RgbaImage {
+        let mut out = img.clone();
+        for px in out.pixels_mut() {
+            let [r, g, b, a] = px.0;
+            let r = (r as f32 * 1.2).min(255.0) as u8;
+            let b = (b as f32 * 0.4) as u8;
+            px.0 = [r, g, b, a];
+        }
+        out
+    }
+
+    #[test]
+    fn warm_tint_still_accepts_real_medal() {
+        let v = ColorVerifier::new();
+        let mystic = image::load_from_memory(MYSTIC_MEDAL_PNG)
+            .unwrap()
+            .into_rgba8();
+        let tinted = warm_tint(&mystic);
+        let report = v.evaluate(alias::MYSTIC_MEDAL, &tinted).unwrap();
+        // The whole point: the tint pushes it past the old 0.30 absolute
+        // cut, yet the relative check still recognises it as the medal.
+        assert!(
+            report.distance > 0.30,
+            "tint should move distance past the old absolute threshold (got {})",
+            report.distance
+        );
+        assert!(
+            report.passed,
+            "relative check must still accept a tinted real medal (distance {}, fraction {})",
+            report.distance, report.coloured_fraction
+        );
     }
 
     #[test]

@@ -615,6 +615,8 @@ fn spawn_setup_preview(gui: &mut ShopGui, ctx: &egui::Context) {
         .regions
         .shop_grid
         .unwrap_or(crate::layout::SHOP_GRID);
+    let colour_threshold = gui.config.matching.colour_match_threshold;
+    let colour_margin = gui.config.matching.colour_match_margin;
 
     gui.setup_preview_in_flight = true;
     // Named so the thread shows up under a useful label in panic logs /
@@ -626,7 +628,15 @@ fn spawn_setup_preview(gui: &mut ShopGui, ctx: &egui::Context) {
         // sends *something* down the channel — otherwise `in_flight` would
         // never clear and auto-refresh would silently die.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_setup_preview(capture, detector, targets, shop_grid).map_err(|e| e.to_string())
+            run_setup_preview(
+                capture,
+                detector,
+                targets,
+                shop_grid,
+                colour_threshold,
+                colour_margin,
+            )
+            .map_err(|e| e.to_string())
         }))
         .unwrap_or_else(|payload| Err(panic_payload_message(payload)));
         if let Err(e) = &outcome {
@@ -659,9 +669,12 @@ fn run_setup_preview(
     detector: Arc<crate::detector::Detector>,
     targets: Vec<&'static str>,
     shop_grid: [f32; 4],
+    colour_threshold: f32,
+    colour_margin: f32,
 ) -> crate::error::Result<SetupPreviewResult> {
     let scan = crate::shop::scan_shop_raw(&*capture, &detector, &targets, shop_grid)?;
-    let colour_check = crate::color_check::ColorVerifier::new();
+    let colour_check =
+        crate::color_check::ColorVerifier::with_thresholds(colour_threshold, colour_margin);
 
     let matches = scan
         .hits

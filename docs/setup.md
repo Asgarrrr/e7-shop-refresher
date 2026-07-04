@@ -65,7 +65,11 @@ about equally (an ambiguous match the bot rejects). A blank list while
 an item is on screen means either the template is wrong or the **NCC
 threshold** is too high. The same hue-histogram check the bot uses runs
 here too, so an NCC hit on a wrong-coloured icon is dropped from the
-list rather than shown.
+list rather than shown. If a *correct* item is being dropped — the log
+shows `rejected by colour check` with `likely_screen_tint=true` — a
+global screen colour cast (Windows Night Light, an ICC/HDR profile) is
+shifting the hues; disable it or raise `matching.colour_match_threshold`
+toward 0.8.
 
 **Buy-click alignment.** The red **Buy reference** line and **Buy click**
 box are always drawn on the snapshot. Drag the line onto the centre of

@@ -99,7 +99,10 @@ impl ShopRunner {
         Self {
             capture,
             detector,
-            color_check: ColorVerifier::new(),
+            color_check: ColorVerifier::with_thresholds(
+                config.matching.colour_match_threshold,
+                config.matching.colour_match_margin,
+            ),
             clicker,
             config,
             live_shop,
