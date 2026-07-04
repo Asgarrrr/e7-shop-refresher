@@ -129,12 +129,7 @@ fn download_path_for(exe_name: &str) -> Result<PathBuf> {
     Ok(parent.join(format!("{exe_name}.new")))
 }
 
-fn verify_sha256(path: &Path, exe_name: &str, checksums_url: &str) -> Result<()> {
-    let body =
-        crate::http::get_text(checksums_url).map_err(|e| anyhow!("fetch SHA256SUMS: {e}"))?;
-    let expected = parse_expected_checksum(&body, exe_name)
-        .ok_or_else(|| anyhow!("{exe_name} not listed in SHA256SUMS"))?;
-
+fn file_sha256_hex(path: &Path) -> Result<String> {
     let mut file =
         File::open(path).map_err(|e| anyhow!("open {} for verify: {e}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -155,6 +150,16 @@ fn verify_sha256(path: &Path, exe_name: &str, checksums_url: &str) -> Result<()>
         use std::fmt::Write;
         let _ = write!(&mut actual, "{byte:02x}");
     }
+    Ok(actual)
+}
+
+fn verify_sha256(path: &Path, exe_name: &str, checksums_url: &str) -> Result<()> {
+    let body =
+        crate::http::get_text(checksums_url).map_err(|e| anyhow!("fetch SHA256SUMS: {e}"))?;
+    let expected = parse_expected_checksum(&body, exe_name)
+        .ok_or_else(|| anyhow!("{exe_name} not listed in SHA256SUMS"))?;
+
+    let actual = file_sha256_hex(path)?;
     if actual != expected {
         bail!("SHA256 mismatch: expected {expected}, got {actual}");
     }
@@ -181,17 +186,16 @@ fn parse_expected_checksum(body: &str, exe_name: &str) -> Option<String> {
     None
 }
 
-fn install_and_restart(downloaded: &Path) -> Result<()> {
-    let current = std::env::current_exe().map_err(|e| anyhow!("resolve current_exe: {e}"))?;
-    let bak = current.with_extension("exe.bak");
-
+/// The rename dance, separated from process spawn/exit so it can run
+/// under test against scratch files.
+fn swap_binaries(current: &Path, bak: &Path, downloaded: &Path) -> Result<()> {
     // Leftover .bak deletes freely once the previous process exited.
-    let _ = std::fs::remove_file(&bak);
+    let _ = std::fs::remove_file(bak);
 
     // Renaming a running .exe is allowed on Windows — once renamed,
     // the original path is free even though the old file is still
     // locked under its new name.
-    std::fs::rename(&current, &bak).map_err(|e| {
+    std::fs::rename(current, bak).map_err(|e| {
         anyhow!(
             "rename current exe {} → {}: {e}",
             current.display(),
@@ -204,8 +208,8 @@ fn install_and_restart(downloaded: &Path) -> Result<()> {
     // lock racing both renames), surface that distinctly so the user
     // knows the install path is empty and they need to recover by
     // hand.
-    if let Err(e) = std::fs::rename(downloaded, &current) {
-        match std::fs::rename(&bak, &current) {
+    if let Err(e) = std::fs::rename(downloaded, current) {
+        match std::fs::rename(bak, current) {
             Ok(()) => bail!(
                 "move new exe → {}: {e} (rolled back from {})",
                 current.display(),
@@ -222,6 +226,13 @@ fn install_and_restart(downloaded: &Path) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn install_and_restart(downloaded: &Path) -> Result<()> {
+    let current = std::env::current_exe().map_err(|e| anyhow!("resolve current_exe: {e}"))?;
+    let bak = current.with_extension("exe.bak");
+    swap_binaries(&current, &bak, downloaded)?;
     info!(target = %current.display(), "new binary in place — spawning replacement");
 
     // Spawned child inherits our admin token (manifest requires it).
@@ -269,6 +280,84 @@ pub fn cleanup_previous_bak() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("e7-auto-update-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn file_sha256_hex_matches_known_vector() {
+        let dir = scratch_dir("sha256-abc");
+        let p = dir.join("input.bin");
+        std::fs::write(&p, b"abc").unwrap();
+        assert_eq!(
+            file_sha256_hex(&p).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_sha256_hex_of_empty_file() {
+        let dir = scratch_dir("sha256-empty");
+        let p = dir.join("empty.bin");
+        std::fs::write(&p, b"").unwrap();
+        assert_eq!(
+            file_sha256_hex(&p).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swap_binaries_moves_new_into_place_and_keeps_bak() {
+        let dir = scratch_dir("swap-happy");
+        let current = dir.join("current.exe");
+        let bak = current.with_extension("exe.bak");
+        let downloaded = dir.join("current.exe.new");
+        std::fs::write(&current, b"old").unwrap();
+        std::fs::write(&downloaded, b"new").unwrap();
+        assert!(swap_binaries(&current, &bak, &downloaded).is_ok());
+        assert_eq!(std::fs::read(&current).unwrap(), b"new");
+        assert_eq!(std::fs::read(&bak).unwrap(), b"old");
+        assert!(!downloaded.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swap_binaries_rolls_back_when_downloaded_is_missing() {
+        let dir = scratch_dir("swap-rollback");
+        let current = dir.join("current.exe");
+        let bak = current.with_extension("exe.bak");
+        let downloaded = dir.join("current.exe.new"); // not created
+        std::fs::write(&current, b"old").unwrap();
+        let result = swap_binaries(&current, &bak, &downloaded);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("rolled back"), "error was: {msg}");
+        assert_eq!(std::fs::read(&current).unwrap(), b"old");
+        assert!(!bak.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swap_binaries_overwrites_stale_bak() {
+        let dir = scratch_dir("swap-stale-bak");
+        let current = dir.join("current.exe");
+        let bak = current.with_extension("exe.bak");
+        let downloaded = dir.join("current.exe.new");
+        std::fs::write(&bak, b"stale").unwrap();
+        std::fs::write(&current, b"old").unwrap();
+        std::fs::write(&downloaded, b"new").unwrap();
+        assert!(swap_binaries(&current, &bak, &downloaded).is_ok());
+        assert_eq!(std::fs::read(&current).unwrap(), b"new");
+        assert_eq!(std::fs::read(&bak).unwrap(), b"old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn release_target_constructs_release_urls_from_tag() {

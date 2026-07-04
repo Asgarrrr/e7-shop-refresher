@@ -103,6 +103,15 @@ extra_scales = [0.95, 1.0, 1.05]
 # capture + NCC frequency for the preview only — the bot loop is not
 # gated by this. Lower = more responsive zone drag, higher CPU.
 preview_refresh_ms = 500
+# Post-NCC hue check. `colour_match_threshold` is the absolute ceiling on
+# the hue distance to the claimed icon; `colour_match_margin` is how far
+# that icon must beat the next-closest reference. A warm screen cast
+# (Windows Night Light, an ICC/HDR profile) inflates every distance —
+# if real items get rejected with "likely cross-colour false positive"
+# in the log, raise the threshold toward 0.8. The margin keeps the
+# cross-colour guard intact regardless.
+colour_match_threshold = 0.60
+colour_match_margin    = 0.05
 
 [templates]
 # Override directory for the bundled item templates. Leave the defaults

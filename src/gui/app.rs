@@ -49,6 +49,10 @@ pub(super) struct DebugMatch {
     pub alias: &'static str,
     pub hit: Option<Hit>,
     pub tpl_size: Option<(u32, u32)>,
+    /// Set only when NCC matched this alias but the colour check rejected
+    /// the hit — lets the Setup list explain the near-miss instead of
+    /// showing the same silence as "not on screen".
+    pub colour_reject: Option<crate::color_check::ColourReport>,
 }
 
 /// Output of one background capture + NCC pass driven by the Setup-tab

@@ -6,6 +6,8 @@ use egui_phosphor::regular as icon;
 use image::RgbaImage;
 use tracing::{info, warn};
 
+use crate::color_check::ColourReport;
+use crate::detector::Hit;
 use crate::gui::app::{
     BuyDragHandle, DebugMatch, DragRect, SetupPreviewResult, ShopGui, Tab, palette,
 };
@@ -613,6 +615,8 @@ fn spawn_setup_preview(gui: &mut ShopGui, ctx: &egui::Context) {
         .regions
         .shop_grid
         .unwrap_or(crate::layout::SHOP_GRID);
+    let colour_threshold = gui.config.matching.colour_match_threshold;
+    let colour_margin = gui.config.matching.colour_match_margin;
 
     gui.setup_preview_in_flight = true;
     // Named so the thread shows up under a useful label in panic logs /
@@ -624,7 +628,15 @@ fn spawn_setup_preview(gui: &mut ShopGui, ctx: &egui::Context) {
         // sends *something* down the channel — otherwise `in_flight` would
         // never clear and auto-refresh would silently die.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_setup_preview(capture, detector, targets, shop_grid).map_err(|e| e.to_string())
+            run_setup_preview(
+                capture,
+                detector,
+                targets,
+                shop_grid,
+                colour_threshold,
+                colour_margin,
+            )
+            .map_err(|e| e.to_string())
         }))
         .unwrap_or_else(|payload| Err(panic_payload_message(payload)));
         if let Err(e) = &outcome {
@@ -657,27 +669,26 @@ fn run_setup_preview(
     detector: Arc<crate::detector::Detector>,
     targets: Vec<&'static str>,
     shop_grid: [f32; 4],
+    colour_threshold: f32,
+    colour_margin: f32,
 ) -> crate::error::Result<SetupPreviewResult> {
     let scan = crate::shop::scan_shop_raw(&*capture, &detector, &targets, shop_grid)?;
-    let colour_check = crate::color_check::ColorVerifier::new();
+    let colour_check =
+        crate::color_check::ColorVerifier::with_thresholds(colour_threshold, colour_margin);
 
     let matches = scan
         .hits
         .into_iter()
-        .map(|(alias, mut hit)| {
-            // Drop NCC hits the runner would reject so the overlay
-            // reflects what the bot would actually act on.
-            if let Some(h) = hit.as_ref()
-                && let Some(report) =
-                    colour_check.evaluate(alias, &crate::shop::crop_icon_patch(&scan.rgba, h))
-                && !report.passed
-            {
-                hit = None;
-            }
+        .map(|(alias, hit)| {
+            let report = hit.as_ref().and_then(|h| {
+                colour_check.evaluate(alias, &crate::shop::crop_icon_patch(&scan.rgba, h))
+            });
+            let (hit, colour_reject) = resolve_colour_verdict(hit, report);
             DebugMatch {
                 alias,
                 hit,
                 tpl_size: detector.template_dimensions(alias),
+                colour_reject,
             }
         })
         .collect();
@@ -686,6 +697,21 @@ fn run_setup_preview(
         rgba: Arc::new(scan.rgba),
         matches,
     })
+}
+
+/// Splits an NCC hit and its colour-check report into the hit the bot
+/// would act on and the rejection to surface. A colour-rejected hit is
+/// dropped from `hit` so the overlay keeps drawing only acted-on matches,
+/// and its report is returned separately so the Setup list can explain
+/// the near-miss rather than fall silent.
+fn resolve_colour_verdict(
+    hit: Option<Hit>,
+    report: Option<ColourReport>,
+) -> (Option<Hit>, Option<ColourReport>) {
+    match (hit, report) {
+        (Some(_), Some(r)) if !r.passed => (None, Some(r)),
+        (hit, _) => (hit, None),
+    }
 }
 
 pub(super) fn draw_compact_stepper(ui: &mut egui::Ui, gui: &ShopGui) {
@@ -744,4 +770,62 @@ fn stepper_separator(ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.colored_label(palette::TEXT_MUTED, "·");
     ui.add_space(4.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit() -> Hit {
+        Hit {
+            x: 10,
+            y: 20,
+            score: 0.9,
+            scale: 1.0,
+            margin: 0.2,
+        }
+    }
+
+    fn report(passed: bool) -> ColourReport {
+        ColourReport {
+            passed,
+            distance: 0.42,
+            coloured_fraction: 0.18,
+        }
+    }
+
+    #[test]
+    fn passing_colour_keeps_the_hit_and_reports_no_rejection() {
+        let (kept, reject) = resolve_colour_verdict(Some(hit()), Some(report(true)));
+        assert!(kept.is_some());
+        assert!(reject.is_none());
+    }
+
+    #[test]
+    fn failing_colour_drops_the_hit_and_surfaces_the_report() {
+        let (kept, reject) = resolve_colour_verdict(Some(hit()), Some(report(false)));
+        assert!(
+            kept.is_none(),
+            "overlay must not draw a colour-rejected hit"
+        );
+        let reject = reject.expect("the rejection report must be surfaced");
+        assert!(!reject.passed);
+        assert_eq!(reject.distance, 0.42);
+    }
+
+    #[test]
+    fn no_ncc_hit_yields_no_hit_and_no_rejection() {
+        let (kept, reject) = resolve_colour_verdict(None, None);
+        assert!(kept.is_none());
+        assert!(reject.is_none());
+    }
+
+    #[test]
+    fn hit_without_a_report_passes_through_unrejected() {
+        // Unknown alias → ColorVerifier::evaluate returns None; the hit
+        // must survive (the colour filter is a no-op there).
+        let (kept, reject) = resolve_colour_verdict(Some(hit()), None);
+        assert!(kept.is_some());
+        assert!(reject.is_none());
+    }
 }
