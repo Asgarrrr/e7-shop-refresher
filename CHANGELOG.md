@@ -6,6 +6,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-07-06
+
+### Fixed
+
+- Colour check no longer rejects genuine items when a global screen tint
+  (Windows Night Light, an ICC/HDR profile) shifts every hue at once. An
+  NCC hit still matched at 0.95+, but the tint pushed the hue distance
+  past the fixed cut, dropping real mystic-medal buys. The gate now pairs
+  an absolute ceiling with a nearest-reference margin: a uniform tint
+  inflates all distances together so the ranking survives, while a
+  wrong-colour icon is still rejected.
+
+### Added
+
+- `matching.colour_match_threshold` and `matching.colour_match_margin`
+  to tune the colour check for an unusual display. The reject log now
+  flags `likely_screen_tint` when a screen colour cast is the probable
+  cause rather than a real cross-colour false positive.
+
 ## [0.7.1] — 2026-06-13
 
 ### Added
