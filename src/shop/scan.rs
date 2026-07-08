@@ -32,7 +32,6 @@ pub(crate) fn scan_shop_rows(
     colors: &ColorVerifier,
     targets: &[&'static str],
     buy_column: [f32; 4],
-    icon_column: [f32; 4],
     icon_y_offset_ratio: f32,
 ) -> Result<Vec<ShopRow>> {
     let rgba = capture.snapshot_rgba()?;
@@ -48,7 +47,7 @@ pub(crate) fn scan_shop_rows(
     let rows = anchors
         .into_iter()
         .map(|anchor| {
-            let cell = icon_cell_for(anchor.y, icon_column, icon_y_offset_ratio, frame_h);
+            let cell = icon_cell_for(anchor.y, icon_y_offset_ratio, frame_h);
             let cell_ctx = detector.prepare_search(&gray, Some(cell));
             // NCC inside the cell first (one candidate position, cheap),
             // then the hue check on a patch centred on the hit — NOT on
@@ -83,19 +82,19 @@ pub(crate) fn scan_shop_rows(
     Ok(rows)
 }
 
-/// Icon-cell rect for the row anchored at `anchor_y_px`: the icon
-/// column's X band, centred `icon_y_offset_ratio` above the buy button
-/// (`layout::ROW_ICON_Y_OFFSET` at runtime — pure row geometry).
-fn icon_cell_for(
-    anchor_y_px: i32,
-    icon_column: [f32; 4],
-    icon_y_offset_ratio: f32,
-    frame_h: f32,
-) -> [f32; 4] {
+/// Icon-cell rect for the row anchored at `anchor_y_px`: the bundled
+/// icon-column X band, centred `icon_y_offset_ratio` above the buy
+/// button (`layout::ROW_ICON_Y_OFFSET` at runtime — pure row geometry).
+fn icon_cell_for(anchor_y_px: i32, icon_y_offset_ratio: f32, frame_h: f32) -> [f32; 4] {
     let center_y = anchor_y_px as f32 / frame_h.max(1.0) - icon_y_offset_ratio;
     let y0 = (center_y - ICON_CELL_H_RATIO / 2.0).clamp(0.0, 1.0);
     let h = ICON_CELL_H_RATIO.min(1.0 - y0);
-    [icon_column[0], y0, icon_column[2], h]
+    [
+        crate::layout::ICON_COLUMN_X,
+        y0,
+        crate::layout::ICON_COLUMN_W,
+        h,
+    ]
 }
 
 pub(super) fn crop_ratio_rect(rgba: &RgbaImage, [x, y, w, h]: [f32; 4]) -> RgbaImage {
@@ -230,11 +229,14 @@ mod tests {
             );
         };
         // Three rows anchored in the buy column: mystic, covenant, and
-        // one with an empty icon cell.
+        // one with an empty icon cell. Icons sit at the centre of the
+        // bundled icon column band.
+        let icon_cx =
+            ((crate::layout::ICON_COLUMN_X + crate::layout::ICON_COLUMN_W / 2.0) * w as f32) as i64;
         for (row_y, icon) in [(300i64, Some(&mystic)), (500, Some(&covenant)), (650, None)] {
             paste(&mut scene, &button, 875, row_y);
             if let Some(icon) = icon {
-                paste(&mut scene, icon, 500, row_y - dy);
+                paste(&mut scene, icon, icon_cx, row_y - dy);
             }
         }
 
@@ -262,7 +264,6 @@ mod tests {
             &ColorVerifier::new(),
             &[alias::MYSTIC_MEDAL, alias::COVENANT],
             [0.8, 0.0, 0.15, 1.0],
-            [0.4, 0.0, 0.2, 1.0],
             offset_ratio,
         )
         .unwrap();
@@ -277,11 +278,11 @@ mod tests {
 
     #[test]
     fn icon_cell_sits_above_the_anchor_by_the_offset() {
-        let cell = icon_cell_for(500, [0.4, 0.0, 0.2, 1.0], 0.045, 1000.0);
+        let cell = icon_cell_for(500, 0.045, 1000.0);
         // Cell centre = 0.5 - 0.045 = 0.455.
         assert!((cell[1] + cell[3] / 2.0 - 0.455).abs() < 1e-3);
-        assert_eq!(cell[0], 0.4);
-        assert_eq!(cell[2], 0.2);
+        assert_eq!(cell[0], crate::layout::ICON_COLUMN_X);
+        assert_eq!(cell[2], crate::layout::ICON_COLUMN_W);
     }
 
     fn solid_gray(w: u32, h: u32, value: u8) -> GrayImage {

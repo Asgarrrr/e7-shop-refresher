@@ -47,16 +47,25 @@ pub const BUY_MODAL_ICON: RectRatio = [0.245, 0.42, 0.08, 0.145];
 pub const BUY_COLUMN_X: f32 = 0.83;
 pub const BUY_COLUMN_W: f32 = 0.142;
 
-/// Vertical column inside which item icons stack — NCC search region
-/// for `mystic_medal` / `covenant`. The runner restricts `Detector::find`
-/// to this rect so item icons that appear elsewhere on screen (event
-/// popups, inventory floats, sidebar quests) can't false-match.
+/// Item-list column used for the modal-dim luminance checks, the
+/// reroll / scroll-bottom hashes, and the Setup-tab preview search.
+/// Row-cell classification uses `ICON_COLUMN_X/W` instead.
 pub const SHOP_GRID: RectRatio = [0.425, 0.085, 0.09, 0.915];
 
 /// Row geometry: window-height fraction between a row's buy-button
 /// centre and its item-icon centre (icon sits slightly higher).
 /// Measured 0.019–0.026 across rows on live captures.
 pub const ROW_ICON_Y_OFFSET: f32 = 0.023;
+
+/// X band of the item-icon column for row-cell classification: the
+/// bundled grid column widened by ~2% of width per side. Deliberately
+/// NOT the user-calibratable `regions.shop_grid` — legacy overrides
+/// (drawn when that region was only a reroll-hash zone) would move the
+/// search off the icons entirely. Icon centres measured at 0.45–0.46
+/// of width across two window aspect ratios; this band holds both with
+/// margin.
+pub const ICON_COLUMN_X: f32 = 0.405;
+pub const ICON_COLUMN_W: f32 = 0.13;
 
 /// Tag for the GUI overlay: do we look here (NCC search) or click here
 /// (mouse target)? Drives the colour split on the debug overlay.

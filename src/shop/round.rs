@@ -101,7 +101,6 @@ impl ShopRunner {
                 &self.color_check,
                 &pending,
                 self.buy_column(),
-                self.shop_grid(),
                 layout::ROW_ICON_Y_OFFSET,
             )?;
             debug!(
