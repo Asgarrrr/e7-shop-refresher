@@ -16,6 +16,9 @@ use crate::error::{Error, Result};
 pub mod alias {
     pub const MYSTIC_MEDAL: &str = "mystic_medal";
     pub const COVENANT: &str = "covenant";
+    /// Row anchor: the locale-independent "1/1" segment of the green
+    /// buy pill. One match per visible shop row.
+    pub const BUY_BUTTON: &str = "buy_button";
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +60,10 @@ const COARSE_THRESHOLD_RATIO: f32 = 0.70;
 /// templates scale against this rather than `config.window.base_resolution`
 /// — that field tracks the user's OWN crops (if any), not ours.
 const BUNDLED_TEMPLATE_NATIVE_HEIGHT: u32 = 837;
+
+/// The buy-button anchor was cropped from a different capture than the
+/// icon templates — it carries its own native height.
+const BUY_BUTTON_NATIVE_HEIGHT: u32 = 778;
 
 struct ScaledTemplate {
     image: GrayImage,
@@ -101,18 +108,34 @@ impl Detector {
         let dir = config.template_dir();
         let t = &config.templates;
         // Bundled fallbacks let a fresh install with no `templates/`
-        // dir still classify correctly.
+        // dir still classify correctly. Each carries the window height
+        // its crop was taken at — see *_NATIVE_HEIGHT.
         let entries = [
-            (alias::MYSTIC_MEDAL, &t.mystic_medal, MYSTIC_MEDAL_FALLBACK),
-            (alias::COVENANT, &t.covenant, COVENANT_FALLBACK),
+            (
+                alias::MYSTIC_MEDAL,
+                &t.mystic_medal,
+                MYSTIC_MEDAL_FALLBACK,
+                BUNDLED_TEMPLATE_NATIVE_HEIGHT,
+            ),
+            (
+                alias::COVENANT,
+                &t.covenant,
+                COVENANT_FALLBACK,
+                BUNDLED_TEMPLATE_NATIVE_HEIGHT,
+            ),
+            (
+                alias::BUY_BUTTON,
+                &t.buy_button,
+                BUY_BUTTON_FALLBACK,
+                BUY_BUTTON_NATIVE_HEIGHT,
+            ),
         ];
 
-        // Bundled fallbacks scale against their own crop height, not
-        // the user's base_resolution — see BUNDLED_TEMPLATE_NATIVE_HEIGHT.
-        let bundled_scale = current_size.1 as f32 / BUNDLED_TEMPLATE_NATIVE_HEIGHT.max(1) as f32;
-
         let mut templates = HashMap::with_capacity(entries.len());
-        for (alias_name, file, fallback) in entries {
+        for (alias_name, file, fallback, native_height) in entries {
+            // Bundled fallbacks scale against their own crop height, not
+            // the user's base_resolution — that tracks the user's crops.
+            let bundled_scale = current_size.1 as f32 / native_height.max(1) as f32;
             let path = dir.join(file);
             let scaled = load_scaled_or_fallback(
                 &path,
@@ -156,7 +179,9 @@ impl Detector {
         }
     }
 
-    /// Native-scale `(w, h)`.
+    /// `(w, h)` of the closest-to-native scaled variant — i.e. already
+    /// resampled for the current window size, NOT the crop's native
+    /// dimensions. Callers must not multiply by a hit's scale again.
     pub fn template_dimensions(&self, alias: &str) -> Option<(u32, u32)> {
         let templates = self.templates.get(alias)?;
         let first = templates.first()?;
@@ -299,10 +324,116 @@ impl Detector {
 
         Ok(best)
     }
+
+    /// Every above-threshold peak, not just the best — one hit per
+    /// repeated on-screen element (row anchors). Full-res NCC over the
+    /// whole search area: callers pass a small ROI (the buy column), so
+    /// the pyramid short-cut isn't worth its peak-merging risk here.
+    /// Peaks within a template-size box of a stronger peak are
+    /// suppressed; edge-touching hits are dropped as partial rows.
+    pub fn find_all_in(&self, ctx: &SearchContext<'_>, alias: &str) -> Result<Vec<Hit>> {
+        let templates = self
+            .templates
+            .get(alias)
+            .ok_or_else(|| Error::UnknownTemplate(alias.into()))?;
+
+        let search_ref: &GrayImage = &ctx.search;
+        let mut best: Vec<Hit> = Vec::new();
+        let mut best_top = f32::NEG_INFINITY;
+        for tpl in templates {
+            if tpl.image.width() >= search_ref.width() || tpl.image.height() >= search_ref.height()
+            {
+                trace!(
+                    alias,
+                    scale = tpl.scale,
+                    "template too large for search area"
+                );
+                continue;
+            }
+
+            let scores = match_template_parallel(
+                search_ref,
+                &tpl.image,
+                MatchTemplateMethod::CrossCorrelationNormalized,
+            );
+            let peaks = collect_peaks(&scores, tpl.image.dimensions(), self.threshold);
+
+            // Edge filter BEFORE picking the top score: a partial-row
+            // peak at the ROI edge must neither win the scale contest
+            // nor trigger the early-out for a scale it was dropped from.
+            let hits: Vec<Hit> = peaks
+                .into_iter()
+                .filter(|&(x, y, _)| {
+                    !hit_touches_edge((x, y), tpl.image.dimensions(), search_ref.dimensions())
+                })
+                .map(|(x, y, score)| Hit {
+                    x: ctx.ox + x as i32 + (tpl.image.width() / 2) as i32,
+                    y: ctx.oy + y as i32 + (tpl.image.height() / 2) as i32,
+                    score,
+                    scale: tpl.scale,
+                    // Unambiguous by construction — repeated elements
+                    // legitimately have same-scoring siblings.
+                    margin: f32::INFINITY,
+                })
+                .collect();
+
+            let top = hits
+                .iter()
+                .map(|h| h.score)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if top <= best_top {
+                continue;
+            }
+            best_top = top;
+            best = hits;
+
+            // Comfortable top hit → skip the remaining scales.
+            if best_top >= (self.threshold + 0.05).min(1.0) {
+                break;
+            }
+        }
+
+        best.sort_by_key(|h| h.y);
+        if !best.is_empty() {
+            trace!(alias, count = best.len(), top = best_top, "anchor hits");
+        }
+        Ok(best)
+    }
+}
+
+/// Greedy non-maximum suppression: strongest peak first, then every
+/// remaining candidate outside a template-sized box of an accepted
+/// peak. Per-axis separation — a square of min(w, h) would let a
+/// second peak survive along the long axis of a wide template.
+/// Returned strongest-first.
+fn collect_peaks(
+    scores: &Image<Luma<f32>>,
+    (sep_x, sep_y): (u32, u32),
+    threshold: f32,
+) -> Vec<(u32, u32, f32)> {
+    let mut cands: Vec<(u32, u32, f32)> = scores
+        .enumerate_pixels()
+        .filter(|(_, _, p)| p[0] >= threshold)
+        .map(|(x, y, p)| (x, y, p[0]))
+        .collect();
+    cands.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let (sep_x, sep_y) = (sep_x as i32, sep_y as i32);
+    let mut kept: Vec<(u32, u32, f32)> = Vec::new();
+    for (x, y, v) in cands {
+        let suppressed = kept.iter().any(|&(kx, ky, _)| {
+            (x as i32 - kx as i32).abs() < sep_x && (y as i32 - ky as i32).abs() < sep_y
+        });
+        if !suppressed {
+            kept.push((x, y, v));
+        }
+    }
+    kept
 }
 
 const MYSTIC_MEDAL_FALLBACK: &[u8] = include_bytes!("../assets/mystic_medal.png");
 const COVENANT_FALLBACK: &[u8] = include_bytes!("../assets/covenant.png");
+const BUY_BUTTON_FALLBACK: &[u8] = include_bytes!("../assets/buy_button.png");
 
 fn load_scaled_or_fallback(
     path: &Path,
@@ -506,6 +637,76 @@ mod tests {
         assert_eq!(ox, 20);
         assert_eq!(oy, 30);
         assert_eq!(owned.dimensions(), (50, 40));
+    }
+
+    #[test]
+    fn collect_peaks_keeps_separated_peaks_strongest_first() {
+        let scores = make_scores(50, 50, &[(10, 10, 0.92), (10, 40, 0.97), (40, 25, 0.91)]);
+        let peaks = collect_peaks(&scores, (8, 8), 0.9);
+        assert_eq!(peaks.len(), 3);
+        assert_eq!(peaks[0], (10, 40, 0.97));
+    }
+
+    #[test]
+    fn collect_peaks_suppresses_neighbours_of_a_stronger_peak() {
+        let scores = make_scores(50, 50, &[(10, 10, 0.95), (12, 13, 0.92), (10, 40, 0.91)]);
+        let peaks = collect_peaks(&scores, (8, 8), 0.9);
+        assert_eq!(peaks.len(), 2, "the 0.92 sibling sits inside the box");
+    }
+
+    #[test]
+    fn collect_peaks_separation_is_per_axis_for_wide_templates() {
+        // Wide template (sep 40×10): a peak 20 px to the right on the
+        // same row is a duplicate on the same element — suppressed —
+        // while a peak 20 px below is a different row — kept.
+        let scores = make_scores(80, 80, &[(10, 10, 0.95), (30, 10, 0.93), (10, 30, 0.92)]);
+        let peaks = collect_peaks(&scores, (40, 10), 0.9);
+        assert_eq!(peaks.len(), 2);
+        assert!(peaks.iter().any(|&(x, y, _)| (x, y) == (10, 30)));
+    }
+
+    #[test]
+    fn collect_peaks_drops_below_threshold() {
+        let scores = make_scores(50, 50, &[(10, 10, 0.85)]);
+        assert!(collect_peaks(&scores, (8, 8), 0.9).is_empty());
+    }
+
+    fn paste(dst: &mut GrayImage, src: &GrayImage, ox: u32, oy: u32) {
+        for (x, y, p) in src.enumerate_pixels() {
+            dst.put_pixel(ox + x, oy + y, *p);
+        }
+    }
+
+    #[test]
+    fn find_all_in_returns_one_hit_per_repeated_element_sorted_by_y() {
+        // Distinctive 8×8 checker template pasted twice in a flat frame.
+        let mut tpl = GrayImage::new(8, 8);
+        for (x, y, p) in tpl.enumerate_pixels_mut() {
+            p.0 = [if (x / 2 + y / 2) % 2 == 0 { 20 } else { 230 }];
+        }
+        let mut frame = GrayImage::from_pixel(100, 200, Luma([128]));
+        paste(&mut frame, &tpl, 30, 130);
+        paste(&mut frame, &tpl, 30, 40);
+
+        let det = Detector::from_test_images(std::collections::HashMap::from([("anchor", tpl)]));
+        let ctx = det.prepare_search(&frame, None);
+        let hits = det.find_all_in(&ctx, "anchor").unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].y < hits[1].y, "hits must come back top-to-bottom");
+        assert_eq!((hits[0].x, hits[0].y), (34, 44));
+        assert_eq!((hits[1].x, hits[1].y), (34, 134));
+    }
+
+    #[test]
+    fn find_all_in_returns_empty_when_nothing_matches() {
+        let mut tpl = GrayImage::new(8, 8);
+        for (x, y, p) in tpl.enumerate_pixels_mut() {
+            p.0 = [if (x / 2 + y / 2) % 2 == 0 { 20 } else { 230 }];
+        }
+        let frame = GrayImage::from_pixel(100, 200, Luma([128]));
+        let det = Detector::from_test_images(std::collections::HashMap::from([("anchor", tpl)]));
+        let ctx = det.prepare_search(&frame, None);
+        assert!(det.find_all_in(&ctx, "anchor").unwrap().is_empty());
     }
 
     #[test]

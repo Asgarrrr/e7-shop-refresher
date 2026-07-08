@@ -1,7 +1,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
-use image::GrayImage;
+use image::{GrayImage, RgbaImage};
 
 use crate::capture::{Capture, WindowRect};
 use crate::config::Config;
@@ -15,15 +15,24 @@ use super::ShopRunner;
 /// reattach / graceful exit.
 pub(super) struct FakeCapture {
     frames: StdMutex<Vec<GrayImage>>,
+    /// Override queue for `snapshot_rgba`. Empty → synthesize from the
+    /// gray queue like the trait default would.
+    rgba_frames: StdMutex<Vec<RgbaImage>>,
     rect: WindowRect,
 }
 
 impl FakeCapture {
     pub fn new(frames: Vec<GrayImage>, rect: WindowRect) -> Self {
+        Self::with_rgba(frames, vec![], rect)
+    }
+
+    pub fn with_rgba(frames: Vec<GrayImage>, rgba: Vec<RgbaImage>, rect: WindowRect) -> Self {
         // Reversed so pop() returns frames in caller-supplied order.
         let frames: Vec<_> = frames.into_iter().rev().collect();
+        let rgba: Vec<_> = rgba.into_iter().rev().collect();
         Self {
             frames: StdMutex::new(frames),
+            rgba_frames: StdMutex::new(rgba),
             rect,
         }
     }
@@ -36,6 +45,18 @@ impl Capture for FakeCapture {
             .expect("frames mutex poisoned")
             .pop()
             .ok_or(Error::WindowGone)
+    }
+    fn snapshot_rgba(&self) -> Result<RgbaImage> {
+        if let Some(f) = self.rgba_frames.lock().expect("rgba mutex poisoned").pop() {
+            return Ok(f);
+        }
+        let gray = self.snapshot_gray()?;
+        let mut rgba = RgbaImage::new(gray.width(), gray.height());
+        for (x, y, p) in gray.enumerate_pixels() {
+            let v = p[0];
+            rgba.put_pixel(x, y, image::Rgba([v, v, v, 255]));
+        }
+        Ok(rgba)
     }
     fn rect(&self) -> Result<WindowRect> {
         Ok(self.rect)

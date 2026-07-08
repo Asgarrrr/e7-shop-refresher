@@ -15,9 +15,6 @@ pub(super) struct AutoSavedFields {
     pub stop_when_gold_spent: u32,
     pub buy_mystic_medals: bool,
     pub buy_covenant: bool,
-    pub buy_button_y_offset_ratio: f32,
-    pub buy_button_band_h_ratio: f32,
-    pub buy_calibration_line_y_ratio: f32,
     pub threshold: f32,
     pub preview_refresh_ms: u32,
     pub sleep_when_done: bool,
@@ -44,8 +41,6 @@ pub(super) struct AutoSavedFields {
     pub long_pause_min_ms: u64,
     pub long_pause_max_ms: u64,
     pub scroll_amount: i32,
-    pub scroll_pause_ms: u64,
-    pub modal_open_pause_ms: u64,
     pub cooperative_idle_ms: u64,
     pub discord_webhook_url: String,
 }
@@ -61,9 +56,6 @@ impl AutoSavedFields {
             stop_when_gold_spent: cfg.shop.stop_when_gold_spent,
             buy_mystic_medals: cfg.shop.buy_mystic_medals,
             buy_covenant: cfg.shop.buy_covenant,
-            buy_button_y_offset_ratio: cfg.shop.buy_button_y_offset_ratio,
-            buy_button_band_h_ratio: cfg.shop.buy_button_band_h_ratio,
-            buy_calibration_line_y_ratio: cfg.shop.buy_calibration_line_y_ratio,
             threshold: cfg.matching.threshold,
             preview_refresh_ms: cfg.matching.preview_refresh_ms,
             sleep_when_done: cfg.shop.sleep_when_done,
@@ -90,8 +82,6 @@ impl AutoSavedFields {
             long_pause_min_ms: cfg.timing.long_pause_min_ms,
             long_pause_max_ms: cfg.timing.long_pause_max_ms,
             scroll_amount: cfg.timing.scroll_amount,
-            scroll_pause_ms: cfg.timing.scroll_pause_ms,
-            modal_open_pause_ms: cfg.timing.modal_open_pause_ms,
             cooperative_idle_ms: cfg.timing.cooperative_idle_ms,
             discord_webhook_url: cfg.notifications.discord_webhook_url.clone(),
         }
@@ -147,24 +137,6 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
         config.shop.buy_mystic_medals,
     );
     set_scalar(&mut doc, "shop", "buy_covenant", config.shop.buy_covenant);
-    set_scalar(
-        &mut doc,
-        "shop",
-        "buy_button_y_offset_ratio",
-        rounded3(f64::from(config.shop.buy_button_y_offset_ratio)),
-    );
-    set_scalar(
-        &mut doc,
-        "shop",
-        "buy_button_band_h_ratio",
-        rounded3(f64::from(config.shop.buy_button_band_h_ratio)),
-    );
-    set_scalar(
-        &mut doc,
-        "shop",
-        "buy_calibration_line_y_ratio",
-        rounded3(f64::from(config.shop.buy_calibration_line_y_ratio)),
-    );
     set_scalar(
         &mut doc,
         "shop",
@@ -294,18 +266,6 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
         "timing",
         "scroll_amount",
         i64::from(config.timing.scroll_amount),
-    );
-    set_scalar(
-        &mut doc,
-        "timing",
-        "scroll_pause_ms",
-        i64::try_from(config.timing.scroll_pause_ms).unwrap_or(i64::MAX),
-    );
-    set_scalar(
-        &mut doc,
-        "timing",
-        "modal_open_pause_ms",
-        i64::try_from(config.timing.modal_open_pause_ms).unwrap_or(i64::MAX),
     );
     set_scalar(
         &mut doc,
@@ -463,9 +423,6 @@ mod tests {
         cfg.shop.stop_when_gold_spent = 500_000;
         cfg.shop.buy_mystic_medals = false;
         cfg.shop.buy_covenant = false;
-        cfg.shop.buy_button_y_offset_ratio = 0.11;
-        cfg.shop.buy_button_band_h_ratio = 0.05;
-        cfg.shop.buy_calibration_line_y_ratio = 0.4;
         cfg.shop.sleep_when_done = true;
         cfg.matching.threshold = 0.88;
         cfg.matching.preview_refresh_ms = 750;
@@ -492,8 +449,6 @@ mod tests {
         cfg.timing.long_pause_min_ms = 4000;
         cfg.timing.long_pause_max_ms = 11_000;
         cfg.timing.scroll_amount = 6;
-        cfg.timing.scroll_pause_ms = 300;
-        cfg.timing.modal_open_pause_ms = 240;
         cfg.timing.cooperative_idle_ms = 2000;
         cfg.notifications.discord_webhook_url =
             "https://discord.com/api/webhooks/1/round-trip-test".into();
@@ -533,9 +488,6 @@ mod tests {
             stop_when_gold_spent: _,
             buy_mystic_medals: _,
             buy_covenant: _,
-            buy_button_y_offset_ratio: _,
-            buy_button_band_h_ratio: _,
-            buy_calibration_line_y_ratio: _,
             threshold: _,
             preview_refresh_ms: _,
             sleep_when_done: _,
@@ -562,8 +514,6 @@ mod tests {
             long_pause_min_ms: _,
             long_pause_max_ms: _,
             scroll_amount: _,
-            scroll_pause_ms: _,
-            modal_open_pause_ms: _,
             cooperative_idle_ms: _,
             discord_webhook_url: _,
         } = AutoSavedFields::from_config(&non_default_config());

@@ -1,14 +1,106 @@
 use image::{GrayImage, RgbaImage};
 
 use crate::capture::Capture;
-use crate::detector::Detector;
+use crate::color_check::ColorVerifier;
+use crate::detector::{Detector, Hit, alias};
 use crate::error::Result;
 
-/// One capture + parallel NCC pass against `targets`. Single source of
-/// truth for "what's on screen in the shop right now" — used both by the
-/// bot loop and the Setup-tab live preview worker. The colour check is
-/// kept at the call site so the bot can `warn!` on rejections while the
-/// Setup preview drops them silently.
+/// One visible shop row, anchored on its buy button. `klass` is the
+/// icon-cell classification: `Some(alias)` only when an NCC match
+/// inside the cell AND the hue check on the matched patch agree;
+/// `None` = not a target (unknown item, grayed-out sold icon,
+/// ambiguous colour).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShopRow {
+    pub anchor: Hit,
+    pub klass: Option<&'static str>,
+}
+
+/// Height of one icon cell as a fraction of window height. Row pitch is
+/// ≈ 0.21, the icon ≈ 0.12 — 0.16 gives ± a few px of offset slack
+/// without reaching the neighbouring row's icon.
+const ICON_CELL_H_RATIO: f32 = 0.16;
+
+/// Row inventory for the current view: find every buy-button anchor in
+/// the buy column, then classify the icon cell each row carries at a
+/// fixed offset against `targets`. The anchor is large and
+/// locale-independent, so this never searches for a small icon in a
+/// big frame — classification of a known cell replaces detection.
+pub(crate) fn scan_shop_rows(
+    capture: &dyn Capture,
+    detector: &Detector,
+    colors: &ColorVerifier,
+    targets: &[&'static str],
+    buy_column: [f32; 4],
+    icon_y_offset_ratio: f32,
+) -> Result<Vec<ShopRow>> {
+    let rgba = capture.snapshot_rgba()?;
+    let gray = image::imageops::grayscale(&rgba);
+    let frame_h = gray.height() as f32;
+
+    // Only the X range of the buy column matters; rows can sit anywhere
+    // vertically (scroll position varies).
+    let roi = [buy_column[0], 0.0, buy_column[2], 1.0];
+    let ctx = detector.prepare_search(&gray, Some(roi));
+    let anchors = detector.find_all_in(&ctx, alias::BUY_BUTTON)?;
+
+    let rows = anchors
+        .into_iter()
+        .map(|anchor| {
+            let cell = icon_cell_for(anchor.y, icon_y_offset_ratio, frame_h);
+            let cell_ctx = detector.prepare_search(&gray, Some(cell));
+            // NCC inside the cell first (one candidate position, cheap),
+            // then the hue check on a patch centred on the hit — NOT on
+            // the whole cell, whose tinted row background would drown
+            // the icon's histogram.
+            let klass = targets.iter().copied().find(|item| {
+                let Ok(Some(hit)) = detector.find_in(&cell_ctx, item) else {
+                    return false;
+                };
+                let report = colors.evaluate(item, &crop_icon_patch(&rgba, &hit));
+                let passed = report.as_ref().is_none_or(|r| r.passed);
+                if let Some(r) = report.filter(|r| !r.passed) {
+                    // Structure matched but colour didn't: either a
+                    // genuine cross-colour lookalike or a global screen
+                    // cast (Night Light / ICC / HDR) — surface which.
+                    tracing::warn!(
+                        alias = item,
+                        score = hit.score,
+                        colour_distance = r.distance,
+                        coloured_fraction = r.coloured_fraction,
+                        likely_screen_tint = hit.score > 0.95 && r.coloured_fraction > 0.6,
+                        "cell NCC hit rejected by colour check — if this fires on real \
+                         items, suspect a screen colour cast and raise \
+                         matching.colour_match_threshold"
+                    );
+                }
+                passed
+            });
+            ShopRow { anchor, klass }
+        })
+        .collect();
+    Ok(rows)
+}
+
+/// Icon-cell rect for the row anchored at `anchor_y_px`: the bundled
+/// icon-column X band, centred `icon_y_offset_ratio` above the buy
+/// button (`layout::ROW_ICON_Y_OFFSET` at runtime — pure row geometry).
+fn icon_cell_for(anchor_y_px: i32, icon_y_offset_ratio: f32, frame_h: f32) -> [f32; 4] {
+    let center_y = anchor_y_px as f32 / frame_h.max(1.0) - icon_y_offset_ratio;
+    let y0 = (center_y - ICON_CELL_H_RATIO / 2.0).clamp(0.0, 1.0);
+    let h = ICON_CELL_H_RATIO.min(1.0 - y0);
+    [
+        crate::layout::ICON_COLUMN_X,
+        y0,
+        crate::layout::ICON_COLUMN_W,
+        h,
+    ]
+}
+
+/// One capture + parallel NCC pass against `targets` over the whole
+/// grid. Setup-tab live-preview only — the bot loop uses
+/// `scan_shop_rows`; this whole-grid search remains useful for
+/// validating icon templates and colour thresholds interactively.
 pub(crate) fn scan_shop_raw(
     capture: &dyn Capture,
     detector: &Detector,
@@ -86,6 +178,102 @@ pub(super) fn strip_hash(gray: &GrayImage, [x, y, w, h]: [f32; 4]) -> u64 {
 mod tests {
     use super::*;
     use image::GrayImage;
+
+    #[test]
+    fn scan_shop_rows_classifies_rows_via_anchor_and_cell() {
+        use super::super::test_support::FakeCapture;
+        use crate::capture::WindowRect;
+        use image::imageops::FilterType;
+
+        let (w, h) = (1000u32, 778u32);
+        let decode = |bytes: &[u8]| {
+            image::load_from_memory(bytes)
+                .expect("bundled asset decodes")
+                .into_rgba8()
+        };
+        // Buy button at its native 778-height size; icons resized to
+        // their realistic on-screen size (the bundled crops are small).
+        let button = decode(include_bytes!("../../assets/buy_button.png"));
+        let mystic = image::imageops::resize(
+            &decode(include_bytes!("../../assets/mystic_medal.png")),
+            90,
+            90,
+            FilterType::Triangle,
+        );
+        let covenant = image::imageops::resize(
+            &decode(include_bytes!("../../assets/covenant.png")),
+            90,
+            90,
+            FilterType::Triangle,
+        );
+
+        let offset_ratio = 0.045f32;
+        let dy = (offset_ratio * h as f32).round() as i64;
+        let mut scene = RgbaImage::from_pixel(w, h, image::Rgba([25, 25, 35, 255]));
+        let paste = |scene: &mut RgbaImage, img: &RgbaImage, cx: i64, cy: i64| {
+            image::imageops::overlay(
+                scene,
+                img,
+                cx - i64::from(img.width()) / 2,
+                cy - i64::from(img.height()) / 2,
+            );
+        };
+        // Three rows anchored in the buy column: mystic, covenant, and
+        // one with an empty icon cell. Icons sit at the centre of the
+        // bundled icon column band.
+        let icon_cx =
+            ((crate::layout::ICON_COLUMN_X + crate::layout::ICON_COLUMN_W / 2.0) * w as f32) as i64;
+        for (row_y, icon) in [(300i64, Some(&mystic)), (500, Some(&covenant)), (650, None)] {
+            paste(&mut scene, &button, 875, row_y);
+            if let Some(icon) = icon {
+                paste(&mut scene, icon, icon_cx, row_y - dy);
+            }
+        }
+
+        let gray_of = image::imageops::grayscale::<RgbaImage>;
+        let detector =
+            crate::detector::Detector::from_test_images(std::collections::HashMap::from([
+                (alias::BUY_BUTTON, gray_of(&button)),
+                (alias::MYSTIC_MEDAL, gray_of(&mystic)),
+                (alias::COVENANT, gray_of(&covenant)),
+            ]));
+        let capture = FakeCapture::with_rgba(
+            vec![],
+            vec![scene],
+            WindowRect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
+        );
+
+        let rows = scan_shop_rows(
+            &capture,
+            &detector,
+            &ColorVerifier::new(),
+            &[alias::MYSTIC_MEDAL, alias::COVENANT],
+            [0.8, 0.0, 0.15, 1.0],
+            offset_ratio,
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 3, "one row per pasted buy button");
+        assert_eq!(rows[0].klass, Some(alias::MYSTIC_MEDAL));
+        assert_eq!(rows[1].klass, Some(alias::COVENANT));
+        assert_eq!(rows[2].klass, None, "empty cell must classify as None");
+        assert!((rows[0].anchor.y - 300).abs() <= 2);
+        assert!((rows[1].anchor.y - 500).abs() <= 2);
+    }
+
+    #[test]
+    fn icon_cell_sits_above_the_anchor_by_the_offset() {
+        let cell = icon_cell_for(500, 0.045, 1000.0);
+        // Cell centre = 0.5 - 0.045 = 0.455.
+        assert!((cell[1] + cell[3] / 2.0 - 0.455).abs() < 1e-3);
+        assert_eq!(cell[0], crate::layout::ICON_COLUMN_X);
+        assert_eq!(cell[2], crate::layout::ICON_COLUMN_W);
+    }
 
     fn solid_gray(w: u32, h: u32, value: u8) -> GrayImage {
         GrayImage::from_pixel(w, h, image::Luma([value]))

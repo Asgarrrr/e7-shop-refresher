@@ -45,22 +45,6 @@ pub struct ShopConfig {
     /// 6 items per refresh, 4 visible at once — 1 scroll reveals the
     /// last 2. Bump to 2 if your setup undershoots.
     pub max_scrolls_per_round: u32,
-    /// Fraction of window height between an item icon's centre and its
-    /// row's buy button. 0.04 ≈ 44 px at 1080p.
-    #[serde(default = "default_buy_button_y_offset_ratio")]
-    pub buy_button_y_offset_ratio: f32,
-    /// Vertical thickness of the buy-button click band as a fraction of
-    /// window height. Sets the click target's height; X is taken from
-    /// `zones.buy_column`.
-    #[serde(default = "default_buy_button_band_h_ratio")]
-    pub buy_button_band_h_ratio: f32,
-    /// User-placed reference Y for Buy-click calibration, as a fraction of
-    /// window height. Pure UI affordance — the runtime uses the detected
-    /// icon Y, never this — but it persists the user's "this is what a
-    /// row looks like" so the box (line + offset) renders on the same
-    /// spot every session. Default ≈ shop-grid centre.
-    #[serde(default = "default_buy_calibration_line_y_ratio")]
-    pub buy_calibration_line_y_ratio: f32,
     /// 0 = no limit. Checked at round boundary — may overshoot by one round.
     #[serde(default)]
     pub stop_after_minutes: u32,
@@ -79,21 +63,6 @@ pub struct ShopConfig {
     pub sleep_when_done: bool,
 }
 
-fn default_buy_button_y_offset_ratio() -> f32 {
-    crate::layout::BUY_BUTTON_Y_OFFSET
-}
-
-fn default_buy_button_band_h_ratio() -> f32 {
-    crate::shop::BUY_COLUMN_ROW_BAND_RATIO
-}
-
-fn default_buy_calibration_line_y_ratio() -> f32 {
-    // Kept in sync with the bundled config.toml — picked empirically
-    // so a fresh-from-source run and a config-file run land in the
-    // same place.
-    0.65
-}
-
 impl Default for ShopConfig {
     fn default() -> Self {
         Self {
@@ -101,9 +70,6 @@ impl Default for ShopConfig {
             buy_mystic_medals: true,
             buy_covenant: true,
             max_scrolls_per_round: 1,
-            buy_button_y_offset_ratio: default_buy_button_y_offset_ratio(),
-            buy_button_band_h_ratio: default_buy_button_band_h_ratio(),
-            buy_calibration_line_y_ratio: default_buy_calibration_line_y_ratio(),
             stop_after_minutes: 0,
             stop_when_mystic_medals: 0,
             stop_when_covenants: 0,
@@ -144,12 +110,6 @@ pub struct TimingConfig {
 
     /// Mouse-wheel lines per scroll. Positive scrolls down.
     pub scroll_amount: i32,
-    pub scroll_pause_ms: u64,
-
-    /// Must outlast the modal slide-in animation; anything beyond is
-    /// dead time.
-    #[serde(default = "default_modal_open_pause_ms")]
-    pub modal_open_pause_ms: u64,
 
     /// Cooperative mode: pause the bot when the user touches mouse /
     /// keyboard, resume after this many ms of idle. 0 disables — bot
@@ -157,10 +117,6 @@ pub struct TimingConfig {
     /// Discord message without the bot stealing input mid-sentence.
     #[serde(default = "default_cooperative_idle_ms")]
     pub cooperative_idle_ms: u64,
-}
-
-fn default_modal_open_pause_ms() -> u64 {
-    220
 }
 
 fn default_cooperative_idle_ms() -> u64 {
@@ -192,8 +148,6 @@ impl Default for TimingConfig {
             long_pause_max_ms: 12000,
 
             scroll_amount: 8,
-            scroll_pause_ms: 250,
-            modal_open_pause_ms: default_modal_open_pause_ms(),
             cooperative_idle_ms: default_cooperative_idle_ms(),
         }
     }
@@ -266,8 +220,8 @@ pub struct ZonesConfig {
     pub refresh: Option<[f32; 4]>,
     pub refresh_confirm: Option<[f32; 4]>,
     pub buy_confirm: Option<[f32; 4]>,
-    /// Only the X range is honoured at click time — Y comes from the
-    /// matched item icon's Y + `shop.buy_button_y_offset_ratio`.
+    /// Only the X range is honoured — rows are anchored by matching the
+    /// buy-button template inside this column at any Y.
     pub buy_column: Option<[f32; 4]>,
 }
 
@@ -283,6 +237,8 @@ pub struct TemplatesConfig {
     pub mystic_medal: String,
     #[serde(default = "default_covenant")]
     pub covenant: String,
+    #[serde(default = "default_buy_button")]
+    pub buy_button: String,
 }
 
 impl Default for TemplatesConfig {
@@ -291,6 +247,7 @@ impl Default for TemplatesConfig {
             dir: default_templates_dir(),
             mystic_medal: default_mystic_medal(),
             covenant: default_covenant(),
+            buy_button: default_buy_button(),
         }
     }
 }
@@ -303,6 +260,9 @@ fn default_mystic_medal() -> String {
 }
 fn default_covenant() -> String {
     "covenant.png".into()
+}
+fn default_buy_button() -> String {
+    "buy_button.png".into()
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

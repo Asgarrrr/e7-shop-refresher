@@ -16,11 +16,11 @@ use crate::input::Input;
 mod round;
 mod scan;
 mod stop;
+mod wait;
 
 #[cfg(test)]
 mod test_support;
 
-pub use round::{BUY_COLUMN_ROW_BAND_RATIO, buy_column_row_rect_for};
 pub(crate) use scan::{crop_icon_patch, scan_shop_raw};
 pub use stop::{COVENANT_DROP_PER_SLOT, MYSTIC_DROP_PER_SLOT, SHOP_SLOTS_PER_REFRESH, prices};
 pub(crate) use stop::{gold_spent_for, stop_condition_for};
@@ -382,9 +382,9 @@ impl ShopRunner {
 
         // No "are we in the shop?" pre-check — too brittle across
         // languages/resolutions. IAP-redirect safety is covered downstream
-        // by the modal-open hash checks in `refresh_shop` and
-        // `try_buy_at_pixel_y` (a mis-clicked first click never triggers
-        // a follow-up on a stale confirm zone).
+        // by the modal-dimming checks in `refresh_shop` and `try_buy_row`
+        // (a mis-clicked first click never triggers a follow-up on an
+        // unchanged screen).
         let bought = self.buy_round()?;
         info!(round, bought, "items bought");
 
@@ -421,8 +421,7 @@ mod tests {
     use crate::input::Input;
 
     use super::test_support::{
-        FakeCapture, FakeEvent, FakeInput, REFRESH_CONFIRM, SHOP_GRID, gray_frame, paint_zone,
-        runner_for_loop_tests,
+        FakeCapture, FakeEvent, FakeInput, SHOP_GRID, gray_frame, paint_zone, runner_for_loop_tests,
     };
 
     #[test]
@@ -582,18 +581,24 @@ mod tests {
         let base = gray_frame(200, 200, 100);
         // Frame order for one full round:
         // 1. buy_round bottom-strip snapshot
-        // 2. refresh_shop frame A
-        // 3. refresh_shop frame B (modal opened)
-        // 4. refresh_shop frame C (grid changed)
-        let buy_strip = base.clone();
-        let frame_a = base.clone();
-        let mut frame_b = base.clone();
-        paint_zone(&mut frame_b, REFRESH_CONFIRM, 200);
-        let mut frame_c = base.clone();
-        paint_zone(&mut frame_c, SHOP_GRID, 30);
+        // 2. refresh_shop baseline
+        // 3. refresh_shop dimmed (modal opened)
+        // 4-6. refresh_shop undimmed + settle ×2
+        // 7. refresh_shop post-reroll hash check (grid changed)
+        let mut dimmed = base.clone();
+        paint_zone(&mut dimmed, SHOP_GRID, 30);
+        let mut rerolled = base.clone();
+        paint_zone(&mut rerolled, SHOP_GRID, 90);
 
-        let (mut runner, events) =
-            runner_for_loop_tests(vec![buy_strip, frame_a, frame_b, frame_c]);
+        let (mut runner, events) = runner_for_loop_tests(vec![
+            base.clone(),
+            base,
+            dimmed,
+            rerolled.clone(),
+            rerolled.clone(),
+            rerolled.clone(),
+            rerolled,
+        ]);
         runner.config.shop.max_refreshes = 1;
         {
             let mut ls = runner.live_shop.write().unwrap();

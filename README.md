@@ -126,10 +126,10 @@ detection misses on your resolution or after a game patch:
   click *Edit* next to the alias, then drag a tight rectangle around the
   mystic medal or covenant icon on the snapshot. The Detector reloads on
   release.
-- **Click lands next to a button.** Drag the red **Buy reference** line
-  onto any item row, then drag the **Buy click** box down onto that row's
-  Buy button (Setup → Layout → Click zones). Both are also typeable as
-  y/h ratios.
+- **Rows not found / clicks miss the Buy button.** The bot clicks the
+  buy-button pill it matched on screen, so re-crop the **Buy button
+  anchor** template (same *Edit* flow — drag a tight rectangle around
+  the "1/1" segment of any green Buy pill).
 - **Click zones drift.** Setup → Layout → Click zones lets you redraw the
   *Refresh* button, the two modal confirms, and the buy-column X strip.
   Keep each box inside its real button — smaller is fine, overflowing the

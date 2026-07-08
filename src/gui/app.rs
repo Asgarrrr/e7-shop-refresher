@@ -27,7 +27,6 @@ pub(super) mod palette {
     pub const WARN: Color32 = Color32::from_rgb(230, 180, 60);
     pub const ERROR: Color32 = Color32::from_rgb(220, 90, 90);
     pub const DEBUG_LABEL: Color32 = Color32::from_rgb(255, 240, 100);
-    pub const DEBUG_BAND_STROKE: Color32 = Color32::from_rgb(255, 80, 80);
 
     pub const SECTION_STROKE: Color32 = Color32::from_rgb(58, 60, 66);
     pub const ACCENT: Color32 = Color32::from_rgb(80, 140, 255);
@@ -84,23 +83,11 @@ pub(super) struct DragRect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EditFocus {
     Jitter,
-    /// User is hovering / dragging one of the Buy-click DragValues. Drives
-    /// the snapshot overlay to thicken the click band + draw the exact
-    /// click line so alignment with the in-game buy button is visible.
-    BuyClick,
     /// User is hovering / dragging an x/y/w/h DragValue for one of the
     /// layout rects. Snapshot thickens the matching overlay so the user
     /// sees which rect they're about to nudge. Carries the same name
     /// `crate::layout::overlay_rects()` emits.
     Rect(&'static str),
-}
-
-/// Which Buy-click handle the user is currently dragging on the snapshot.
-/// Set on drag_started after proximity-test, cleared on drag_stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BuyDragHandle {
-    Line,
-    Box,
 }
 
 pub(super) fn edit_focus_id() -> egui::Id {
@@ -158,11 +145,6 @@ pub struct ShopGui {
     pub(super) auto_save_error: Option<String>,
 
     pub(super) active_tab: Tab,
-
-    /// Which Buy-click handle the user is currently dragging on the
-    /// snapshot, if any. Persists across frames because egui's drag
-    /// events fire over many frames.
-    pub(super) buy_drag_handle: Option<BuyDragHandle>,
 
     /// Wall clock of the last Setup-tab auto-refresh + detection.
     /// Drives the 2 Hz live preview without re-capturing every frame.
@@ -274,7 +256,6 @@ impl ShopGui {
             dirty_since: None,
             auto_save_error: None,
             active_tab: Tab::Run,
-            buy_drag_handle: None,
             last_setup_refresh: None,
             setup_preview_in_flight: false,
             setup_preview_tx,
@@ -408,6 +389,7 @@ impl ShopGui {
         let file = match alias {
             "mystic_medal" => &self.config.templates.mystic_medal,
             "covenant" => &self.config.templates.covenant,
+            "buy_button" => &self.config.templates.buy_button,
             _ => return None,
         };
         Some(self.config.template_dir().join(file))
