@@ -21,7 +21,7 @@ mod wait;
 #[cfg(test)]
 mod test_support;
 
-pub use round::{BUY_COLUMN_ROW_BAND_RATIO, buy_column_row_rect_for};
+pub use round::BUY_COLUMN_ROW_BAND_RATIO;
 pub(crate) use scan::{crop_icon_patch, scan_shop_raw};
 pub use stop::{COVENANT_DROP_PER_SLOT, MYSTIC_DROP_PER_SLOT, SHOP_SLOTS_PER_REFRESH, prices};
 pub(crate) use stop::{gold_spent_for, stop_condition_for};
@@ -383,9 +383,9 @@ impl ShopRunner {
 
         // No "are we in the shop?" pre-check — too brittle across
         // languages/resolutions. IAP-redirect safety is covered downstream
-        // by the modal-open hash checks in `refresh_shop` and
-        // `try_buy_at_pixel_y` (a mis-clicked first click never triggers
-        // a follow-up on a stale confirm zone).
+        // by the modal-dimming checks in `refresh_shop` and `try_buy_row`
+        // (a mis-clicked first click never triggers a follow-up on an
+        // unchanged screen).
         let bought = self.buy_round()?;
         info!(round, bought, "items bought");
 

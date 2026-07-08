@@ -38,6 +38,10 @@ pub const BUY_CONFIRM: RectRatio = [0.488, 0.686, 0.198, 0.059];
 /// "Cancel" pill in the item-buy modal (left side, brown).
 pub const BUY_CANCEL: RectRatio = [0.31, 0.686, 0.13, 0.059];
 
+/// Full-size item icon in the item-buy modal. Reclassified before the
+/// confirm click so a drifted row click can never buy the wrong item.
+pub const BUY_MODAL_ICON: RectRatio = [0.245, 0.42, 0.08, 0.145];
+
 /// Buy-button column X-range. Y is per-row, supplied at click time from
 /// the matched icon's Y coordinate.
 pub const BUY_COLUMN_X: f32 = 0.83;

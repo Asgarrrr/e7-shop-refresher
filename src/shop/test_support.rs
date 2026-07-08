@@ -1,7 +1,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
-use image::GrayImage;
+use image::{GrayImage, RgbaImage};
 
 use crate::capture::{Capture, WindowRect};
 use crate::config::Config;
@@ -15,15 +15,24 @@ use super::ShopRunner;
 /// reattach / graceful exit.
 pub(super) struct FakeCapture {
     frames: StdMutex<Vec<GrayImage>>,
+    /// Override queue for `snapshot_rgba`. Empty → synthesize from the
+    /// gray queue like the trait default would.
+    rgba_frames: StdMutex<Vec<RgbaImage>>,
     rect: WindowRect,
 }
 
 impl FakeCapture {
     pub fn new(frames: Vec<GrayImage>, rect: WindowRect) -> Self {
+        Self::with_rgba(frames, vec![], rect)
+    }
+
+    pub fn with_rgba(frames: Vec<GrayImage>, rgba: Vec<RgbaImage>, rect: WindowRect) -> Self {
         // Reversed so pop() returns frames in caller-supplied order.
         let frames: Vec<_> = frames.into_iter().rev().collect();
+        let rgba: Vec<_> = rgba.into_iter().rev().collect();
         Self {
             frames: StdMutex::new(frames),
+            rgba_frames: StdMutex::new(rgba),
             rect,
         }
     }
@@ -36,6 +45,18 @@ impl Capture for FakeCapture {
             .expect("frames mutex poisoned")
             .pop()
             .ok_or(Error::WindowGone)
+    }
+    fn snapshot_rgba(&self) -> Result<RgbaImage> {
+        if let Some(f) = self.rgba_frames.lock().expect("rgba mutex poisoned").pop() {
+            return Ok(f);
+        }
+        let gray = self.snapshot_gray()?;
+        let mut rgba = RgbaImage::new(gray.width(), gray.height());
+        for (x, y, p) in gray.enumerate_pixels() {
+            let v = p[0];
+            rgba.put_pixel(x, y, image::Rgba([v, v, v, 255]));
+        }
+        Ok(rgba)
     }
     fn rect(&self) -> Result<WindowRect> {
         Ok(self.rect)
@@ -127,8 +148,31 @@ pub(super) const REFRESH: [f32; 4] = [0.1, 0.8, 0.1, 0.1];
 pub(super) const REFRESH_CONFIRM: [f32; 4] = [0.4, 0.5, 0.1, 0.1];
 pub(super) const SHOP_GRID: [f32; 4] = [0.1, 0.1, 0.6, 0.6];
 
+/// RGBA frame whose `zone` contains the bundled mystic-medal art —
+/// classifies as `mystic_medal` in colour checks; the rest is dark.
+pub(super) fn rgba_frame_with_mystic_in(w: u32, h: u32, zone: [f32; 4]) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(w, h, image::Rgba([20, 20, 28, 255]));
+    let icon = image::load_from_memory(include_bytes!("../../assets/mystic_medal.png"))
+        .expect("bundled asset decodes")
+        .into_rgba8();
+    let zx = (zone[0] * w as f32) as u32;
+    let zy = (zone[1] * h as f32) as u32;
+    let zw = ((zone[2] * w as f32) as u32).max(1);
+    let zh = ((zone[3] * h as f32) as u32).max(1);
+    let icon = image::imageops::resize(&icon, zw, zh, image::imageops::FilterType::Triangle);
+    image::imageops::overlay(&mut img, &icon, i64::from(zx), i64::from(zy));
+    img
+}
+
 pub(super) fn runner_for_loop_tests(
     frames: Vec<GrayImage>,
+) -> (ShopRunner, Arc<StdMutex<Vec<FakeEvent>>>) {
+    runner_with_frames(frames, vec![])
+}
+
+pub(super) fn runner_with_frames(
+    frames: Vec<GrayImage>,
+    rgba: Vec<RgbaImage>,
 ) -> (ShopRunner, Arc<StdMutex<Vec<FakeEvent>>>) {
     let mut config: Config = toml::from_str(crate::config::DEFAULT_TOML).unwrap();
     config.zones.refresh = Some(REFRESH);
@@ -141,8 +185,9 @@ pub(super) fn runner_for_loop_tests(
     config.shop.max_scrolls_per_round = 0;
     config.shop.sleep_when_done = false;
 
-    let capture: Arc<dyn Capture> = Arc::new(FakeCapture::new(
+    let capture: Arc<dyn Capture> = Arc::new(FakeCapture::with_rgba(
         frames,
+        rgba,
         WindowRect {
             x: 0,
             y: 0,

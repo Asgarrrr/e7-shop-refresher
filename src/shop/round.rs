@@ -1,34 +1,16 @@
-use image::{GrayImage, RgbaImage};
+use image::GrayImage;
 use tracing::{debug, info, warn};
 
 use crate::error::Result;
 use crate::layout;
 
-use super::scan::{crop_icon_patch, scan_shop_raw, strip_hash};
+use super::scan::{crop_ratio_rect, scan_shop_rows, strip_hash};
 use super::{ShopRunner, wait};
 
 /// 4% of window height ≈ one row at 1080p — wide enough for sub-pixel
 /// scroll drift, narrow enough to never leak into the adjacent row.
+/// Kept as the GUI calibration overlay's default band height.
 pub const BUY_COLUMN_ROW_BAND_RATIO: f32 = 0.04;
-
-/// Only x/w of `column` are used; the row Y comes from the icon match.
-pub fn buy_column_row_rect_for(
-    column: [f32; 4],
-    item_y: i32,
-    frame_h: u32,
-    window_w: u32,
-    window_h: u32,
-    y_offset_ratio: f32,
-    band_h_ratio: f32,
-) -> [i32; 4] {
-    let (w, h) = (window_w as i32, window_h as i32);
-    let bx = (column[0] * w as f32).round() as i32;
-    let bw = (column[2] * w as f32).round() as i32;
-    let band_h = ((frame_h as f32) * band_h_ratio).round() as i32;
-    let y_offset = ((frame_h as f32) * y_offset_ratio).round() as i32;
-    let by = (item_y + y_offset - band_h / 2).clamp(0, (h - band_h.max(1)).max(0));
-    [bx.max(0), by, bw.max(1), band_h.max(1)]
-}
 
 impl ShopRunner {
     pub(super) fn buy_round(&mut self) -> Result<u32> {
@@ -80,136 +62,86 @@ impl ShopRunner {
         strip_hash(gray, strip)
     }
 
-    /// Searching the full column rather than a fixed slot patch absorbs
-    /// Y-drift across resolutions and patches.
+    /// Row-inventory pass: anchor every visible row on its buy button,
+    /// classify each row's icon cell, buy the first pending target.
+    /// One buy per scan — the sold overlay relayouts rows, so hits from
+    /// a pre-buy frame are stale afterwards.
     pub(super) fn process_current_view(&mut self) -> Result<u32> {
         let mut bought = 0u32;
-        let shop_grid = self.config.regions.shop_grid.unwrap_or(layout::SHOP_GRID);
-
-        let mut pending: Vec<&'static str> = self
-            .enabled_targets
-            .iter()
-            .copied()
-            .filter(|a| !self.bought_types.contains(a))
-            .collect();
-        if pending.is_empty() {
-            return Ok(0);
-        }
-
-        // After a buy the sold overlay / row relayout makes the previous
-        // hit.y stale, so refresh the frame before evaluating remaining
-        // aliases. Each iteration shares one capture between NCC and the
-        // colour verify so they sample the same pixels.
-        while !pending.is_empty() {
+        loop {
             if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return Ok(bought);
             }
-
-            let scan = scan_shop_raw(&*self.capture, &self.detector, &pending, shop_grid)?;
-
-            let mut any_bought = false;
-            let mut still_pending: Vec<&'static str> = Vec::with_capacity(pending.len());
-
-            for (alias_name, hit) in scan.hits {
-                if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Ok(bought);
-                }
-                let Some(hit) = hit else {
-                    continue;
-                };
-                debug!(
-                    alias = alias_name,
-                    score = hit.score,
-                    margin = hit.margin,
-                    x = hit.x,
-                    y = hit.y,
-                    "item matched in shop_grid"
-                );
-
-                if !self.verify_colour(alias_name, &hit, &scan.rgba) {
-                    continue;
-                }
-
-                // Already bought one this frame — defer remaining buys
-                // to the next iteration with a fresh snapshot so the
-                // click Y isn't computed against pre-buy pixels.
-                if any_bought {
-                    still_pending.push(alias_name);
-                    continue;
-                }
-
-                let success = self.try_buy_at_pixel_y(alias_name, hit.y, scan.rgba.height())?;
-                // Mark regardless: a failed click (modal didn't open)
-                // shouldn't re-fire on the next scroll view in the same
-                // round either — the button isn't going to wake up.
-                self.bought_types.insert(alias_name);
-                if success {
-                    bought += 1;
-                    self.progress.item_bought(alias_name);
-                    any_bought = true;
-                }
+            if self
+                .enabled_targets
+                .iter()
+                .all(|a| self.bought_types.contains(a))
+            {
+                return Ok(bought);
             }
 
-            if !any_bought {
-                break;
+            let rows = scan_shop_rows(
+                &*self.capture,
+                &self.detector,
+                &self.color_check,
+                self.buy_column(),
+                self.shop_grid(),
+                self.config.shop.buy_button_y_offset_ratio,
+            )?;
+            debug!(
+                rows = rows.len(),
+                classified = ?rows.iter().filter_map(|r| r.klass).collect::<Vec<_>>(),
+                "row inventory scanned"
+            );
+
+            let target = rows.iter().find_map(|row| {
+                row.klass
+                    .filter(|k| self.enabled_targets.contains(k) && !self.bought_types.contains(k))
+                    .map(|k| (k, row.anchor))
+            });
+            let Some((alias_name, anchor)) = target else {
+                return Ok(bought);
+            };
+
+            let success = self.try_buy_row(alias_name, &anchor)?;
+            // Mark regardless: a failed buy (modal didn't open, wrong
+            // item shown in the modal) shouldn't re-fire on the next
+            // scan in the same round — the row won't change until the
+            // next refresh.
+            self.bought_types.insert(alias_name);
+            if success {
+                bought += 1;
+                self.progress.item_bought(alias_name);
             }
-            pending = still_pending;
         }
-        Ok(bought)
     }
 
-    /// Returns `false` on colour mismatch — caller treats it as "no
-    /// match". `rgba` MUST be the frame the NCC hit was computed from
-    /// so the patch sampled here matches the matched pixels.
-    pub(super) fn verify_colour(
-        &self,
-        alias_name: &'static str,
-        hit: &crate::detector::Hit,
-        rgba: &RgbaImage,
-    ) -> bool {
-        let patch = crop_icon_patch(rgba, hit);
-        let Some(report) = self.color_check.evaluate(alias_name, &patch) else {
-            return true;
-        };
-        if report.passed {
-            return true;
-        }
-        // A strong NCC hit whose patch is almost entirely saturated is the
-        // signature of a global screen tint (Night Light / ICC / HDR)
-        // rather than a genuine wrong-colour icon — flag it so the log
-        // points at the display, not the detector.
-        let likely_screen_tint = hit.score > 0.95 && report.coloured_fraction > 0.6;
-        warn!(
-            alias = alias_name,
-            score = hit.score,
-            x = hit.x,
-            y = hit.y,
-            colour_distance = report.distance,
-            coloured_fraction = report.coloured_fraction,
-            likely_screen_tint,
-            "NCC hit rejected by colour check — likely cross-colour false positive \
-             (if this fires on real items, suspect a screen colour cast such as \
-             Windows Night Light and raise matching.colour_match_threshold)"
-        );
-        false
+    fn buy_column(&self) -> [f32; 4] {
+        self.config.zones.buy_column.unwrap_or([
+            layout::BUY_COLUMN_X,
+            0.0,
+            layout::BUY_COLUMN_W,
+            1.0,
+        ])
     }
 
     /// Modal state is observed (grid dimming), never assumed: the buy
     /// click must dim the grid before confirm fires, and confirm must
     /// un-dim it before the loop moves on — a missed click can't
-    /// cascade into a blind buy.
-    pub(super) fn try_buy_at_pixel_y(
+    /// cascade into a blind buy. The modal also shows the item at full
+    /// size; it is reclassified there and cancelled on mismatch, so a
+    /// drifted row click can never buy the wrong item.
+    pub(super) fn try_buy_row(
         &mut self,
         alias_name: &'static str,
-        icon_y_px: i32,
-        frame_h: u32,
+        anchor: &crate::detector::Hit,
     ) -> Result<bool> {
         let buy_confirm = self.config.zones.buy_confirm.unwrap_or(layout::BUY_CONFIRM);
 
         let before_gray = self.snapshot()?;
         let baseline = wait::mean_luma(&before_gray, self.shop_grid());
 
-        let row_rect = self.buy_button_local_rect(icon_y_px, frame_h)?;
+        let row_rect = self.anchor_click_rect(anchor);
         self.clicker.click_local_in_rect(&*self.capture, row_rect)?;
         self.clicker.human_pause();
         if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -221,6 +153,21 @@ impl ShopRunner {
                 alias = alias_name,
                 "buy modal did not open — skipping confirm click"
             );
+            return Ok(false);
+        }
+
+        // Let the slide-in finish so the modal's item icon is fully
+        // drawn, then make sure it is the item we clicked for.
+        self.wait_settled(layout::BUY_MODAL_ICON, wait::SETTLE_TIMEOUT_MS)?;
+        let modal = self.capture.snapshot_rgba()?;
+        let icon = crop_ratio_rect(&modal, layout::BUY_MODAL_ICON);
+        if !self.color_check.accepts(alias_name, &icon) {
+            warn!(
+                alias = alias_name,
+                "buy modal shows a different item — cancelling"
+            );
+            self.click_zone(layout::BUY_CANCEL)?;
+            self.wait_grid_undimmed(baseline)?;
             return Ok(false);
         }
 
@@ -255,26 +202,18 @@ impl ShopRunner {
         Ok(())
     }
 
-    /// Delegates to the pure `buy_column_row_rect_for` helper — also
-    /// used by the GUI debug overlay so both stay in lockstep.
-    pub(super) fn buy_button_local_rect(&self, icon_y_px: i32, frame_h: u32) -> Result<[i32; 4]> {
-        let r = self.capture.rect()?;
-        // Only column[0] / column[2] (X / W) are used at click time.
-        let column = self.config.zones.buy_column.unwrap_or([
-            layout::BUY_COLUMN_X,
-            0.0,
-            layout::BUY_COLUMN_W,
-            0.0,
-        ]);
-        Ok(buy_column_row_rect_for(
-            column,
-            icon_y_px,
-            frame_h,
-            r.width,
-            r.height,
-            self.config.shop.buy_button_y_offset_ratio,
-            self.config.shop.buy_button_band_h_ratio,
-        ))
+    /// Click box centred on the matched buy-button anchor, shrunk so a
+    /// uniform random point stays well inside the pill.
+    fn anchor_click_rect(&self, anchor: &crate::detector::Hit) -> [i32; 4] {
+        // Dimensions are always present in prod (bundled fallback); the
+        // default only serves detector-less tests.
+        let (tw, th) = self
+            .detector
+            .template_dimensions(crate::detector::alias::BUY_BUTTON)
+            .unwrap_or((40, 20));
+        let w = (((tw as f32) * anchor.scale).round() as i32 * 3 / 5).max(1);
+        let h = (((th as f32) * anchor.scale).round() as i32 * 3 / 5).max(1);
+        [anchor.x - w / 2, anchor.y - h / 2, w, h]
     }
 
     pub(super) fn ratio_rect_to_local(&self, zone: [f32; 4]) -> Result<[i32; 4]> {
@@ -381,51 +320,23 @@ impl ShopRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use super::super::test_support::{
-        FakeEvent, SHOP_GRID, gray_frame, paint_zone, runner_for_loop_tests,
+        FakeEvent, SHOP_GRID, gray_frame, paint_zone, rgba_frame_with_mystic_in,
+        runner_for_loop_tests, runner_with_frames,
     };
 
-    #[test]
-    fn buy_column_rect_centers_band_on_item_y_with_offset() {
-        // 100×1000 window, item at y=500, band ratio 0.04 → 40 px band centred on 500.
-        let r = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.0, 0.04);
-        assert_eq!(r[0], 80);
-        assert!(r[1] >= 478 && r[1] <= 482);
-        assert_eq!(r[2], 10);
-        assert_eq!(r[3], 40);
+    fn anchor_at(x: i32, y: i32) -> crate::detector::Hit {
+        crate::detector::Hit {
+            x,
+            y,
+            score: 1.0,
+            scale: 1.0,
+            margin: 0.0,
+        }
     }
 
-    #[test]
-    fn buy_column_rect_shifts_down_by_y_offset_ratio() {
-        let no_off = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.0, 0.04);
-        let with_off =
-            buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.04, 0.04);
-        assert_eq!(with_off[1] - no_off[1], 40);
-    }
-
-    #[test]
-    fn buy_column_rect_clamps_band_to_window_bounds() {
-        let r = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 0, 1000, 100, 1000, 0.0, 0.04);
-        assert!(r[1] >= 0);
-        let r = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 1000, 1000, 100, 1000, 0.0, 0.04);
-        assert!(i64::from(r[1] + r[3]) <= 1000);
-    }
-
-    #[test]
-    fn buy_column_rect_y_h_of_zone_are_ignored() {
-        let a = buy_column_row_rect_for([0.8, 0.1, 0.1, 0.2], 500, 1000, 100, 1000, 0.0, 0.04);
-        let b = buy_column_row_rect_for([0.8, 0.9, 0.1, 0.05], 500, 1000, 100, 1000, 0.0, 0.04);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn buy_column_rect_band_height_scales_with_ratio() {
-        let thin = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.0, 0.02);
-        let thick = buy_column_row_rect_for([0.8, 0.0, 0.1, 1.0], 500, 1000, 100, 1000, 0.0, 0.08);
-        assert_eq!(thin[3], 20);
-        assert_eq!(thick[3], 80);
+    fn mystic_modal_rgba() -> image::RgbaImage {
+        rgba_frame_with_mystic_in(200, 200, crate::layout::BUY_MODAL_ICON)
     }
 
     /// Enough identical frames to exhaust a full predicate-wait
@@ -511,16 +422,25 @@ mod tests {
     }
 
     #[test]
-    fn try_buy_at_pixel_y_confirms_when_modal_opens() {
+    fn try_buy_row_confirms_when_modal_opens_with_the_right_item() {
         let before = gray_frame(200, 200, 100);
         let mut dim = before.clone();
         paint_zone(&mut dim, SHOP_GRID, 30);
-        // baseline, dimmed (modal), undimmed, settle ×2.
-        let frames = vec![before.clone(), dim, before.clone(), before.clone(), before];
-        let (mut runner, events) = runner_for_loop_tests(frames);
+        // baseline, dimmed (modal), modal-icon settle ×2, then the rgba
+        // modal check (separate queue), undimmed, grid settle ×2.
+        let frames = vec![
+            before.clone(),
+            dim.clone(),
+            dim.clone(),
+            dim,
+            before.clone(),
+            before.clone(),
+            before,
+        ];
+        let (mut runner, events) = runner_with_frames(frames, vec![mystic_modal_rgba()]);
 
         let result = runner
-            .try_buy_at_pixel_y(crate::detector::alias::MYSTIC_MEDAL, 100, 200)
+            .try_buy_row(crate::detector::alias::MYSTIC_MEDAL, &anchor_at(160, 100))
             .unwrap();
 
         assert!(result, "modal opened — should report a successful buy");
@@ -528,14 +448,14 @@ mod tests {
     }
 
     #[test]
-    fn try_buy_at_pixel_y_skips_confirm_when_modal_stays_shut() {
+    fn try_buy_row_skips_confirm_when_modal_stays_shut() {
         let before = gray_frame(200, 200, 100);
         let mut frames = vec![before.clone()];
         frames.extend(timeout_frames(&before));
         let (mut runner, events) = runner_for_loop_tests(frames);
 
         let result = runner
-            .try_buy_at_pixel_y(crate::detector::alias::MYSTIC_MEDAL, 100, 200)
+            .try_buy_row(crate::detector::alias::MYSTIC_MEDAL, &anchor_at(160, 100))
             .unwrap();
 
         assert!(!result, "modal never opened — must not report a buy");
@@ -547,17 +467,42 @@ mod tests {
     }
 
     #[test]
-    fn try_buy_at_pixel_y_clicks_cancel_when_confirm_leaves_modal_open() {
+    fn try_buy_row_cancels_when_modal_shows_a_different_item() {
         let before = gray_frame(200, 200, 100);
         let mut dim = before.clone();
         paint_zone(&mut dim, SHOP_GRID, 30);
-        let mut frames = vec![before.clone(), dim.clone()];
-        frames.extend(timeout_frames(&dim));
-        frames.push(before);
+        // No rgba override: the modal check sees a synthesized gray
+        // frame — zero saturation, so it cannot be the clicked item.
+        let frames = vec![
+            before.clone(),
+            dim.clone(),
+            dim.clone(),
+            dim.clone(),
+            dim,
+            before,
+        ];
         let (mut runner, events) = runner_for_loop_tests(frames);
 
         let result = runner
-            .try_buy_at_pixel_y(crate::detector::alias::MYSTIC_MEDAL, 100, 200)
+            .try_buy_row(crate::detector::alias::MYSTIC_MEDAL, &anchor_at(160, 100))
+            .unwrap();
+
+        assert!(!result, "wrong item in the modal must not be bought");
+        assert_eq!(click_count(&events), 2, "buy + cancel, no confirm");
+    }
+
+    #[test]
+    fn try_buy_row_clicks_cancel_when_confirm_leaves_modal_open() {
+        let before = gray_frame(200, 200, 100);
+        let mut dim = before.clone();
+        paint_zone(&mut dim, SHOP_GRID, 30);
+        let mut frames = vec![before.clone(), dim.clone(), dim.clone(), dim.clone()];
+        frames.extend(timeout_frames(&dim));
+        frames.push(before);
+        let (mut runner, events) = runner_with_frames(frames, vec![mystic_modal_rgba()]);
+
+        let result = runner
+            .try_buy_row(crate::detector::alias::MYSTIC_MEDAL, &anchor_at(160, 100))
             .unwrap();
 
         assert!(!result, "a cancelled buy must not count");

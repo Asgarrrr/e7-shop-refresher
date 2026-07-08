@@ -271,6 +271,8 @@ pub struct TemplatesConfig {
     pub mystic_medal: String,
     #[serde(default = "default_covenant")]
     pub covenant: String,
+    #[serde(default = "default_buy_button")]
+    pub buy_button: String,
 }
 
 impl Default for TemplatesConfig {
@@ -279,6 +281,7 @@ impl Default for TemplatesConfig {
             dir: default_templates_dir(),
             mystic_medal: default_mystic_medal(),
             covenant: default_covenant(),
+            buy_button: default_buy_button(),
         }
     }
 }
@@ -291,6 +294,9 @@ fn default_mystic_medal() -> String {
 }
 fn default_covenant() -> String {
     "covenant.png".into()
+}
+fn default_buy_button() -> String {
+    "buy_button.png".into()
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
