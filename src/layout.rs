@@ -53,16 +53,9 @@ pub const BUY_COLUMN_W: f32 = 0.142;
 /// popups, inventory floats, sidebar quests) can't false-match.
 pub const SHOP_GRID: RectRatio = [0.425, 0.085, 0.09, 0.915];
 
-/// Window-height fraction between an item icon's Y centre (returned by
-/// NCC) and its row's Buy button centre. E7 puts the Buy button on the
-/// same row as the icon, shifted ~5% of window height downward.
-pub const BUY_BUTTON_Y_OFFSET: f32 = 0.045;
-
 /// Row geometry: window-height fraction between a row's buy-button
 /// centre and its item-icon centre (icon sits slightly higher).
-/// Measured 0.019–0.026 across rows on live captures. Distinct from
-/// `BUY_BUTTON_Y_OFFSET` / the user's click calibration — those relate
-/// the *icon template crop* to the click Y, not button to icon centre.
+/// Measured 0.019–0.026 across rows on live captures.
 pub const ROW_ICON_Y_OFFSET: f32 = 0.023;
 
 /// Tag for the GUI overlay: do we look here (NCC search) or click here
@@ -98,6 +91,11 @@ pub fn overlay_rects() -> Vec<(String, RectRatio, OverlayKind)> {
         ),
         ("buy_cancel".to_string(), BUY_CANCEL, OverlayKind::Click),
         (
+            "buy_modal_icon".to_string(),
+            BUY_MODAL_ICON,
+            OverlayKind::Search,
+        ),
+        (
             "buy_column".to_string(),
             buy_column_overlay_rect(),
             OverlayKind::Click,
@@ -124,6 +122,7 @@ mod tests {
         rect_in_unit_square(REFRESH_CANCEL);
         rect_in_unit_square(BUY_CONFIRM);
         rect_in_unit_square(BUY_CANCEL);
+        rect_in_unit_square(BUY_MODAL_ICON);
         rect_in_unit_square(SHOP_GRID);
         rect_in_unit_square(buy_column_overlay_rect());
     }

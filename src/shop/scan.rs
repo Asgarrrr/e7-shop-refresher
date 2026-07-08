@@ -21,18 +21,16 @@ pub(crate) struct ShopRow {
 /// without reaching the neighbouring row's icon.
 const ICON_CELL_H_RATIO: f32 = 0.16;
 
-/// Buyable item classes, tried in order when classifying a cell.
-const TARGET_ALIASES: [&str; 2] = [alias::MYSTIC_MEDAL, alias::COVENANT];
-
 /// Row inventory for the current view: find every buy-button anchor in
 /// the buy column, then classify the icon cell each row carries at a
-/// fixed offset. The anchor is large and locale-independent, so this
-/// never searches for a small icon in a big frame — classification of a
-/// known cell replaces detection.
+/// fixed offset against `targets`. The anchor is large and
+/// locale-independent, so this never searches for a small icon in a
+/// big frame — classification of a known cell replaces detection.
 pub(crate) fn scan_shop_rows(
     capture: &dyn Capture,
     detector: &Detector,
     colors: &ColorVerifier,
+    targets: &[&'static str],
     buy_column: [f32; 4],
     icon_column: [f32; 4],
     icon_y_offset_ratio: f32,
@@ -51,16 +49,33 @@ pub(crate) fn scan_shop_rows(
         .into_iter()
         .map(|anchor| {
             let cell = icon_cell_for(anchor.y, icon_column, icon_y_offset_ratio, frame_h);
+            let cell_ctx = detector.prepare_search(&gray, Some(cell));
             // NCC inside the cell first (one candidate position, cheap),
             // then the hue check on a patch centred on the hit — NOT on
             // the whole cell, whose tinted row background would drown
             // the icon's histogram.
-            let klass = TARGET_ALIASES.iter().copied().find(|item| {
-                detector
-                    .find(&gray, item, Some(cell))
-                    .ok()
-                    .flatten()
-                    .is_some_and(|hit| colors.accepts(item, &crop_icon_patch(&rgba, &hit)))
+            let klass = targets.iter().copied().find(|item| {
+                let Ok(Some(hit)) = detector.find_in(&cell_ctx, item) else {
+                    return false;
+                };
+                let report = colors.evaluate(item, &crop_icon_patch(&rgba, &hit));
+                let passed = report.as_ref().is_none_or(|r| r.passed);
+                if let Some(r) = report.filter(|r| !r.passed) {
+                    // Structure matched but colour didn't: either a
+                    // genuine cross-colour lookalike or a global screen
+                    // cast (Night Light / ICC / HDR) — surface which.
+                    tracing::warn!(
+                        alias = item,
+                        score = hit.score,
+                        colour_distance = r.distance,
+                        coloured_fraction = r.coloured_fraction,
+                        likely_screen_tint = hit.score > 0.95 && r.coloured_fraction > 0.6,
+                        "cell NCC hit rejected by colour check — if this fires on real \
+                         items, suspect a screen colour cast and raise \
+                         matching.colour_match_threshold"
+                    );
+                }
+                passed
             });
             ShopRow { anchor, klass }
         })
@@ -93,11 +108,10 @@ pub(super) fn crop_ratio_rect(rgba: &RgbaImage, [x, y, w, h]: [f32; 4]) -> RgbaI
     rgba.view(x0, y0, cw, ch).to_image()
 }
 
-/// One capture + parallel NCC pass against `targets`. Single source of
-/// truth for "what's on screen in the shop right now" — used both by the
-/// bot loop and the Setup-tab live preview worker. The colour check is
-/// kept at the call site so the bot can `warn!` on rejections while the
-/// Setup preview drops them silently.
+/// One capture + parallel NCC pass against `targets` over the whole
+/// grid. Setup-tab live-preview only — the bot loop uses
+/// `scan_shop_rows`; this whole-grid search remains useful for
+/// validating icon templates and colour thresholds interactively.
 pub(crate) fn scan_shop_raw(
     capture: &dyn Capture,
     detector: &Detector,
@@ -246,6 +260,7 @@ mod tests {
             &capture,
             &detector,
             &ColorVerifier::new(),
+            &[alias::MYSTIC_MEDAL, alias::COVENANT],
             [0.8, 0.0, 0.15, 1.0],
             [0.4, 0.0, 0.2, 1.0],
             offset_ratio,

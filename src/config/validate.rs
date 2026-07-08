@@ -48,11 +48,6 @@ fn validate_window(w: &WindowConfig) -> Result<()> {
 }
 
 fn validate_shop(s: &ShopConfig) -> Result<()> {
-    if !(0.0..=1.0).contains(&s.buy_calibration_line_y_ratio) {
-        return Err(Error::ConfigInvalid(
-            "shop.buy_calibration_line_y_ratio must be in [0, 1]".into(),
-        ));
-    }
     // Per-alias stop counts paired with the matching buy flag off can
     // never trip — warn but don't fail, otherwise the GUI (which can
     // toggle the Buy checkbox without resetting the stop count) bricks

@@ -7,10 +7,23 @@ use crate::layout;
 use super::scan::{crop_ratio_rect, scan_shop_rows, strip_hash};
 use super::{ShopRunner, wait};
 
-/// 4% of window height ≈ one row at 1080p — wide enough for sub-pixel
-/// scroll drift, narrow enough to never leak into the adjacent row.
-/// Kept as the GUI calibration overlay's default band height.
-pub const BUY_COLUMN_ROW_BAND_RATIO: f32 = 0.04;
+/// Re-scans per view. Bounds the buy loop when a wrong-item cancel
+/// keeps the target unbought (the row stays buyable and is retried on
+/// the next scan) — more scans than visible rows never helps.
+const MAX_VIEW_SCANS: u32 = 8;
+
+/// What happened to one buy attempt. Only `RowDead` blacklists the
+/// alias for the round: the row genuinely won't wake up. A `WrongItem`
+/// cancel means the click drifted onto a NEIGHBOURING row — the real
+/// target row was never opened and stays buyable.
+enum BuyOutcome {
+    Bought,
+    /// Modal never opened, or confirm left it open — retrying the same
+    /// row this round won't change anything.
+    RowDead,
+    /// Modal opened on a different item; cancelled before confirm.
+    WrongItem,
+}
 
 impl ShopRunner {
     pub(super) fn buy_round(&mut self) -> Result<u32> {
@@ -68,15 +81,17 @@ impl ShopRunner {
     /// a pre-buy frame are stale afterwards.
     pub(super) fn process_current_view(&mut self) -> Result<u32> {
         let mut bought = 0u32;
-        loop {
+        for _ in 0..MAX_VIEW_SCANS {
             if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return Ok(bought);
             }
-            if self
+            let pending: Vec<&'static str> = self
                 .enabled_targets
                 .iter()
-                .all(|a| self.bought_types.contains(a))
-            {
+                .copied()
+                .filter(|a| !self.bought_types.contains(a))
+                .collect();
+            if pending.is_empty() {
                 return Ok(bought);
             }
 
@@ -84,6 +99,7 @@ impl ShopRunner {
                 &*self.capture,
                 &self.detector,
                 &self.color_check,
+                &pending,
                 self.buy_column(),
                 self.shop_grid(),
                 layout::ROW_ICON_Y_OFFSET,
@@ -96,24 +112,29 @@ impl ShopRunner {
 
             let target = rows.iter().find_map(|row| {
                 row.klass
-                    .filter(|k| self.enabled_targets.contains(k) && !self.bought_types.contains(k))
+                    .filter(|k| pending.contains(k))
                     .map(|k| (k, row.anchor))
             });
             let Some((alias_name, anchor)) = target else {
                 return Ok(bought);
             };
 
-            let success = self.try_buy_row(alias_name, &anchor)?;
-            // Mark regardless: a failed buy (modal didn't open, wrong
-            // item shown in the modal) shouldn't re-fire on the next
-            // scan in the same round — the row won't change until the
-            // next refresh.
-            self.bought_types.insert(alias_name);
-            if success {
-                bought += 1;
-                self.progress.item_bought(alias_name);
+            match self.try_buy_row(alias_name, &anchor)? {
+                BuyOutcome::Bought => {
+                    self.bought_types.insert(alias_name);
+                    bought += 1;
+                    self.progress.item_bought(alias_name);
+                }
+                BuyOutcome::RowDead => {
+                    self.bought_types.insert(alias_name);
+                }
+                // The real target row was never opened — leave the
+                // alias pending; the fresh scan retries it, bounded by
+                // MAX_VIEW_SCANS.
+                BuyOutcome::WrongItem => {}
             }
         }
+        Ok(bought)
     }
 
     fn buy_column(&self) -> [f32; 4] {
@@ -131,30 +152,30 @@ impl ShopRunner {
     /// cascade into a blind buy. The modal also shows the item at full
     /// size; it is reclassified there and cancelled on mismatch, so a
     /// drifted row click can never buy the wrong item.
-    pub(super) fn try_buy_row(
+    fn try_buy_row(
         &mut self,
         alias_name: &'static str,
         anchor: &crate::detector::Hit,
-    ) -> Result<bool> {
+    ) -> Result<BuyOutcome> {
         let buy_confirm = self.config.zones.buy_confirm.unwrap_or(layout::BUY_CONFIRM);
 
         let before_gray = self.snapshot()?;
-        let baseline = wait::mean_luma(&before_gray, self.shop_grid());
+        let baseline = wait::mean_luma(&before_gray, crate::layout::SHOP_GRID);
 
         let row_rect = self.anchor_click_rect(anchor);
         self.clicker.click_local_in_rect(&*self.capture, row_rect)?;
         self.clicker.human_pause();
         if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(false);
+            return Ok(BuyOutcome::RowDead);
         }
 
-        if !self.wait_grid_dimmed(baseline)? {
+        let Some(dimmed) = self.wait_grid_dimmed(baseline)? else {
             warn!(
                 alias = alias_name,
                 "buy modal did not open — skipping confirm click"
             );
-            return Ok(false);
-        }
+            return Ok(BuyOutcome::RowDead);
+        };
 
         // Let the slide-in finish so the modal's item icon is fully
         // drawn, then make sure it is the item we clicked for.
@@ -166,9 +187,8 @@ impl ShopRunner {
                 alias = alias_name,
                 "buy modal shows a different item — cancelling"
             );
-            self.click_zone(layout::BUY_CANCEL)?;
-            self.wait_grid_undimmed(baseline)?;
-            return Ok(false);
+            self.cancel_modal(layout::BUY_CANCEL, baseline, dimmed)?;
+            return Ok(BuyOutcome::WrongItem);
         }
 
         let confirm_rect = self.ratio_rect_to_local(buy_confirm)?;
@@ -179,31 +199,35 @@ impl ShopRunner {
         // Grid still dimmed = the confirm click missed and the modal is
         // still up. Cancel out rather than leave a live modal eating the
         // next scroll/click.
-        if !self.wait_grid_undimmed(baseline)? {
+        if !self.wait_grid_undimmed(baseline, dimmed)? {
             warn!(
                 alias = alias_name,
                 "buy modal still open after confirm — clicking cancel"
             );
-            self.click_zone(layout::BUY_CANCEL)?;
-            self.wait_grid_undimmed(baseline)?;
-            return Ok(false);
+            self.cancel_modal(layout::BUY_CANCEL, baseline, dimmed)?;
+            return Ok(BuyOutcome::RowDead);
         }
 
         // Close animation + sold-overlay relayout must finish before the
         // caller re-scans or scrolls, or the input gets eaten.
         self.wait_settled(self.shop_grid(), wait::SETTLE_TIMEOUT_MS)?;
-        Ok(true)
+        Ok(BuyOutcome::Bought)
     }
 
-    fn click_zone(&mut self, zone: [f32; 4]) -> Result<()> {
-        let rect = self.ratio_rect_to_local(zone)?;
+    /// Click the modal's Cancel pill and wait for the dim to lift.
+    fn cancel_modal(&mut self, cancel_zone: [f32; 4], baseline: f32, dimmed: f32) -> Result<()> {
+        let rect = self.ratio_rect_to_local(cancel_zone)?;
         self.clicker.click_local_in_rect(&*self.capture, rect)?;
         self.clicker.human_pause();
+        self.wait_grid_undimmed(baseline, dimmed)?;
         Ok(())
     }
 
     /// Click box centred on the matched buy-button anchor, shrunk so a
     /// uniform random point stays well inside the pill.
+    /// `template_dimensions` is already resampled for the current
+    /// window — multiplying by `anchor.scale` again would square the
+    /// scale and overshoot the pill on any non-native window height.
     fn anchor_click_rect(&self, anchor: &crate::detector::Hit) -> [i32; 4] {
         // Dimensions are always present in prod (bundled fallback); the
         // default only serves detector-less tests.
@@ -211,8 +235,8 @@ impl ShopRunner {
             .detector
             .template_dimensions(crate::detector::alias::BUY_BUTTON)
             .unwrap_or((40, 20));
-        let w = (((tw as f32) * anchor.scale).round() as i32 * 3 / 5).max(1);
-        let h = (((th as f32) * anchor.scale).round() as i32 * 3 / 5).max(1);
+        let w = (tw as i32 * 3 / 5).max(1);
+        let h = (th as i32 * 3 / 5).max(1);
         [anchor.x - w / 2, anchor.y - h / 2, w, h]
     }
 
@@ -272,7 +296,7 @@ impl ShopRunner {
         let shop_grid = self.shop_grid();
 
         let before_gray = self.snapshot()?;
-        let baseline = wait::mean_luma(&before_gray, shop_grid);
+        let baseline = wait::mean_luma(&before_gray, crate::layout::SHOP_GRID);
         let before_grid = strip_hash(&before_gray, shop_grid);
 
         info!("clicking refresh");
@@ -285,10 +309,10 @@ impl ShopRunner {
             return Ok(false);
         }
 
-        if !self.wait_grid_dimmed(baseline)? {
+        let Some(dimmed) = self.wait_grid_dimmed(baseline)? else {
             warn!("refresh modal did not open — skipping confirm click (this round won't refresh)");
             return Ok(false);
-        }
+        };
 
         let confirm_rect = self.ratio_rect_to_local(refresh_confirm)?;
         self.clicker
@@ -297,10 +321,9 @@ impl ShopRunner {
 
         // Grid still dimmed = confirm click missed, modal still up.
         // Cancel out so the next round doesn't fight a live modal.
-        if !self.wait_grid_undimmed(baseline)? {
+        if !self.wait_grid_undimmed(baseline, dimmed)? {
             warn!("refresh modal still open after confirm — clicking cancel");
-            self.click_zone(layout::REFRESH_CANCEL)?;
-            self.wait_grid_undimmed(baseline)?;
+            self.cancel_modal(layout::REFRESH_CANCEL, baseline, dimmed)?;
             return Ok(false);
         }
 
@@ -443,7 +466,10 @@ mod tests {
             .try_buy_row(crate::detector::alias::MYSTIC_MEDAL, &anchor_at(160, 100))
             .unwrap();
 
-        assert!(result, "modal opened — should report a successful buy");
+        assert!(
+            matches!(result, super::BuyOutcome::Bought),
+            "modal opened — should report a successful buy"
+        );
         assert_eq!(click_count(&events), 2, "buy-button click + confirm click");
     }
 
@@ -458,7 +484,10 @@ mod tests {
             .try_buy_row(crate::detector::alias::MYSTIC_MEDAL, &anchor_at(160, 100))
             .unwrap();
 
-        assert!(!result, "modal never opened — must not report a buy");
+        assert!(
+            matches!(result, super::BuyOutcome::RowDead),
+            "modal never opened — the row is dead for this round"
+        );
         assert_eq!(
             click_count(&events),
             1,
@@ -487,7 +516,10 @@ mod tests {
             .try_buy_row(crate::detector::alias::MYSTIC_MEDAL, &anchor_at(160, 100))
             .unwrap();
 
-        assert!(!result, "wrong item in the modal must not be bought");
+        assert!(
+            matches!(result, super::BuyOutcome::WrongItem),
+            "wrong item in the modal must leave the target retryable"
+        );
         assert_eq!(click_count(&events), 2, "buy + cancel, no confirm");
     }
 
@@ -505,7 +537,10 @@ mod tests {
             .try_buy_row(crate::detector::alias::MYSTIC_MEDAL, &anchor_at(160, 100))
             .unwrap();
 
-        assert!(!result, "a cancelled buy must not count");
+        assert!(
+            matches!(result, super::BuyOutcome::RowDead),
+            "a cancelled buy must not count"
+        );
         assert_eq!(click_count(&events), 3, "buy + confirm + cancel");
     }
 

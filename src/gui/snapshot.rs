@@ -8,9 +8,7 @@ use tracing::{info, warn};
 
 use crate::color_check::ColourReport;
 use crate::detector::Hit;
-use crate::gui::app::{
-    BuyDragHandle, DebugMatch, DragRect, SetupPreviewResult, ShopGui, Tab, palette,
-};
+use crate::gui::app::{DebugMatch, DragRect, SetupPreviewResult, ShopGui, Tab, palette};
 use crate::gui::bot::effective_status;
 
 pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
@@ -69,7 +67,7 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
             };
             let effective = effective_rect(gui, &name, default_ratio);
             let rect = ratio_rect(image_rect, effective);
-            // Mirror BuyClick: hover/drag of the row's x/y/w/h inputs
+            // Hover/drag of the row's x/y/w/h inputs
             // thickens the stroke + deepens the fill so the user sees
             // which rect they're about to nudge.
             let focused =
@@ -91,61 +89,6 @@ pub(super) fn draw_snapshot(ui: &mut egui::Ui, gui: &mut ShopGui) {
                 color,
             );
         }
-    }
-
-    // Buy-click calibration overlay: a full-width LINE the user drags to
-    // an item centre (their reference) and a BOX at line + offset that
-    // they drag onto that row's Buy button. Box width follows
-    // `zones.buy_column` so it reads as the column-bound click target.
-    // Always drawn (even with no detection) — calibration is the whole
-    // point of the Setup tab, so the affordances must be visible.
-    if gui.show_layout_overlay {
-        let line_ratio = gui.config.shop.buy_calibration_line_y_ratio;
-        let offset = gui.config.shop.buy_button_y_offset_ratio;
-        let band_h_ratio = gui.config.shop.buy_button_band_h_ratio;
-        let column = gui.config.zones.buy_column.unwrap_or([
-            crate::layout::BUY_COLUMN_X,
-            0.0,
-            crate::layout::BUY_COLUMN_W,
-            0.0,
-        ]);
-
-        let line_y_screen = image_rect.min.y + line_ratio * image_rect.height();
-        let click_y_ratio = line_ratio + offset;
-        let box_x_ratio = column[0];
-        let box_w_ratio = column[2];
-        let box_y_ratio = (click_y_ratio - band_h_ratio * 0.5).clamp(0.0, 1.0);
-        let box_rect = ratio_rect(
-            image_rect,
-            [box_x_ratio, box_y_ratio, box_w_ratio, band_h_ratio],
-        );
-
-        handle_buy_click_drag(gui, &response, image_rect, line_y_screen, box_rect);
-
-        let editing = edit_focus == Some(crate::gui::app::EditFocus::BuyClick)
-            || gui.buy_drag_handle.is_some();
-        let line_stroke = if editing { 2.0 } else { 1.0 };
-        let (fill_alpha, box_stroke) = if editing { (120, 2.5) } else { (70, 1.5) };
-
-        // Reference line — full width, drawn first so the box sits on top.
-        painter.line_segment(
-            [
-                egui::pos2(image_rect.min.x, line_y_screen),
-                egui::pos2(image_rect.max.x, line_y_screen),
-            ],
-            Stroke::new(line_stroke, palette::DEBUG_BAND_STROKE),
-        );
-        painter.rect_filled(
-            box_rect,
-            0.0,
-            Color32::from_rgba_unmultiplied(255, 100, 100, fill_alpha),
-        );
-        painter.rect_stroke(
-            box_rect,
-            0.0,
-            Stroke::new(box_stroke, palette::DEBUG_BAND_STROKE),
-            StrokeKind::Inside,
-        );
     }
 
     for m in &gui.debug_matches {
@@ -272,63 +215,6 @@ fn handle_override_drag(
             return;
         }
         commit_template_crop(gui, alias, rect);
-    }
-}
-
-/// Direct-manipulation of the Buy-click calibration overlay: drag the
-/// line to set the icon-row reference, drag the box to set the click
-/// offset. No-op while a template Edit is armed (override_drag wins).
-fn handle_buy_click_drag(
-    gui: &mut ShopGui,
-    response: &egui::Response,
-    image_rect: Rect,
-    line_y_screen: f32,
-    box_rect: Rect,
-) {
-    // Override-drag (template crop) consumes the same response; let it
-    // take priority so an armed Edit still works on top of the overlay.
-    if gui.override_drag.is_some() {
-        return;
-    }
-
-    // 8 px slack so a line 1 px thick is still grabbable. Box wins ties
-    // because its hit area is larger and intentional.
-    const LINE_PROXIMITY_PX: f32 = 8.0;
-
-    if response.drag_started()
-        && gui.buy_drag_handle.is_none()
-        && let Some(pos) = response.interact_pointer_pos()
-    {
-        if box_rect.contains(pos) {
-            gui.buy_drag_handle = Some(BuyDragHandle::Box);
-        } else if (pos.y - line_y_screen).abs() <= LINE_PROXIMITY_PX {
-            gui.buy_drag_handle = Some(BuyDragHandle::Line);
-        }
-    }
-
-    if let Some(handle) = gui.buy_drag_handle
-        && response.dragged()
-    {
-        // Image height in screen px maps 1:1 to window-height fraction
-        // (the image fills its rect, so 1 ratio unit = image_rect.height()).
-        let delta_ratio = response.drag_delta().y / image_rect.height().max(1.0);
-        match handle {
-            BuyDragHandle::Line => {
-                let r = &mut gui.config.shop.buy_calibration_line_y_ratio;
-                *r = (*r + delta_ratio).clamp(0.0, 1.0);
-            }
-            BuyDragHandle::Box => {
-                // Offset's upper bound matches the DragValue range so a
-                // wild drag can't push the value out of the configurable
-                // space.
-                let r = &mut gui.config.shop.buy_button_y_offset_ratio;
-                *r = (*r + delta_ratio).clamp(0.0, 0.15);
-            }
-        }
-    }
-
-    if response.drag_stopped() {
-        gui.buy_drag_handle = None;
     }
 }
 

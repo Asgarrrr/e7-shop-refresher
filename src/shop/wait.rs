@@ -23,6 +23,13 @@ pub(super) const STATE_TIMEOUT_MS: u64 = 2_500;
 /// scroll glide) to stop mutating the frame.
 pub(super) const SETTLE_TIMEOUT_MS: u64 = 1_500;
 
+/// Floor before settle sampling starts. Without it, two polls that
+/// both land before the game begins rendering the animation (input
+/// latency + slide-in start) hash identically and "settle" on the
+/// pre-action frame. Covers the ~150 ms modal slide-in and typical
+/// input latency; the adaptive polling handles everything longer.
+const SETTLE_GRACE_MS: u64 = 250;
+
 /// A modal dims the whole background. Measured on live captures the
 /// shop grid drops to 0.44–0.72 of its pre-click luminance; 0.85 splits
 /// dimmed from undimmed with margin on both sides. Ratio-based, so a
@@ -52,49 +59,70 @@ pub(super) fn mean_luma(gray: &GrayImage, [x, y, w, h]: [f32; 4]) -> f32 {
 }
 
 impl ShopRunner {
-    /// Polls `pred` on fresh snapshots every `STATE_POLL_MS` until it
-    /// holds or `timeout_ms` elapses. Attempt-count based rather than
-    /// wall-clock so tests with instant fake pauses terminate.
-    pub(super) fn wait_for(
+    /// Polls `extract` on fresh snapshots every `STATE_POLL_MS` until it
+    /// returns `Some` or `timeout_ms` elapses. Attempt-count based
+    /// rather than wall-clock so tests with instant fake pauses
+    /// terminate.
+    pub(super) fn wait_map<T>(
         &self,
         timeout_ms: u64,
-        mut pred: impl FnMut(&GrayImage) -> bool,
-    ) -> Result<bool> {
+        mut extract: impl FnMut(&GrayImage) -> Option<T>,
+    ) -> Result<Option<T>> {
         let attempts = (timeout_ms / STATE_POLL_MS).max(1);
         for i in 0..attempts {
             if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(false);
+                return Ok(None);
             }
             let gray = self.snapshot()?;
-            if pred(&gray) {
-                return Ok(true);
+            if let Some(v) = extract(&gray) {
+                return Ok(Some(v));
             }
             if i + 1 < attempts {
                 self.clicker.pause_ms(STATE_POLL_MS);
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
-    /// `true` once the shop grid luminance drops below the dim ratio of
-    /// `baseline` — i.e. a modal opened over it.
-    pub(super) fn wait_grid_dimmed(&self, baseline: f32) -> Result<bool> {
-        let grid = self.shop_grid();
-        let cut = baseline.max(1.0) * MODAL_DIM_RATIO;
-        self.wait_for(STATE_TIMEOUT_MS, |g| mean_luma(g, grid) < cut)
+    pub(super) fn wait_for(
+        &self,
+        timeout_ms: u64,
+        mut pred: impl FnMut(&GrayImage) -> bool,
+    ) -> Result<bool> {
+        Ok(self
+            .wait_map(timeout_ms, |g| pred(g).then_some(()))?
+            .is_some())
     }
 
-    /// `true` once the shop grid luminance is back at (or above) the
-    /// dim ratio of `baseline` — i.e. the modal closed.
-    pub(super) fn wait_grid_undimmed(&self, baseline: f32) -> Result<bool> {
-        let grid = self.shop_grid();
+    /// `Some(dimmed mean)` once the dim-zone luminance drops below the
+    /// dim ratio of `baseline` — i.e. a modal opened over it. The
+    /// returned reading feeds `wait_grid_undimmed`.
+    pub(super) fn wait_grid_dimmed(&self, baseline: f32) -> Result<Option<f32>> {
+        let zone = dim_zone();
         let cut = baseline.max(1.0) * MODAL_DIM_RATIO;
-        self.wait_for(STATE_TIMEOUT_MS, |g| mean_luma(g, grid) >= cut)
+        self.wait_map(STATE_TIMEOUT_MS, |g| {
+            let m = mean_luma(g, zone);
+            (m < cut).then_some(m)
+        })
+    }
+
+    /// `true` once the dim-zone luminance is back above the midpoint
+    /// between the observed dimmed level and the pre-click baseline.
+    /// Midpoint, not the dim cut itself: a successful buy/refresh
+    /// legitimately changes grid content brightness, and darker
+    /// rerolled items must not read as "modal still open".
+    pub(super) fn wait_grid_undimmed(&self, baseline: f32, dimmed: f32) -> Result<bool> {
+        let zone = dim_zone();
+        let cut = dimmed + (baseline.max(1.0) - dimmed) * 0.5;
+        self.wait_for(STATE_TIMEOUT_MS, |g| mean_luma(g, zone) >= cut)
     }
 
     /// `true` once two consecutive snapshots hash identically over
-    /// `zone` — the animation touching it has finished.
+    /// `zone` — the animation touching it has finished. Sampling only
+    /// starts after `SETTLE_GRACE_MS` so the pre-action frame can't
+    /// satisfy the check before the animation begins.
     pub(super) fn wait_settled(&self, zone: [f32; 4], timeout_ms: u64) -> Result<bool> {
+        self.clicker.pause_ms(SETTLE_GRACE_MS);
         let mut prev: Option<u64> = None;
         self.wait_for(timeout_ms, move |g| {
             let h = strip_hash(g, zone);
@@ -110,6 +138,15 @@ impl ShopRunner {
             .shop_grid
             .unwrap_or(crate::layout::SHOP_GRID)
     }
+}
+
+/// Luminance zone for modal-dim detection: always the bundled icon
+/// column, NOT the user-calibratable `regions.shop_grid`. A user who
+/// drew a wide grid region (valid for the hash checks) would otherwise
+/// include the bright modal window itself and the ratio would never
+/// trip.
+fn dim_zone() -> [f32; 4] {
+    crate::layout::SHOP_GRID
 }
 
 #[cfg(test)]
@@ -133,13 +170,14 @@ mod tests {
     }
 
     #[test]
-    fn wait_grid_dimmed_fires_on_darkened_grid() {
+    fn wait_grid_dimmed_fires_on_darkened_grid_and_reports_the_level() {
         let base = gray_frame(200, 200, 100);
         let mut dim = base.clone();
         paint_zone(&mut dim, SHOP_GRID, 40);
         // First poll sees the still-bright frame, second the dimmed one.
         let (runner, _) = runner_for_loop_tests(vec![base, dim]);
-        assert!(runner.wait_grid_dimmed(100.0).unwrap());
+        let dimmed = runner.wait_grid_dimmed(100.0).unwrap();
+        assert!(dimmed.is_some_and(|m| m < 85.0));
     }
 
     #[test]
@@ -147,7 +185,19 @@ mod tests {
         let base = gray_frame(200, 200, 100);
         let attempts = (STATE_TIMEOUT_MS / STATE_POLL_MS) as usize;
         let (runner, _) = runner_for_loop_tests(vec![base; attempts]);
-        assert!(!runner.wait_grid_dimmed(100.0).unwrap());
+        assert!(runner.wait_grid_dimmed(100.0).unwrap().is_none());
+    }
+
+    #[test]
+    fn wait_grid_undimmed_tolerates_darker_rerolled_content() {
+        // Baseline 100, dimmed reading 40 → cut is the midpoint 70.
+        // Rerolled content at 80 is darker than baseline but must still
+        // count as "modal closed".
+        let base = gray_frame(200, 200, 100);
+        let mut rerolled = base.clone();
+        paint_zone(&mut rerolled, SHOP_GRID, 78);
+        let (runner, _) = runner_for_loop_tests(vec![rerolled]);
+        assert!(runner.wait_grid_undimmed(100.0, 40.0).unwrap());
     }
 
     #[test]

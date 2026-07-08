@@ -27,19 +27,6 @@ stop_when_gold_spent       = 0
 
 buy_mystic_medals     = true
 buy_covenant          = true
-# Window-height fraction from the icon centre down to the row's buy
-# button. E7 puts the button under the icon, not next to it. Calibrate
-# on the Setup tab: drag the red line to an item centre, then drag the
-# red box onto that row's Buy button — this value updates live.
-buy_button_y_offset_ratio = 0.09
-# Vertical extent of the click band around the offset, as a window-height
-# fraction. Each click is randomised inside this band — wider absorbs
-# Y-drift between resolutions, narrower keeps clicks on the button itself.
-buy_button_band_h_ratio = 0.063
-# User-placed reference Y on the Setup-tab snapshot (fraction of window
-# height). Drives where the calibration line and box render; the bot
-# itself uses live detection, not this value.
-buy_calibration_line_y_ratio = 0.65
 # 6 items per refresh, 4 visible at once — 1 scroll reveals the last 2.
 # Set to 2 if your setup undershoots; bottom_strip_hash stops early anyway.
 max_scrolls_per_round = 1

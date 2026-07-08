@@ -15,9 +15,6 @@ pub(super) struct AutoSavedFields {
     pub stop_when_gold_spent: u32,
     pub buy_mystic_medals: bool,
     pub buy_covenant: bool,
-    pub buy_button_y_offset_ratio: f32,
-    pub buy_button_band_h_ratio: f32,
-    pub buy_calibration_line_y_ratio: f32,
     pub threshold: f32,
     pub preview_refresh_ms: u32,
     pub sleep_when_done: bool,
@@ -59,9 +56,6 @@ impl AutoSavedFields {
             stop_when_gold_spent: cfg.shop.stop_when_gold_spent,
             buy_mystic_medals: cfg.shop.buy_mystic_medals,
             buy_covenant: cfg.shop.buy_covenant,
-            buy_button_y_offset_ratio: cfg.shop.buy_button_y_offset_ratio,
-            buy_button_band_h_ratio: cfg.shop.buy_button_band_h_ratio,
-            buy_calibration_line_y_ratio: cfg.shop.buy_calibration_line_y_ratio,
             threshold: cfg.matching.threshold,
             preview_refresh_ms: cfg.matching.preview_refresh_ms,
             sleep_when_done: cfg.shop.sleep_when_done,
@@ -143,24 +137,6 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
         config.shop.buy_mystic_medals,
     );
     set_scalar(&mut doc, "shop", "buy_covenant", config.shop.buy_covenant);
-    set_scalar(
-        &mut doc,
-        "shop",
-        "buy_button_y_offset_ratio",
-        rounded3(f64::from(config.shop.buy_button_y_offset_ratio)),
-    );
-    set_scalar(
-        &mut doc,
-        "shop",
-        "buy_button_band_h_ratio",
-        rounded3(f64::from(config.shop.buy_button_band_h_ratio)),
-    );
-    set_scalar(
-        &mut doc,
-        "shop",
-        "buy_calibration_line_y_ratio",
-        rounded3(f64::from(config.shop.buy_calibration_line_y_ratio)),
-    );
     set_scalar(
         &mut doc,
         "shop",
@@ -447,9 +423,6 @@ mod tests {
         cfg.shop.stop_when_gold_spent = 500_000;
         cfg.shop.buy_mystic_medals = false;
         cfg.shop.buy_covenant = false;
-        cfg.shop.buy_button_y_offset_ratio = 0.11;
-        cfg.shop.buy_button_band_h_ratio = 0.05;
-        cfg.shop.buy_calibration_line_y_ratio = 0.4;
         cfg.shop.sleep_when_done = true;
         cfg.matching.threshold = 0.88;
         cfg.matching.preview_refresh_ms = 750;
@@ -515,9 +488,6 @@ mod tests {
             stop_when_gold_spent: _,
             buy_mystic_medals: _,
             buy_covenant: _,
-            buy_button_y_offset_ratio: _,
-            buy_button_band_h_ratio: _,
-            buy_calibration_line_y_ratio: _,
             threshold: _,
             preview_refresh_ms: _,
             sleep_when_done: _,

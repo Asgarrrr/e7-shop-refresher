@@ -179,7 +179,9 @@ impl Detector {
         }
     }
 
-    /// Native-scale `(w, h)`.
+    /// `(w, h)` of the closest-to-native scaled variant — i.e. already
+    /// resampled for the current window size, NOT the crop's native
+    /// dimensions. Callers must not multiply by a hit's scale again.
     pub fn template_dimensions(&self, alias: &str) -> Option<(u32, u32)> {
         let templates = self.templates.get(alias)?;
         let first = templates.first()?;
@@ -354,15 +356,12 @@ impl Detector {
                 &tpl.image,
                 MatchTemplateMethod::CrossCorrelationNormalized,
             );
-            let sep = tpl.image.width().min(tpl.image.height());
-            let peaks = collect_peaks(&scores, sep, self.threshold);
+            let peaks = collect_peaks(&scores, tpl.image.dimensions(), self.threshold);
 
-            let top = peaks.first().map(|p| p.2).unwrap_or(f32::NEG_INFINITY);
-            if top <= best_top {
-                continue;
-            }
-            best_top = top;
-            best = peaks
+            // Edge filter BEFORE picking the top score: a partial-row
+            // peak at the ROI edge must neither win the scale contest
+            // nor trigger the early-out for a scale it was dropped from.
+            let hits: Vec<Hit> = peaks
                 .into_iter()
                 .filter(|&(x, y, _)| {
                     !hit_touches_edge((x, y), tpl.image.dimensions(), search_ref.dimensions())
@@ -372,11 +371,21 @@ impl Detector {
                     y: ctx.oy + y as i32 + (tpl.image.height() / 2) as i32,
                     score,
                     scale: tpl.scale,
-                    // Not meaningful for repeated elements — every peak
-                    // has same-scoring siblings by construction.
-                    margin: 0.0,
+                    // Unambiguous by construction — repeated elements
+                    // legitimately have same-scoring siblings.
+                    margin: f32::INFINITY,
                 })
                 .collect();
+
+            let top = hits
+                .iter()
+                .map(|h| h.score)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if top <= best_top {
+                continue;
+            }
+            best_top = top;
+            best = hits;
 
             // Comfortable top hit → skip the remaining scales.
             if best_top >= (self.threshold + 0.05).min(1.0) {
@@ -393,9 +402,15 @@ impl Detector {
 }
 
 /// Greedy non-maximum suppression: strongest peak first, then every
-/// remaining candidate outside a `sep × sep` box of an accepted peak.
+/// remaining candidate outside a template-sized box of an accepted
+/// peak. Per-axis separation — a square of min(w, h) would let a
+/// second peak survive along the long axis of a wide template.
 /// Returned strongest-first.
-fn collect_peaks(scores: &Image<Luma<f32>>, sep: u32, threshold: f32) -> Vec<(u32, u32, f32)> {
+fn collect_peaks(
+    scores: &Image<Luma<f32>>,
+    (sep_x, sep_y): (u32, u32),
+    threshold: f32,
+) -> Vec<(u32, u32, f32)> {
     let mut cands: Vec<(u32, u32, f32)> = scores
         .enumerate_pixels()
         .filter(|(_, _, p)| p[0] >= threshold)
@@ -403,11 +418,11 @@ fn collect_peaks(scores: &Image<Luma<f32>>, sep: u32, threshold: f32) -> Vec<(u3
         .collect();
     cands.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-    let sep = sep as i32;
+    let (sep_x, sep_y) = (sep_x as i32, sep_y as i32);
     let mut kept: Vec<(u32, u32, f32)> = Vec::new();
     for (x, y, v) in cands {
         let suppressed = kept.iter().any(|&(kx, ky, _)| {
-            (x as i32 - kx as i32).abs() < sep && (y as i32 - ky as i32).abs() < sep
+            (x as i32 - kx as i32).abs() < sep_x && (y as i32 - ky as i32).abs() < sep_y
         });
         if !suppressed {
             kept.push((x, y, v));
@@ -627,7 +642,7 @@ mod tests {
     #[test]
     fn collect_peaks_keeps_separated_peaks_strongest_first() {
         let scores = make_scores(50, 50, &[(10, 10, 0.92), (10, 40, 0.97), (40, 25, 0.91)]);
-        let peaks = collect_peaks(&scores, 8, 0.9);
+        let peaks = collect_peaks(&scores, (8, 8), 0.9);
         assert_eq!(peaks.len(), 3);
         assert_eq!(peaks[0], (10, 40, 0.97));
     }
@@ -635,14 +650,25 @@ mod tests {
     #[test]
     fn collect_peaks_suppresses_neighbours_of_a_stronger_peak() {
         let scores = make_scores(50, 50, &[(10, 10, 0.95), (12, 13, 0.92), (10, 40, 0.91)]);
-        let peaks = collect_peaks(&scores, 8, 0.9);
+        let peaks = collect_peaks(&scores, (8, 8), 0.9);
         assert_eq!(peaks.len(), 2, "the 0.92 sibling sits inside the box");
+    }
+
+    #[test]
+    fn collect_peaks_separation_is_per_axis_for_wide_templates() {
+        // Wide template (sep 40×10): a peak 20 px to the right on the
+        // same row is a duplicate on the same element — suppressed —
+        // while a peak 20 px below is a different row — kept.
+        let scores = make_scores(80, 80, &[(10, 10, 0.95), (30, 10, 0.93), (10, 30, 0.92)]);
+        let peaks = collect_peaks(&scores, (40, 10), 0.9);
+        assert_eq!(peaks.len(), 2);
+        assert!(peaks.iter().any(|&(x, y, _)| (x, y) == (10, 30)));
     }
 
     #[test]
     fn collect_peaks_drops_below_threshold() {
         let scores = make_scores(50, 50, &[(10, 10, 0.85)]);
-        assert!(collect_peaks(&scores, 8, 0.9).is_empty());
+        assert!(collect_peaks(&scores, (8, 8), 0.9).is_empty());
     }
 
     fn paste(dst: &mut GrayImage, src: &GrayImage, ox: u32, oy: u32) {

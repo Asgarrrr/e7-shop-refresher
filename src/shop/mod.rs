@@ -21,7 +21,6 @@ mod wait;
 #[cfg(test)]
 mod test_support;
 
-pub use round::BUY_COLUMN_ROW_BAND_RATIO;
 pub(crate) use scan::{crop_icon_patch, scan_shop_raw};
 pub use stop::{COVENANT_DROP_PER_SLOT, MYSTIC_DROP_PER_SLOT, SHOP_SLOTS_PER_REFRESH, prices};
 pub(crate) use stop::{gold_spent_for, stop_condition_for};

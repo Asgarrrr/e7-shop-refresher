@@ -43,6 +43,7 @@ const LAYOUT_ZONES: &[(&str, &str)] = &[
 const LAYOUT_TEMPLATES: &[(&str, &str)] = &[
     ("mystic_medal", "Mystic Medal icon"),
     ("covenant", "Covenant Bookmark icon"),
+    ("buy_button", "Buy button anchor (1/1 pill)"),
 ];
 
 // Matches `TIMING_LABEL_W` so labels line up across cards.
@@ -98,10 +99,6 @@ fn draw_layout_card(ui: &mut egui::Ui, gui: &mut ShopGui) {
                 }
                 ui.end_row();
             }
-            buy_reference_row(ui, gui);
-            ui.end_row();
-            buy_click_row(ui, gui);
-            ui.end_row();
         });
     ui.add_space(10.0);
 
@@ -183,81 +180,6 @@ fn rect_row(
     if changed {
         *slot = Some(current);
     }
-}
-
-// Mirror of `buy_click_row` for the reference line itself — sharing the
-// y column makes "line y, then offset y" read top-to-bottom on the same
-// axis. Mouse drag on the snapshot stays as the primary affordance; this
-// is the typed-input escape hatch.
-fn buy_reference_row(ui: &mut egui::Ui, gui: &mut ShopGui) {
-    ui.label("Buy reference");
-    ui.horizontal(|ui| {
-        let h = ui.spacing().interact_size.y;
-        let skip = LAYOUT_RECT_INPUT_W + ui.spacing().item_spacing.x;
-
-        ui.add_space(skip); // x slot
-        let y_resp = ui
-            .add_sized(
-                [LAYOUT_RECT_INPUT_W, h],
-                egui::DragValue::new(&mut gui.config.shop.buy_calibration_line_y_ratio)
-                    .speed(0.001)
-                    .range(0.0..=1.0)
-                    .max_decimals(3)
-                    .min_decimals(3)
-                    .prefix("y "),
-            )
-            .on_hover_text(
-                "Align the red line with the centre of any shop item. \
-                 Rough alignment is enough — the bot detects items live; \
-                 the line is just your visual anchor for the box below.",
-            );
-        crate::gui::app::register_edit_focus(&y_resp, crate::gui::app::EditFocus::BuyClick);
-    });
-}
-
-// Inputs land under the `y` / `h` columns of the rect rows above so the
-// row reads as "extra y/h knobs for buy_column". Each skip folds in
-// `item_spacing.x` because `add_space` doesn't emit it.
-fn buy_click_row(ui: &mut egui::Ui, gui: &mut ShopGui) {
-    ui.label("Buy click");
-    ui.horizontal(|ui| {
-        let h = ui.spacing().interact_size.y;
-        let skip = LAYOUT_RECT_INPUT_W + ui.spacing().item_spacing.x;
-
-        ui.add_space(skip); // x slot
-        let y_resp = ui
-            .add_sized(
-                [LAYOUT_RECT_INPUT_W, h],
-                egui::DragValue::new(&mut gui.config.shop.buy_button_y_offset_ratio)
-                    .speed(0.001)
-                    .range(0.0..=0.15)
-                    .max_decimals(3)
-                    .min_decimals(3)
-                    .prefix("y "),
-            )
-            .on_hover_text(
-                "Sit the red box on that row's Buy button. Distance \
-                 from the reference line down to the click.",
-            );
-        crate::gui::app::register_edit_focus(&y_resp, crate::gui::app::EditFocus::BuyClick);
-
-        ui.add_space(skip); // w slot
-        let h_resp = ui
-            .add_sized(
-                [LAYOUT_RECT_INPUT_W, h],
-                egui::DragValue::new(&mut gui.config.shop.buy_button_band_h_ratio)
-                    .speed(0.001)
-                    .range(0.005..=0.20)
-                    .max_decimals(3)
-                    .min_decimals(3)
-                    .prefix("h "),
-            )
-            .on_hover_text(
-                "Box height — keep it within the Buy button face. Each \
-                 click picks a random Y inside the box.",
-            );
-        crate::gui::app::register_edit_focus(&h_resp, crate::gui::app::EditFocus::BuyClick);
-    });
 }
 
 fn template_row(ui: &mut egui::Ui, gui: &mut ShopGui, label: &str, name: &'static str) {
