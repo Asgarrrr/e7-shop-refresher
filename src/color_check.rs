@@ -172,26 +172,6 @@ impl ColorVerifier {
         self.evaluate(alias, patch).is_none_or(|r| r.passed)
     }
 
-    /// Nearest-reference classification of an icon patch. `Some(alias)`
-    /// only when the closest reference is inside the ceiling AND beats
-    /// the runner-up by the margin; `None` for grayed-out, ambiguous or
-    /// unknown icons — the caller must treat that as "don't buy".
-    pub fn classify(&self, patch: &RgbaImage) -> Option<&'static str> {
-        let sig = HueSig::from_rgba(patch);
-        if sig.coloured_fraction < MIN_COLOURED_FRACTION {
-            return None;
-        }
-        let mut dists: Vec<(&'static str, f32)> = self
-            .refs
-            .iter()
-            .map(|(name, reference)| (*name, sig.distance(reference)))
-            .collect();
-        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        let (best, d0) = dists[0];
-        let d1 = dists.get(1).map_or(f32::INFINITY, |d| d.1);
-        (d0 <= self.threshold && d0 + self.margin <= d1).then_some(best)
-    }
-
     fn ref_for(&self, alias: &str) -> Option<&HueSig> {
         self.refs.iter().find(|(n, _)| *n == alias).map(|(_, s)| s)
     }
@@ -300,26 +280,6 @@ mod tests {
         let gray = solid(64, 64, [128, 128, 128, 255]);
         assert!(!v.accepts(alias::MYSTIC_MEDAL, &gray));
         assert!(!v.accepts(alias::COVENANT, &gray));
-    }
-
-    #[test]
-    fn classify_recognises_each_bundled_reference() {
-        let v = ColorVerifier::new();
-        let mystic = image::load_from_memory(MYSTIC_MEDAL_PNG)
-            .unwrap()
-            .into_rgba8();
-        assert_eq!(v.classify(&mystic), Some(alias::MYSTIC_MEDAL));
-        let covenant = image::load_from_memory(COVENANT_PNG).unwrap().into_rgba8();
-        assert_eq!(v.classify(&covenant), Some(alias::COVENANT));
-    }
-
-    #[test]
-    fn classify_rejects_grayscale_and_off_palette_patches() {
-        let v = ColorVerifier::new();
-        // Grayed-out (sold) icon: no saturated pixels.
-        assert_eq!(v.classify(&solid(64, 64, [128, 128, 128, 255])), None);
-        // Unknown item colour, far from both references.
-        assert_eq!(v.classify(&solid(64, 64, [40, 90, 220, 255])), None);
     }
 
     #[test]

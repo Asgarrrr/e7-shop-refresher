@@ -59,10 +59,10 @@ src/
 - **Detection is row-anchored.** `Detector::find_all_in` locates every
   buy-button anchor (the locale-independent "1/1" pill segment) in the
   buy column; each row's icon cell — at a fixed offset from its anchor —
-  is then classified by `ColorVerifier::classify` (nearest hue
-  reference with margin) AND confirmed by an NCC `find` restricted to
-  that cell. Both must agree or the row is not a target. The click
-  target is the matched anchor itself.
+  is then classified by an NCC `find` restricted to that cell AND a
+  `ColorVerifier` hue check on the matched patch. Both must agree or
+  the row is not a target. The click target is the matched anchor
+  itself.
 - **Waits are observed, never timed.** A modal is open when the shop
   grid's mean luminance drops below 0.85× its pre-click baseline
   (ratio-based, so screen tints cancel); an animation is over when two

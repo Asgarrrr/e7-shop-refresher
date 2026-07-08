@@ -6,9 +6,10 @@ use crate::detector::{Detector, Hit, alias};
 use crate::error::Result;
 
 /// One visible shop row, anchored on its buy button. `klass` is the
-/// icon-cell classification: `Some(alias)` only when the hue histogram
-/// AND an NCC confirm in the cell agree; `None` = not a target
-/// (unknown item, grayed-out sold icon, ambiguous colour).
+/// icon-cell classification: `Some(alias)` only when an NCC match
+/// inside the cell AND the hue check on the matched patch agree;
+/// `None` = not a target (unknown item, grayed-out sold icon,
+/// ambiguous colour).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShopRow {
     pub anchor: Hit,
@@ -19,6 +20,9 @@ pub(crate) struct ShopRow {
 /// ≈ 0.21, the icon ≈ 0.12 — 0.16 gives ± a few px of offset slack
 /// without reaching the neighbouring row's icon.
 const ICON_CELL_H_RATIO: f32 = 0.16;
+
+/// Buyable item classes, tried in order when classifying a cell.
+const TARGET_ALIASES: [&str; 2] = [alias::MYSTIC_MEDAL, alias::COVENANT];
 
 /// Row inventory for the current view: find every buy-button anchor in
 /// the buy column, then classify the icon cell each row carries at a
@@ -47,13 +51,16 @@ pub(crate) fn scan_shop_rows(
         .into_iter()
         .map(|anchor| {
             let cell = icon_cell_for(anchor.y, icon_column, icon_y_offset_ratio, frame_h);
-            let patch = crop_ratio_rect(&rgba, cell);
-            let klass = colors.classify(&patch).filter(|item| {
+            // NCC inside the cell first (one candidate position, cheap),
+            // then the hue check on a patch centred on the hit — NOT on
+            // the whole cell, whose tinted row background would drown
+            // the icon's histogram.
+            let klass = TARGET_ALIASES.iter().copied().find(|item| {
                 detector
                     .find(&gray, item, Some(cell))
                     .ok()
                     .flatten()
-                    .is_some()
+                    .is_some_and(|hit| colors.accepts(item, &crop_icon_patch(&rgba, &hit)))
             });
             ShopRow { anchor, klass }
         })
