@@ -69,8 +69,6 @@ src/
   consecutive zone hashes match (`shop/wait.rs`). Poll cadence and
   timeouts are universal constants, not config. On a missed confirm the
   runner clicks the modal's Cancel and counts the action as failed.
-- **The buy modal's item icon is reclassified before confirm** — a
-  drifted row click cancels out instead of buying the wrong item.
 - **`bought_types` HashSet caps each round to one buy per item type** —
   the shop carries at most one of each per refresh. Cleared at round
   start.

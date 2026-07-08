@@ -21,9 +21,11 @@ pub fn buy_column_overlay_rect() -> RectRatio {
     [BUY_COLUMN_X, SHOP_GRID[1], BUY_COLUMN_W, SHOP_GRID[3]]
 }
 
-/// Refresh button (bottom-left, includes the skystone icon + "Refresh"
-/// glyphs). Click jitter picks a uniform random point inside.
-pub const REFRESH: RectRatio = [0.05, 0.88, 0.22, 0.10];
+/// Refresh button (bottom-left). Click jitter picks a uniform random
+/// point inside, so the zone must sit fully INSIDE the button — sized
+/// to the intersection of the button's measured extent across window
+/// aspect ratios (x 0.087–0.26, y 0.90–0.955 were the tightest bounds).
+pub const REFRESH: RectRatio = [0.10, 0.905, 0.14, 0.045];
 
 /// "Confirm" pill in the refresh-skystone modal (right side, blue).
 pub const REFRESH_CONFIRM: RectRatio = [0.529, 0.621, 0.121, 0.057];
@@ -37,10 +39,6 @@ pub const BUY_CONFIRM: RectRatio = [0.488, 0.686, 0.198, 0.059];
 
 /// "Cancel" pill in the item-buy modal (left side, brown).
 pub const BUY_CANCEL: RectRatio = [0.31, 0.686, 0.13, 0.059];
-
-/// Full-size item icon in the item-buy modal. Reclassified before the
-/// confirm click so a drifted row click can never buy the wrong item.
-pub const BUY_MODAL_ICON: RectRatio = [0.245, 0.42, 0.08, 0.145];
 
 /// Buy-button column X-range. Y is per-row, supplied at click time from
 /// the matched icon's Y coordinate.
@@ -100,11 +98,6 @@ pub fn overlay_rects() -> Vec<(String, RectRatio, OverlayKind)> {
         ),
         ("buy_cancel".to_string(), BUY_CANCEL, OverlayKind::Click),
         (
-            "buy_modal_icon".to_string(),
-            BUY_MODAL_ICON,
-            OverlayKind::Search,
-        ),
-        (
             "buy_column".to_string(),
             buy_column_overlay_rect(),
             OverlayKind::Click,
@@ -131,7 +124,6 @@ mod tests {
         rect_in_unit_square(REFRESH_CANCEL);
         rect_in_unit_square(BUY_CONFIRM);
         rect_in_unit_square(BUY_CANCEL);
-        rect_in_unit_square(BUY_MODAL_ICON);
         rect_in_unit_square(SHOP_GRID);
         rect_in_unit_square(buy_column_overlay_rect());
     }

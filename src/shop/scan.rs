@@ -97,16 +97,6 @@ fn icon_cell_for(anchor_y_px: i32, icon_y_offset_ratio: f32, frame_h: f32) -> [f
     ]
 }
 
-pub(super) fn crop_ratio_rect(rgba: &RgbaImage, [x, y, w, h]: [f32; 4]) -> RgbaImage {
-    let (iw, ih) = (rgba.width() as f32, rgba.height() as f32);
-    let x0 = (x * iw).round().clamp(0.0, iw - 1.0) as u32;
-    let y0 = (y * ih).round().clamp(0.0, ih - 1.0) as u32;
-    let cw = ((w * iw).round() as u32).clamp(1, rgba.width() - x0);
-    let ch = ((h * ih).round() as u32).clamp(1, rgba.height() - y0);
-    use image::GenericImageView;
-    rgba.view(x0, y0, cw, ch).to_image()
-}
-
 /// One capture + parallel NCC pass against `targets` over the whole
 /// grid. Setup-tab live-preview only — the bot loop uses
 /// `scan_shop_rows`; this whole-grid search remains useful for

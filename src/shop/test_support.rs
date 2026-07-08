@@ -148,31 +148,8 @@ pub(super) const REFRESH: [f32; 4] = [0.1, 0.8, 0.1, 0.1];
 pub(super) const REFRESH_CONFIRM: [f32; 4] = [0.4, 0.5, 0.1, 0.1];
 pub(super) const SHOP_GRID: [f32; 4] = [0.1, 0.1, 0.6, 0.6];
 
-/// RGBA frame whose `zone` contains the bundled mystic-medal art —
-/// classifies as `mystic_medal` in colour checks; the rest is dark.
-pub(super) fn rgba_frame_with_mystic_in(w: u32, h: u32, zone: [f32; 4]) -> RgbaImage {
-    let mut img = RgbaImage::from_pixel(w, h, image::Rgba([20, 20, 28, 255]));
-    let icon = image::load_from_memory(include_bytes!("../../assets/mystic_medal.png"))
-        .expect("bundled asset decodes")
-        .into_rgba8();
-    let zx = (zone[0] * w as f32) as u32;
-    let zy = (zone[1] * h as f32) as u32;
-    let zw = ((zone[2] * w as f32) as u32).max(1);
-    let zh = ((zone[3] * h as f32) as u32).max(1);
-    let icon = image::imageops::resize(&icon, zw, zh, image::imageops::FilterType::Triangle);
-    image::imageops::overlay(&mut img, &icon, i64::from(zx), i64::from(zy));
-    img
-}
-
 pub(super) fn runner_for_loop_tests(
     frames: Vec<GrayImage>,
-) -> (ShopRunner, Arc<StdMutex<Vec<FakeEvent>>>) {
-    runner_with_frames(frames, vec![])
-}
-
-pub(super) fn runner_with_frames(
-    frames: Vec<GrayImage>,
-    rgba: Vec<RgbaImage>,
 ) -> (ShopRunner, Arc<StdMutex<Vec<FakeEvent>>>) {
     let mut config: Config = toml::from_str(crate::config::DEFAULT_TOML).unwrap();
     config.zones.refresh = Some(REFRESH);
@@ -185,9 +162,8 @@ pub(super) fn runner_with_frames(
     config.shop.max_scrolls_per_round = 0;
     config.shop.sleep_when_done = false;
 
-    let capture: Arc<dyn Capture> = Arc::new(FakeCapture::with_rgba(
+    let capture: Arc<dyn Capture> = Arc::new(FakeCapture::new(
         frames,
-        rgba,
         WindowRect {
             x: 0,
             y: 0,
