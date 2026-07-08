@@ -86,7 +86,7 @@ impl ShopRunner {
                 &self.color_check,
                 self.buy_column(),
                 self.shop_grid(),
-                self.config.shop.buy_button_y_offset_ratio,
+                layout::ROW_ICON_Y_OFFSET,
             )?;
             debug!(
                 rows = rows.len(),

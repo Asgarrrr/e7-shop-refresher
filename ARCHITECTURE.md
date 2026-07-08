@@ -19,8 +19,9 @@ src/
 ├── layout.rs        Bundled click positions + search ROIs (window-relative ratios)
 ├── shop/
 │   ├── mod.rs       ShopRunner lifecycle: run loop, failure cap, webhooks
-│   ├── round.rs     Per-round actions: buy, scroll, refresh + hash checks
-│   ├── scan.rs      scan_shop_raw + strip_hash capture helpers
+│   ├── round.rs     Per-round actions: buy, scroll, refresh
+│   ├── scan.rs      Row inventory (scan_shop_rows) + strip_hash helpers
+│   ├── wait.rs      Screen-state waits: modal dimming, frame settling
 │   └── stop.rs      Stop conditions + shop price/drop-rate constants
 ├── power.rs         Suspend-to-sleep on completion
 ├── error.rs         Typed errors (thiserror)
@@ -55,21 +56,30 @@ src/
 
 ## Invariants
 
-- **`Detector::find` / `find_in` is the only template-matching path.**
-  Every NCC hit is then colour-gated through `ColorVerifier` (hue
-  histogram) before the runner acts, so a cross-colour false positive
-  never triggers a buy. Buy buttons are never template-matched at
-  runtime; they're click zones with pre/post hash checks to verify the
-  modal opened.
+- **Detection is row-anchored.** `Detector::find_all_in` locates every
+  buy-button anchor (the locale-independent "1/1" pill segment) in the
+  buy column; each row's icon cell — at a fixed offset from its anchor —
+  is then classified by `ColorVerifier::classify` (nearest hue
+  reference with margin) AND confirmed by an NCC `find` restricted to
+  that cell. Both must agree or the row is not a target. The click
+  target is the matched anchor itself.
+- **Waits are observed, never timed.** A modal is open when the shop
+  grid's mean luminance drops below 0.85× its pre-click baseline
+  (ratio-based, so screen tints cancel); an animation is over when two
+  consecutive zone hashes match (`shop/wait.rs`). Poll cadence and
+  timeouts are universal constants, not config. On a missed confirm the
+  runner clicks the modal's Cancel and counts the action as failed.
+- **The buy modal's item icon is reclassified before confirm** — a
+  drifted row click cancels out instead of buying the wrong item.
 - **`bought_types` HashSet caps each round to one buy per item type** —
   the shop carries at most one of each per refresh. Cleared at round
   start.
 - **`refresh_shop` returns `true` only when the items grid actually
   rerolled.** Failed rounds count toward `consecutive_failures` so the
   bot bails rather than hammering a non-shop screen. There is no
-  pre-flight "are we in the shop?" check — the modal-open hash checks
-  on `refresh_confirm` and `buy_confirm` plus the post-refresh
-  `shop_grid` hash cover the IAP-redirect / wrong-screen cases.
+  pre-flight "are we in the shop?" check — the modal-dimming checks
+  plus the post-refresh `shop_grid` hash cover the IAP-redirect /
+  wrong-screen cases.
 - **Long-running loops poll an `Arc<AtomicBool>` stop flag.** Stop
   responds within ~200 ms.
 - **Run-tab parameters** (stop conditions, item targets,

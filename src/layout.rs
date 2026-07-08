@@ -58,6 +58,13 @@ pub const SHOP_GRID: RectRatio = [0.425, 0.085, 0.09, 0.915];
 /// same row as the icon, shifted ~5% of window height downward.
 pub const BUY_BUTTON_Y_OFFSET: f32 = 0.045;
 
+/// Row geometry: window-height fraction between a row's buy-button
+/// centre and its item-icon centre (icon sits slightly higher).
+/// Measured 0.019–0.026 across rows on live captures. Distinct from
+/// `BUY_BUTTON_Y_OFFSET` / the user's click calibration — those relate
+/// the *icon template crop* to the click Y, not button to icon centre.
+pub const ROW_ICON_Y_OFFSET: f32 = 0.023;
+
 /// Tag for the GUI overlay: do we look here (NCC search) or click here
 /// (mouse target)? Drives the colour split on the debug overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -117,6 +117,7 @@ colour_match_margin    = 0.05
 dir          = "templates"
 mystic_medal = "mystic_medal.png"
 covenant     = "covenant.png"
+buy_button   = "buy_button.png"
 
 # `[regions]` and `[zones]` are intentionally omitted from defaults: all
 # click positions and search regions are now compile-time constants in

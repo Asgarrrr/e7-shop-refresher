@@ -16,9 +16,9 @@ pub(crate) struct ShopRow {
 }
 
 /// Height of one icon cell as a fraction of window height. Row pitch is
-/// ≈ 0.21, the icon ≈ 0.12 — 0.14 covers the icon with slack without
-/// leaking into the neighbouring row.
-const ICON_CELL_H_RATIO: f32 = 0.14;
+/// ≈ 0.21, the icon ≈ 0.12 — 0.16 gives ± a few px of offset slack
+/// without reaching the neighbouring row's icon.
+const ICON_CELL_H_RATIO: f32 = 0.16;
 
 /// Row inventory for the current view: find every buy-button anchor in
 /// the buy column, then classify the icon cell each row carries at a
@@ -63,7 +63,7 @@ pub(crate) fn scan_shop_rows(
 
 /// Icon-cell rect for the row anchored at `anchor_y_px`: the icon
 /// column's X band, centred `icon_y_offset_ratio` above the buy button
-/// (same constant the click path used in the other direction).
+/// (`layout::ROW_ICON_Y_OFFSET` at runtime — pure row geometry).
 fn icon_cell_for(
     anchor_y_px: i32,
     icon_column: [f32; 4],
