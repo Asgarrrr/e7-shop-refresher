@@ -73,12 +73,9 @@ long_pause_min_ms  = 5000
 long_pause_max_ms  = 12000
 
 # Positive scroll_amount = scroll down (Windows wheel notches).
+# Modal and scroll waits are observed on screen (luminance / frame
+# settling), not configured — no pause tuning needed.
 scroll_amount      = 8
-scroll_pause_ms    = 250
-
-# Must outlast the modal slide-in animation (~150 ms in E7). Anything
-# beyond is dead time.
-modal_open_pause_ms = 220
 
 # Cooperative mode — pause the bot when you touch the mouse/keyboard,
 # resume after this many ms of idle. 0 disables (bot fights you for the

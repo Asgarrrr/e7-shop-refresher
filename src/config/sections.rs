@@ -144,12 +144,6 @@ pub struct TimingConfig {
 
     /// Mouse-wheel lines per scroll. Positive scrolls down.
     pub scroll_amount: i32,
-    pub scroll_pause_ms: u64,
-
-    /// Must outlast the modal slide-in animation; anything beyond is
-    /// dead time.
-    #[serde(default = "default_modal_open_pause_ms")]
-    pub modal_open_pause_ms: u64,
 
     /// Cooperative mode: pause the bot when the user touches mouse /
     /// keyboard, resume after this many ms of idle. 0 disables — bot
@@ -157,10 +151,6 @@ pub struct TimingConfig {
     /// Discord message without the bot stealing input mid-sentence.
     #[serde(default = "default_cooperative_idle_ms")]
     pub cooperative_idle_ms: u64,
-}
-
-fn default_modal_open_pause_ms() -> u64 {
-    220
 }
 
 fn default_cooperative_idle_ms() -> u64 {
@@ -192,8 +182,6 @@ impl Default for TimingConfig {
             long_pause_max_ms: 12000,
 
             scroll_amount: 8,
-            scroll_pause_ms: 250,
-            modal_open_pause_ms: default_modal_open_pause_ms(),
             cooperative_idle_ms: default_cooperative_idle_ms(),
         }
     }

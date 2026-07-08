@@ -28,8 +28,15 @@ pub const REFRESH: RectRatio = [0.05, 0.88, 0.22, 0.10];
 /// "Confirm" pill in the refresh-skystone modal (right side, blue).
 pub const REFRESH_CONFIRM: RectRatio = [0.529, 0.621, 0.121, 0.057];
 
+/// "Cancel" pill in the refresh-skystone modal (left side, brown).
+/// Recovery target when the confirm click misses and the modal stays up.
+pub const REFRESH_CANCEL: RectRatio = [0.35, 0.621, 0.121, 0.057];
+
 /// "Buy" pill in the item-buy modal (right side, green).
 pub const BUY_CONFIRM: RectRatio = [0.488, 0.686, 0.198, 0.059];
+
+/// "Cancel" pill in the item-buy modal (left side, brown).
+pub const BUY_CANCEL: RectRatio = [0.31, 0.686, 0.13, 0.059];
 
 /// Buy-button column X-range. Y is per-row, supplied at click time from
 /// the matched icon's Y coordinate.
@@ -74,6 +81,12 @@ pub fn overlay_rects() -> Vec<(String, RectRatio, OverlayKind)> {
         ),
         ("buy_confirm".to_string(), BUY_CONFIRM, OverlayKind::Click),
         (
+            "refresh_cancel".to_string(),
+            REFRESH_CANCEL,
+            OverlayKind::Click,
+        ),
+        ("buy_cancel".to_string(), BUY_CANCEL, OverlayKind::Click),
+        (
             "buy_column".to_string(),
             buy_column_overlay_rect(),
             OverlayKind::Click,
@@ -97,7 +110,9 @@ mod tests {
     fn all_constants_are_valid_rects() {
         rect_in_unit_square(REFRESH);
         rect_in_unit_square(REFRESH_CONFIRM);
+        rect_in_unit_square(REFRESH_CANCEL);
         rect_in_unit_square(BUY_CONFIRM);
+        rect_in_unit_square(BUY_CANCEL);
         rect_in_unit_square(SHOP_GRID);
         rect_in_unit_square(buy_column_overlay_rect());
     }

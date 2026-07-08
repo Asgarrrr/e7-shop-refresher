@@ -128,12 +128,6 @@ fn validate_timing(t: &TimingConfig) -> Result<()> {
     validate_range("inter_round", t.inter_round_min_ms, t.inter_round_max_ms)?;
     validate_range("long_pause", t.long_pause_min_ms, t.long_pause_max_ms)?;
 
-    if t.scroll_pause_ms == 0 {
-        return Err(Error::ConfigInvalid(
-            "timing.scroll_pause_ms must be > 0".into(),
-        ));
-    }
-
     if t.move_steps_min == 0 || t.move_steps_min > t.move_steps_max {
         return Err(Error::ConfigInvalid(
             "timing.move_steps_min must be in 1..=move_steps_max".into(),

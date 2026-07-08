@@ -44,8 +44,6 @@ pub(super) struct AutoSavedFields {
     pub long_pause_min_ms: u64,
     pub long_pause_max_ms: u64,
     pub scroll_amount: i32,
-    pub scroll_pause_ms: u64,
-    pub modal_open_pause_ms: u64,
     pub cooperative_idle_ms: u64,
     pub discord_webhook_url: String,
 }
@@ -90,8 +88,6 @@ impl AutoSavedFields {
             long_pause_min_ms: cfg.timing.long_pause_min_ms,
             long_pause_max_ms: cfg.timing.long_pause_max_ms,
             scroll_amount: cfg.timing.scroll_amount,
-            scroll_pause_ms: cfg.timing.scroll_pause_ms,
-            modal_open_pause_ms: cfg.timing.modal_open_pause_ms,
             cooperative_idle_ms: cfg.timing.cooperative_idle_ms,
             discord_webhook_url: cfg.notifications.discord_webhook_url.clone(),
         }
@@ -298,18 +294,6 @@ pub(super) fn write_all_back(path: &Path, config: &Config) -> anyhow::Result<()>
     set_scalar(
         &mut doc,
         "timing",
-        "scroll_pause_ms",
-        i64::try_from(config.timing.scroll_pause_ms).unwrap_or(i64::MAX),
-    );
-    set_scalar(
-        &mut doc,
-        "timing",
-        "modal_open_pause_ms",
-        i64::try_from(config.timing.modal_open_pause_ms).unwrap_or(i64::MAX),
-    );
-    set_scalar(
-        &mut doc,
-        "timing",
         "cooperative_idle_ms",
         i64::try_from(config.timing.cooperative_idle_ms).unwrap_or(i64::MAX),
     );
@@ -492,8 +476,6 @@ mod tests {
         cfg.timing.long_pause_min_ms = 4000;
         cfg.timing.long_pause_max_ms = 11_000;
         cfg.timing.scroll_amount = 6;
-        cfg.timing.scroll_pause_ms = 300;
-        cfg.timing.modal_open_pause_ms = 240;
         cfg.timing.cooperative_idle_ms = 2000;
         cfg.notifications.discord_webhook_url =
             "https://discord.com/api/webhooks/1/round-trip-test".into();
@@ -562,8 +544,6 @@ mod tests {
             long_pause_min_ms: _,
             long_pause_max_ms: _,
             scroll_amount: _,
-            scroll_pause_ms: _,
-            modal_open_pause_ms: _,
             cooperative_idle_ms: _,
             discord_webhook_url: _,
         } = AutoSavedFields::from_config(&non_default_config());

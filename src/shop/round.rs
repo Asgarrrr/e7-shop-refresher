@@ -4,8 +4,8 @@ use tracing::{debug, info, warn};
 use crate::error::Result;
 use crate::layout;
 
-use super::ShopRunner;
 use super::scan::{crop_icon_patch, scan_shop_raw, strip_hash};
+use super::{ShopRunner, wait};
 
 /// 4% of window height ≈ one row at 1080p — wide enough for sub-pixel
 /// scroll drift, narrow enough to never leak into the adjacent row.
@@ -194,8 +194,10 @@ impl ShopRunner {
         false
     }
 
-    /// Pre/post hash on `buy_confirm` gates the confirm click so a
-    /// missed first click can't blindly trigger an unrelated buy.
+    /// Modal state is observed (grid dimming), never assumed: the buy
+    /// click must dim the grid before confirm fires, and confirm must
+    /// un-dim it before the loop moves on — a missed click can't
+    /// cascade into a blind buy.
     pub(super) fn try_buy_at_pixel_y(
         &mut self,
         alias_name: &'static str,
@@ -205,7 +207,7 @@ impl ShopRunner {
         let buy_confirm = self.config.zones.buy_confirm.unwrap_or(layout::BUY_CONFIRM);
 
         let before_gray = self.snapshot()?;
-        let before = strip_hash(&before_gray, buy_confirm);
+        let baseline = wait::mean_luma(&before_gray, self.shop_grid());
 
         let row_rect = self.buy_button_local_rect(icon_y_px, frame_h)?;
         self.clicker.click_local_in_rect(&*self.capture, row_rect)?;
@@ -214,17 +216,7 @@ impl ShopRunner {
             return Ok(false);
         }
 
-        self.clicker
-            .pause_ms(self.config.timing.modal_open_pause_ms);
-        if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(false);
-        }
-
-        // Unchanged confirm-zone = modal didn't open (greyed-out buy
-        // button, animation hiccup). Bail before clicking blind.
-        let after_gray = self.snapshot()?;
-        let after = strip_hash(&after_gray, buy_confirm);
-        if before == after {
+        if !self.wait_grid_dimmed(baseline)? {
             warn!(
                 alias = alias_name,
                 "buy modal did not open — skipping confirm click"
@@ -236,14 +228,31 @@ impl ShopRunner {
         self.clicker
             .click_local_in_rect(&*self.capture, confirm_rect)?;
         self.clicker.human_pause();
-        // Symmetric to `refresh_shop`: let the close animation finish
-        // before subsequent input. Skipping this lets `scroll_one_step`
-        // fire while the modal still has focus, the scroll event gets
-        // eaten, and the next iteration sees the unchanged top view —
-        // round buys one item then refreshes without scanning the rest.
-        self.clicker
-            .pause_ms(self.config.timing.modal_open_pause_ms);
+
+        // Grid still dimmed = the confirm click missed and the modal is
+        // still up. Cancel out rather than leave a live modal eating the
+        // next scroll/click.
+        if !self.wait_grid_undimmed(baseline)? {
+            warn!(
+                alias = alias_name,
+                "buy modal still open after confirm — clicking cancel"
+            );
+            self.click_zone(layout::BUY_CANCEL)?;
+            self.wait_grid_undimmed(baseline)?;
+            return Ok(false);
+        }
+
+        // Close animation + sold-overlay relayout must finish before the
+        // caller re-scans or scrolls, or the input gets eaten.
+        self.wait_settled(self.shop_grid(), wait::SETTLE_TIMEOUT_MS)?;
         Ok(true)
+    }
+
+    fn click_zone(&mut self, zone: [f32; 4]) -> Result<()> {
+        let rect = self.ratio_rect_to_local(zone)?;
+        self.clicker.click_local_in_rect(&*self.capture, rect)?;
+        self.clicker.human_pause();
+        Ok(())
     }
 
     /// Delegates to the pure `buy_column_row_rect_for` helper — also
@@ -282,7 +291,9 @@ impl ShopRunner {
         let (mx, my) = self.scroll_point()?;
         self.clicker
             .scroll_at(&*self.capture, mx, my, self.config.timing.scroll_amount)?;
-        self.clicker.pause_ms(self.config.timing.scroll_pause_ms);
+        // Scroll glide done = two identical grid hashes. A scroll that
+        // moved nothing (already at the bottom) settles immediately.
+        self.wait_settled(self.shop_grid(), wait::SETTLE_TIMEOUT_MS)?;
         Ok(())
     }
 
@@ -319,10 +330,10 @@ impl ShopRunner {
             .zones
             .refresh_confirm
             .unwrap_or(layout::REFRESH_CONFIRM);
-        let shop_grid = self.config.regions.shop_grid.unwrap_or(layout::SHOP_GRID);
+        let shop_grid = self.shop_grid();
 
         let before_gray = self.snapshot()?;
-        let before_confirm = strip_hash(&before_gray, refresh_confirm);
+        let baseline = wait::mean_luma(&before_gray, shop_grid);
         let before_grid = strip_hash(&before_gray, shop_grid);
 
         info!("clicking refresh");
@@ -335,20 +346,7 @@ impl ShopRunner {
             return Ok(false);
         }
 
-        self.clicker
-            .pause_ms(self.config.timing.modal_open_pause_ms);
-        if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(false);
-        }
-
-        let after_gray = self.snapshot()?;
-        let after_confirm = strip_hash(&after_gray, refresh_confirm);
-        debug!(
-            before_hash = before_confirm,
-            after_hash = after_confirm,
-            "refresh modal hash check"
-        );
-        if before_confirm == after_confirm {
+        if !self.wait_grid_dimmed(baseline)? {
             warn!("refresh modal did not open — skipping confirm click (this round won't refresh)");
             return Ok(false);
         }
@@ -358,11 +356,19 @@ impl ShopRunner {
             .click_local_in_rect(&*self.capture, confirm_rect)?;
         self.clicker.human_pause();
 
+        // Grid still dimmed = confirm click missed, modal still up.
+        // Cancel out so the next round doesn't fight a live modal.
+        if !self.wait_grid_undimmed(baseline)? {
+            warn!("refresh modal still open after confirm — clicking cancel");
+            self.click_zone(layout::REFRESH_CANCEL)?;
+            self.wait_grid_undimmed(baseline)?;
+            return Ok(false);
+        }
+
         // After modal close + items re-render, verify the items grid
         // actually changed — catches confirm-click missed / game lagged
         // / never on a real shop modal in the first place.
-        self.clicker
-            .pause_ms(self.config.timing.modal_open_pause_ms);
+        self.wait_settled(shop_grid, wait::SETTLE_TIMEOUT_MS)?;
         let post_gray = self.snapshot()?;
         let post_grid = strip_hash(&post_gray, shop_grid);
         if post_grid == before_grid {
@@ -378,7 +384,7 @@ mod tests {
     use super::*;
 
     use super::super::test_support::{
-        FakeEvent, REFRESH_CONFIRM, SHOP_GRID, gray_frame, paint_zone, runner_for_loop_tests,
+        FakeEvent, SHOP_GRID, gray_frame, paint_zone, runner_for_loop_tests,
     };
 
     #[test]
@@ -422,105 +428,148 @@ mod tests {
         assert_eq!(thick[3], 80);
     }
 
-    #[test]
-    fn refresh_shop_returns_false_when_modal_does_not_open() {
-        let a = gray_frame(200, 200, 100);
-        let b = a.clone();
-        let (mut runner, events) = runner_for_loop_tests(vec![a, b]);
-        let result = runner.refresh_shop().unwrap();
-        assert!(!result);
-        let clicks = events
+    /// Enough identical frames to exhaust a full predicate-wait
+    /// timeout (attempt-count = timeout / poll cadence).
+    fn timeout_frames(frame: &image::GrayImage) -> Vec<image::GrayImage> {
+        let attempts =
+            (super::super::wait::STATE_TIMEOUT_MS / super::super::wait::STATE_POLL_MS) as usize;
+        vec![frame.clone(); attempts]
+    }
+
+    fn click_count(events: &std::sync::Mutex<Vec<FakeEvent>>) -> usize {
+        events
             .lock()
             .unwrap()
             .iter()
             .filter(|e| matches!(e, FakeEvent::Click(_)))
-            .count();
-        assert_eq!(clicks, 1);
+            .count()
+    }
+
+    #[test]
+    fn refresh_shop_returns_false_when_modal_does_not_open() {
+        // Baseline + a full timeout of never-dimming frames.
+        let a = gray_frame(200, 200, 100);
+        let mut frames = vec![a.clone()];
+        frames.extend(timeout_frames(&a));
+        let (mut runner, events) = runner_for_loop_tests(frames);
+        let result = runner.refresh_shop().unwrap();
+        assert!(!result);
+        assert_eq!(click_count(&events), 1);
     }
 
     #[test]
     fn refresh_shop_returns_false_when_grid_does_not_reroll() {
         let a = gray_frame(200, 200, 100);
-        let mut b = a.clone();
-        paint_zone(&mut b, REFRESH_CONFIRM, 200);
-        let c = a.clone();
-        let (mut runner, events) = runner_for_loop_tests(vec![a, b, c]);
+        let mut dim = a.clone();
+        paint_zone(&mut dim, SHOP_GRID, 30);
+        // baseline, dimmed (modal), undimmed, settle ×2, post — post
+        // grid hash equals the baseline's, so no reroll happened.
+        let frames = vec![a.clone(), dim, a.clone(), a.clone(), a.clone(), a.clone()];
+        let (mut runner, events) = runner_for_loop_tests(frames);
         let result = runner.refresh_shop().unwrap();
         assert!(!result);
-        let clicks = events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| matches!(e, FakeEvent::Click(_)))
-            .count();
-        assert_eq!(clicks, 2);
+        assert_eq!(click_count(&events), 2);
     }
 
     #[test]
     fn refresh_shop_returns_true_when_modal_opens_and_grid_changes() {
         let a = gray_frame(200, 200, 100);
-        let mut b = a.clone();
-        paint_zone(&mut b, REFRESH_CONFIRM, 200);
-        let mut c = a.clone();
-        paint_zone(&mut c, SHOP_GRID, 30);
-        let (mut runner, events) = runner_for_loop_tests(vec![a, b, c]);
+        let mut dim = a.clone();
+        paint_zone(&mut dim, SHOP_GRID, 30);
+        // Rerolled grid: bright enough to count as undimmed, different
+        // pixels so the pre/post hash comparison sees the change.
+        let mut rerolled = a.clone();
+        paint_zone(&mut rerolled, SHOP_GRID, 90);
+        let frames = vec![
+            a,
+            dim,
+            rerolled.clone(),
+            rerolled.clone(),
+            rerolled.clone(),
+            rerolled,
+        ];
+        let (mut runner, events) = runner_for_loop_tests(frames);
         let result = runner.refresh_shop().unwrap();
         assert!(result);
-        let clicks = events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| matches!(e, FakeEvent::Click(_)))
-            .count();
-        assert_eq!(clicks, 2);
+        assert_eq!(click_count(&events), 2);
+    }
+
+    #[test]
+    fn refresh_shop_clicks_cancel_when_confirm_leaves_modal_open() {
+        let a = gray_frame(200, 200, 100);
+        let mut dim = a.clone();
+        paint_zone(&mut dim, SHOP_GRID, 30);
+        // baseline, modal opens, then the grid never un-dims (confirm
+        // missed) until after the cancel click.
+        let mut frames = vec![a.clone(), dim.clone()];
+        frames.extend(timeout_frames(&dim));
+        frames.push(a);
+        let (mut runner, events) = runner_for_loop_tests(frames);
+        let result = runner.refresh_shop().unwrap();
+        assert!(!result, "a cancelled refresh must count as failed");
+        assert_eq!(click_count(&events), 3, "refresh + confirm + cancel");
     }
 
     #[test]
     fn try_buy_at_pixel_y_confirms_when_modal_opens() {
         let before = gray_frame(200, 200, 100);
-        let mut after = before.clone();
-        paint_zone(&mut after, [0.4, 0.5, 0.1, 0.1], 200);
-        let (mut runner, events) = runner_for_loop_tests(vec![before, after]);
+        let mut dim = before.clone();
+        paint_zone(&mut dim, SHOP_GRID, 30);
+        // baseline, dimmed (modal), undimmed, settle ×2.
+        let frames = vec![before.clone(), dim, before.clone(), before.clone(), before];
+        let (mut runner, events) = runner_for_loop_tests(frames);
 
         let result = runner
             .try_buy_at_pixel_y(crate::detector::alias::MYSTIC_MEDAL, 100, 200)
             .unwrap();
 
         assert!(result, "modal opened — should report a successful buy");
-        let clicks = events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| matches!(e, FakeEvent::Click(_)))
-            .count();
-        assert_eq!(clicks, 2, "buy-button click + confirm click");
+        assert_eq!(click_count(&events), 2, "buy-button click + confirm click");
     }
 
     #[test]
     fn try_buy_at_pixel_y_skips_confirm_when_modal_stays_shut() {
         let before = gray_frame(200, 200, 100);
-        let after = before.clone();
-        let (mut runner, events) = runner_for_loop_tests(vec![before, after]);
+        let mut frames = vec![before.clone()];
+        frames.extend(timeout_frames(&before));
+        let (mut runner, events) = runner_for_loop_tests(frames);
 
         let result = runner
             .try_buy_at_pixel_y(crate::detector::alias::MYSTIC_MEDAL, 100, 200)
             .unwrap();
 
         assert!(!result, "modal never opened — must not report a buy");
-        let clicks = events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| matches!(e, FakeEvent::Click(_)))
-            .count();
-        assert_eq!(clicks, 1, "only the buy-button click; confirm suppressed");
+        assert_eq!(
+            click_count(&events),
+            1,
+            "only the buy-button click; confirm suppressed"
+        );
+    }
+
+    #[test]
+    fn try_buy_at_pixel_y_clicks_cancel_when_confirm_leaves_modal_open() {
+        let before = gray_frame(200, 200, 100);
+        let mut dim = before.clone();
+        paint_zone(&mut dim, SHOP_GRID, 30);
+        let mut frames = vec![before.clone(), dim.clone()];
+        frames.extend(timeout_frames(&dim));
+        frames.push(before);
+        let (mut runner, events) = runner_for_loop_tests(frames);
+
+        let result = runner
+            .try_buy_at_pixel_y(crate::detector::alias::MYSTIC_MEDAL, 100, 200)
+            .unwrap();
+
+        assert!(!result, "a cancelled buy must not count");
+        assert_eq!(click_count(&events), 3, "buy + confirm + cancel");
     }
 
     #[test]
     fn buy_round_breaks_early_when_bottom_strip_repeats() {
+        // strip snapshot, scroll settle ×2, second strip snapshot
+        // (identical → early break).
         let a = gray_frame(200, 200, 100);
-        let b = a.clone();
-        let (mut runner, _events) = runner_for_loop_tests(vec![a, b]);
+        let (mut runner, _events) = runner_for_loop_tests(vec![a.clone(), a.clone(), a.clone(), a]);
         runner.config.shop.max_scrolls_per_round = 5;
 
         let bought = runner.buy_round().unwrap();

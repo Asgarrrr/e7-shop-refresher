@@ -238,19 +238,6 @@ fn draw_timing_misc(ui: &mut egui::Ui, gui: &mut ShopGui) {
         .show(ui, |ui| {
             apply_timing_field_width(ui);
 
-            ui.label("Modal open pause");
-            ui.add(ms_drag(
-                &mut gui.config.timing.modal_open_pause_ms,
-                2.0,
-                0..=2000,
-                "",
-            ))
-            .on_hover_text(
-                "Wait after click for the confirm modal slide-in animation. \
-                 Lower this and the bot may click before the modal is ready.",
-            );
-            ui.end_row();
-
             ui.label("Yield to user (idle ms)");
             ui.add(ms_drag(
                 &mut gui.config.timing.cooperative_idle_ms,
@@ -275,17 +262,6 @@ fn draw_timing_misc(ui: &mut egui::Ui, gui: &mut ShopGui) {
                 "Wheel notches per scroll. Positive scrolls down. Negative \
                  inverts everything (rarely useful).",
             );
-            ui.end_row();
-
-            ui.label("Scroll pause");
-            ui.add(ms_drag(
-                &mut gui.config.timing.scroll_pause_ms,
-                2.0,
-                // > 0 enforced by validator; dragging to 0 would leave
-                // the bot in a permanently-invalid state on next launch.
-                50..=2000,
-                "",
-            ));
             ui.end_row();
         });
 }
