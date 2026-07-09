@@ -8,6 +8,9 @@
 /captures
 *.bin
 
+# Notes internes — ne jamais publier
+/info.txt
+
 # Divers OS / éditeur
 Thumbs.db
 .DS_Store

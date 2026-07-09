@@ -6,8 +6,9 @@ use tracing::{error, info};
 
 use crate::capture::{Direction, PacketSource, Segment};
 use crate::config::ForwardConfig;
+use crate::domain::shop::{ItemKind, ShopItem, ShopSnapshot};
 use crate::stream::Reassembler;
-use crate::uplink::protocol::{Alert, ItemKind, ServerMessage, ShopItem, ShopSnapshot};
+use crate::uplink::protocol::{Alert, ServerMessage};
 use crate::watch::WatchGate;
 use crate::{Config, Result};
 
