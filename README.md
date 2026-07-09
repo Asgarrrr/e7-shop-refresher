@@ -26,13 +26,23 @@ WinDivert SNIFF ─▶ parse IP/TCP ─▶ réassemblage TCP ─▶ gate ─▶ 
 L'interrupteur **Shop Watch** (activé par défaut) coupe la transmission quand le
 joueur n'est pas dans le shop.
 
+## Distribution — un seul exécutable
+
+Le code user-mode de WinDivert est **lié statiquement** dans l'exe, et le driver
+`WinDivert64.sys` est **embarqué** (`include_bytes!`) puis extrait à côté de
+l'exe au premier lancement. On distribue donc **un unique `.exe`** (release
+GitHub par ex.) : pas de DLL ni de fichiers annexes à joindre.
+
+> Le `.sys` est un driver noyau : Windows le charge depuis un fichier sur disque
+> (jamais depuis la mémoire). L'exe le dépose lui-même — invisible pour
+> l'utilisateur, et les droits admin déjà requis suffisent à l'écrire.
+
 ## Prérequis
 
-- Windows x64, Rust ≥ 1.85.
-- **Droits administrateur** au lancement : WinDivert charge un driver noyau
-  (popup UAC au premier run).
-- Le runtime WinDivert (`WinDivert.dll` + `WinDivert64.sys`) est fourni dans
-  `vendor/windivert/` et copié automatiquement à côté de l'exécutable au build.
+- **Utilisateur final** : Windows x64 + droits administrateur au lancement
+  (WinDivert charge un driver noyau — popup UAC au premier run). Rien d'autre.
+- **Machine de build** : Rust ≥ 1.85 et les MSVC Build Tools (`cl.exe`) — le lien
+  statique compile WinDivert depuis ses sources C.
 
 ## Build
 
@@ -40,8 +50,8 @@ joueur n'est pas dans le shop.
 cargo build --release
 ```
 
-`WINDIVERT_PATH` (défini dans `.cargo/config.toml`) pointe le SDK pour le
-linking. Pour compiler/tester le pipeline sans le backend natif :
+Le lien statique est activé par `WINDIVERT_STATIC` dans `.cargo/config.toml`.
+Pour compiler/tester le pipeline sans le backend natif (aucun MSVC requis) :
 
 ```sh
 cargo test --no-default-features
