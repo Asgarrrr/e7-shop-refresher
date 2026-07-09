@@ -130,17 +130,17 @@ async fn control_loop(gate: WatchGate) {
         match line.trim().to_ascii_lowercase().as_str() {
             "" | "t" | "toggle" => {
                 let on = gate.toggle();
-                println!(">> Shop Watch {}", if on { "ACTIVÉ" } else { "éteint" });
+                println!(">> Shop Watch {}", if on { "ON" } else { "OFF" });
             }
             "on" | "start" => {
                 gate.set(true);
-                println!(">> Shop Watch ACTIVÉ");
+                println!(">> Shop Watch ON");
             }
             "off" | "stop" => {
                 gate.set(false);
-                println!(">> Shop Watch éteint");
+                println!(">> Shop Watch OFF");
             }
-            other => println!(">> commande inconnue : {other:?} (entrée=toggle, on, off)"),
+            other => println!(">> unknown command: {other:?} (enter = toggle, on, off)"),
         }
     }
 }
@@ -153,7 +153,7 @@ async fn display_loop(mut messages: mpsc::Receiver<ServerMessage>) {
                 render(&message);
             }
         } => {}
-        _ = tokio::signal::ctrl_c() => println!("\n>> Ctrl+C — arrêt"),
+        _ = tokio::signal::ctrl_c() => println!("\n>> Ctrl+C, stopping"),
     }
 }
 
@@ -167,29 +167,28 @@ fn render(message: &ServerMessage) {
 
 fn render_shop(snapshot: &ShopSnapshot) {
     let merchant = snapshot.merchant.as_deref().unwrap_or("Secret Shop");
-    println!("\n── {merchant} ──");
+    println!("\n[{merchant}]");
     for item in &snapshot.slots {
         println!("  {}", format_item(item));
     }
 }
 
 fn render_alert(alert: &Alert) {
-    println!("\n★★★ ALERTE ★★★  {}", alert.message);
+    println!("\n[ALERT] {}", alert.message);
     for item in &alert.items {
-        println!("  → {}", format_item(item));
+        println!("  {}", format_item(item));
     }
 }
 
 fn format_item(item: &ShopItem) -> String {
-    let mark = if item.interesting { "★" } else { " " };
     let kind = match item.kind {
-        ItemKind::Equipment => "équipement",
-        ItemKind::Hero => "héros",
-        ItemKind::Token => "jeton",
+        ItemKind::Equipment => "equipment",
+        ItemKind::Hero => "hero",
+        ItemKind::Token => "token",
         ItemKind::Unknown => "?",
     };
 
-    let mut line = format!("[{mark}] slot {} · {kind}", item.slot);
+    let mut line = format!("slot {} · {kind}", item.slot);
     if let Some(name) = &item.name {
         line.push_str(&format!(" · {name}"));
     }
@@ -200,7 +199,7 @@ fn format_item(item: &ShopItem) -> String {
         line.push_str(&format!(" · grade {grade}"));
     }
     if let Some(price) = item.price {
-        line.push_str(&format!(" · {price} or"));
+        line.push_str(&format!(" · {price} gold"));
     }
     if !item.substats.is_empty() {
         let stats: Vec<String> = item
@@ -216,11 +215,14 @@ fn format_item(item: &ShopItem) -> String {
     if let Some(limit) = item.limit {
         line.push_str(&format!(" · {}/{}", limit.remaining, limit.total));
     }
+    if item.interesting {
+        line.push_str(" (interesting)");
+    }
     line
 }
 
 fn print_controls() {
-    println!("Commandes : [Entrée] bascule Shop Watch · `on` · `off` · Ctrl+C pour quitter");
+    println!("Commands: [Enter] toggle Shop Watch, on, off, Ctrl+C to quit");
 }
 
 #[cfg(all(windows, feature = "windivert-backend"))]

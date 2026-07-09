@@ -1,48 +1,48 @@
 # Arkyve — Refresh Shop
 
-Relais local du Secret Shop d'Epic Seven. **Strictement passif et en lecture
-seule** : il observe une copie du trafic du jeu, transmet le flux brut à un
-serveur d'analyse, et affiche les alertes renvoyées. Il n'automatise rien,
-n'envoie aucune donnée vers le jeu, et n'altère jamais ses communications.
+Local relay for Epic Seven's Secret Shop. **Strictly passive and read-only**: it
+observes a copy of the game's traffic, forwards the raw stream to an analysis
+server, and displays the alerts it gets back. It automates nothing, sends no
+data to the game, and never alters its communications.
 
-## Fonctionnement
+## How it works
 
 ```
-WinDivert SNIFF ─▶ parse IP/TCP ─▶ réassemblage TCP ─▶ gate ─▶ WebSocket ─▶ serveur
-   (bloquant)                        (ordonné/dédup)                   ▲          │
-                                                                  alertes ◀───────┘
+WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket ─▶ server
+   (blocking)                       (ordered/dedup)                  ▲         │
+                                                                 alerts ◀──────┘
 ```
 
-- **Capture** : WinDivert en mode `SNIFF` + `RECV_ONLY` livre une *copie* des
-  paquets TCP du port de jeu ; les originaux poursuivent leur route intacts.
-- **Réassemblage** : les segments capturés (potentiellement désordonnés ou
-  retransmis) sont recomposés en un flux d'octets ordonné, par connexion.
-- **Transmission** : le flux brut serveur → client est envoyé tel quel au
-  serveur d'analyse. Le déchiffrement et l'interprétation se font **côté
-  serveur** — le client ne déchiffre rien.
-- **Affichage** : les messages du serveur (instantané du shop, alertes) sont
-  rendus en console.
+- **Capture**: WinDivert in `SNIFF` + `RECV_ONLY` mode yields a *copy* of the
+  game-port TCP packets; the originals continue on their way intact.
+- **Reassembly**: captured segments (possibly out of order or retransmitted) are
+  recomposed into an ordered byte stream, per connection.
+- **Forwarding**: the raw server → client stream is sent as-is to the analysis
+  server. Decryption and interpretation happen **server-side** — the client
+  decrypts nothing.
+- **Display**: server messages (shop snapshot, alerts) are rendered in the
+  console.
 
-L'interrupteur **Shop Watch** (activé par défaut) coupe la transmission quand le
-joueur n'est pas dans le shop.
+The **Shop Watch** switch (on by default) stops forwarding while the player is
+not in the shop.
 
-## Distribution — un seul exécutable
+## Distribution — a single executable
 
-Le code user-mode de WinDivert est **lié statiquement** dans l'exe, et le driver
-`WinDivert64.sys` est **embarqué** (`include_bytes!`) puis extrait à côté de
-l'exe au premier lancement. On distribue donc **un unique `.exe`** (release
-GitHub par ex.) : pas de DLL ni de fichiers annexes à joindre.
+WinDivert's user-mode code is **statically linked** into the exe, and the
+`WinDivert64.sys` driver is **embedded** (`include_bytes!`) then extracted next
+to the exe on first launch. You ship **one `.exe`** (e.g. a GitHub release): no
+DLL or side files to bundle.
 
-> Le `.sys` est un driver noyau : Windows le charge depuis un fichier sur disque
-> (jamais depuis la mémoire). L'exe le dépose lui-même — invisible pour
-> l'utilisateur, et les droits admin déjà requis suffisent à l'écrire.
+> The `.sys` is a kernel driver: Windows loads it from a file on disk (never from
+> memory). The exe drops it itself — invisible to the user, and the already
+> required admin rights are enough to write it.
 
-## Prérequis
+## Requirements
 
-- **Utilisateur final** : Windows x64 + droits administrateur au lancement
-  (WinDivert charge un driver noyau — popup UAC au premier run). Rien d'autre.
-- **Machine de build** : Rust ≥ 1.85 et les MSVC Build Tools (`cl.exe`) — le lien
-  statique compile WinDivert depuis ses sources C.
+- **End user**: Windows x64 + administrator rights at launch (WinDivert loads a
+  kernel driver — UAC prompt on first run). Nothing else.
+- **Build machine**: Rust >= 1.85 and the MSVC Build Tools (`cl.exe`) — static
+  linking compiles WinDivert from its C sources.
 
 ## Build
 
@@ -50,8 +50,8 @@ GitHub par ex.) : pas de DLL ni de fichiers annexes à joindre.
 cargo build --release
 ```
 
-Le lien statique est activé par `WINDIVERT_STATIC` dans `.cargo/config.toml`.
-Pour compiler/tester le pipeline sans le backend natif (aucun MSVC requis) :
+Static linking is enabled via `WINDIVERT_STATIC` in `.cargo/config.toml`. To
+build/test the pipeline without the native backend (no MSVC required):
 
 ```sh
 cargo test --no-default-features
@@ -59,21 +59,20 @@ cargo test --no-default-features
 
 ## Configuration
 
-Copier `config.example.toml` en `config.toml` et ajuster. Toutes les clés ont
-un défaut ; un fichier absent revient aux valeurs par défaut.
+Copy `config.example.toml` to `config.toml` and adjust. Every key has a default;
+a missing file falls back to the defaults.
 
-| Clé | Défaut | Rôle |
-|-----|--------|------|
-| `game_port` | `3333` | Port TCP du serveur de jeu |
-| `server_url` | `ws://127.0.0.1:3001/refresh-shop` | Serveur d'analyse |
-| `forward.server_to_client` | `true` | Transmettre les réponses (contenu du shop) |
-| `forward.client_to_server` | `false` | Transmettre les requêtes (contexte) |
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `game_port` | `3333` | Game server TCP port |
+| `server_url` | `ws://127.0.0.1:3001/refresh-shop` | Analysis server |
+| `forward.server_to_client` | `true` | Forward responses (shop contents) |
+| `forward.client_to_server` | `false` | Forward requests (context) |
 
-## Lancement
+## Running
 
 ```sh
-cargo run --release   # en administrateur
+cargo run --release   # as administrator
 ```
 
-Commandes en cours d'exécution : `[Entrée]` bascule Shop Watch · `on` · `off` ·
-`Ctrl+C` pour quitter.
+Runtime commands: `[Enter]` toggles Shop Watch, `on`, `off`, `Ctrl+C` to quit.
