@@ -1,0 +1,15 @@
+# Build
+/target
+
+# Configuration locale (utiliser config.example.toml comme modèle)
+/config.toml
+
+# Captures / dumps éventuels
+/captures
+*.bin
+
+# Divers OS / éditeur
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

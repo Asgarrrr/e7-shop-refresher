@@ -1,0 +1,22 @@
+# Copier en `config.toml` et ajuster. Toutes les clés ont un défaut ;
+# un fichier absent revient aux valeurs par défaut.
+
+# Port TCP du serveur de jeu Epic Seven.
+game_port = 3333
+
+# Serveur d'analyse (ws:// ou wss://).
+server_url = "ws://127.0.0.1:3001/refresh-shop"
+
+[forward]
+# Réponses serveur → client : contiennent le contenu du shop (à transmettre).
+server_to_client = true
+# Requêtes client → serveur : contexte optionnel.
+client_to_server = false
+
+[reconnect]
+initial_ms = 1000
+max_ms = 30000
+
+[capture]
+buffer_size = 65535
+# filter = "tcp and tcp.SrcPort == 3333"   # override manuel du filtre WinDivert

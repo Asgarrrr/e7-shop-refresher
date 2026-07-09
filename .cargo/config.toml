@@ -1,0 +1,4 @@
+# WinDivert-sys résout le SDK (WinDivert.dll / .lib / WinDivert64.sys) via cette
+# variable au moment du build. Le chemin est relatif à la racine du projet.
+[env]
+WINDIVERT_PATH = { value = "vendor/windivert", relative = true }
