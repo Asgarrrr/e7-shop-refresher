@@ -3,14 +3,14 @@ name = "arkyve-refresh-shop"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Relais local passif qui capture le trafic du Secret Shop d'Epic Seven et le transmet au serveur d'analyse."
+description = "Passive local relay that captures Epic Seven Secret Shop traffic and forwards it to the analysis server."
 license = "MIT"
 publish = false
 
 [features]
 default = ["windivert-backend"]
-# Backend de capture natif Windows (WinDivert). Désactiver pour compiler/tester
-# le pipeline (réassemblage, uplink, modèles) sans le SDK WinDivert.
+# Native Windows capture backend (WinDivert). Disable to build/test the pipeline
+# (reassembly, uplink, models) without the WinDivert SDK.
 windivert-backend = ["dep:windivert"]
 
 [dependencies]

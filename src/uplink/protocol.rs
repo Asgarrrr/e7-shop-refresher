@@ -1,22 +1,22 @@
-//! Contrat des messages renvoyés par le serveur d'analyse.
+//! Contract of the messages returned by the analysis server.
 //!
-//! Le client envoie des octets bruts (le flux du jeu, non déchiffré) ; le serveur
-//! déchiffre, interprète, et répond avec ces messages structurés. Les champs
-//! reprennent le contenu d'un item décrit dans la documentation du Secret Shop.
+//! The client sends raw bytes (the undecrypted game stream); the server
+//! decrypts, interprets, and replies with these structured messages. The fields
+//! mirror a shop item as described in the Secret Shop documentation.
 
 use serde::Deserialize;
 
-/// Message descendant du serveur vers le relais.
+/// Downstream message from the server to the relay.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// Accusé de réception d'un lot d'octets.
+    /// Acknowledges a batch of bytes.
     Ack,
-    /// Instantané complet du shop décodé par le serveur.
+    /// Full shop snapshot decoded by the server.
     Shop(ShopSnapshot),
-    /// Un ou plusieurs items méritent l'attention du joueur.
+    /// One or more items worth the player's attention.
     Alert(Alert),
-    /// Type inconnu — ignoré (compatibilité ascendante).
+    /// Unknown type — ignored (forward compatibility).
     #[serde(other)]
     Unknown,
 }
@@ -38,21 +38,21 @@ pub struct Alert {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShopItem {
-    /// Emplacement dans le shop (1 à 6). `0` si le serveur l'omet.
+    /// Shop slot (1..=6); `0` if the server omits it.
     #[serde(default)]
     pub slot: u8,
-    /// Type d'item ; `Unknown` plutôt que d'invalider tout le message si absent.
+    /// Item type; defaults to `Unknown` rather than failing the whole message.
     #[serde(default)]
     pub kind: ItemKind,
     #[serde(default)]
     pub name: Option<String>,
-    /// Prix en or (pour le lobby).
+    /// Price in gold (lobby shop).
     #[serde(default)]
     pub price: Option<u32>,
-    /// Grade de l'équipement (2, 3 ou 4).
+    /// Gear grade (2, 3, or 4).
     #[serde(default)]
     pub grade: Option<u8>,
-    /// Set de l'équipement (Vitesse, Coup Critique, …).
+    /// Gear set (Speed, Critical, ...).
     #[serde(default)]
     pub set: Option<String>,
     #[serde(default)]
@@ -61,7 +61,7 @@ pub struct ShopItem {
     pub required_level: Option<u8>,
     #[serde(default)]
     pub limit: Option<PurchaseLimit>,
-    /// Verdict du serveur : cet item mérite l'attention.
+    /// Server verdict: this item is worth attention.
     #[serde(default)]
     pub interesting: bool,
 }
@@ -84,7 +84,7 @@ pub struct SubStat {
     pub value: Option<f64>,
 }
 
-/// Limite d'achat, p. ex. « 0/1 » (épuisé) ou « 1/1 » (disponible).
+/// Purchase limit, e.g. "0/1" (sold out) or "1/1" (available).
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct PurchaseLimit {
     pub remaining: u32,

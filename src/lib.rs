@@ -1,14 +1,14 @@
-//! Secret Shop Watcher — relais local.
+//! Secret Shop relay.
 //!
-//! Pipeline entièrement passif : on **observe** une copie du trafic du jeu, on
-//! le réassemble en un flux ordonné, et on transmet les octets bruts au serveur
-//! d'analyse qui, lui, déchiffre et interprète. Le relais n'altère jamais les
-//! communications du jeu et n'envoie rien vers celui-ci.
+//! A fully passive pipeline: it *observes* a copy of the game's traffic,
+//! reassembles it into an ordered stream, and forwards the raw bytes to the
+//! analysis server, which decrypts and interprets them. The relay never alters
+//! the game's communications and never sends anything back to the game.
 //!
 //! ```text
-//! WinDivert SNIFF ─▶ parse IP/TCP ─▶ réassemblage TCP ─▶ gate ─▶ WebSocket ─▶ serveur
-//!    (bloquant)                        (ordonné/dédup)                   ▲          │
-//!                                                                  alertes ◀───────┘
+//! WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket ─▶ server
+//!    (blocking)                       (ordered/dedup)                  ▲         │
+//!                                                                  alerts ◀──────┘
 //! ```
 
 pub mod app;

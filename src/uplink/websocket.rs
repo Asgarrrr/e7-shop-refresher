@@ -1,7 +1,7 @@
-//! Client WebSocket : streame les octets bruts, reçoit les messages du serveur.
+//! WebSocket client: streams the raw bytes, receives server messages.
 //!
-//! La connexion se rétablit automatiquement (backoff exponentiel plafonné). Le
-//! canal sortant fermé signale un arrêt propre : on cesse alors de reconnecter.
+//! The connection re-establishes automatically (capped exponential backoff). A
+//! closed outbound channel signals a clean shutdown: reconnection then stops.
 
 use std::time::Duration;
 
@@ -13,70 +13,65 @@ use tracing::{debug, info, warn};
 
 use super::protocol::ServerMessage;
 
-/// Issue d'une session de connexion.
+/// Outcome of one connection session.
 enum Outcome {
-    /// Le canal sortant est fermé : arrêt demandé.
+    /// The outbound channel is closed: shutdown requested.
     Shutdown,
-    /// La liaison est tombée : reconnexion attendue.
+    /// The link dropped: reconnection expected.
     Disconnected,
 }
 
-pub struct WebSocketUplink;
+/// Connection loop, to be spawned in its own task.
+///
+/// - `outbound`: raw byte batches to send (closing it stops the loop).
+/// - `inbound`: decoded messages received from the server.
+pub async fn run(
+    url: String,
+    mut outbound: mpsc::Receiver<Vec<u8>>,
+    inbound: mpsc::Sender<ServerMessage>,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) {
+    let floor = initial_backoff.max(Duration::from_millis(100));
+    let mut backoff = floor;
 
-impl WebSocketUplink {
-    /// Boucle de connexion, à lancer dans une tâche dédiée.
-    ///
-    /// - `outbound` : lots d'octets bruts à transmettre (fermer ⇒ arrêt).
-    /// - `inbound`  : messages décodés reçus du serveur.
-    pub async fn run(
-        url: String,
-        mut outbound: mpsc::Receiver<Vec<u8>>,
-        inbound: mpsc::Sender<ServerMessage>,
-        initial_backoff: Duration,
-        max_backoff: Duration,
-    ) {
-        let floor = initial_backoff.max(Duration::from_millis(100));
-        let mut backoff = floor;
-
-        loop {
-            match connect_async(&url).await {
-                Ok((stream, _response)) => {
-                    info!(url = %url, "liaison serveur établie");
-                    backoff = floor;
-                    match pump(stream, &mut outbound, &inbound).await {
-                        Outcome::Shutdown => return,
-                        Outcome::Disconnected => warn!("liaison serveur interrompue"),
-                    }
+    loop {
+        match connect_async(&url).await {
+            Ok((stream, _response)) => {
+                info!(url = %url, "server link established");
+                backoff = floor;
+                match pump(stream, &mut outbound, &inbound).await {
+                    Outcome::Shutdown => return,
+                    Outcome::Disconnected => warn!("server link interrupted"),
                 }
-                Err(err) => warn!(url = %url, error = %err, "connexion serveur échouée"),
             }
-
-            if outbound.is_closed() {
-                return;
-            }
-            // Pendant le backoff on continue de vider `outbound` (en le jetant) :
-            // sinon le canal se remplit, le réassemblage bloque, et de proche en
-            // proche le thread de capture stalle — le noyau perd alors des
-            // paquets, créant de vrais trous impossibles à combler. On préfère
-            // jeter les octets tant que le serveur est injoignable (il
-            // resynchronise à la reconnexion).
-            if drain_until(&mut outbound, backoff).await == Drained::Closed {
-                return;
-            }
-            backoff = (backoff * 2).min(max_backoff);
+            Err(err) => warn!(url = %url, error = %err, "server connection failed"),
         }
+
+        if outbound.is_closed() {
+            return;
+        }
+        // Keep draining `outbound` (discarding) during backoff: otherwise the
+        // channel fills, reassembly blocks, and the stall propagates back to the
+        // capture thread — the kernel then drops packets, creating real gaps that
+        // can never be filled. Better to drop bytes while the server is
+        // unreachable (it resyncs on reconnect).
+        if drain_until(&mut outbound, backoff).await == Drained::Closed {
+            return;
+        }
+        backoff = (backoff * 2).min(max_backoff);
     }
 }
 
 #[derive(PartialEq, Eq)]
 enum Drained {
-    /// Le délai est écoulé, le canal est toujours ouvert.
+    /// The delay elapsed; the channel is still open.
     Elapsed,
-    /// Le canal sortant a été fermé : arrêt demandé.
+    /// The outbound channel closed: shutdown requested.
     Closed,
 }
 
-/// Absorbe et jette les lots sortants pendant `wait`, sans bloquer l'amont.
+/// Absorbs and discards outbound batches for `wait`, without stalling upstream.
 async fn drain_until(outbound: &mut mpsc::Receiver<Vec<u8>>, wait: Duration) -> Drained {
     let deadline = tokio::time::sleep(wait);
     tokio::pin!(deadline);
@@ -87,13 +82,13 @@ async fn drain_until(outbound: &mut mpsc::Receiver<Vec<u8>>, wait: Duration) -> 
                 if batch.is_none() {
                     return Drained::Closed;
                 }
-                // lot jeté : serveur injoignable.
+                // batch dropped: server unreachable.
             }
         }
     }
 }
 
-/// Fait circuler les octets sortants et les messages entrants sur une connexion.
+/// Pumps outbound bytes and inbound messages over one connection.
 async fn pump<S>(
     stream: S,
     outbound: &mut mpsc::Receiver<Vec<u8>>,
@@ -118,9 +113,9 @@ where
                 Some(Ok(Message::Text(text))) => forward(text.as_str().as_bytes(), inbound).await,
                 Some(Ok(Message::Binary(bytes))) => forward(&bytes, inbound).await,
                 Some(Ok(Message::Close(_))) | None => return Outcome::Disconnected,
-                Some(Ok(_)) => {} // ping/pong/frame : géré par la lib.
+                Some(Ok(_)) => {} // ping/pong/frame: handled by the library.
                 Some(Err(err)) => {
-                    warn!(error = %err, "erreur de lecture WebSocket");
+                    warn!(error = %err, "WebSocket read error");
                     return Outcome::Disconnected;
                 }
             },
@@ -128,12 +123,12 @@ where
     }
 }
 
-/// Décode un message serveur et le pousse en aval (les indéchiffrables sont ignorés).
+/// Decodes a server message and pushes it downstream (undecodable ones dropped).
 async fn forward(payload: &[u8], inbound: &mpsc::Sender<ServerMessage>) {
     match serde_json::from_slice::<ServerMessage>(payload) {
         Ok(message) => {
             let _ = inbound.send(message).await;
         }
-        Err(err) => debug!(error = %err, "message serveur non reconnu, ignoré"),
+        Err(err) => debug!(error = %err, "unrecognized server message, ignored"),
     }
 }

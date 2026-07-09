@@ -1,24 +1,24 @@
-//! Réassemblage TCP.
+//! TCP reassembly.
 //!
-//! WinDivert opère sous TCP : on reçoit des segments potentiellement désordonnés,
-//! dupliqués (retransmissions) ou chevauchants. Cette couche reconstitue, par
-//! demi-flux, le flux d'octets ordonné exactement tel que la stack TCP le
-//! livrerait — c'est ce flux que le serveur d'analyse s'attend à recevoir.
+//! WinDivert operates below TCP, so segments may arrive out of order,
+//! duplicated (retransmissions), or overlapping. This layer reconstructs, per
+//! half-stream, the ordered byte stream the TCP stack would deliver — which is
+//! what the analysis server expects.
 //!
-//! Tout le travail se fait en **offsets relatifs** à l'origine du flux (le
-//! premier segment observé). Les numéros de séquence TCP sont des `u32` qui
-//! bouclent (une connexion dont l'ISN est proche de `2^32` boucle après quelques
-//! centaines d'octets) ; raisonner en offsets `i64` calculés par `seq_diff`
-//! élimine ce piège, l'ordre et la comparaison devenant monotones.
+//! All work is done in *relative offsets* from the stream origin (the first
+//! observed segment). TCP sequence numbers are `u32` and wrap (a connection
+//! whose ISN is near `2^32` wraps after a few hundred bytes); reasoning in
+//! `i64` offsets computed via `seq_diff` sidesteps that, keeping ordering and
+//! comparison monotonic.
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::capture::{Direction, FlowKey, Segment};
 
-/// Plafond d'octets hors-ordre bufferisés par demi-flux (garde-fou mémoire).
+/// Cap on out-of-order bytes buffered per half-stream (memory guard).
 const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
-/// Réassemble le trafic de plusieurs connexions, indexé par (flux, direction).
+/// Reassembles traffic from several connections, keyed by (flow, direction).
 #[derive(Default)]
 pub struct Reassembler {
     halves: HashMap<(FlowKey, Direction), HalfStream>,
@@ -29,42 +29,41 @@ impl Reassembler {
         Self::default()
     }
 
-    /// Intègre un segment et renvoie les octets nouvellement contigus (ordonnés).
+    /// Integrates a segment and returns the newly contiguous (ordered) bytes.
     ///
-    /// Renvoie un vecteur vide quand le segment est un doublon, comble un trou
-    /// partiel, ou attend encore un segment manquant. Le flux n'est jamais
-    /// démonté sur FIN : un FIN réordonné arrivant avant un segment qui comble
-    /// un trou ne doit pas jeter les données déjà bufferisées.
+    /// Returns an empty vector when the segment is a duplicate, partially fills
+    /// a gap, or still waits on a missing segment. The half-stream is never torn
+    /// down on FIN: a reordered FIN arriving before a gap-filling segment must
+    /// not discard already-buffered data.
     pub fn push(&mut self, segment: &Segment) -> Vec<u8> {
         let half = self.halves.entry((segment.flow, segment.direction)).or_default();
         half.push(segment.seq, segment.syn, &segment.payload)
     }
 
-    /// Réinitialise tout l'état : le prochain segment de chaque flux refixe une
-    /// nouvelle origine. Utilisé après une pause Shop Watch pour repartir d'un
-    /// point de resynchronisation propre plutôt que d'un `next_seq` périmé.
+    /// Resets all state so the next segment of each flow re-anchors a new
+    /// origin. Used after a Shop Watch pause to restart from a clean resync
+    /// point rather than a stale `next_off`.
     pub fn clear(&mut self) {
         self.halves.clear();
     }
 }
 
-/// État de réassemblage d'un sens d'une connexion, en offsets relatifs.
+/// Reassembly state of one direction of a connection, in relative offsets.
 #[derive(Default)]
 struct HalfStream {
-    /// Origine du flux (numéro de séquence du 1er octet), `None` avant la 1re obs.
+    /// Stream origin (sequence number of the first byte); `None` until first seen.
     baseline: Option<u32>,
-    /// Offset (depuis `baseline`) du prochain octet attendu.
+    /// Offset (from `baseline`) of the next expected byte.
     next_off: i64,
-    /// Segments futurs bufferisés, clés par offset (ordre monotone, sans wrap).
+    /// Buffered future segments, keyed by offset (monotonic order, no wrap).
     pending: BTreeMap<i64, Vec<u8>>,
     pending_bytes: usize,
 }
 
 impl HalfStream {
     fn push(&mut self, seq: u32, syn: bool, payload: &[u8]) -> Vec<u8> {
-        // Le SYN consomme un numéro de séquence : les données démarrent à seq+1.
+        // SYN consumes a sequence number: data starts at seq + 1.
         let data_seq = if syn { seq.wrapping_add(1) } else { seq };
-        // Première observation : on adopte ce point comme origine du flux.
         let baseline = *self.baseline.get_or_insert(data_seq);
         let offset = seq_diff(data_seq, baseline);
 
@@ -74,7 +73,7 @@ impl HalfStream {
         out
     }
 
-    /// Intègre un segment isolé : en ordre (append), futur (buffer), ancien (trim).
+    /// Integrates one segment: in order (append), future (buffer), or old (trim).
     fn absorb(&mut self, offset: i64, payload: &[u8], out: &mut Vec<u8>) {
         if payload.is_empty() {
             return;
@@ -84,17 +83,17 @@ impl HalfStream {
             return;
         }
 
-        // offset <= next_off : le segment commence à/avant l'octet attendu.
+        // offset <= next_off: the segment starts at or before the expected byte.
         let already = (self.next_off - offset) as usize;
         if already < payload.len() {
             out.extend_from_slice(&payload[already..]);
             self.next_off += (payload.len() - already) as i64;
         }
-        // sinon : entièrement déjà livré (retransmission) → ignoré.
+        // else: fully delivered already (retransmission) — ignored.
     }
 
     fn buffer_future(&mut self, offset: i64, payload: &[u8]) {
-        // Ne conserver que le plus grand segment vu à un offset donné.
+        // Keep only the largest segment seen at a given offset.
         if self.pending.get(&offset).is_none_or(|v| v.len() < payload.len()) {
             if let Some(old) = self.pending.insert(offset, payload.to_vec()) {
                 self.pending_bytes -= old.len();
@@ -104,11 +103,11 @@ impl HalfStream {
         self.relieve_pressure();
     }
 
-    /// Écoule les segments bufferisés devenus contigus après avancée de `next_off`.
+    /// Flushes buffered segments that became contiguous once `next_off` advanced.
     fn drain(&mut self, out: &mut Vec<u8>) {
         while let Some((&offset, _)) = self.pending.iter().next() {
             if offset > self.next_off {
-                break; // trou toujours présent.
+                break; // gap still present.
             }
             let payload = self.pending.remove(&offset).unwrap();
             self.pending_bytes -= payload.len();
@@ -116,11 +115,11 @@ impl HalfStream {
         }
     }
 
-    /// Sous pression mémoire, on **abandonne le trou courant** : `next_off` saute
-    /// jusqu'au plus proche segment en attente, qui devient alors livrable (le
-    /// `drain` suivant l'écoule). Un octet manquant capté hors-ordre par un tap
-    /// passif ne sera jamais retransmis — mieux vaut une discontinuité que le
-    /// serveur resynchronise qu'un flux figé à jamais.
+    /// Under memory pressure, *give up on the current gap*: jump `next_off` to
+    /// the nearest buffered segment, which then becomes deliverable (the next
+    /// `drain` flushes it). A byte missed out-of-order by a passive tap is never
+    /// retransmitted — a discontinuity the server resyncs on beats a permanently
+    /// stalled stream.
     fn relieve_pressure(&mut self) {
         if self.pending_bytes <= MAX_PENDING_BYTES {
             return;
@@ -133,7 +132,7 @@ impl HalfStream {
     }
 }
 
-/// Distance signée `a - b` sur l'espace circulaire des numéros de séquence.
+/// Signed distance `a - b` over the circular sequence-number space.
 fn seq_diff(a: u32, b: u32) -> i64 {
     (a.wrapping_sub(b) as i32) as i64
 }
@@ -172,12 +171,12 @@ mod tests {
     #[test]
     fn reordering_flushes_multiple_buffered_segments() {
         let mut r = Reassembler::new();
-        // La baseline est fixée par le premier segment observé.
+        // Baseline is set by the first observed segment.
         assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
-        // Deux segments futurs arrivent dans le désordre : rien de livrable.
+        // Two future segments arrive out of order: nothing deliverable yet.
         assert!(r.push(&seg(1006, false, false, b"GH")).is_empty());
         assert!(r.push(&seg(1004, false, false, b"EF")).is_empty());
-        // Le trou comblé écoule tout ce qui était en attente, dans l'ordre.
+        // Filling the gap flushes everything buffered, in order.
         assert_eq!(r.push(&seg(1002, false, false, b"CD")), b"CDEFGH");
     }
 
@@ -192,14 +191,14 @@ mod tests {
     fn overlapping_segment_keeps_only_fresh_tail() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(1000, false, false, b"ABCD")), b"ABCD");
-        // Chevauche "CD" (déjà vus) et apporte "EF".
+        // Overlaps "CD" (already seen) and brings "EF".
         assert_eq!(r.push(&seg(1002, false, false, b"CDEF")), b"EF");
     }
 
     #[test]
     fn syn_sets_the_baseline() {
         let mut r = Reassembler::new();
-        // Le SYN (seq 999, sans données) fixe l'origine à 1000.
+        // The SYN (seq 999, no data) anchors the origin at 1000.
         assert!(r.push(&seg(999, true, false, b"")).is_empty());
         assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
     }
@@ -208,7 +207,7 @@ mod tests {
     fn gap_filled_out_of_order() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
-        assert!(r.push(&seg(1004, false, false, b"EF")).is_empty()); // trou.
+        assert!(r.push(&seg(1004, false, false, b"EF")).is_empty()); // gap.
         assert_eq!(r.push(&seg(1002, false, false, b"CD")), b"CDEF");
     }
 
@@ -216,18 +215,18 @@ mod tests {
     fn fin_does_not_discard_buffered_data() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
-        // Un FIN réordonné, en avance sur un trou, ne doit pas jeter son payload.
+        // A reordered FIN, ahead of a gap, must not drop its payload.
         assert!(r.push(&seg(1004, false, true, b"EF")).is_empty());
-        // Le segment qui comble le trou écoule aussi les données du FIN.
+        // The gap-filling segment flushes the FIN's data too.
         assert_eq!(r.push(&seg(1002, false, false, b"CD")), b"CDEF");
     }
 
     #[test]
     fn reassembles_across_sequence_wrap() {
         let mut r = Reassembler::new();
-        // Baseline juste avant le rebouclage de l'espace de séquence u32.
+        // Baseline just before the u32 sequence space wraps.
         assert_eq!(r.push(&seg(0xFFFF_FFFE, false, false, b"AB")), b"AB");
-        // Le segment suivant est à 0x0000_0000 (wrap) : il reste contigu.
+        // The next segment is at 0x0000_0000 (wrap): still contiguous.
         assert_eq!(r.push(&seg(0x0000_0000, false, false, b"CD")), b"CD");
     }
 
@@ -235,7 +234,7 @@ mod tests {
     fn reordering_across_wrap_is_ordered_correctly() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(0xFFFF_FFFE, false, false, b"AB")), b"AB");
-        // Segment futur post-wrap bufferisé, puis comblement du trou.
+        // A post-wrap future segment is buffered, then the gap is filled.
         assert!(r.push(&seg(0x0000_0002, false, false, b"EF")).is_empty());
         assert_eq!(r.push(&seg(0x0000_0000, false, false, b"CD")), b"CDEF");
     }
@@ -244,8 +243,8 @@ mod tests {
     fn clear_resets_baseline_for_resync() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
-        // Après une pause, l'état est vidé : un segment très en avant redevient
-        // une nouvelle origine au lieu d'être bufferisé indéfiniment.
+        // After a pause the state is wiped: a far-ahead segment becomes a new
+        // origin instead of being buffered forever.
         r.clear();
         assert_eq!(r.push(&seg(9000, false, false, b"XY")), b"XY");
     }

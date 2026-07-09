@@ -1,4 +1,4 @@
-//! Décodage d'un paquet IP brut (couche réseau WinDivert) en [`Segment`].
+//! Decodes a raw IP packet (WinDivert network layer) into a [`Segment`].
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -6,10 +6,10 @@ use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 
 use super::{Direction, FlowKey, Segment};
 
-/// Extrait un segment TCP d'un paquet IP.
+/// Extracts a TCP segment from an IP packet.
 ///
-/// Renvoie `None` si le paquet n'est pas du TCP concernant `game_port`, ou s'il
-/// est malformé. La direction est déduite du port du serveur de jeu.
+/// Returns `None` when the packet is not TCP concerning `game_port`, or is
+/// malformed. Direction is inferred from which side owns `game_port`.
 pub fn parse_segment(bytes: &[u8], game_port: u16) -> Option<Segment> {
     let sliced = SlicedPacket::from_ip(bytes).ok()?;
 
@@ -35,9 +35,9 @@ pub fn parse_segment(bytes: &[u8], game_port: u16) -> Option<Segment> {
         return None;
     };
 
-    // Ignorer les ACK purs (sans données ni SYN/FIN) : ils n'apportent aucun
-    // octet au flux et sont ~la moitié des paquets d'une connexion active. Le
-    // SYN et le FIN sont conservés (baseline / fin de flux).
+    // Skip pure ACKs (no data, no SYN/FIN): they carry no stream bytes and are
+    // ~half the packets on an active connection. SYN/FIN are kept (baseline /
+    // teardown signal).
     if tcp.payload().is_empty() && !tcp.syn() && !tcp.fin() {
         return None;
     }

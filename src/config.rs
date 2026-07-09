@@ -1,4 +1,4 @@
-//! Configuration du relais, chargée depuis un fichier TOML (défauts sinon).
+//! Relay configuration, loaded from a TOML file (defaults otherwise).
 
 use std::path::Path;
 use std::time::Duration;
@@ -7,52 +7,52 @@ use serde::Deserialize;
 
 use crate::error::Result;
 
-/// Port TCP du serveur de jeu Epic Seven (`msg://`).
+/// TCP port of the Epic Seven game server (`msg://`).
 pub const DEFAULT_GAME_PORT: u16 = 3333;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Port TCP du serveur de jeu, côté distant.
+    /// TCP port of the game server, remote side.
     pub game_port: u16,
 
-    /// URL du serveur d'analyse (`ws://` ou `wss://`).
+    /// Analysis server URL (`ws://` or `wss://`).
     pub server_url: String,
 
-    /// Directions du flux à transmettre au serveur.
+    /// Stream directions to forward to the server.
     pub forward: ForwardConfig,
 
-    /// Politique de reconnexion à la liaison serveur.
+    /// Reconnection policy for the server link.
     pub reconnect: ReconnectConfig,
 
-    /// Réglages bas niveau de la capture.
+    /// Low-level capture settings.
     pub capture: CaptureConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ForwardConfig {
-    /// Réponses serveur → client : contiennent le contenu du shop.
+    /// Server -> client responses: carry the shop contents.
     pub server_to_client: bool,
-    /// Requêtes client → serveur : contexte (commande émise), optionnel.
+    /// Client -> server requests: context (issued command), optional.
     pub client_to_server: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReconnectConfig {
-    /// Délai initial avant nouvelle tentative (millisecondes).
+    /// Initial delay before retrying (milliseconds).
     pub initial_ms: u64,
-    /// Plafond du backoff exponentiel (millisecondes).
+    /// Cap on the exponential backoff (milliseconds).
     pub max_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
-    /// Taille du tampon de réception d'un paquet WinDivert (octets).
+    /// Receive buffer size for one WinDivert packet (bytes).
     pub buffer_size: usize,
-    /// Filtre WinDivert explicite ; sinon dérivé de `game_port` + `forward`.
+    /// Explicit WinDivert filter; otherwise derived from `game_port` + `forward`.
     pub filter: Option<String>,
 }
 
@@ -70,7 +70,7 @@ impl Default for Config {
 
 impl Default for ForwardConfig {
     fn default() -> Self {
-        // Le contenu du shop vit dans les réponses serveur → client.
+        // Shop contents live in the server -> client responses.
         Self {
             server_to_client: true,
             client_to_server: false,
@@ -97,7 +97,7 @@ impl Default for CaptureConfig {
 }
 
 impl Config {
-    /// Charge la configuration depuis `path`. Un fichier absent donne les défauts.
+    /// Loads the configuration from `path`. A missing file yields the defaults.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         match std::fs::read_to_string(path) {
@@ -113,23 +113,23 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         if self.game_port == 0 {
-            return Err(crate::Error::Config("game_port ne peut pas être 0".into()));
+            return Err(crate::Error::Config("game_port cannot be 0".into()));
         }
         if !self.forward.server_to_client && !self.forward.client_to_server {
             return Err(crate::Error::Config(
-                "au moins une direction doit être transmise (forward)".into(),
+                "at least one direction must be forwarded (forward)".into(),
             ));
         }
         if self.server_url.trim().is_empty() {
-            return Err(crate::Error::Config("server_url est vide".into()));
+            return Err(crate::Error::Config("server_url is empty".into()));
         }
-        // La direction d'un segment est déduite en comparant ses ports à
-        // `game_port` : un filtre personnalisé qui capture un autre port livre
-        // du trafic que rien ne saura classer — zéro segment, sans erreur.
+        // A segment's direction is inferred by comparing its ports to
+        // `game_port`: a custom filter capturing a different port delivers
+        // traffic nothing can classify — zero segments, no error.
         if let Some(filter) = &self.capture.filter {
             if !filter.contains(&self.game_port.to_string()) {
                 return Err(crate::Error::Config(format!(
-                    "capture.filter ne référence pas game_port ({}) : aucun paquet ne serait classé",
+                    "capture.filter does not reference game_port ({}): no packet would be classified",
                     self.game_port
                 )));
             }
@@ -137,9 +137,9 @@ impl Config {
         Ok(())
     }
 
-    /// Filtre WinDivert effectif : uniquement les directions à transmettre.
+    /// Effective WinDivert filter: only the directions to forward.
     ///
-    /// La réponse du shop transite serveur → client (`tcp.SrcPort == game_port`).
+    /// The shop response travels server -> client (`tcp.SrcPort == game_port`).
     pub fn capture_filter(&self) -> String {
         if let Some(filter) = &self.capture.filter {
             return filter.clone();

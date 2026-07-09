@@ -1,6 +1,5 @@
-# Lien statique : le code user-mode de WinDivert est compilé dans l'exe (depuis
-# les sources C vendorisées par windivert-sys, via MSVC). Plus de WinDivert.dll
-# à distribuer — seul le driver WinDivert64.sys reste nécessaire, embarqué dans
-# l'exe et extrait au runtime.
+# Static linking: WinDivert's user-mode code is compiled into the exe (from the
+# C sources vendored by windivert-sys, via MSVC). No WinDivert.dll to ship — only
+# the WinDivert64.sys driver remains, embedded in the exe and extracted at runtime.
 [env]
 WINDIVERT_STATIC = "1"

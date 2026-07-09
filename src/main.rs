@@ -1,4 +1,4 @@
-//! Point d'entrée du relais Secret Shop Watcher.
+//! Entry point for the Secret Shop relay.
 
 use std::process::ExitCode;
 
@@ -21,7 +21,7 @@ async fn main() -> ExitCode {
     let config = match Config::load(CONFIG_PATH) {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("Configuration invalide : {err}");
+            eprintln!("Invalid configuration: {err}");
             return ExitCode::FAILURE;
         }
     };
@@ -29,7 +29,7 @@ async fn main() -> ExitCode {
     match app::run(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("Erreur fatale : {err}");
+            eprintln!("Fatal error: {err}");
             ExitCode::FAILURE
         }
     }

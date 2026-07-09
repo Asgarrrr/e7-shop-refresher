@@ -1,4 +1,4 @@
-//! Orchestration : capture → réassemblage → gate → uplink → affichage.
+//! Orchestration: capture -> reassembly -> gate -> uplink -> display.
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -8,20 +8,19 @@ use crate::capture::{Direction, PacketSource, Segment};
 use crate::config::ForwardConfig;
 use crate::stream::Reassembler;
 use crate::uplink::protocol::{Alert, ItemKind, ServerMessage, ShopItem, ShopSnapshot};
-use crate::uplink::WebSocketUplink;
 use crate::watch::WatchGate;
 use crate::{Config, Result};
 
-/// Événement remontant du thread de capture vers le réassemblage.
+/// Event flowing from the capture thread to reassembly.
 enum CaptureEvent {
-    /// Un segment TCP à réassembler.
+    /// A TCP segment to reassemble.
     Segment(Segment),
-    /// Le Shop Watch vient d'être réactivé après une pause : le réassembleur
-    /// doit repartir d'une origine neuve (les octets de la pause sont perdus).
+    /// Shop Watch was just re-enabled after a pause: the reassembler must
+    /// re-anchor a fresh origin (the bytes during the pause are lost).
     Resync,
 }
 
-/// Lance le relais et bloque jusqu'à l'arrêt (Ctrl+C ou fin de flux).
+/// Runs the relay and blocks until shutdown (Ctrl+C or end of stream).
 pub async fn run(config: Config) -> Result<()> {
     let gate = WatchGate::new(true);
 
@@ -29,15 +28,15 @@ pub async fn run(config: Config) -> Result<()> {
     let (raw_tx, raw_rx) = mpsc::channel::<Vec<u8>>(1_024);
     let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(256);
 
-    // Capture bloquante sur un thread dédié (WinDivert::recv est synchrone).
+    // Blocking capture on a dedicated thread (WinDivert::recv is synchronous).
     let source = build_source(&config)?;
     let capture_gate = gate.clone();
     std::thread::Builder::new()
         .name("capture".to_owned())
         .spawn(move || capture_loop(source, segment_tx, capture_gate))?;
 
-    // Liaison serveur avec reconnexion automatique.
-    tokio::spawn(WebSocketUplink::run(
+    // Server link with automatic reconnection.
+    tokio::spawn(crate::uplink::run(
         config.server_url.clone(),
         raw_rx,
         message_tx,
@@ -45,21 +44,21 @@ pub async fn run(config: Config) -> Result<()> {
         config.reconnect_max(),
     ));
 
-    // Réassemblage + filtrage des directions à transmettre.
+    // Reassembly + filtering of the directions to forward.
     tokio::spawn(reassemble_loop(segment_rx, raw_tx, config.forward.clone()));
 
-    // Contrôle interactif de l'interrupteur Shop Watch.
+    // Interactive control of the Shop Watch switch.
     tokio::spawn(control_loop(gate.clone()));
 
-    info!(server = %config.server_url, "relais démarré — Shop Watch actif");
+    info!(server = %config.server_url, "relay started — Shop Watch active");
     print_controls();
 
     display_loop(message_rx).await;
-    info!("arrêt du relais");
+    info!("relay stopped");
     Ok(())
 }
 
-/// Consomme les événements de capture, réassemble, transmet le flux ordonné.
+/// Consumes capture events, reassembles, forwards the ordered stream.
 async fn reassemble_loop(
     mut events: mpsc::Receiver<CaptureEvent>,
     raw_tx: mpsc::Sender<Vec<u8>>,
@@ -82,7 +81,7 @@ async fn reassemble_loop(
             continue;
         }
         if raw_tx.send(ordered).await.is_err() {
-            break; // uplink arrêté.
+            break; // uplink gone.
         }
     }
 }
@@ -94,29 +93,29 @@ fn should_forward(direction: Direction, forward: &ForwardConfig) -> bool {
     }
 }
 
-/// Boucle de capture (contexte synchrone). S'arrête si le pipeline se ferme.
+/// Capture loop (synchronous context). Stops when the pipeline closes.
 fn capture_loop(mut source: Box<dyn PacketSource>, tx: mpsc::Sender<CaptureEvent>, gate: WatchGate) {
     let mut was_enabled = gate.is_enabled();
     loop {
         let segment = match source.next_segment() {
             Ok(segment) => segment,
             Err(err) => {
-                error!(error = %err, "capture interrompue");
+                error!(error = %err, "capture interrupted");
                 break;
             }
         };
 
         let enabled = gate.is_enabled();
-        // Transition éteint → allumé : demander une resynchronisation avant
-        // d'émettre, sinon le réassembleur traite le saut de séquence comme un
-        // trou infranchissable et ne livre plus jamais rien.
+        // Off -> on transition: request a resync before emitting, otherwise the
+        // reassembler treats the sequence jump as an unfillable gap and never
+        // delivers anything again.
         if enabled && !was_enabled && tx.blocking_send(CaptureEvent::Resync).is_err() {
             break;
         }
         was_enabled = enabled;
 
         if !enabled {
-            continue; // Shop Watch éteint : on n'émet rien.
+            continue; // Shop Watch off: emit nothing.
         }
         if tx.blocking_send(CaptureEvent::Segment(segment)).is_err() {
             break;
@@ -124,7 +123,7 @@ fn capture_loop(mut source: Box<dyn PacketSource>, tx: mpsc::Sender<CaptureEvent
     }
 }
 
-/// Lit les commandes clavier pour piloter l'interrupteur Shop Watch.
+/// Reads keyboard commands to drive the Shop Watch switch.
 async fn control_loop(gate: WatchGate) {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -146,7 +145,7 @@ async fn control_loop(gate: WatchGate) {
     }
 }
 
-/// Affiche les messages du serveur jusqu'à Ctrl+C ou fermeture de la liaison.
+/// Displays server messages until Ctrl+C or the link closes.
 async fn display_loop(mut messages: mpsc::Receiver<ServerMessage>) {
     tokio::select! {
         _ = async {
@@ -228,7 +227,7 @@ fn print_controls() {
 fn build_source(config: &Config) -> Result<Box<dyn PacketSource>> {
     use crate::capture::WinDivertSource;
     let filter = config.capture_filter();
-    info!(filter = %filter, "ouverture de la capture WinDivert (admin requis)");
+    info!(filter = %filter, "opening WinDivert capture (admin required)");
     let source = WinDivertSource::open(&filter, config.game_port, config.capture.buffer_size)?;
     Ok(Box::new(source))
 }
@@ -236,7 +235,6 @@ fn build_source(config: &Config) -> Result<Box<dyn PacketSource>> {
 #[cfg(not(all(windows, feature = "windivert-backend")))]
 fn build_source(_config: &Config) -> Result<Box<dyn PacketSource>> {
     Err(crate::Error::Capture(
-        "aucun backend de capture compilé — activez la feature `windivert-backend` sur Windows"
-            .to_owned(),
+        "no capture backend compiled — enable the `windivert-backend` feature on Windows".to_owned(),
     ))
 }

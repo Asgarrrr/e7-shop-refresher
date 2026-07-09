@@ -1,8 +1,8 @@
-//! Interrupteur « Shop Watch ».
+//! The "Shop Watch" switch.
 //!
-//! Quand il est éteint, le flux capturé n'est pas transmis au serveur : le
-//! joueur l'active en ouvrant le shop, l'éteint quand il a terminé. Partagé
-//! sans verrou entre le thread de capture et le contrôle interactif.
+//! While off, the captured stream is not forwarded: the player turns it on when
+//! opening the shop and off when done. Shared lock-free between the capture
+//! thread and the interactive control.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ impl WatchGate {
         self.enabled.store(on, Ordering::Relaxed);
     }
 
-    /// Bascule l'état et renvoie la nouvelle valeur.
+    /// Flips the state and returns the new value.
     pub fn toggle(&self) -> bool {
         !self.enabled.fetch_xor(true, Ordering::Relaxed)
     }
