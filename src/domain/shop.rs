@@ -2,7 +2,7 @@
 //! display and filter. Only this shape crosses the link; how the server
 //! produces it is not the client's concern.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShopSnapshot {
@@ -10,9 +10,39 @@ pub struct ShopSnapshot {
     pub merchant: Option<String>,
     #[serde(default)]
     pub slots: Vec<ShopItem>,
+    /// Refresh-session facts (balance, cost) — grouped apart because they are
+    /// not shop *contents*. Present means both are known; absent means neither
+    /// is, which makes crystal limits unenforceable.
+    #[serde(default, deserialize_with = "refresh_or_none")]
+    pub refresh: Option<RefreshMeta>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct RefreshMeta {
+    /// Crystal balance after the debit.
+    pub crystal_balance: u32,
+    /// Cost of one manual refresh (3 in the lobby).
+    pub cost: u32,
+}
+
+/// Degrades a partial `refresh` object (or `null`) to `None` rather than
+/// failing the whole snapshot, like the rest of the model.
+fn refresh_or_none<'de, D: Deserializer<'de>>(de: D) -> Result<Option<RefreshMeta>, D::Error> {
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Partial {
+        crystal_balance: Option<u32>,
+        cost: Option<u32>,
+    }
+    Ok(Option::<Partial>::deserialize(de)?.and_then(|partial| {
+        Some(RefreshMeta {
+            crystal_balance: partial.crystal_balance?,
+            cost: partial.cost?,
+        })
+    }))
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ShopItem {
     /// Shop slot (1..=6); `0` if the server omits it.
     #[serde(default)]
@@ -75,4 +105,39 @@ pub struct SubStat {
 pub struct PurchaseLimit {
     pub remaining: u32,
     pub total: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> ShopSnapshot {
+        serde_json::from_str(json).expect("snapshot should parse")
+    }
+
+    #[test]
+    fn refresh_full_object_parses() {
+        let snapshot = parse(r#"{"refresh":{"crystal_balance":95,"cost":3}}"#);
+        assert_eq!(
+            snapshot.refresh,
+            Some(RefreshMeta {
+                crystal_balance: 95,
+                cost: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn refresh_partial_object_degrades_to_none() {
+        // A half-shipped `refresh` must not fail the whole snapshot.
+        let snapshot = parse(r#"{"refresh":{"crystal_balance":95},"slots":[{}]}"#);
+        assert_eq!(snapshot.refresh, None);
+        assert_eq!(snapshot.slots.len(), 1);
+    }
+
+    #[test]
+    fn refresh_null_or_absent_is_none() {
+        assert_eq!(parse(r#"{"refresh":null}"#).refresh, None);
+        assert_eq!(parse("{}").refresh, None);
+    }
 }
