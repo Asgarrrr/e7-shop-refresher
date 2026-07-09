@@ -35,6 +35,13 @@ pub fn parse_segment(bytes: &[u8], game_port: u16) -> Option<Segment> {
         return None;
     };
 
+    // Ignorer les ACK purs (sans données ni SYN/FIN) : ils n'apportent aucun
+    // octet au flux et sont ~la moitié des paquets d'une connexion active. Le
+    // SYN et le FIN sont conservés (baseline / fin de flux).
+    if tcp.payload().is_empty() && !tcp.syn() && !tcp.fin() {
+        return None;
+    }
+
     let src = SocketAddr::new(src_ip, tcp.source_port());
     let dst = SocketAddr::new(dst_ip, tcp.destination_port());
 

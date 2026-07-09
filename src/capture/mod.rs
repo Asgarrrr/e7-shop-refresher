@@ -23,15 +23,6 @@ pub enum Direction {
     ServerToClient,
 }
 
-impl Direction {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Direction::ClientToServer => "c2s",
-            Direction::ServerToClient => "s2c",
-        }
-    }
-}
-
 /// Identifie une connexion TCP indépendamment du sens observé.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowKey {

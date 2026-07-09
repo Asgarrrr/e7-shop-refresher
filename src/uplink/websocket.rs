@@ -54,8 +54,41 @@ impl WebSocketUplink {
             if outbound.is_closed() {
                 return;
             }
-            tokio::time::sleep(backoff).await;
+            // Pendant le backoff on continue de vider `outbound` (en le jetant) :
+            // sinon le canal se remplit, le réassemblage bloque, et de proche en
+            // proche le thread de capture stalle — le noyau perd alors des
+            // paquets, créant de vrais trous impossibles à combler. On préfère
+            // jeter les octets tant que le serveur est injoignable (il
+            // resynchronise à la reconnexion).
+            if drain_until(&mut outbound, backoff).await == Drained::Closed {
+                return;
+            }
             backoff = (backoff * 2).min(max_backoff);
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum Drained {
+    /// Le délai est écoulé, le canal est toujours ouvert.
+    Elapsed,
+    /// Le canal sortant a été fermé : arrêt demandé.
+    Closed,
+}
+
+/// Absorbe et jette les lots sortants pendant `wait`, sans bloquer l'amont.
+async fn drain_until(outbound: &mut mpsc::Receiver<Vec<u8>>, wait: Duration) -> Drained {
+    let deadline = tokio::time::sleep(wait);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Drained::Elapsed,
+            batch = outbound.recv() => {
+                if batch.is_none() {
+                    return Drained::Closed;
+                }
+                // lot jeté : serveur injoignable.
+            }
         }
     }
 }

@@ -38,8 +38,11 @@ pub struct Alert {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShopItem {
-    /// Emplacement dans le shop (1 à 6).
+    /// Emplacement dans le shop (1 à 6). `0` si le serveur l'omet.
+    #[serde(default)]
     pub slot: u8,
+    /// Type d'item ; `Unknown` plutôt que d'invalider tout le message si absent.
+    #[serde(default)]
     pub kind: ItemKind,
     #[serde(default)]
     pub name: Option<String>,
@@ -63,12 +66,13 @@ pub struct ShopItem {
     pub interesting: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemKind {
     Equipment,
     Hero,
     Token,
+    #[default]
     #[serde(other)]
     Unknown,
 }

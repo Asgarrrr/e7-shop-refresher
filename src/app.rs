@@ -12,11 +12,20 @@ use crate::uplink::WebSocketUplink;
 use crate::watch::WatchGate;
 use crate::{Config, Result};
 
+/// Événement remontant du thread de capture vers le réassemblage.
+enum CaptureEvent {
+    /// Un segment TCP à réassembler.
+    Segment(Segment),
+    /// Le Shop Watch vient d'être réactivé après une pause : le réassembleur
+    /// doit repartir d'une origine neuve (les octets de la pause sont perdus).
+    Resync,
+}
+
 /// Lance le relais et bloque jusqu'à l'arrêt (Ctrl+C ou fin de flux).
 pub async fn run(config: Config) -> Result<()> {
     let gate = WatchGate::new(true);
 
-    let (segment_tx, segment_rx) = mpsc::channel::<Segment>(8_192);
+    let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(8_192);
     let (raw_tx, raw_rx) = mpsc::channel::<Vec<u8>>(1_024);
     let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(256);
 
@@ -50,17 +59,26 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
-/// Consomme les segments capturés, les réassemble, transmet le flux ordonné.
+/// Consomme les événements de capture, réassemble, transmet le flux ordonné.
 async fn reassemble_loop(
-    mut segments: mpsc::Receiver<Segment>,
+    mut events: mpsc::Receiver<CaptureEvent>,
     raw_tx: mpsc::Sender<Vec<u8>>,
     forward: ForwardConfig,
 ) {
     let mut reassembler = Reassembler::new();
-    while let Some(segment) = segments.recv().await {
-        let direction = segment.direction;
+    while let Some(event) = events.recv().await {
+        let segment = match event {
+            CaptureEvent::Resync => {
+                reassembler.clear();
+                continue;
+            }
+            CaptureEvent::Segment(segment) => segment,
+        };
+        if !should_forward(segment.direction, &forward) {
+            continue;
+        }
         let ordered = reassembler.push(&segment);
-        if ordered.is_empty() || !should_forward(direction, &forward) {
+        if ordered.is_empty() {
             continue;
         }
         if raw_tx.send(ordered).await.is_err() {
@@ -77,21 +95,31 @@ fn should_forward(direction: Direction, forward: &ForwardConfig) -> bool {
 }
 
 /// Boucle de capture (contexte synchrone). S'arrête si le pipeline se ferme.
-fn capture_loop(mut source: Box<dyn PacketSource>, tx: mpsc::Sender<Segment>, gate: WatchGate) {
+fn capture_loop(mut source: Box<dyn PacketSource>, tx: mpsc::Sender<CaptureEvent>, gate: WatchGate) {
+    let mut was_enabled = gate.is_enabled();
     loop {
-        match source.next_segment() {
-            Ok(segment) => {
-                if !gate.is_enabled() {
-                    continue; // Shop Watch éteint : on n'émet rien.
-                }
-                if tx.blocking_send(segment).is_err() {
-                    break;
-                }
-            }
+        let segment = match source.next_segment() {
+            Ok(segment) => segment,
             Err(err) => {
                 error!(error = %err, "capture interrompue");
                 break;
             }
+        };
+
+        let enabled = gate.is_enabled();
+        // Transition éteint → allumé : demander une resynchronisation avant
+        // d'émettre, sinon le réassembleur traite le saut de séquence comme un
+        // trou infranchissable et ne livre plus jamais rien.
+        if enabled && !was_enabled && tx.blocking_send(CaptureEvent::Resync).is_err() {
+            break;
+        }
+        was_enabled = enabled;
+
+        if !enabled {
+            continue; // Shop Watch éteint : on n'émet rien.
+        }
+        if tx.blocking_send(CaptureEvent::Segment(segment)).is_err() {
+            break;
         }
     }
 }

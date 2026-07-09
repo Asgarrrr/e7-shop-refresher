@@ -123,6 +123,17 @@ impl Config {
         if self.server_url.trim().is_empty() {
             return Err(crate::Error::Config("server_url est vide".into()));
         }
+        // La direction d'un segment est déduite en comparant ses ports à
+        // `game_port` : un filtre personnalisé qui capture un autre port livre
+        // du trafic que rien ne saura classer — zéro segment, sans erreur.
+        if let Some(filter) = &self.capture.filter {
+            if !filter.contains(&self.game_port.to_string()) {
+                return Err(crate::Error::Config(format!(
+                    "capture.filter ne référence pas game_port ({}) : aucun paquet ne serait classé",
+                    self.game_port
+                )));
+            }
+        }
         Ok(())
     }
 
