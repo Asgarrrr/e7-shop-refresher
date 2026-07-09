@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use tracing_subscriber::EnvFilter;
 
-use arkyve_refresh_shop::{app, Config};
+use arkyve_refresh_shop::{Config, app};
 
 const CONFIG_PATH: &str = "config.toml";
 

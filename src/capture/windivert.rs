@@ -10,7 +10,7 @@ use std::path::Path;
 use tracing::warn;
 use windivert::prelude::*;
 
-use super::{parse_segment, PacketSource, Segment};
+use super::{PacketSource, Segment, parse_segment};
 use crate::error::{Error, Result};
 
 /// Signed kernel driver, embedded in the executable and extracted at runtime.
@@ -67,8 +67,8 @@ impl PacketSource for WinDivertSource {
 /// Drops the driver next to the exe when it is missing or differs from the
 /// embedded binary. Idempotent and safe alongside another running instance.
 fn ensure_driver_present() -> Result<()> {
-    let exe = std::env::current_exe()
-        .map_err(|err| Error::Capture(format!("executable path: {err}")))?;
+    let exe =
+        std::env::current_exe().map_err(|err| Error::Capture(format!("executable path: {err}")))?;
     let dir = exe
         .parent()
         .ok_or_else(|| Error::Capture("executable directory not found".to_owned()))?;

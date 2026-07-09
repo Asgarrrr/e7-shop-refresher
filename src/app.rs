@@ -94,7 +94,11 @@ fn should_forward(direction: Direction, forward: &ForwardConfig) -> bool {
 }
 
 /// Capture loop (synchronous context). Stops when the pipeline closes.
-fn capture_loop(mut source: Box<dyn PacketSource>, tx: mpsc::Sender<CaptureEvent>, gate: WatchGate) {
+fn capture_loop(
+    mut source: Box<dyn PacketSource>,
+    tx: mpsc::Sender<CaptureEvent>,
+    gate: WatchGate,
+) {
     let mut was_enabled = gate.is_enabled();
     loop {
         let segment = match source.next_segment() {
@@ -237,6 +241,7 @@ fn build_source(config: &Config) -> Result<Box<dyn PacketSource>> {
 #[cfg(not(all(windows, feature = "windivert-backend")))]
 fn build_source(_config: &Config) -> Result<Box<dyn PacketSource>> {
     Err(crate::Error::Capture(
-        "no capture backend compiled — enable the `windivert-backend` feature on Windows".to_owned(),
+        "no capture backend compiled — enable the `windivert-backend` feature on Windows"
+            .to_owned(),
     ))
 }

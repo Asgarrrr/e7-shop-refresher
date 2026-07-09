@@ -4,8 +4,8 @@
 //! opening the shop and off when done. Shared lock-free between the capture
 //! thread and the interactive control.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone)]
 pub struct WatchGate {

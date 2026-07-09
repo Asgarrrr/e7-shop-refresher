@@ -110,7 +110,7 @@ where
                 None => return Outcome::Shutdown,
             },
             incoming = read.next() => match incoming {
-                Some(Ok(Message::Text(text))) => forward(text.as_str().as_bytes(), inbound).await,
+                Some(Ok(Message::Text(text))) => forward(text.as_bytes(), inbound).await,
                 Some(Ok(Message::Binary(bytes))) => forward(&bytes, inbound).await,
                 Some(Ok(Message::Close(_))) | None => return Outcome::Disconnected,
                 Some(Ok(_)) => {} // ping/pong/frame: handled by the library.

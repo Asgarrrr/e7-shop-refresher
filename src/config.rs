@@ -126,13 +126,13 @@ impl Config {
         // A segment's direction is inferred by comparing its ports to
         // `game_port`: a custom filter capturing a different port delivers
         // traffic nothing can classify — zero segments, no error.
-        if let Some(filter) = &self.capture.filter {
-            if !filter.contains(&self.game_port.to_string()) {
-                return Err(crate::Error::Config(format!(
-                    "capture.filter does not reference game_port ({}): no packet would be classified",
-                    self.game_port
-                )));
-            }
+        if let Some(filter) = &self.capture.filter
+            && !filter.contains(&self.game_port.to_string())
+        {
+            return Err(crate::Error::Config(format!(
+                "capture.filter does not reference game_port ({}): no packet would be classified",
+                self.game_port
+            )));
         }
         Ok(())
     }

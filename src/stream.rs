@@ -36,7 +36,10 @@ impl Reassembler {
     /// down on FIN: a reordered FIN arriving before a gap-filling segment must
     /// not discard already-buffered data.
     pub fn push(&mut self, segment: &Segment) -> Vec<u8> {
-        let half = self.halves.entry((segment.flow, segment.direction)).or_default();
+        let half = self
+            .halves
+            .entry((segment.flow, segment.direction))
+            .or_default();
         half.push(segment.seq, segment.syn, &segment.payload)
     }
 
@@ -94,7 +97,11 @@ impl HalfStream {
 
     fn buffer_future(&mut self, offset: i64, payload: &[u8]) {
         // Keep only the largest segment seen at a given offset.
-        if self.pending.get(&offset).is_none_or(|v| v.len() < payload.len()) {
+        if self
+            .pending
+            .get(&offset)
+            .is_none_or(|v| v.len() < payload.len())
+        {
             if let Some(old) = self.pending.insert(offset, payload.to_vec()) {
                 self.pending_bytes -= old.len();
             }
@@ -105,11 +112,11 @@ impl HalfStream {
 
     /// Flushes buffered segments that became contiguous once `next_off` advanced.
     fn drain(&mut self, out: &mut Vec<u8>) {
-        while let Some((&offset, _)) = self.pending.iter().next() {
+        while let Some((&offset, _)) = self.pending.first_key_value() {
             if offset > self.next_off {
                 break; // gap still present.
             }
-            let payload = self.pending.remove(&offset).unwrap();
+            let (offset, payload) = self.pending.pop_first().expect("peeked above");
             self.pending_bytes -= payload.len();
             self.absorb(offset, &payload, out);
         }
@@ -124,10 +131,10 @@ impl HalfStream {
         if self.pending_bytes <= MAX_PENDING_BYTES {
             return;
         }
-        if let Some((&offset, _)) = self.pending.iter().next() {
-            if offset > self.next_off {
-                self.next_off = offset;
-            }
+        if let Some((&offset, _)) = self.pending.first_key_value()
+            && offset > self.next_off
+        {
+            self.next_off = offset;
         }
     }
 }
