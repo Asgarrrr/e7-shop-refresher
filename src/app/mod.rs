@@ -48,6 +48,7 @@ pub enum Command {
 /// Cheap clones of the shared session state, for a view (the GUI) running
 /// beside the session loop: read `status()`/`progress()`/`last_snapshot()`/
 /// `checklist()` under short locks, send [`Command`]s, read the journal.
+#[derive(Clone)]
 pub struct SessionHandles {
     pub controller: Arc<Mutex<Controller>>,
     pub commands: mpsc::Sender<Command>,
@@ -58,10 +59,7 @@ pub struct SessionHandles {
 /// The owned half of [`setup`]: everything the relay pipeline consumes.
 pub struct Session {
     config: Config,
-    controller: Arc<Mutex<Controller>>,
-    gate: WatchGate,
-    journal: EventLog,
-    command_tx: mpsc::Sender<Command>,
+    handles: SessionHandles,
     command_rx: mpsc::Receiver<Command>,
 }
 
@@ -79,17 +77,14 @@ pub fn setup(config: Config) -> (Session, SessionHandles) {
         config.limits.clone(),
     )));
     let handles = SessionHandles {
-        controller: Arc::clone(&controller),
-        commands: command_tx.clone(),
-        gate: gate.clone(),
-        journal: journal.clone(),
+        controller,
+        commands: command_tx,
+        gate,
+        journal,
     };
     let session = Session {
         config,
-        controller,
-        gate,
-        journal,
-        command_tx,
+        handles: handles.clone(),
         command_rx,
     };
     (session, handles)
@@ -116,12 +111,15 @@ impl Session {
     pub async fn run(self) -> Result<()> {
         let Self {
             config,
-            controller,
-            gate,
-            journal,
-            command_tx,
+            handles,
             command_rx,
         } = self;
+        let SessionHandles {
+            controller,
+            commands,
+            gate,
+            journal,
+        } = handles;
         let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(8_192);
         let (raw_tx, raw_rx) = mpsc::channel::<Vec<u8>>(1_024);
         let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(256);
@@ -146,7 +144,7 @@ impl Session {
         tokio::spawn(reassemble_loop(segment_rx, raw_tx, config.forward.clone()));
 
         // Keyboard input, decoupled from the session loop through the channel.
-        tokio::spawn(stdin_loop(command_tx));
+        tokio::spawn(stdin_loop(commands));
 
         info!(server = %config.server_url, "relay started — idle, `start` arms the watch");
         print_controls();

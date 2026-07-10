@@ -35,7 +35,7 @@ pub fn show_fatal(message: String) -> eframe::Result {
     eframe::run_native(
         "Arkyve Refresh Shop — error",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([560.0, 140.0]),
+            viewport: egui::ViewportBuilder::default().with_inner_size([560.0, 260.0]),
             ..Default::default()
         },
         Box::new(move |_cc| Ok(Box::new(FatalApp(message)))),
@@ -47,8 +47,12 @@ struct FatalApp(String);
 impl eframe::App for FatalApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.colored_label(ui.visuals().error_fg_color, &self.0);
-            ui.weak("fix config.toml and restart");
+            // toml errors span many lines; the tail carries the diagnosis.
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.colored_label(ui.visuals().error_fg_color, &self.0);
+                });
         });
     }
 }
@@ -58,6 +62,10 @@ pub struct ShopApp {
     handles: SessionHandles,
     error: SessionErrorSlot,
     editor: EditorState,
+    /// Journal snapshot re-cloned only when the generation changes: the
+    /// journal grows at human pace, repaints at display rate.
+    journal_cache: Vec<LogLine>,
+    journal_generation: u64,
 }
 
 impl ShopApp {
@@ -68,10 +76,14 @@ impl ShopApp {
             let ctrl = lock_ignoring_poison(&handles.controller);
             EditorState::new(ctrl.filter().clone(), ctrl.limits().clone())
         };
+        let journal_cache = handles.journal.entries();
+        let journal_generation = handles.journal.generation();
         Self {
             handles,
             error,
             editor,
+            journal_cache,
+            journal_generation,
         }
     }
 }
@@ -86,7 +98,11 @@ impl eframe::App for ShopApp {
             let ctrl = lock_ignoring_poison(&self.handles.controller);
             view_state(&ctrl, self.handles.gate.is_enabled())
         };
-        let entries = self.handles.journal.entries();
+        let generation = self.handles.journal.generation();
+        if generation != self.journal_generation {
+            self.journal_cache = self.handles.journal.entries();
+            self.journal_generation = generation;
+        }
         let outcome = lock_ignoring_poison(&self.error).clone();
         // Root scroll: expanded editors must never push the table or journal
         // out of a clipped (non-scrolling) panel.
@@ -96,7 +112,13 @@ impl eframe::App for ShopApp {
                     .id_salt("root")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        render(ui, &view, &entries, outcome.as_deref(), &mut self.editor)
+                        render(
+                            ui,
+                            &view,
+                            &self.journal_cache,
+                            outcome.as_deref(),
+                            &mut self.editor,
+                        )
                     })
                     .inner
             })
@@ -137,16 +159,21 @@ fn render(
         });
     });
 
-    ui.horizontal(|ui| {
-        if ui.button("Start").clicked() {
-            clicked = Some(Command::Start);
-        }
-        if ui.button("Stop").clicked() {
-            clicked = Some(Command::Stop);
-        }
-        if ui.button("Toggle").clicked() {
-            clicked = Some(Command::Toggle);
-        }
+    // A terminal outcome means the command channel is dead: disable every
+    // control whose click would otherwise vanish into a closed channel.
+    let session_alive = outcome.is_none();
+    ui.add_enabled_ui(session_alive, |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("Start").clicked() {
+                clicked = Some(Command::Start);
+            }
+            if ui.button("Stop").clicked() {
+                clicked = Some(Command::Stop);
+            }
+            if ui.button("Toggle").clicked() {
+                clicked = Some(Command::Toggle);
+            }
+        });
     });
     ui.separator();
 
@@ -175,8 +202,12 @@ fn render(
     });
     ui.separator();
 
-    clicked = editor::edit_filter(ui, editor).or(clicked);
-    clicked = editor::edit_limits(ui, editor).or(clicked);
+    let applied = ui
+        .add_enabled_ui(session_alive, |ui| {
+            editor::edit_filter(ui, editor).or_else(|| editor::edit_limits(ui, editor))
+        })
+        .inner;
+    clicked = applied.or(clicked);
     ui.weak("edits apply to this session only — config.toml is unchanged");
     ui.separator();
 
@@ -219,15 +250,17 @@ fn render(
     ui.separator();
 
     ui.label(egui::RichText::new("Journal").strong());
-    // show_rows: only the visible slice is laid out — a full 500-line journal
-    // must not tax every repaint.
+    // show_rows lays out only the visible slice; its uniform-row math
+    // requires exactly one visual row per entry, so long lines extend into
+    // a horizontal scroll instead of wrapping.
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::both()
         .id_salt("journal")
         .stick_to_bottom(true)
         .max_height(180.0)
         .auto_shrink([false, false])
         .show_rows(ui, row_height, journal.len(), |ui, rows| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             for line in &journal[rows] {
                 ui.monospace(format!("[{}] {}", timestamp(line.at_ms), line.text));
             }
