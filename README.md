@@ -29,7 +29,8 @@ WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ Web
   bought. A `[limits]` threshold reached → it stops the session. The default
   build opens an **egui window** (status, shop table, session journal,
   Start/Stop buttons, live filter/limits editors — edits are session-only,
-  `config.toml` is not rewritten); the console mirrors the same lines.
+  `config.toml` is not rewritten); there is no console beside the window —
+  the journal carries every session line.
 
 The relay starts **idle** (nothing is captured or forwarded): press **Start**
 in the window (or type `start` in the console) when opening the shop to arm
@@ -86,12 +87,11 @@ a missing file falls back to the defaults.
 cargo run --release   # as administrator; opens the window (default features)
 ```
 
-Control from the window (Start / Stop / Toggle buttons, filter & limits
-editors) or from the console: `start` arms the session, `stop` ends it,
-`[Enter]` toggles start/stop. Close the window to quit; `Ctrl+C` in the
-console only ends the capture session — the window stays open and says so.
+Control from the window: Start / Stop / Toggle buttons, filter & limits
+editors. Close the window to quit.
 
-Console-only build (no window, `Ctrl+C` quits):
+Console-only build (no window; `start`/`stop`/`[Enter]` on stdin, `Ctrl+C`
+quits):
 
 ```sh
 cargo run --release --no-default-features --features windivert-backend

@@ -80,16 +80,10 @@ mod tests {
     use super::*;
     use crate::domain::control::Event;
     use crate::domain::filter::Filter;
-    use crate::domain::shop::{ItemKind, PurchaseLimit, RefreshMeta, ShopItem, ShopSnapshot};
+    use crate::domain::shop::{PurchaseLimit, RefreshMeta, ShopItem, ShopSnapshot};
 
-    /// Restricted (the domain refuses arming an unrestricted filter) yet
-    /// still matching `ShopItem::default()` (kind `Unknown`).
     fn controller() -> Controller {
-        let filter = Filter {
-            kinds: vec![ItemKind::Unknown],
-            ..Filter::default()
-        };
-        Controller::new(filter, Limits::default())
+        Controller::new(Filter::matching_default_items(), Limits::default())
     }
 
     fn shop(slots: Vec<ShopItem>) -> ShopSnapshot {

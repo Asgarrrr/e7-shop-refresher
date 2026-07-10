@@ -1,5 +1,10 @@
 //! Entry point for the Secret Shop relay.
 
+// The windowed build is a real windowed app: no console opens beside the
+// window. Everything player-facing flows through the journal/banner; stdout
+// and stdin become inert sinks there (the console build keeps them).
+#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
+
 use std::process::ExitCode;
 
 use tracing_subscriber::EnvFilter;
@@ -20,12 +25,9 @@ fn main() -> ExitCode {
     let config = match Config::load(CONFIG_PATH) {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("Invalid configuration: {err}");
-            // In the windowed build the console may not be readable (or
-            // visible at all): show the error where the player looks.
-            #[cfg(feature = "gui")]
-            let _ = arkyve_refresh_shop::ui::show_fatal(format!("Invalid configuration: {err}"));
-            return ExitCode::FAILURE;
+            return fatal(format!(
+                "Invalid configuration: {err}\n\nFix config.toml and restart."
+            ));
         }
     };
 
@@ -36,12 +38,20 @@ fn main() -> ExitCode {
         .build()
     {
         Ok(runtime) => runtime,
-        Err(err) => {
-            eprintln!("Fatal error: {err}");
-            return ExitCode::FAILURE;
-        }
+        Err(err) => return fatal(format!("Failed to start the async runtime: {err}")),
     };
     run_mode(runtime, config)
+}
+
+/// Every fatal error before the main window opens lands here: stderr always,
+/// an error window in the windowed build (which has no console to read).
+fn fatal(message: String) -> ExitCode {
+    eprintln!("{message}");
+    #[cfg(feature = "gui")]
+    if let Err(err) = arkyve_refresh_shop::ui::show_fatal(message) {
+        eprintln!("error window failed: {err}");
+    }
+    ExitCode::FAILURE
 }
 
 /// Console-only build: the session blocks the main thread, as before.
