@@ -1,5 +1,5 @@
-# Copy to `config.toml` and adjust. Every key has a default;
-# a missing file falls back to the defaults.
+# Copy to `config.toml` and adjust. Every key has a default, but the relay
+# refuses to start without at least one [filter] criterion.
 
 # Epic Seven game server TCP port.
 game_port = 3333
@@ -22,8 +22,10 @@ buffer_size = 65535
 # filter = "tcp and tcp.SrcPort == 3333"   # manual WinDivert filter override
 
 [filter]
-# Player interest criteria, all ANDed. Every key is optional; an empty or
-# missing [filter] matches every available item.
+# Player interest criteria, all ANDed. At least one criterion is required:
+# with none, every item would match and the relay refuses to start.
+# Default hunt: covenant bookmarks + mystic medals.
+names = ["ticketrare_name", "ticketspecial_name"]
 # kinds = ["equipment"]                 # any-of: equipment, hero, token
 # sets = ["set_speed", "set_counter"]   # any-of, exact internal set ids
 # min_substats = 3                      # minimum substat count

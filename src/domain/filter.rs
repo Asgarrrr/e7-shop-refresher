@@ -21,6 +21,9 @@ use crate::domain::shop::{ItemKind, ShopItem};
 pub struct Filter {
     /// Kept item kinds (any-of); empty keeps all, including `Unknown`.
     pub kinds: Vec<ItemKind>,
+    /// Kept items (any-of), by exact internal name (`ticketrare_name`, ...);
+    /// empty keeps all.
+    pub names: Vec<String>,
     /// Kept sets (any-of), by exact internal id; empty keeps all.
     pub sets: Vec<String>,
     /// Minimum substat count (raw list length).
@@ -54,6 +57,14 @@ impl Filter {
         if !self.kinds.is_empty() && !self.kinds.contains(&item.kind) {
             return false;
         }
+        if !self.names.is_empty()
+            && !item
+                .name
+                .as_ref()
+                .is_some_and(|name| self.names.contains(name))
+        {
+            return false;
+        }
         if let Some(min) = self.min_substats
             && item.substats.len() < usize::from(min)
         {
@@ -70,6 +81,18 @@ impl Filter {
         self.required_substats
             .iter()
             .all(|req| req.satisfied_by(item))
+    }
+
+    /// `true` when no criterion is set — such a filter matches every
+    /// available item; the relay treats that as a configuration error.
+    /// (`include_sold_out` widens, it does not restrict.)
+    pub fn is_unrestricted(&self) -> bool {
+        self.kinds.is_empty()
+            && self.names.is_empty()
+            && self.sets.is_empty()
+            && self.min_substats.is_none()
+            && self.required_substats.is_empty()
+            && self.max_price.is_none()
     }
 }
 
@@ -152,6 +175,49 @@ mod tests {
     #[test]
     fn empty_filter_matches_available_item() {
         assert!(Filter::default().matches(&equip()));
+    }
+
+    #[test]
+    fn unrestricted_detection_ignores_include_sold_out() {
+        assert!(Filter::default().is_unrestricted());
+        let sold_out_only = Filter {
+            include_sold_out: true,
+            ..Filter::default()
+        };
+        assert!(sold_out_only.is_unrestricted());
+        assert!(!speed_filter().is_unrestricted());
+        let names_only = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            ..Filter::default()
+        };
+        assert!(!names_only.is_unrestricted());
+    }
+
+    #[test]
+    fn names_any_of_matches() {
+        let filter = Filter {
+            names: vec![
+                "ticketrare_name".to_owned(),
+                "ticketspecial_name".to_owned(),
+            ],
+            ..Filter::default()
+        };
+        let mut item = equip();
+        item.name = Some("ticketrare_name".to_owned());
+        assert!(filter.matches(&item));
+        item.name = Some("friendpoint_name".to_owned());
+        assert!(!filter.matches(&item));
+    }
+
+    #[test]
+    fn name_none_fails_when_names_filter_active() {
+        let filter = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            ..Filter::default()
+        };
+        let mut item = equip();
+        item.name = None;
+        assert!(!filter.matches(&item));
     }
 
     #[test]

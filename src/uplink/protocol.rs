@@ -29,7 +29,8 @@ pub struct PurchaseNotice {
     /// `id`; `0` when the server omits it.
     #[serde(default)]
     pub item: u32,
-    /// Gold paid. Always present in practice; tolerated absent per convention.
+    /// Gold balance after the buy (not the price). Always present in
+    /// practice; tolerated absent per convention.
     #[serde(default)]
     pub gold: Option<u32>,
 }

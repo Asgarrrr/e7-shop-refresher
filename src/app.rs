@@ -38,6 +38,14 @@ enum Command {
 
 /// Runs the relay and blocks until shutdown (Ctrl+C or end of stream).
 pub async fn run(config: Config) -> Result<()> {
+    // The loop must have a target: unfiltered, every slot of every shop
+    // matches and the relay would advise buying everything.
+    if config.filter.is_unrestricted() {
+        return Err(crate::Error::Config(
+            "no [filter] criteria in config.toml — define what to hunt (see config.example.toml)"
+                .to_owned(),
+        ));
+    }
     // Gate off at startup: the session starts Idle and the player arms it
     // with `start`.
     let gate = WatchGate::new(false);
@@ -321,7 +329,7 @@ fn purchase_line(controller: &Controller, notice: &PurchaseNotice) -> String {
         None => format!("item {}", notice.item),
     };
     match notice.gold {
-        Some(gold) => format!(">> bought: {label} ({gold} gold)"),
+        Some(gold) => format!(">> bought: {label} — {gold} gold left"),
         None => format!(">> bought: {label}"),
     }
 }
@@ -488,6 +496,12 @@ mod tests {
     use crate::domain::control::Limits;
     use crate::domain::filter::Filter;
 
+    #[tokio::test]
+    async fn run_refuses_unrestricted_filter() {
+        let err = run(Config::default()).await.expect_err("must refuse");
+        assert!(matches!(err, crate::Error::Config(_)));
+    }
+
     #[test]
     fn parse_command_maps_aliases() {
         assert_eq!(parse_command("start"), Some(Command::Start));
@@ -627,7 +641,7 @@ mod tests {
         };
         assert_eq!(
             purchase_line(&controller_with_named_item(), &notice),
-            ">> bought: Reforged Sword (250000 gold)"
+            ">> bought: Reforged Sword — 250000 gold left"
         );
     }
 
@@ -640,7 +654,7 @@ mod tests {
         };
         assert_eq!(
             purchase_line(&controller, &notice),
-            ">> bought: item 7 (100 gold)"
+            ">> bought: item 7 — 100 gold left"
         );
     }
 
