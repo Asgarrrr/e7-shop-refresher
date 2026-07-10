@@ -16,6 +16,8 @@ pub mod capture;
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod journal;
+mod render;
 pub mod stream;
 #[cfg(feature = "gui")]
 pub mod ui;
