@@ -116,9 +116,9 @@ fn string_list(ui: &mut egui::Ui, label: &str, values: &mut Vec<String>, input: 
     ui.label(label);
     let mut removed = None;
     for (index, value) in values.iter().enumerate() {
-        // Stable per-row ids: without them a removal shifts the positional
-        // auto-ids of every widget below (focus, edit state).
-        ui.push_id(index, |ui| {
+        // Content-keyed row ids (duplicates are rejected on add): focus and
+        // edit state survive a removal above the row.
+        ui.push_id(egui::Id::new(value), |ui| {
             ui.horizontal(|ui| {
                 ui.monospace(value);
                 if ui.small_button("✕").clicked() {
@@ -132,9 +132,12 @@ fn string_list(ui: &mut egui::Ui, label: &str, values: &mut Vec<String>, input: 
     }
     ui.horizontal(|ui| {
         ui.text_edit_singleline(input);
-        if ui.button("add").clicked() && !input.trim().is_empty() {
-            values.push(input.trim().to_owned());
-            input.clear();
+        if ui.button("add").clicked() {
+            let value = input.trim();
+            if !value.is_empty() && !values.iter().any(|kept| kept == value) {
+                values.push(value.to_owned());
+                input.clear();
+            }
         }
     });
 }
@@ -144,7 +147,8 @@ fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input: &mut Strin
     ui.label("required substats");
     let mut removed = None;
     for (index, req) in reqs.iter_mut().enumerate() {
-        ui.push_id(index, |ui| {
+        let row_id = egui::Id::new(&req.name);
+        ui.push_id(row_id, |ui| {
             ui.horizontal(|ui| {
                 ui.monospace(&req.name);
                 let mut has_min = req.min.is_some();
@@ -165,19 +169,23 @@ fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input: &mut Strin
     }
     ui.horizontal(|ui| {
         ui.text_edit_singleline(input);
-        if ui.button("add").clicked() && !input.trim().is_empty() {
-            reqs.push(SubstatReq {
-                name: input.trim().to_owned(),
-                min: None,
-            });
-            input.clear();
+        if ui.button("add").clicked() {
+            let name = input.trim();
+            if !name.is_empty() && !reqs.iter().any(|req| req.name == name) {
+                reqs.push(SubstatReq {
+                    name: name.to_owned(),
+                    min: None,
+                });
+                input.clear();
+            }
         }
     });
 }
 
 /// Checkbox-gated numeric criterion: unchecked means "no constraint". The
-/// seed must be a sensible non-zero value — a zero limit halts the session at
-/// the next check-point and a zero criterion constrains nothing.
+/// seed must be non-zero and the widget clamps at 1 — a zero limit halts the
+/// session at the next check-point and a zero criterion constrains nothing;
+/// "no constraint" is the unchecked box, never a 0.
 fn optional_value<T: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     label: &str,
@@ -188,7 +196,9 @@ fn optional_value<T: egui::emath::Numeric>(
         let mut on = value.is_some();
         ui.checkbox(&mut on, label);
         if on {
-            ui.add(egui::DragValue::new(value.get_or_insert(seed)));
+            ui.add(
+                egui::DragValue::new(value.get_or_insert(seed)).range(T::from_f64(1.0)..=T::MAX),
+            );
         } else {
             *value = None;
         }
@@ -206,7 +216,10 @@ fn duration_minutes(ui: &mut egui::Ui, value: &mut Option<u64>) {
             // whole minutes (the player-facing unit) and only rewrite the
             // stored value when the player actually drags.
             let mut minutes = ms.div_ceil(60_000);
-            if ui.add(egui::DragValue::new(&mut minutes)).changed() {
+            if ui
+                .add(egui::DragValue::new(&mut minutes).range(1..=u64::MAX / 60_000))
+                .changed()
+            {
                 *ms = minutes.saturating_mul(60_000);
             }
         } else {
