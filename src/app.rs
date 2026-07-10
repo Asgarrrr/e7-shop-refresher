@@ -1,5 +1,6 @@
 //! Orchestration: capture -> reassembly -> gate -> uplink -> controller -> display.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,64 +29,168 @@ enum CaptureEvent {
 /// A player command, decoupled from its source: today a stdin task, tomorrow
 /// the GUI pushing the same values through the same channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Command {
+pub enum Command {
     Start,
     Stop,
     /// Start or stop, depending on the current status.
     Toggle,
 }
 
-/// Runs the relay and blocks until shutdown (Ctrl+C or end of stream).
-pub async fn run(config: Config) -> Result<()> {
-    // The loop must have a target: unfiltered, every slot of every shop
-    // matches and the relay would advise buying everything.
-    if config.filter.is_unrestricted() {
-        return Err(crate::Error::Config(
-            "no [filter] criteria in config.toml — define what to hunt (see config.example.toml)"
-                .to_owned(),
-        ));
+/// One journal entry: a console line with its session-relative timestamp.
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub at_ms: u64,
+    pub text: String,
+}
+
+/// Oldest entries drop out first: a session left running for hours must not
+/// grow the journal without bound.
+const JOURNAL_CAP: usize = 500;
+
+/// Bounded session journal: the same lines the console prints, kept for a
+/// view. The session loop writes, readers copy entries out.
+#[derive(Clone, Default)]
+pub struct EventLog {
+    entries: Arc<Mutex<VecDeque<LogLine>>>,
+}
+
+impl EventLog {
+    pub fn push(&self, at_ms: u64, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        let mut entries = self.entries.lock().expect("journal mutex poisoned");
+        for text in lines {
+            entries.push_back(LogLine {
+                at_ms,
+                text: text.clone(),
+            });
+        }
+        while entries.len() > JOURNAL_CAP {
+            entries.pop_front();
+        }
     }
+
+    pub fn entries(&self) -> Vec<LogLine> {
+        self.entries
+            .lock()
+            .expect("journal mutex poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Cheap clones of the shared session state, for a view (the GUI) running
+/// beside the session loop: read `status()`/`progress()`/`last_snapshot()`/
+/// `checklist()` under short locks, send [`Command`]s, read the journal.
+pub struct SessionHandles {
+    pub controller: Arc<Mutex<Controller>>,
+    pub commands: mpsc::Sender<Command>,
+    pub gate: WatchGate,
+    pub journal: EventLog,
+}
+
+/// The owned half of [`setup`]: everything the relay pipeline consumes.
+pub struct Session {
+    config: Config,
+    controller: Arc<Mutex<Controller>>,
+    gate: WatchGate,
+    journal: EventLog,
+    command_tx: mpsc::Sender<Command>,
+    command_rx: mpsc::Receiver<Command>,
+}
+
+/// Builds the shared session state and hands out clones before any fallible
+/// work runs: a view keeps live handles even when [`Session::run`] fails
+/// later (bad filter, no capture backend).
+pub fn setup(config: Config) -> (Session, SessionHandles) {
     // Gate off at startup: the session starts Idle and the player arms it
     // with `start`.
     let gate = WatchGate::new(false);
-
-    let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(8_192);
-    let (raw_tx, raw_rx) = mpsc::channel::<Vec<u8>>(1_024);
-    let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(256);
+    let journal = EventLog::default();
     let (command_tx, command_rx) = mpsc::channel::<Command>(16);
+    let controller = Arc::new(Mutex::new(Controller::new(
+        config.filter.clone(),
+        config.limits.clone(),
+    )));
+    let handles = SessionHandles {
+        controller: Arc::clone(&controller),
+        commands: command_tx.clone(),
+        gate: gate.clone(),
+        journal: journal.clone(),
+    };
+    let session = Session {
+        config,
+        controller,
+        gate,
+        journal,
+        command_tx,
+        command_rx,
+    };
+    (session, handles)
+}
 
-    // Blocking capture on a dedicated thread (WinDivert::recv is synchronous).
-    let source = build_source(&config)?;
-    let capture_gate = gate.clone();
-    std::thread::Builder::new()
-        .name("capture".to_owned())
-        .spawn(move || capture_loop(source, segment_tx, capture_gate))?;
+/// Console-only entry point: [`setup`] + [`Session::run`], discarding the
+/// view handles.
+pub async fn run(config: Config) -> Result<()> {
+    let (session, _handles) = setup(config);
+    session.run().await
+}
 
-    // Server link with automatic reconnection.
-    tokio::spawn(crate::uplink::run(
-        config.server_url.clone(),
-        raw_rx,
-        message_tx,
-        config.reconnect_initial(),
-        config.reconnect_max(),
-    ));
+impl Session {
+    /// Runs the relay and blocks until shutdown (Ctrl+C or end of stream).
+    pub async fn run(self) -> Result<()> {
+        let Self {
+            config,
+            controller,
+            gate,
+            journal,
+            command_tx,
+            command_rx,
+        } = self;
+        // The loop must have a target: unfiltered, every slot of every shop
+        // matches and the relay would advise buying everything.
+        if config.filter.is_unrestricted() {
+            return Err(crate::Error::Config(
+                "no [filter] criteria in config.toml — define what to hunt (see config.example.toml)"
+                    .to_owned(),
+            ));
+        }
 
-    // Reassembly + filtering of the directions to forward.
-    tokio::spawn(reassemble_loop(segment_rx, raw_tx, config.forward.clone()));
+        let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(8_192);
+        let (raw_tx, raw_rx) = mpsc::channel::<Vec<u8>>(1_024);
+        let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(256);
 
-    // Keyboard input, decoupled from the session loop through the channel.
-    tokio::spawn(stdin_loop(command_tx));
+        // Blocking capture on a dedicated thread (WinDivert::recv is synchronous).
+        let source = build_source(&config)?;
+        let capture_gate = gate.clone();
+        std::thread::Builder::new()
+            .name("capture".to_owned())
+            .spawn(move || capture_loop(source, segment_tx, capture_gate))?;
 
-    // Shared so the upcoming GUI can clone the Arc and read
-    // `status()`/`progress()`/`last_snapshot()` alongside the session loop.
-    let controller = Arc::new(Mutex::new(Controller::new(config.filter, config.limits)));
+        // Server link with automatic reconnection.
+        tokio::spawn(crate::uplink::run(
+            config.server_url.clone(),
+            raw_rx,
+            message_tx,
+            config.reconnect_initial(),
+            config.reconnect_max(),
+        ));
 
-    info!(server = %config.server_url, "relay started — idle, `start` arms the watch");
-    print_controls();
+        // Reassembly + filtering of the directions to forward.
+        tokio::spawn(reassemble_loop(segment_rx, raw_tx, config.forward.clone()));
 
-    session_loop(&controller, &gate, command_rx, message_rx).await;
-    info!("relay stopped");
-    Ok(())
+        // Keyboard input, decoupled from the session loop through the channel.
+        tokio::spawn(stdin_loop(command_tx));
+
+        info!(server = %config.server_url, "relay started — idle, `start` arms the watch");
+        print_controls();
+
+        session_loop(&controller, &gate, &journal, command_rx, message_rx).await;
+        info!("relay stopped");
+        Ok(())
+    }
 }
 
 /// Consumes capture events, reassembles, forwards the ordered stream.
@@ -193,6 +298,7 @@ fn parse_command(line: &str) -> Option<Command> {
 async fn session_loop(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
+    journal: &EventLog,
     mut commands: mpsc::Receiver<Command>,
     mut messages: mpsc::Receiver<ServerMessage>,
 ) {
@@ -207,14 +313,17 @@ async fn session_loop(
     loop {
         tokio::select! {
             command = commands.recv(), if commands_open => match command {
-                Some(command) => on_command(controller, gate, command, now_ms()),
+                Some(command) => on_command(controller, gate, journal, command, now_ms()),
                 None => commands_open = false,
             },
             message = messages.recv() => match message {
-                Some(message) => on_message(controller, gate, message, now_ms()),
+                Some(message) => on_message(controller, gate, journal, message, now_ms()),
                 None => break, // uplink gone.
             },
-            _ = ticker.tick() => dispatch(controller, gate, Event::Tick { now_ms: now_ms() }),
+            _ = ticker.tick() => {
+                let now_ms = now_ms();
+                dispatch(controller, gate, journal, Event::Tick { now_ms }, now_ms);
+            }
             _ = &mut ctrl_c => {
                 println!("\n>> Ctrl+C, stopping");
                 break;
@@ -225,8 +334,16 @@ async fn session_loop(
 
 /// Translates a player command into a controller event and echoes an outcome:
 /// a command is never silent, even when the controller ignores it.
-fn on_command(controller: &Mutex<Controller>, gate: &WatchGate, command: Command, now_ms: u64) {
-    for line in handle_command(controller, gate, command, now_ms) {
+fn on_command(
+    controller: &Mutex<Controller>,
+    gate: &WatchGate,
+    journal: &EventLog,
+    command: Command,
+    now_ms: u64,
+) {
+    let lines = handle_command(controller, gate, command, now_ms);
+    journal.push(now_ms, &lines);
+    for line in lines {
         println!("{line}");
     }
 }
@@ -275,17 +392,28 @@ fn handle_command(
 fn on_message(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
+    journal: &EventLog,
     message: ServerMessage,
     now_ms: u64,
 ) {
     match message {
         ServerMessage::Ack | ServerMessage::Unknown => {}
         ServerMessage::Shop(snapshot) => {
+            // The full item dump stays console-only: the GUI table shows the
+            // same snapshot; the journal only carries the decisions.
             render_shop(&snapshot);
-            dispatch(controller, gate, Event::Snapshot { snapshot, now_ms });
+            dispatch(
+                controller,
+                gate,
+                journal,
+                Event::Snapshot { snapshot, now_ms },
+                now_ms,
+            );
         }
         ServerMessage::Purchase(notice) => {
-            for line in handle_purchase(controller, gate, &notice, now_ms) {
+            let lines = handle_purchase(controller, gate, &notice, now_ms);
+            journal.push(now_ms, &lines);
+            for line in lines {
                 println!("{line}");
             }
         }
@@ -332,11 +460,18 @@ fn purchase_line(controller: &Controller, notice: &PurchaseNotice) -> String {
 }
 
 /// Locks, handles, applies; printing happens after the guard is released.
-fn dispatch(controller: &Mutex<Controller>, gate: &WatchGate, event: Event) {
+fn dispatch(
+    controller: &Mutex<Controller>,
+    gate: &WatchGate,
+    journal: &EventLog,
+    event: Event,
+    now_ms: u64,
+) {
     let mut ctrl = controller.lock().expect("controller mutex poisoned");
     let actions = ctrl.handle(event);
     let lines = apply(&actions, &ctrl, gate);
     drop(ctrl);
+    journal.push(now_ms, &lines);
     for line in &lines {
         println!("{line}");
     }
@@ -398,7 +533,7 @@ fn render_alert(lines: &mut Vec<String>, slots: &[u8], controller: &Controller) 
     }
 }
 
-fn status_label(controller: &Controller) -> &'static str {
+pub(crate) fn status_label(controller: &Controller) -> &'static str {
     match controller.status() {
         Status::Idle => "idle (`start` arms the watch)",
         Status::Watching => "watching",
@@ -409,7 +544,7 @@ fn status_label(controller: &Controller) -> &'static str {
     }
 }
 
-fn describe(reason: StopReason) -> &'static str {
+pub(crate) fn describe(reason: StopReason) -> &'static str {
     match reason {
         StopReason::PlayerStopped => "player stopped",
         StopReason::OutOfFunds => "out of crystals",
@@ -428,13 +563,19 @@ fn render_shop(snapshot: &ShopSnapshot) {
     }
 }
 
-fn format_item(item: &ShopItem) -> String {
-    let kind = match item.kind {
+/// Player-facing label for an item kind — shared by the console line and the
+/// GUI table.
+pub(crate) fn kind_label(kind: ItemKind) -> &'static str {
+    match kind {
         ItemKind::Equipment => "equipment",
         ItemKind::Hero => "hero",
         ItemKind::Token => "token",
         ItemKind::Unknown => "?",
-    };
+    }
+}
+
+pub(crate) fn format_item(item: &ShopItem) -> String {
+    let kind = kind_label(item.kind);
 
     let mut line = format!("slot {} · {kind}", item.slot);
     if let Some(name) = &item.name {
@@ -497,6 +638,53 @@ mod tests {
     async fn run_refuses_unrestricted_filter() {
         let err = run(Config::default()).await.expect_err("must refuse");
         assert!(matches!(err, crate::Error::Config(_)));
+    }
+
+    #[test]
+    fn setup_starts_idle_with_gate_off() {
+        let (_session, handles) = setup(Config::default());
+        assert_eq!(handles.controller.lock().unwrap().status(), Status::Idle);
+        assert!(!handles.gate.is_enabled());
+        assert!(handles.journal.entries().is_empty());
+        // The command channel is wired before the fallible pipeline runs.
+        handles
+            .commands
+            .try_send(Command::Toggle)
+            .expect("channel open");
+    }
+
+    #[test]
+    fn kind_label_names_each_kind() {
+        assert_eq!(kind_label(ItemKind::Equipment), "equipment");
+        assert_eq!(kind_label(ItemKind::Hero), "hero");
+        assert_eq!(kind_label(ItemKind::Token), "token");
+        assert_eq!(kind_label(ItemKind::Unknown), "?");
+    }
+
+    #[test]
+    fn journal_receives_command_lines() {
+        let gate = WatchGate::new(false);
+        let journal = EventLog::default();
+        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        on_command(&controller, &gate, &journal, Command::Start, 1_000);
+        let entries = journal.entries();
+        assert!(entries.iter().any(|line| line.text.contains("watching")));
+        assert!(entries.iter().all(|line| line.at_ms == 1_000));
+    }
+
+    #[test]
+    fn journal_caps_entries() {
+        let journal = EventLog::default();
+        for i in 0..(JOURNAL_CAP as u64 + 100) {
+            journal.push(i, &[format!("line {i}")]);
+        }
+        let entries = journal.entries();
+        assert_eq!(entries.len(), JOURNAL_CAP);
+        assert_eq!(entries.first().unwrap().text, "line 100");
+        assert_eq!(
+            entries.last().unwrap().text,
+            format!("line {}", JOURNAL_CAP + 99)
+        );
     }
 
     #[test]
@@ -567,30 +755,33 @@ mod tests {
     #[test]
     fn toggle_resolves_against_status() {
         let gate = WatchGate::new(false);
+        let journal = EventLog::default();
         let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
 
-        on_command(&controller, &gate, Command::Toggle, 0); // Idle -> Start
+        on_command(&controller, &gate, &journal, Command::Toggle, 0); // Idle -> Start
         assert_eq!(controller.lock().unwrap().status(), Status::Watching);
         assert!(gate.is_enabled());
 
-        on_command(&controller, &gate, Command::Toggle, 1); // Watching -> Stop
+        on_command(&controller, &gate, &journal, Command::Toggle, 1); // Watching -> Stop
         assert_eq!(
             controller.lock().unwrap().status(),
             Status::Stopped(StopReason::PlayerStopped)
         );
         assert!(!gate.is_enabled());
 
-        on_command(&controller, &gate, Command::Toggle, 2); // Stopped -> Start
+        on_command(&controller, &gate, &journal, Command::Toggle, 2); // Stopped -> Start
         // Default filter matches the default item -> Paused.
         dispatch(
             &controller,
             &gate,
+            &journal,
             Event::Snapshot {
                 snapshot: one_item_shop(),
                 now_ms: 3,
             },
+            3,
         );
-        on_command(&controller, &gate, Command::Toggle, 4); // Paused -> Stop
+        on_command(&controller, &gate, &journal, Command::Toggle, 4); // Paused -> Stop
         assert_eq!(
             controller.lock().unwrap().status(),
             Status::Stopped(StopReason::PlayerStopped)
@@ -601,19 +792,32 @@ mod tests {
     #[test]
     fn purchase_message_auto_resumes_controller() {
         let gate = WatchGate::new(false);
+        let journal = EventLog::default();
         let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
-        on_command(&controller, &gate, Command::Start, 0);
+        on_command(&controller, &gate, &journal, Command::Start, 0);
         let mut snapshot = one_item_shop();
         snapshot.slots[0].id = 42;
         // Default filter matches the default item -> Paused, checklist [42].
-        on_message(&controller, &gate, ServerMessage::Shop(snapshot), 1);
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            ServerMessage::Shop(snapshot),
+            1,
+        );
         assert_eq!(controller.lock().unwrap().status(), Status::Paused);
 
         let notice = PurchaseNotice {
             item: 42,
             gold: Some(100),
         };
-        on_message(&controller, &gate, ServerMessage::Purchase(notice), 2);
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            ServerMessage::Purchase(notice),
+            2,
+        );
         assert_eq!(controller.lock().unwrap().status(), Status::Watching);
         assert!(gate.is_enabled());
     }
@@ -698,17 +902,20 @@ mod tests {
     #[test]
     fn paused_label_reflects_manual_flow_when_checklist_empty() {
         let gate = WatchGate::new(false);
+        let journal = EventLog::default();
         let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
-        on_command(&controller, &gate, Command::Start, 0);
+        on_command(&controller, &gate, &journal, Command::Start, 0);
         // Paused on an untrackable (id-0) match: a no-effect command's echo
         // must advise manual resume, not a phantom auto-resume.
         dispatch(
             &controller,
             &gate,
+            &journal,
             Event::Snapshot {
                 snapshot: one_item_shop(),
                 now_ms: 1,
             },
+            1,
         );
         let lines = handle_command(&controller, &gate, Command::Start, 2);
         assert!(lines.iter().any(|line| line.contains("buy, then refresh")));
@@ -729,10 +936,12 @@ mod tests {
         dispatch(
             &controller,
             &gate,
+            &EventLog::default(),
             Event::Snapshot {
                 snapshot: one_item_shop(),
                 now_ms: 2,
             },
+            2,
         );
         let lines = handle_command(&controller, &gate, Command::Start, 3);
         assert!(lines.iter().any(|line| line.contains("not replayed")));
@@ -741,21 +950,24 @@ mod tests {
     #[test]
     fn ignored_command_leaves_state_and_gate_unchanged() {
         let gate = WatchGate::new(false);
+        let journal = EventLog::default();
         let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
-        on_command(&controller, &gate, Command::Start, 0);
+        on_command(&controller, &gate, &journal, Command::Start, 0);
         dispatch(
             &controller,
             &gate,
+            &journal,
             Event::Snapshot {
                 snapshot: one_item_shop(),
                 now_ms: 1,
             },
+            1,
         );
         assert_eq!(controller.lock().unwrap().status(), Status::Paused);
 
         // `start` mid-session is ignored by the controller: still Paused,
         // gate still on, counters untouched.
-        on_command(&controller, &gate, Command::Start, 2);
+        on_command(&controller, &gate, &journal, Command::Start, 2);
         assert_eq!(controller.lock().unwrap().status(), Status::Paused);
         assert_eq!(controller.lock().unwrap().progress().matches_found, 1);
         assert!(gate.is_enabled());
