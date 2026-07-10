@@ -16,3 +16,6 @@ Thumbs.db
 .DS_Store
 .idea/
 .vscode/
+
+# Instructions agent — local, jamais publié
+/CLAUDE.md

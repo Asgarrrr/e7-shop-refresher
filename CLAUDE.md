@@ -25,14 +25,17 @@ loop from the decoded snapshots. Single-user tool, Windows target.
 
 Data flow: capture → reassembly → uplink (server decodes) → `ServerMessage::Shop(ShopSnapshot)` → render (today) / `Controller` (tranche 3+).
 
+The server sends the full shop on every shop response (client filters, server no longer pre-judges interest), plus a `refresh` meta block (`crystal_balance`, `cost`). On each successful buy it also emits `{type:"purchase", item, gold}` (`gold` omitted when paid in another currency); the client currently drops it as `ServerMessage::Unknown` — consuming it is tranche 3's follow-up.
+
 ## Don't recreate — it already exists
 
 | Need | Use | Where |
 |---|---|---|
-| Item interest verdict | `Filter::matches` — never `ShopItem.interesting` (legacy, removal planned) | `src/domain/filter.rs` |
+| Item interest verdict | `Filter::matches` (client-side, sole authority) | `src/domain/filter.rs` |
 | Refresh-loop decisions | `Controller::handle(Event) -> Vec<Action>` | `src/domain/control.rs` |
 | Stop limits / counters / status | `Limits`, `Progress`, `StopReason`, `Status` | `src/domain/control.rs` |
 | Refresh balance/cost | `ShopSnapshot.refresh: Option<RefreshMeta>` | `src/domain/shop.rs` |
+| Slot ↔ purchase link | `ShopItem.id` — global catalog id (stable per item, not an index, not kind-scoped); `{type:"purchase"}.item` is the **same** id space, match directly, no conversion | `src/domain/shop.rs` |
 | Test item fixture | `ShopItem::default()` + struct update syntax | see tests in `src/domain/control.rs` |
 
 Before creating any file, helper, or type: Grep for it, then check this table.
@@ -50,7 +53,8 @@ When you build something reusable, add it to this table in the same change.
 
 1. ✅ Domain: shop model + `Filter`.
 2. ✅ `Controller` state machine — pure, not wired.
-3. Wire into `app.rs` (replace `WatchGate`), remove `ShopItem.interesting`, feed real `now_ms` + `Tick`s. Known gaps to solve here: no snapshot identity → duplicate/unsolicited snapshots (hourly auto-refresh) each trigger a paid refresh; Start-before-shop-open ordering contract (see `Event::Start` doc).
+2b. ✅ Server sends full shop + `refresh` meta + `{type:"purchase"}`; client dropped the legacy `interesting` field and `ServerMessage::Alert`, added `ShopItem.id`.
+3. Wire into `app.rs` (replace `WatchGate`), feed real `now_ms` + `Tick`s, consume `{type:"purchase"}` (buy checklist + safe refresh: a refresh must not fire while a matched item is unbought). The checklist matches `purchase.item` against the **current** shop's `ShopItem.id`s and must reset/re-evaluate on every new `{type:"shop"}` — catalog ids are stable but the shop's contents change on refresh, so a stale shop would mis-match. Known gaps to solve here: no snapshot identity → duplicate/unsolicited snapshots (hourly auto-refresh) each trigger a paid refresh; Start-before-shop-open ordering contract (see `Event::Start` doc).
 4. GUI reading `status()`/`progress()`/`last_snapshot()`/`limits_enforceable()`.
 5. Actuator executing `Action::Refresh` — must also update the "fully passive" claim in `lib.rs` docs (and README).
 
