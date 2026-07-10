@@ -2,8 +2,21 @@
 //! renders it, and pushes player commands through the existing channel. No
 //! egui type crosses into `app.rs` or the domain.
 
-use crate::app::{describe, format_item, kind_label, status_label};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use eframe::egui;
+use tokio::sync::mpsc;
+
+use crate::app::{
+    Command, EventLog, LogLine, SessionHandles, describe, format_item, kind_label, status_label,
+};
 use crate::domain::control::{Controller, Limits, Progress, Status};
+use crate::watch::WatchGate;
+
+/// Where the session's terminal outcome lands (fatal error or clean end):
+/// written once by the spawn wrapper in `main`, shown as a banner.
+pub type SessionErrorSlot = Arc<Mutex<Option<String>>>;
 
 /// Plain per-frame copy of everything the window shows; built under the
 /// controller lock, rendered after the guard is dropped.
@@ -69,6 +82,188 @@ pub fn view_state(controller: &Controller, capture_on: bool) -> ViewState {
         crystal_balance: refresh.map(|meta| meta.crystal_balance),
         refresh_cost: refresh.map(|meta| meta.cost),
         rows,
+    }
+}
+
+/// The eframe application: a thin shell around the session handles.
+pub struct ShopApp {
+    controller: Arc<Mutex<Controller>>,
+    commands: mpsc::Sender<Command>,
+    gate: WatchGate,
+    journal: EventLog,
+    error: SessionErrorSlot,
+}
+
+impl ShopApp {
+    pub fn new(handles: SessionHandles, error: SessionErrorSlot) -> Self {
+        Self {
+            controller: handles.controller,
+            commands: handles.commands,
+            gate: handles.gate,
+            journal: handles.journal,
+            error,
+        }
+    }
+}
+
+impl eframe::App for ShopApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Poll-based repaint: state changes arrive from the session loop at
+        // human pace; 4 Hz keeps the window fresh without coupling app.rs to
+        // egui.
+        ui.ctx().request_repaint_after(Duration::from_millis(250));
+        let view = {
+            let ctrl = self.controller.lock().expect("controller mutex poisoned");
+            view_state(&ctrl, self.gate.is_enabled())
+        };
+        let entries = self.journal.entries();
+        let outcome = self.error.lock().expect("error slot poisoned").clone();
+        let clicked = egui::CentralPanel::default()
+            .show(ui, |ui| render(ui, &view, &entries, outcome.as_deref()))
+            .inner;
+        if let Some(command) = clicked {
+            // A full channel only happens with a dead session loop, where the
+            // banner already explains the situation: dropping the click is fine.
+            let _ = self.commands.try_send(command);
+        }
+    }
+}
+
+/// Renders one frame; returns the command the player clicked, if any.
+fn render(
+    ui: &mut egui::Ui,
+    view: &ViewState,
+    journal: &[LogLine],
+    outcome: Option<&str>,
+) -> Option<Command> {
+    let mut clicked = None;
+
+    if let Some(outcome) = outcome {
+        ui.colored_label(ui.visuals().error_fg_color, outcome);
+        ui.separator();
+    }
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(view.status).strong());
+        if let Some(reason) = view.stop_reason {
+            ui.label(format!("({reason})"));
+        }
+        ui.separator();
+        ui.label(if view.capture_on {
+            "capture on"
+        } else {
+            "capture off"
+        });
+    });
+
+    ui.horizontal(|ui| {
+        if ui.button("Start").clicked() {
+            clicked = Some(Command::Start);
+        }
+        if ui.button("Stop").clicked() {
+            clicked = Some(Command::Stop);
+        }
+        if ui.button("Toggle").clicked() {
+            clicked = Some(Command::Toggle);
+        }
+    });
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "refreshes {}",
+            against(view.progress.refreshes, view.limits.max_refreshes)
+        ));
+        ui.label(format!(
+            "spent {}",
+            against(view.progress.spent, view.limits.max_spend)
+        ));
+        ui.label(format!(
+            "matches {}",
+            against(view.progress.matches_found, view.limits.max_matches)
+        ));
+        ui.separator();
+        match (view.crystal_balance, view.refresh_cost) {
+            (Some(balance), Some(cost)) => {
+                ui.label(format!("crystals {balance} (refresh costs {cost})"));
+            }
+            (Some(balance), None) => {
+                ui.label(format!("crystals {balance}"));
+            }
+            _ => {
+                ui.label("crystals —");
+            }
+        }
+    });
+    ui.separator();
+
+    ui.label(egui::RichText::new(view.merchant.as_deref().unwrap_or("Secret Shop")).strong());
+    if view.rows.is_empty() {
+        ui.weak("no shop captured yet — open the Secret Shop in game");
+    } else {
+        egui::Grid::new("shop")
+            .num_columns(4)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Slot");
+                ui.strong("Kind");
+                ui.strong("Name");
+                ui.strong("Price");
+                ui.end_row();
+                for row in &view.rows {
+                    let cell = |text: String| {
+                        let mut text = egui::RichText::new(text);
+                        if row.wanted {
+                            text = text.strong().color(egui::Color32::LIGHT_GREEN);
+                        }
+                        if row.sold_out {
+                            text = text.weak().strikethrough();
+                        }
+                        text
+                    };
+                    ui.label(cell(row.slot.to_string()));
+                    ui.label(cell(row.kind.to_owned()));
+                    ui.label(cell(row.name.clone().unwrap_or_else(|| "—".to_owned())))
+                        .on_hover_text(&row.detail);
+                    ui.label(cell(match row.price {
+                        Some(price) => format!("{price} gold"),
+                        None => "—".to_owned(),
+                    }));
+                    ui.end_row();
+                }
+            });
+    }
+    ui.separator();
+
+    ui.label(egui::RichText::new("Journal").strong());
+    egui::ScrollArea::vertical()
+        .stick_to_bottom(true)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for line in journal {
+                ui.monospace(format!("[{}] {}", timestamp(line.at_ms), line.text));
+            }
+        });
+
+    clicked
+}
+
+/// `3/10` against a limit, `3/—` without one.
+fn against(value: u32, limit: Option<u32>) -> String {
+    match limit {
+        Some(limit) => format!("{value}/{limit}"),
+        None => format!("{value}/—"),
+    }
+}
+
+/// Session-relative `+m:ss` (hours appear once the session runs that long).
+fn timestamp(at_ms: u64) -> String {
+    let secs = at_ms / 1000;
+    let (hours, minutes, seconds) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if hours > 0 {
+        format!("+{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("+{minutes}:{seconds:02}")
     }
 }
 
@@ -218,5 +413,18 @@ mod tests {
             now_ms: 0,
         });
         assert_eq!(view_state(&ctrl, false).rows[0].detail, expected);
+    }
+
+    #[test]
+    fn against_renders_missing_limit_as_dash() {
+        assert_eq!(against(3, Some(10)), "3/10");
+        assert_eq!(against(3, None), "3/—");
+    }
+
+    #[test]
+    fn timestamp_rolls_into_hours() {
+        assert_eq!(timestamp(59_000), "+0:59");
+        assert_eq!(timestamp(61_000), "+1:01");
+        assert_eq!(timestamp(3_661_000), "+1:01:01");
     }
 }
