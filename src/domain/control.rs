@@ -184,9 +184,13 @@ impl Controller {
             Event::Snapshot { snapshot, now_ms } => self.on_snapshot(snapshot, now_ms),
             Event::Purchase { item, now_ms } => self.on_purchase(item, now_ms),
             Event::FilterChanged(filter) => {
-                // Applies from the next *new* snapshot: neither the stored
-                // snapshot nor a duplicate re-send is re-evaluated.
-                self.filter = filter;
+                // An unrestricted filter is never accepted — armed, it would
+                // match every slot of every shop. Accepted swaps apply from
+                // the next *new* snapshot: neither the stored snapshot nor a
+                // duplicate re-send is re-evaluated.
+                if !filter.is_unrestricted() {
+                    self.filter = filter;
+                }
                 Vec::new()
             }
             Event::LimitsChanged(limits) => {
@@ -200,9 +204,14 @@ impl Controller {
     }
 
     /// Never refreshes: opening the shop is free and yields the first
-    /// snapshot. Ignored mid-session so a stray `Start` cannot reset counters.
+    /// snapshot. Ignored mid-session so a stray `Start` cannot reset
+    /// counters, and refused while the filter is unrestricted — the loop
+    /// must never hunt without a target, whoever sent the event.
     fn on_start(&mut self, now_ms: u64) -> Vec<Action> {
         if !matches!(self.status, Status::Idle | Status::Stopped(_)) {
+            return Vec::new();
+        }
+        if self.filter.is_unrestricted() {
             return Vec::new();
         }
         self.progress = Progress::default();
@@ -524,6 +533,32 @@ mod tests {
         assert!(actions.is_empty());
         assert_eq!(ctrl.status(), Status::Watching);
         assert_eq!(ctrl.progress().refreshes, 0);
+    }
+
+    #[test]
+    fn start_refused_while_filter_unrestricted() {
+        // The invariant lives here, not in the callers: no command producer
+        // may arm a hunt-everything loop.
+        let mut ctrl = Controller::new(Filter::default(), Limits::default());
+        assert!(ctrl.handle(Event::Start { now_ms: 0 }).is_empty());
+        assert_eq!(ctrl.status(), Status::Idle);
+    }
+
+    #[test]
+    fn unrestricted_filter_swap_is_ignored() {
+        let mut ctrl = started(Limits::default());
+        assert!(
+            ctrl.handle(Event::FilterChanged(Filter::default()))
+                .is_empty()
+        );
+        assert!(!ctrl.filter().is_unrestricted());
+        // The old criteria keep hunting: slot 3 still matches.
+        let actions = ctrl.handle(snap(hit_shop(None), 1));
+        assert_eq!(
+            actions,
+            vec![Action::Alert { slots: vec![3] }],
+            "the equipment filter must still be active"
+        );
     }
 
     #[test]

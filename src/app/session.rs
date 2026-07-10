@@ -101,6 +101,10 @@ fn handle_command(
         // Retunes echo their own confirmation: the transition logic below
         // only reads status changes, which these never cause.
         Command::SetFilter(filter) => {
+            // The domain rejects unrestricted swaps; do not claim "updated".
+            if filter.is_unrestricted() {
+                return vec![">> filter ignored — at least one criterion required".to_owned()];
+            }
             let paused = ctrl.status() == Status::Paused;
             let actions = ctrl.handle(Event::FilterChanged(filter));
             let mut lines = apply(&actions, &ctrl, gate);
@@ -400,7 +404,7 @@ mod tests {
     #[test]
     fn gate_follows_controller_status() {
         let gate = WatchGate::new(false);
-        let mut ctrl = Controller::new(Filter::default(), Limits::default());
+        let mut ctrl = Controller::new(match_default_filter(), Limits::default());
         apply(&[], &ctrl, &gate);
         assert!(!gate.is_enabled()); // Idle
 
@@ -568,7 +572,7 @@ mod tests {
     #[test]
     fn alert_hint_warns_when_some_matches_untracked() {
         let gate = WatchGate::new(false);
-        let mut ctrl = Controller::new(Filter::default(), Limits::default());
+        let mut ctrl = Controller::new(match_default_filter(), Limits::default());
         ctrl.handle(Event::Start { now_ms: 0 });
         // Two matches, only one trackable: the first slot keeps the id-0
         // sentinel, so auto-resume would refresh over it.
