@@ -46,6 +46,12 @@ eframe = { version = "0.35", optional = true, default-features = false, features
 [target.'cfg(windows)'.dependencies]
 windivert = { version = "0.7.0-beta.4", optional = true }
 
+[dev-dependencies]
+# Headless widget-interaction tests for the ui module (no renderer needed).
+# Dev-deps cannot be feature-gated: the console-only test lane builds egui
+# once too; the kittest tests themselves are behind the `gui` feature.
+egui_kittest = { version = "0.35", default-features = false }
+
 [profile.release]
 lto = "thin"
 strip = true

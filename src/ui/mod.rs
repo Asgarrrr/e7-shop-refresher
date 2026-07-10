@@ -257,6 +257,13 @@ fn timestamp(at_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    use crate::domain::control::{Controller, Limits};
+    use crate::domain::filter::Filter;
+
     use super::*;
 
     #[test]
@@ -270,5 +277,40 @@ mod tests {
         assert_eq!(timestamp(59_000), "+0:59");
         assert_eq!(timestamp(61_000), "+1:01");
         assert_eq!(timestamp(3_661_000), "+1:01:01");
+    }
+
+    fn frame(
+        clicked: &RefCell<Option<Command>>,
+        editor: &mut EditorState,
+    ) -> impl FnMut(&mut egui::Ui) {
+        let controller = Controller::new(Filter::default(), Limits::default());
+        let view = view_state(&controller, false);
+        move |ui| {
+            if let Some(command) = render(ui, &view, &[], None, editor) {
+                *clicked.borrow_mut() = Some(command);
+            }
+        }
+    }
+
+    #[test]
+    fn start_button_emits_start_command() {
+        let clicked = RefCell::new(None);
+        let mut editor = EditorState::new(Filter::default(), Limits::default());
+        let mut harness = Harness::new_ui(frame(&clicked, &mut editor));
+        harness.get_by_label("Start").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(clicked.into_inner(), Some(Command::Start));
+    }
+
+    #[test]
+    fn stop_button_emits_stop_command() {
+        let clicked = RefCell::new(None);
+        let mut editor = EditorState::new(Filter::default(), Limits::default());
+        let mut harness = Harness::new_ui(frame(&clicked, &mut editor));
+        harness.get_by_label("Stop").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(clicked.into_inner(), Some(Command::Stop));
     }
 }

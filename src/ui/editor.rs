@@ -214,3 +214,88 @@ fn duration_minutes(ui: &mut egui::Ui, value: &mut Option<u64>) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    use super::*;
+
+    fn named_filter() -> Filter {
+        Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            ..Filter::default()
+        }
+    }
+
+    #[test]
+    fn apply_filter_sends_the_draft() {
+        let mut editor = EditorState::new(named_filter(), Limits::default());
+        let sent = RefCell::new(None);
+        let mut harness = Harness::new_ui(|ui| {
+            if let Some(command) = edit_filter(ui, &mut editor) {
+                *sent.borrow_mut() = Some(command);
+            }
+        });
+        harness.get_by_label("Filter").click();
+        harness.run();
+        harness.get_by_label("Apply filter").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(sent.into_inner(), Some(Command::SetFilter(named_filter())));
+    }
+
+    #[test]
+    fn apply_filter_inert_while_draft_unrestricted() {
+        let mut editor = EditorState::new(Filter::default(), Limits::default());
+        let sent = RefCell::new(None);
+        let mut harness = Harness::new_ui(|ui| {
+            if let Some(command) = edit_filter(ui, &mut editor) {
+                *sent.borrow_mut() = Some(command);
+            }
+        });
+        harness.get_by_label("Filter").click();
+        harness.run();
+        harness.get_by_label("Apply filter").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(sent.into_inner(), None);
+    }
+
+    #[test]
+    fn kind_checkbox_updates_the_draft() {
+        let mut editor = EditorState::new(named_filter(), Limits::default());
+        let mut harness = Harness::new_ui(|ui| {
+            edit_filter(ui, &mut editor);
+        });
+        harness.get_by_label("Filter").click();
+        harness.run();
+        harness.get_by_label("token").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.kinds, vec![ItemKind::Token]);
+    }
+
+    #[test]
+    fn apply_limits_sends_the_draft() {
+        let limits = Limits {
+            max_refreshes: Some(7),
+            ..Limits::default()
+        };
+        let mut editor = EditorState::new(Filter::default(), limits.clone());
+        let sent = RefCell::new(None);
+        let mut harness = Harness::new_ui(|ui| {
+            if let Some(command) = edit_limits(ui, &mut editor) {
+                *sent.borrow_mut() = Some(command);
+            }
+        });
+        harness.get_by_label("Limits").click();
+        harness.run();
+        harness.get_by_label("Apply limits").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(sent.into_inner(), Some(Command::SetLimits(limits)));
+    }
+}
