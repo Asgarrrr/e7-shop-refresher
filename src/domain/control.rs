@@ -18,7 +18,7 @@ const REFRESH_COST_CRYSTALS: u32 = 3;
 ///
 /// Deserialized from the config file's `[limits]` section; unknown keys are
 /// rejected because a misspelled limit is a limit that never triggers.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_refreshes: Option<u32>,
@@ -71,6 +71,8 @@ pub enum Event {
         now_ms: u64,
     },
     FilterChanged(Filter),
+    /// The player retuned the stop limits mid-session (from the GUI).
+    LimitsChanged(Limits),
     /// Lets the duration limit expire outside snapshots (e.g. while `Paused`).
     Tick {
         now_ms: u64,
@@ -152,9 +154,14 @@ impl Controller {
         self.progress
     }
 
-    /// The configured stop limits (immutable for the session).
+    /// The active stop limits.
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// The active interest filter.
+    pub fn filter(&self) -> &Filter {
+        &self.filter
     }
 
     /// Matched-but-unbought catalog ids; untrackable matches (id 0, sold
@@ -173,6 +180,12 @@ impl Controller {
                 // Applies from the next *new* snapshot: neither the stored
                 // snapshot nor a duplicate re-send is re-evaluated.
                 self.filter = filter;
+                Vec::new()
+            }
+            Event::LimitsChanged(limits) => {
+                // Applies at the next check-point (snapshot or tick): the
+                // event itself never halts retroactively.
+                self.limits = limits;
                 Vec::new()
             }
             Event::Tick { now_ms } => self.on_tick(now_ms),
@@ -513,6 +526,34 @@ mod tests {
         assert_eq!(actions, vec![Action::Refresh]);
         assert_eq!(ctrl.progress().refreshes, 1);
         assert_eq!(ctrl.progress().spent, 3);
+    }
+
+    #[test]
+    fn limits_changed_applies_to_next_check() {
+        let mut ctrl = started(Limits::default());
+        assert_eq!(ctrl.handle(snap(dud_shop(None), 1)), vec![Action::Refresh]);
+        let tightened = Limits {
+            max_refreshes: Some(1),
+            ..Limits::default()
+        };
+        assert!(ctrl.handle(Event::LimitsChanged(tightened)).is_empty());
+        let actions = ctrl.handle(snap(dud_shop(None), 2));
+        assert_eq!(actions, vec![Action::Halt(StopReason::MaxRefreshes)]);
+        assert_eq!(ctrl.status(), Status::Stopped(StopReason::MaxRefreshes));
+    }
+
+    #[test]
+    fn limits_changed_never_halts_immediately() {
+        let mut ctrl = started(Limits::default());
+        assert_eq!(ctrl.handle(snap(dud_shop(None), 1)), vec![Action::Refresh]);
+        // Already over the new ceiling, yet nothing happens until the next
+        // check-point.
+        let tightened = Limits {
+            max_refreshes: Some(1),
+            ..Limits::default()
+        };
+        assert!(ctrl.handle(Event::LimitsChanged(tightened)).is_empty());
+        assert_eq!(ctrl.status(), Status::Watching);
     }
 
     #[test]

@@ -10,7 +10,8 @@ use tracing::{error, info};
 
 use crate::capture::{Direction, PacketSource, Segment};
 use crate::config::ForwardConfig;
-use crate::domain::control::{Action, Controller, Event, Status, StopReason};
+use crate::domain::control::{Action, Controller, Event, Limits, Status, StopReason};
+use crate::domain::filter::Filter;
 use crate::domain::shop::{ItemKind, ShopItem, ShopSnapshot};
 use crate::stream::Reassembler;
 use crate::uplink::protocol::{PurchaseNotice, ServerMessage};
@@ -26,14 +27,19 @@ enum CaptureEvent {
     Resync,
 }
 
-/// A player command, decoupled from its source: today a stdin task, tomorrow
-/// the GUI pushing the same values through the same channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A player command, decoupled from its source: the stdin task and the GUI
+/// push the same values through the same channel (stdin never produces the
+/// `Set*` variants).
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Start,
     Stop,
     /// Start or stop, depending on the current status.
     Toggle,
+    /// Live filter retune; applies from the next new shop.
+    SetFilter(Filter),
+    /// Live limits retune; checked before the next refresh.
+    SetLimits(Limits),
 }
 
 /// One journal entry: a console line with its session-relative timestamp.
@@ -134,6 +140,15 @@ pub fn setup(config: Config) -> (Session, SessionHandles) {
 /// Console-only entry point: [`setup`] + [`Session::run`], discarding the
 /// view handles.
 pub async fn run(config: Config) -> Result<()> {
+    // The console has no filter editor: an unrestricted filter can only be
+    // fixed in config.toml, so fail fast. The GUI path (setup +
+    // `Session::run`) boots instead and refuses arming until a filter is set.
+    if config.filter.is_unrestricted() {
+        return Err(crate::Error::Config(
+            "no [filter] criteria in config.toml — define what to hunt (see config.example.toml)"
+                .to_owned(),
+        ));
+    }
     let (session, _handles) = setup(config);
     session.run().await
 }
@@ -149,15 +164,6 @@ impl Session {
             command_tx,
             command_rx,
         } = self;
-        // The loop must have a target: unfiltered, every slot of every shop
-        // matches and the relay would advise buying everything.
-        if config.filter.is_unrestricted() {
-            return Err(crate::Error::Config(
-                "no [filter] criteria in config.toml — define what to hunt (see config.example.toml)"
-                    .to_owned(),
-            ));
-        }
-
         let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(8_192);
         let (raw_tx, raw_rx) = mpsc::channel::<Vec<u8>>(1_024);
         let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(256);
@@ -364,7 +370,28 @@ fn handle_command(
             Status::Watching | Status::Paused => Event::Stop,
             Status::Idle | Status::Stopped(_) => Event::Start { now_ms },
         },
+        // Retunes echo their own confirmation: the transition logic below
+        // only reads status changes, which these never cause.
+        Command::SetFilter(filter) => {
+            let actions = ctrl.handle(Event::FilterChanged(filter));
+            let mut lines = apply(&actions, &ctrl, gate);
+            lines.push(">> filter updated — applies from the next shop".to_owned());
+            return lines;
+        }
+        Command::SetLimits(limits) => {
+            let actions = ctrl.handle(Event::LimitsChanged(limits));
+            let mut lines = apply(&actions, &ctrl, gate);
+            lines.push(">> limits updated — checked before the next refresh".to_owned());
+            return lines;
+        }
     };
+    // Arming an unrestricted filter would advise buying everything: refuse
+    // with advice instead of dispatching (the console build already fails
+    // fast at startup; this guards the GUI build, where the filter is edited
+    // live).
+    if matches!(event, Event::Start { .. }) && ctrl.filter().is_unrestricted() {
+        return vec![">> no filter criteria set — define a filter first".to_owned()];
+    }
     let before = ctrl.status();
     let actions = ctrl.handle(event);
     let mut lines = apply(&actions, &ctrl, gate);
@@ -654,6 +681,49 @@ mod tests {
     }
 
     #[test]
+    fn start_refused_while_filter_unrestricted() {
+        let gate = WatchGate::new(false);
+        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        let lines = handle_command(&controller, &gate, Command::Start, 0);
+        assert!(lines.iter().any(|line| line.contains("define a filter")));
+        assert_eq!(controller.lock().unwrap().status(), Status::Idle);
+        assert!(!gate.is_enabled());
+        // Toggle resolves to Start and hits the same guard.
+        let lines = handle_command(&controller, &gate, Command::Toggle, 1);
+        assert!(lines.iter().any(|line| line.contains("define a filter")));
+        assert_eq!(controller.lock().unwrap().status(), Status::Idle);
+    }
+
+    #[test]
+    fn set_filter_unblocks_arming() {
+        let gate = WatchGate::new(false);
+        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        let filter = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            ..Filter::default()
+        };
+        let lines = handle_command(&controller, &gate, Command::SetFilter(filter.clone()), 0);
+        assert!(lines.iter().any(|line| line.contains("filter updated")));
+        assert_eq!(controller.lock().unwrap().filter(), &filter);
+        let lines = handle_command(&controller, &gate, Command::Start, 1);
+        assert!(lines.iter().any(|line| line.contains("watching")));
+        assert_eq!(controller.lock().unwrap().status(), Status::Watching);
+    }
+
+    #[test]
+    fn set_limits_updates_controller() {
+        let gate = WatchGate::new(false);
+        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        let limits = Limits {
+            max_refreshes: Some(5),
+            ..Limits::default()
+        };
+        let lines = handle_command(&controller, &gate, Command::SetLimits(limits.clone()), 0);
+        assert!(lines.iter().any(|line| line.contains("limits updated")));
+        assert_eq!(controller.lock().unwrap().limits(), &limits);
+    }
+
+    #[test]
     fn kind_label_names_each_kind() {
         assert_eq!(kind_label(ItemKind::Equipment), "equipment");
         assert_eq!(kind_label(ItemKind::Hero), "hero");
@@ -665,7 +735,7 @@ mod tests {
     fn journal_receives_command_lines() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
-        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
         on_command(&controller, &gate, &journal, Command::Start, 1_000);
         let entries = journal.entries();
         assert!(entries.iter().any(|line| line.text.contains("watching")));
@@ -744,6 +814,15 @@ mod tests {
         assert!(!gate.is_enabled()); // Stopped
     }
 
+    /// Restricted (passes the arming guard) yet still matching
+    /// `ShopItem::default()` (kind `Unknown`).
+    fn match_default_filter() -> Filter {
+        Filter {
+            kinds: vec![ItemKind::Unknown],
+            ..Filter::default()
+        }
+    }
+
     fn one_item_shop() -> ShopSnapshot {
         ShopSnapshot {
             merchant: None,
@@ -756,7 +835,7 @@ mod tests {
     fn toggle_resolves_against_status() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
-        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
 
         on_command(&controller, &gate, &journal, Command::Toggle, 0); // Idle -> Start
         assert_eq!(controller.lock().unwrap().status(), Status::Watching);
@@ -793,7 +872,7 @@ mod tests {
     fn purchase_message_auto_resumes_controller() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
-        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
         on_command(&controller, &gate, &journal, Command::Start, 0);
         let mut snapshot = one_item_shop();
         snapshot.slots[0].id = 42;
@@ -903,7 +982,7 @@ mod tests {
     fn paused_label_reflects_manual_flow_when_checklist_empty() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
-        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
         on_command(&controller, &gate, &journal, Command::Start, 0);
         // Paused on an untrackable (id-0) match: a no-effect command's echo
         // must advise manual resume, not a phantom auto-resume.
@@ -925,7 +1004,7 @@ mod tests {
     #[test]
     fn start_hint_printed_only_when_shop_stored() {
         let gate = WatchGate::new(false);
-        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
         // Nothing stored yet: plain watching line, no hint.
         let lines = handle_command(&controller, &gate, Command::Start, 0);
         assert!(lines.iter().any(|line| line.contains("watching")));
@@ -951,7 +1030,7 @@ mod tests {
     fn ignored_command_leaves_state_and_gate_unchanged() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
-        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
         on_command(&controller, &gate, &journal, Command::Start, 0);
         dispatch(
             &controller,

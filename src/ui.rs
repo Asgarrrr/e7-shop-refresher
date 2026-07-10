@@ -12,11 +12,36 @@ use crate::app::{
     Command, EventLog, LogLine, SessionHandles, describe, format_item, kind_label, status_label,
 };
 use crate::domain::control::{Controller, Limits, Progress, Status};
+use crate::domain::filter::{Filter, SubstatReq};
+use crate::domain::shop::ItemKind;
 use crate::watch::WatchGate;
 
 /// Where the session's terminal outcome lands (fatal error or clean end):
 /// written once by the spawn wrapper in `main`, shown as a banner.
 pub type SessionErrorSlot = Arc<Mutex<Option<String>>>;
+
+/// Draft criteria owned by the window until Apply pushes them to the
+/// session; seeded from config.toml at startup. Edits are session-only —
+/// nothing is written back to the file.
+pub struct EditorState {
+    filter: Filter,
+    limits: Limits,
+    name_input: String,
+    set_input: String,
+    substat_input: String,
+}
+
+impl EditorState {
+    pub fn new(filter: Filter, limits: Limits) -> Self {
+        Self {
+            filter,
+            limits,
+            name_input: String::new(),
+            set_input: String::new(),
+            substat_input: String::new(),
+        }
+    }
+}
 
 /// Plain per-frame copy of everything the window shows; built under the
 /// controller lock, rendered after the guard is dropped.
@@ -92,16 +117,18 @@ pub struct ShopApp {
     gate: WatchGate,
     journal: EventLog,
     error: SessionErrorSlot,
+    editor: EditorState,
 }
 
 impl ShopApp {
-    pub fn new(handles: SessionHandles, error: SessionErrorSlot) -> Self {
+    pub fn new(handles: SessionHandles, error: SessionErrorSlot, editor: EditorState) -> Self {
         Self {
             controller: handles.controller,
             commands: handles.commands,
             gate: handles.gate,
             journal: handles.journal,
             error,
+            editor,
         }
     }
 }
@@ -119,7 +146,9 @@ impl eframe::App for ShopApp {
         let entries = self.journal.entries();
         let outcome = self.error.lock().expect("error slot poisoned").clone();
         let clicked = egui::CentralPanel::default()
-            .show(ui, |ui| render(ui, &view, &entries, outcome.as_deref()))
+            .show(ui, |ui| {
+                render(ui, &view, &entries, outcome.as_deref(), &mut self.editor)
+            })
             .inner;
         if let Some(command) = clicked {
             // A full channel only happens with a dead session loop, where the
@@ -135,6 +164,7 @@ fn render(
     view: &ViewState,
     journal: &[LogLine],
     outcome: Option<&str>,
+    editor: &mut EditorState,
 ) -> Option<Command> {
     let mut clicked = None;
 
@@ -197,6 +227,66 @@ fn render(
     });
     ui.separator();
 
+    ui.collapsing("Filter", |ui| {
+        ui.horizontal(|ui| {
+            for (kind, label) in [
+                (ItemKind::Equipment, "equipment"),
+                (ItemKind::Hero, "hero"),
+                (ItemKind::Token, "token"),
+            ] {
+                let mut on = editor.filter.kinds.contains(&kind);
+                if ui.checkbox(&mut on, label).changed() {
+                    if on {
+                        editor.filter.kinds.push(kind);
+                    } else {
+                        editor.filter.kinds.retain(|kept| *kept != kind);
+                    }
+                }
+            }
+        });
+        string_list(
+            ui,
+            "names (exact internal ids)",
+            &mut editor.filter.names,
+            &mut editor.name_input,
+        );
+        string_list(
+            ui,
+            "sets (exact internal ids)",
+            &mut editor.filter.sets,
+            &mut editor.set_input,
+        );
+        substat_reqs(
+            ui,
+            &mut editor.filter.required_substats,
+            &mut editor.substat_input,
+        );
+        optional_value(ui, "min substats", &mut editor.filter.min_substats);
+        optional_value(ui, "max price (gold)", &mut editor.filter.max_price);
+        ui.checkbox(&mut editor.filter.include_sold_out, "include sold out");
+        let restricted = !editor.filter.is_unrestricted();
+        if !restricted {
+            ui.weak("at least one criterion is required before Apply");
+        }
+        if ui
+            .add_enabled(restricted, egui::Button::new("Apply filter"))
+            .clicked()
+        {
+            clicked = Some(Command::SetFilter(editor.filter.clone()));
+        }
+    });
+    ui.collapsing("Limits", |ui| {
+        optional_value(ui, "max refreshes", &mut editor.limits.max_refreshes);
+        optional_value(ui, "max spend (crystals)", &mut editor.limits.max_spend);
+        optional_value(ui, "max matches", &mut editor.limits.max_matches);
+        duration_minutes(ui, &mut editor.limits.max_duration_ms);
+        if ui.button("Apply limits").clicked() {
+            clicked = Some(Command::SetLimits(editor.limits.clone()));
+        }
+    });
+    ui.weak("edits apply to this session only — config.toml is unchanged");
+    ui.separator();
+
     ui.label(egui::RichText::new(view.merchant.as_deref().unwrap_or("Secret Shop")).strong());
     if view.rows.is_empty() {
         ui.weak("no shop captured yet — open the Secret Shop in game");
@@ -246,6 +336,98 @@ fn render(
         });
 
     clicked
+}
+
+/// One editable any-of list: entries with a remove cross plus an add row.
+fn string_list(ui: &mut egui::Ui, label: &str, values: &mut Vec<String>, input: &mut String) {
+    ui.label(label);
+    let mut removed = None;
+    for (index, value) in values.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.monospace(value);
+            if ui.small_button("✕").clicked() {
+                removed = Some(index);
+            }
+        });
+    }
+    if let Some(index) = removed {
+        values.remove(index);
+    }
+    ui.horizontal(|ui| {
+        ui.text_edit_singleline(input);
+        if ui.button("add").clicked() && !input.trim().is_empty() {
+            values.push(input.trim().to_owned());
+            input.clear();
+        }
+    });
+}
+
+/// Required-substat rows: name, optional min threshold, remove cross.
+fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input: &mut String) {
+    ui.label("required substats");
+    let mut removed = None;
+    for (index, req) in reqs.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.monospace(&req.name);
+            let mut has_min = req.min.is_some();
+            ui.checkbox(&mut has_min, "min");
+            if has_min {
+                ui.add(egui::DragValue::new(req.min.get_or_insert(0.0)).speed(0.5));
+            } else {
+                req.min = None;
+            }
+            if ui.small_button("✕").clicked() {
+                removed = Some(index);
+            }
+        });
+    }
+    if let Some(index) = removed {
+        reqs.remove(index);
+    }
+    ui.horizontal(|ui| {
+        ui.text_edit_singleline(input);
+        if ui.button("add").clicked() && !input.trim().is_empty() {
+            reqs.push(SubstatReq {
+                name: input.trim().to_owned(),
+                min: None,
+            });
+            input.clear();
+        }
+    });
+}
+
+/// Checkbox-gated numeric criterion: unchecked means "no constraint".
+fn optional_value<T: egui::emath::Numeric + Default>(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut Option<T>,
+) {
+    ui.horizontal(|ui| {
+        let mut on = value.is_some();
+        ui.checkbox(&mut on, label);
+        if on {
+            ui.add(egui::DragValue::new(value.get_or_insert_with(T::default)));
+        } else {
+            *value = None;
+        }
+    });
+}
+
+/// The duration limit, edited in whole minutes (stored as ms).
+fn duration_minutes(ui: &mut egui::Ui, value: &mut Option<u64>) {
+    ui.horizontal(|ui| {
+        let mut on = value.is_some();
+        ui.checkbox(&mut on, "max duration (minutes)");
+        if on {
+            let ms = value.get_or_insert(0);
+            let mut minutes = *ms / 60_000;
+            if ui.add(egui::DragValue::new(&mut minutes)).changed() {
+                *ms = minutes.saturating_mul(60_000);
+            }
+        } else {
+            *value = None;
+        }
+    });
 }
 
 /// `3/10` against a limit, `3/—` without one.

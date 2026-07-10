@@ -59,6 +59,8 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
 fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
     use arkyve_refresh_shop::ui;
 
+    // The editors start from the same criteria the controller was built with.
+    let editor = ui::EditorState::new(config.filter.clone(), config.limits.clone());
     let (session, handles) = app::setup(config);
     let error = ui::SessionErrorSlot::default();
     let slot = error.clone();
@@ -76,7 +78,7 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
             viewport: eframe::egui::ViewportBuilder::default().with_inner_size([640.0, 640.0]),
             ..Default::default()
         },
-        Box::new(move |_cc| Ok(Box::new(ui::ShopApp::new(handles, error)))),
+        Box::new(move |_cc| Ok(Box::new(ui::ShopApp::new(handles, error, editor)))),
     );
     // Not a plain drop: tokio::io::stdin parks a blocking thread, and dropping
     // the runtime would hang window close until the player presses Enter.

@@ -16,7 +16,7 @@ use crate::domain::shop::{ItemKind, ShopItem};
 /// Deserialized from the config file's `[filter]` section. Unlike the wire
 /// models, unknown keys are rejected: a typo here silently loosens the
 /// criteria the refresh loop spends crystals against.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Filter {
     /// Kept item kinds (any-of); empty keeps all, including `Unknown`.
@@ -41,7 +41,7 @@ pub struct Filter {
 ///
 /// `name` is deliberately required (no container default): a nameless
 /// requirement would silently match nothing.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubstatReq {
     pub name: String,
