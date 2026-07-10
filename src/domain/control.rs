@@ -45,7 +45,8 @@ pub enum Status {
     Idle,
     Watching,
     /// A slot matched; waiting for purchases. Auto-resumes when the last
-    /// checklist item is bought; `resume` overrides (abandons the rest).
+    /// checklist item is bought; a genuinely new shop (in-game refresh,
+    /// hourly rotation) is re-evaluated.
     Paused,
     Stopped(StopReason),
 }
@@ -58,11 +59,6 @@ pub enum Event {
         now_ms: u64,
     },
     Stop,
-    /// The player's override while `Paused`: abandons the unbought checklist
-    /// remainder and refreshes on (purchases auto-resume on their own).
-    Resume {
-        now_ms: u64,
-    },
     Snapshot {
         snapshot: ShopSnapshot,
         now_ms: u64,
@@ -104,10 +100,10 @@ pub struct Progress {
 }
 
 /// Invariant: the relay stays passive — a refresh is only requested in
-/// reaction to a no-match snapshot, an explicit `Resume`, or the purchase
-/// clearing the last checklist entry; duplicate snapshots and snapshots
-/// received while unarmed (`Idle`/`Stopped`) never trigger one (they are
-/// still stored for the view).
+/// reaction to a no-match snapshot or the purchase clearing the last
+/// checklist entry; duplicate snapshots and snapshots received while
+/// unarmed (`Idle`/`Stopped`) never trigger one (they are still stored for
+/// the view).
 pub struct Controller {
     filter: Filter,
     limits: Limits,
@@ -124,8 +120,8 @@ pub struct Controller {
     /// Identity of the last snapshot evaluated while armed
     /// (`Watching | Paused`): an identical re-arrival is stored for the view
     /// but never re-evaluated, so it cannot double-bill a refresh. Cleared
-    /// on `Start` only — surviving `Resume` is what mutes a re-open right
-    /// after a buy.
+    /// on `Start` only — surviving the post-buy auto-resume is what mutes a
+    /// re-open right after a buy.
     acted_fingerprint: Option<Vec<SlotIdentity>>,
 }
 
@@ -166,7 +162,6 @@ impl Controller {
         match event {
             Event::Start { now_ms } => self.on_start(now_ms),
             Event::Stop => self.on_stop(),
-            Event::Resume { now_ms } => self.on_resume(now_ms),
             Event::Snapshot { snapshot, now_ms } => self.on_snapshot(snapshot, now_ms),
             Event::Purchase { item, now_ms } => self.on_purchase(item, now_ms),
             Event::FilterChanged(filter) => {
@@ -202,15 +197,6 @@ impl Controller {
             return Vec::new();
         }
         self.halt(StopReason::PlayerStopped)
-    }
-
-    fn on_resume(&mut self, now_ms: u64) -> Vec<Action> {
-        if self.status != Status::Paused {
-            return Vec::new();
-        }
-        self.checklist.clear();
-        self.status = Status::Watching;
-        self.refresh_or_halt(now_ms)
     }
 
     fn on_snapshot(&mut self, snapshot: ShopSnapshot, now_ms: u64) -> Vec<Action> {
@@ -290,8 +276,8 @@ impl Controller {
     }
 
     /// A server-confirmed buy. Only meaningful while `Paused`: checks the
-    /// item off the checklist; the buy clearing the last entry resumes
-    /// through [`Self::on_resume`], the exact path of the player command.
+    /// item off the checklist; the buy clearing the last entry resumes the
+    /// hunt through the limits gate.
     fn on_purchase(&mut self, item: u32, now_ms: u64) -> Vec<Action> {
         if self.status != Status::Paused {
             return Vec::new();
@@ -305,7 +291,8 @@ impl Controller {
         if !self.checklist.is_empty() {
             return Vec::new();
         }
-        self.on_resume(now_ms)
+        self.status = Status::Watching;
+        self.refresh_or_halt(now_ms)
     }
 
     fn on_tick(&mut self, now_ms: u64) -> Vec<Action> {
@@ -328,8 +315,8 @@ impl Controller {
         }
     }
 
-    /// Single emission point: every refresh, including the one after a
-    /// `Resume`, is counted and debited before it goes out.
+    /// Single emission point: every refresh, including the auto-resume one,
+    /// is counted and debited before it goes out.
     fn emit_refresh(&mut self) -> Action {
         self.progress.refreshes += 1;
         let cost = self.refresh_cost();
@@ -533,21 +520,28 @@ mod tests {
     }
 
     #[test]
-    fn resume_refresh_is_counted() {
+    fn auto_resume_refresh_is_counted() {
         let mut ctrl = started(Limits {
             max_refreshes: Some(2),
             ..Limits::default()
         });
-        for now in [1, 3] {
-            ctrl.handle(snap(hit_shop(None), now));
-            let actions = ctrl.handle(Event::Resume { now_ms: now + 1 });
-            assert_eq!(actions, vec![Action::Refresh]);
+        // Distinct ids per round: identical re-sends would be deduped.
+        for round in 0..3u32 {
+            let mut shop = with_ids(hit_shop(None));
+            for item in &mut shop.slots {
+                item.id += round * 100;
+            }
+            let now = u64::from(round) * 2;
+            ctrl.handle(snap(shop, now + 1));
+            let actions = ctrl.handle(buy(102 + round * 100, now + 2));
+            if round < 2 {
+                assert_eq!(actions, vec![Action::Refresh]);
+            } else {
+                // The third one must hit the limit, not silently overshoot.
+                assert_eq!(actions, vec![Action::Halt(StopReason::MaxRefreshes)]);
+            }
         }
         assert_eq!(ctrl.progress().refreshes, 2);
-        // The third one must hit the limit, not silently overshoot it.
-        ctrl.handle(snap(hit_shop(None), 5));
-        let actions = ctrl.handle(Event::Resume { now_ms: 6 });
-        assert_eq!(actions, vec![Action::Halt(StopReason::MaxRefreshes)]);
     }
 
     #[test]
@@ -625,27 +619,17 @@ mod tests {
     }
 
     #[test]
-    fn resume_override_clears_checklist() {
-        let mut ctrl = started(Limits::default());
-        ctrl.handle(snap(with_ids(hit_shop(None)), 1));
-        let actions = ctrl.handle(Event::Resume { now_ms: 2 });
-        assert_eq!(actions, vec![Action::Refresh]);
-        assert!(ctrl.checklist().is_empty());
-        // The late echo of the abandoned buy must not double-refresh.
-        assert!(ctrl.handle(buy(102, 3)).is_empty());
-        assert_eq!(ctrl.progress().refreshes, 1);
-    }
-
-    #[test]
-    fn zero_id_matches_keep_manual_resume_flow() {
+    fn zero_id_matches_pause_until_new_shop() {
         let mut ctrl = started(Limits::default());
         ctrl.handle(snap(hit_shop(None), 1)); // fixture ids are all 0
         assert_eq!(ctrl.status(), Status::Paused);
         assert!(ctrl.checklist().is_empty());
+        // No echo can clear an untrackable match; only a new shop unpauses.
         assert!(ctrl.handle(buy(0, 2)).is_empty());
         assert_eq!(ctrl.status(), Status::Paused);
-        let actions = ctrl.handle(Event::Resume { now_ms: 3 });
+        let actions = ctrl.handle(snap(with_ids(dud_shop(None)), 3));
         assert_eq!(actions, vec![Action::Refresh]);
+        assert_eq!(ctrl.status(), Status::Watching);
     }
 
     #[test]
@@ -671,10 +655,10 @@ mod tests {
         let mut ctrl = started(Limits::default());
         ctrl.handle(snap(with_ids(hit_shop(None)), 1));
         // The deduped re-send still carries truth: a balance too low to
-        // refresh must gate the resume that follows.
+        // refresh must gate the auto-resume that follows.
         let actions = ctrl.handle(snap(with_ids(hit_shop(Some(meta(2, 3)))), 2));
         assert!(actions.is_empty()); // deduped
-        let actions = ctrl.handle(Event::Resume { now_ms: 3 });
+        let actions = ctrl.handle(buy(102, 3));
         assert_eq!(actions, vec![Action::Halt(StopReason::OutOfFunds)]);
     }
 
@@ -866,18 +850,7 @@ mod tests {
         let actions = ctrl.handle(snap(shop, 1));
         assert_eq!(actions, vec![Action::Alert { slots: vec![3] }]);
         assert_eq!(ctrl.status(), Status::Paused);
-        assert!(ctrl.checklist().is_empty()); // manual `resume` flow
-    }
-
-    #[test]
-    fn resume_ignored_unless_paused() {
-        let mut watching = started(Limits::default());
-        assert!(watching.handle(Event::Resume { now_ms: 1 }).is_empty());
-        assert_eq!(watching.progress().refreshes, 0);
-
-        let mut idle = controller(Limits::default());
-        assert!(idle.handle(Event::Resume { now_ms: 1 }).is_empty());
-        assert_eq!(idle.status(), Status::Idle);
+        assert!(ctrl.checklist().is_empty()); // only a new shop unpauses
     }
 
     #[test]
@@ -1095,12 +1068,16 @@ mod tests {
             ..Limits::default()
         });
         assert_eq!(
-            ctrl.handle(snap(hit_shop(None), 1)),
+            ctrl.handle(snap(with_ids(hit_shop(None)), 1)),
             vec![Action::Alert { slots: vec![3] }]
         );
         assert_eq!(ctrl.status(), Status::Paused);
-        ctrl.handle(Event::Resume { now_ms: 2 });
-        let actions = ctrl.handle(snap(hit_shop(None), 3));
+        assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
+        let mut second = with_ids(hit_shop(None));
+        for item in &mut second.slots {
+            item.id += 100; // a new roll, not a deduped re-send
+        }
+        let actions = ctrl.handle(snap(second, 3));
         assert_eq!(
             actions,
             vec![

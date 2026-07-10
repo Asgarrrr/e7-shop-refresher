@@ -31,7 +31,6 @@ enum CaptureEvent {
 enum Command {
     Start,
     Stop,
-    Resume,
     /// Start or stop, depending on the current status.
     Toggle,
 }
@@ -170,7 +169,7 @@ async fn stdin_loop(commands: mpsc::Sender<Command>) {
                 }
             }
             None => println!(
-                ">> unknown command: {:?} (start, stop, resume, enter = toggle)",
+                ">> unknown command: {:?} (start, stop, enter = toggle)",
                 line.trim()
             ),
         }
@@ -182,7 +181,6 @@ fn parse_command(line: &str) -> Option<Command> {
         "" | "t" | "toggle" => Some(Command::Toggle),
         "on" | "start" => Some(Command::Start),
         "off" | "stop" => Some(Command::Stop),
-        "r" | "resume" => Some(Command::Resume),
         _ => None,
     }
 }
@@ -245,7 +243,6 @@ fn handle_command(
     let event = match command {
         Command::Start => Event::Start { now_ms },
         Command::Stop => Event::Stop,
-        Command::Resume => Event::Resume { now_ms },
         Command::Toggle => match ctrl.status() {
             Status::Watching | Status::Paused => Event::Stop,
             Status::Idle | Status::Stopped(_) => Event::Start { now_ms },
@@ -381,14 +378,14 @@ fn render_alert(lines: &mut Vec<String>, slots: &[u8], controller: &Controller) 
         ""
     } else if controller.checklist().is_empty() {
         // Every match is untrackable (sold out or id omitted): no purchase
-        // echo can clear them, so the manual flow stays.
-        ": buy in game, then `resume`"
+        // echo can clear them, only a fresh shop unpauses.
+        ": buy in game, then refresh"
     } else if controller.checklist().len() < slots.len() {
         // Some matches are untrackable: auto-resume only waits on the
         // tracked ones and would refresh over the rest.
-        ": buy in game — some items aren't tracked, finish with `resume`"
+        ": buy in game — some items aren't tracked, refresh when done"
     } else {
-        ": buy in game — resumes automatically (`resume` skips)"
+        ": buy in game — resumes automatically"
     };
     lines.push(format!(">> MATCH — slot(s) {}{hint}", list.join(", ")));
     let Some(snapshot) = controller.last_snapshot() else {
@@ -406,8 +403,8 @@ fn status_label(controller: &Controller) -> &'static str {
         Status::Idle => "idle (`start` arms the watch)",
         Status::Watching => "watching",
         // An empty checklist never auto-resumes.
-        Status::Paused if controller.checklist().is_empty() => "paused (buy, then `resume`)",
-        Status::Paused => "paused (buy — auto-resumes; `resume` skips)",
+        Status::Paused if controller.checklist().is_empty() => "paused (buy, then refresh)",
+        Status::Paused => "paused (buy — auto-resumes)",
         Status::Stopped(_) => "stopped (`start` re-arms)",
     }
 }
@@ -470,7 +467,7 @@ fn format_item(item: &ShopItem) -> String {
 }
 
 fn print_controls() {
-    println!("Commands: start, stop, resume (r), [Enter] toggle, Ctrl+C to quit");
+    println!("Commands: start, stop, [Enter] toggle, Ctrl+C to quit");
 }
 
 #[cfg(all(windows, feature = "windivert-backend"))]
@@ -508,8 +505,6 @@ mod tests {
         assert_eq!(parse_command("on"), Some(Command::Start));
         assert_eq!(parse_command("stop"), Some(Command::Stop));
         assert_eq!(parse_command("off"), Some(Command::Stop));
-        assert_eq!(parse_command("resume"), Some(Command::Resume));
-        assert_eq!(parse_command("r"), Some(Command::Resume));
         assert_eq!(parse_command("toggle"), Some(Command::Toggle));
         assert_eq!(parse_command("t"), Some(Command::Toggle));
         assert_eq!(parse_command(""), Some(Command::Toggle));
@@ -518,13 +513,17 @@ mod tests {
     #[test]
     fn parse_command_trims_and_ignores_case() {
         assert_eq!(parse_command("  START \t"), Some(Command::Start));
-        assert_eq!(parse_command("Resume"), Some(Command::Resume));
+        assert_eq!(parse_command("Stop"), Some(Command::Stop));
     }
 
     #[test]
     fn parse_command_rejects_unknown() {
         assert_eq!(parse_command("refresh"), None);
         assert_eq!(parse_command("sta rt"), None);
+        // The skip command is gone: buying (or a fresh shop) is the only
+        // way out of a pause.
+        assert_eq!(parse_command("resume"), None);
+        assert_eq!(parse_command("r"), None);
     }
 
     #[test]
@@ -712,7 +711,7 @@ mod tests {
             },
         );
         let lines = handle_command(&controller, &gate, Command::Start, 2);
-        assert!(lines.iter().any(|line| line.contains("buy, then `resume`")));
+        assert!(lines.iter().any(|line| line.contains("buy, then refresh")));
         assert!(!lines.iter().any(|line| line.contains("auto-resumes")));
     }
 
