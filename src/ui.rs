@@ -6,23 +6,30 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eframe::egui;
-use tokio::sync::mpsc;
 
 use crate::app::{
-    Command, EventLog, LogLine, SessionHandles, describe, format_item, kind_label, status_label,
+    Command, LogLine, SessionHandles, describe, format_item, kind_label, status_label,
 };
 use crate::domain::control::{Controller, Limits, Progress, Status};
 use crate::domain::filter::{Filter, SubstatReq};
 use crate::domain::shop::ItemKind;
-use crate::watch::WatchGate;
 
-/// Where the session's terminal outcome lands (fatal error or clean end):
-/// written once by the spawn wrapper in `main`, shown as a banner.
+/// Where the session's terminal outcome lands (fatal error, crash, or clean
+/// end): written once by the spawn wrapper in `main`, shown as a banner.
 pub type SessionErrorSlot = Arc<Mutex<Option<String>>>;
 
+/// A poisoned lock means the session panicked. The view keeps rendering the
+/// last state (the banner reports the crash) instead of tearing the window
+/// down with a second panic.
+fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Draft criteria owned by the window until Apply pushes them to the
-/// session; seeded from config.toml at startup. Edits are session-only —
-/// nothing is written back to the file.
+/// session; seeded from the controller's live criteria at startup. Edits are
+/// session-only — config.toml is never rewritten.
 pub struct EditorState {
     filter: Filter,
     limits: Limits,
@@ -51,9 +58,12 @@ pub struct ViewState {
     pub capture_on: bool,
     pub progress: Progress,
     pub limits: Limits,
-    pub merchant: Option<String>,
+    pub merchant: String,
+    /// From the controller's enforced meta (debited per advised refresh,
+    /// cleared on restart) — not the raw snapshot, which can be stale.
     pub crystal_balance: Option<u32>,
-    pub refresh_cost: Option<u32>,
+    /// Always known: wire meta, else the game constant.
+    pub refresh_cost: u32,
     pub rows: Vec<SlotRow>,
 }
 
@@ -96,37 +106,38 @@ pub fn view_state(controller: &Controller, capture_on: bool) -> ViewState {
                 .collect()
         })
         .unwrap_or_default();
-    let refresh = snapshot.and_then(|snapshot| snapshot.refresh);
     ViewState {
         status: status_label(controller),
         stop_reason,
         capture_on,
         progress: controller.progress(),
         limits: controller.limits().clone(),
-        merchant: snapshot.and_then(|snapshot| snapshot.merchant.clone()),
-        crystal_balance: refresh.map(|meta| meta.crystal_balance),
-        refresh_cost: refresh.map(|meta| meta.cost),
+        merchant: snapshot
+            .and_then(|snapshot| snapshot.merchant.clone())
+            .unwrap_or_else(|| "Secret Shop".to_owned()),
+        crystal_balance: controller.refresh_meta().map(|meta| meta.crystal_balance),
+        refresh_cost: controller.refresh_cost(),
         rows,
     }
 }
 
 /// The eframe application: a thin shell around the session handles.
 pub struct ShopApp {
-    controller: Arc<Mutex<Controller>>,
-    commands: mpsc::Sender<Command>,
-    gate: WatchGate,
-    journal: EventLog,
+    handles: SessionHandles,
     error: SessionErrorSlot,
     editor: EditorState,
 }
 
 impl ShopApp {
-    pub fn new(handles: SessionHandles, error: SessionErrorSlot, editor: EditorState) -> Self {
+    pub fn new(handles: SessionHandles, error: SessionErrorSlot) -> Self {
+        // Seed the drafts from the controller itself — the single source of
+        // the criteria actually running.
+        let editor = {
+            let ctrl = lock_ignoring_poison(&handles.controller);
+            EditorState::new(ctrl.filter().clone(), ctrl.limits().clone())
+        };
         Self {
-            controller: handles.controller,
-            commands: handles.commands,
-            gate: handles.gate,
-            journal: handles.journal,
+            handles,
             error,
             editor,
         }
@@ -140,20 +151,28 @@ impl eframe::App for ShopApp {
         // egui.
         ui.ctx().request_repaint_after(Duration::from_millis(250));
         let view = {
-            let ctrl = self.controller.lock().expect("controller mutex poisoned");
-            view_state(&ctrl, self.gate.is_enabled())
+            let ctrl = lock_ignoring_poison(&self.handles.controller);
+            view_state(&ctrl, self.handles.gate.is_enabled())
         };
-        let entries = self.journal.entries();
-        let outcome = self.error.lock().expect("error slot poisoned").clone();
+        let entries = self.handles.journal.entries();
+        let outcome = lock_ignoring_poison(&self.error).clone();
+        // Root scroll: expanded editors must never push the table or journal
+        // out of a clipped (non-scrolling) panel.
         let clicked = egui::CentralPanel::default()
             .show(ui, |ui| {
-                render(ui, &view, &entries, outcome.as_deref(), &mut self.editor)
+                egui::ScrollArea::vertical()
+                    .id_salt("root")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        render(ui, &view, &entries, outcome.as_deref(), &mut self.editor)
+                    })
+                    .inner
             })
             .inner;
         if let Some(command) = clicked {
             // A full channel only happens with a dead session loop, where the
             // banner already explains the situation: dropping the click is fine.
-            let _ = self.commands.try_send(command);
+            let _ = self.handles.commands.try_send(command);
         }
     }
 }
@@ -213,29 +232,29 @@ fn render(
             against(view.progress.matches_found, view.limits.max_matches)
         ));
         ui.separator();
-        match (view.crystal_balance, view.refresh_cost) {
-            (Some(balance), Some(cost)) => {
-                ui.label(format!("crystals {balance} (refresh costs {cost})"));
-            }
-            (Some(balance), None) => {
-                ui.label(format!("crystals {balance}"));
-            }
-            _ => {
-                ui.label("crystals —");
-            }
-        }
+        let balance = match view.crystal_balance {
+            Some(balance) => balance.to_string(),
+            None => "—".to_owned(),
+        };
+        ui.label(format!(
+            "crystals {balance} (refresh costs {})",
+            view.refresh_cost
+        ));
     });
     ui.separator();
 
     ui.collapsing("Filter", |ui| {
         ui.horizontal(|ui| {
-            for (kind, label) in [
-                (ItemKind::Equipment, "equipment"),
-                (ItemKind::Hero, "hero"),
-                (ItemKind::Token, "token"),
+            // All four kinds, Unknown included: a config-seeded criterion must
+            // always be visible and clearable. Labels come from `kind_label`.
+            for kind in [
+                ItemKind::Equipment,
+                ItemKind::Hero,
+                ItemKind::Token,
+                ItemKind::Unknown,
             ] {
                 let mut on = editor.filter.kinds.contains(&kind);
-                if ui.checkbox(&mut on, label).changed() {
+                if ui.checkbox(&mut on, kind_label(kind)).changed() {
                     if on {
                         editor.filter.kinds.push(kind);
                     } else {
@@ -261,8 +280,15 @@ fn render(
             &mut editor.filter.required_substats,
             &mut editor.substat_input,
         );
-        optional_value(ui, "min substats", &mut editor.filter.min_substats);
-        optional_value(ui, "max price (gold)", &mut editor.filter.max_price);
+        optional_value(ui, "min substats", &mut editor.filter.min_substats, 1);
+        // Seeded above the covenant-bookmark price so a fresh cap still
+        // matches the default hunt targets.
+        optional_value(
+            ui,
+            "max price (gold)",
+            &mut editor.filter.max_price,
+            300_000,
+        );
         ui.checkbox(&mut editor.filter.include_sold_out, "include sold out");
         let restricted = !editor.filter.is_unrestricted();
         if !restricted {
@@ -276,9 +302,9 @@ fn render(
         }
     });
     ui.collapsing("Limits", |ui| {
-        optional_value(ui, "max refreshes", &mut editor.limits.max_refreshes);
-        optional_value(ui, "max spend (crystals)", &mut editor.limits.max_spend);
-        optional_value(ui, "max matches", &mut editor.limits.max_matches);
+        optional_value(ui, "max refreshes", &mut editor.limits.max_refreshes, 10);
+        optional_value(ui, "max spend (crystals)", &mut editor.limits.max_spend, 30);
+        optional_value(ui, "max matches", &mut editor.limits.max_matches, 5);
         duration_minutes(ui, &mut editor.limits.max_duration_ms);
         if ui.button("Apply limits").clicked() {
             clicked = Some(Command::SetLimits(editor.limits.clone()));
@@ -287,7 +313,7 @@ fn render(
     ui.weak("edits apply to this session only — config.toml is unchanged");
     ui.separator();
 
-    ui.label(egui::RichText::new(view.merchant.as_deref().unwrap_or("Secret Shop")).strong());
+    ui.label(egui::RichText::new(view.merchant.as_str()).strong());
     if view.rows.is_empty() {
         ui.weak("no shop captured yet — open the Secret Shop in game");
     } else {
@@ -327,7 +353,9 @@ fn render(
 
     ui.label(egui::RichText::new("Journal").strong());
     egui::ScrollArea::vertical()
+        .id_salt("journal")
         .stick_to_bottom(true)
+        .max_height(180.0)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for line in journal {
@@ -343,11 +371,15 @@ fn string_list(ui: &mut egui::Ui, label: &str, values: &mut Vec<String>, input: 
     ui.label(label);
     let mut removed = None;
     for (index, value) in values.iter().enumerate() {
-        ui.horizontal(|ui| {
-            ui.monospace(value);
-            if ui.small_button("✕").clicked() {
-                removed = Some(index);
-            }
+        // Stable per-row ids: without them a removal shifts the positional
+        // auto-ids of every widget below (focus, edit state).
+        ui.push_id(index, |ui| {
+            ui.horizontal(|ui| {
+                ui.monospace(value);
+                if ui.small_button("✕").clicked() {
+                    removed = Some(index);
+                }
+            });
         });
     }
     if let Some(index) = removed {
@@ -367,18 +399,20 @@ fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input: &mut Strin
     ui.label("required substats");
     let mut removed = None;
     for (index, req) in reqs.iter_mut().enumerate() {
-        ui.horizontal(|ui| {
-            ui.monospace(&req.name);
-            let mut has_min = req.min.is_some();
-            ui.checkbox(&mut has_min, "min");
-            if has_min {
-                ui.add(egui::DragValue::new(req.min.get_or_insert(0.0)).speed(0.5));
-            } else {
-                req.min = None;
-            }
-            if ui.small_button("✕").clicked() {
-                removed = Some(index);
-            }
+        ui.push_id(index, |ui| {
+            ui.horizontal(|ui| {
+                ui.monospace(&req.name);
+                let mut has_min = req.min.is_some();
+                ui.checkbox(&mut has_min, "min");
+                if has_min {
+                    ui.add(egui::DragValue::new(req.min.get_or_insert(1.0)).speed(0.5));
+                } else {
+                    req.min = None;
+                }
+                if ui.small_button("✕").clicked() {
+                    removed = Some(index);
+                }
+            });
         });
     }
     if let Some(index) = removed {
@@ -396,17 +430,20 @@ fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input: &mut Strin
     });
 }
 
-/// Checkbox-gated numeric criterion: unchecked means "no constraint".
-fn optional_value<T: egui::emath::Numeric + Default>(
+/// Checkbox-gated numeric criterion: unchecked means "no constraint". The
+/// seed must be a sensible non-zero value — a zero limit halts the session at
+/// the next check-point and a zero criterion constrains nothing.
+fn optional_value<T: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut Option<T>,
+    seed: T,
 ) {
     ui.horizontal(|ui| {
         let mut on = value.is_some();
         ui.checkbox(&mut on, label);
         if on {
-            ui.add(egui::DragValue::new(value.get_or_insert_with(T::default)));
+            ui.add(egui::DragValue::new(value.get_or_insert(seed)));
         } else {
             *value = None;
         }
@@ -419,8 +456,11 @@ fn duration_minutes(ui: &mut egui::Ui, value: &mut Option<u64>) {
         let mut on = value.is_some();
         ui.checkbox(&mut on, "max duration (minutes)");
         if on {
-            let ms = value.get_or_insert(0);
-            let mut minutes = *ms / 60_000;
+            let ms = value.get_or_insert(60 * 60_000);
+            // Ceil so a sub-minute config value never reads as 0; edits are
+            // whole minutes (the player-facing unit) and only rewrite the
+            // stored value when the player actually drags.
+            let mut minutes = ms.div_ceil(60_000);
             if ui.add(egui::DragValue::new(&mut minutes)).changed() {
                 *ms = minutes.saturating_mul(60_000);
             }
@@ -475,11 +515,16 @@ mod tests {
         assert_eq!(view.stop_reason, None);
         assert!(!view.capture_on);
         assert!(view.rows.is_empty());
-        assert_eq!(view.merchant, None);
+        assert_eq!(view.merchant, "Secret Shop");
         assert_eq!(view.crystal_balance, None);
-        assert_eq!(view.refresh_cost, None);
+        // No meta yet: the game-constant fallback, never an unknown cost.
+        assert_eq!(view.refresh_cost, 3);
+    }
 
+    #[test]
+    fn view_state_passes_capture_flag_through() {
         assert!(view_state(&controller(), true).capture_on);
+        assert!(!view_state(&controller(), false).capture_on);
     }
 
     #[test]
@@ -564,9 +609,52 @@ mod tests {
             now_ms: 0,
         });
         let view = view_state(&ctrl, false);
-        assert_eq!(view.merchant.as_deref(), Some("Secret Shop"));
+        assert_eq!(view.merchant, "Secret Shop");
         assert_eq!(view.crystal_balance, Some(95));
-        assert_eq!(view.refresh_cost, Some(3));
+        assert_eq!(view.refresh_cost, 3);
+    }
+
+    #[test]
+    fn view_state_balance_survives_meta_less_snapshot() {
+        // The controller keeps its enforced estimate across snapshots that
+        // omit meta; the display must show that, not the raw snapshot.
+        let mut ctrl = controller();
+        ctrl.handle(Event::Snapshot {
+            snapshot: ShopSnapshot {
+                merchant: None,
+                slots: vec![ShopItem::default()],
+                refresh: Some(RefreshMeta {
+                    crystal_balance: 95,
+                    cost: 3,
+                }),
+            },
+            now_ms: 0,
+        });
+        ctrl.handle(Event::Snapshot {
+            snapshot: shop(vec![ShopItem::default()]),
+            now_ms: 1,
+        });
+        assert_eq!(view_state(&ctrl, false).crystal_balance, Some(95));
+    }
+
+    #[test]
+    fn view_state_balance_cleared_on_restart() {
+        // `Start` discards a stale balance; the display must not resurrect it
+        // from the stored snapshot.
+        let mut ctrl = controller();
+        ctrl.handle(Event::Snapshot {
+            snapshot: ShopSnapshot {
+                merchant: None,
+                slots: vec![ShopItem::default()],
+                refresh: Some(RefreshMeta {
+                    crystal_balance: 95,
+                    cost: 3,
+                }),
+            },
+            now_ms: 0,
+        });
+        ctrl.handle(Event::Start { now_ms: 1 });
+        assert_eq!(view_state(&ctrl, false).crystal_balance, None);
     }
 
     #[test]

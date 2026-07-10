@@ -20,17 +20,20 @@ WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ Web
 - **Forwarding**: the raw server → client stream is sent as-is to the analysis
   server. Decryption and interpretation happen **server-side** — the client
   decrypts nothing.
-- **Display & control**: each decoded shop snapshot is rendered in the console
-  and fed to the refresh-loop controller, which checks it against the
-  `[filter]` criteria from `config.toml`: no match → it advises a refresh (the
-  relay stays passive — nothing is sent to the game); match → it alerts with
-  the item details and pauses. The purchase confirmations decoded from the
-  traffic check the matched items off, and the loop resumes on its own once
-  the last one is bought. A `[limits]` threshold reached → it stops the
-  session.
+- **Display & control**: each decoded shop snapshot is fed to the refresh-loop
+  controller, which checks it against the `[filter]` criteria from
+  `config.toml`: no match → it advises a refresh (the relay stays passive —
+  nothing is sent to the game); match → it alerts with the item details and
+  pauses. The purchase confirmations decoded from the traffic check the
+  matched items off, and the loop resumes on its own once the last one is
+  bought. A `[limits]` threshold reached → it stops the session. The default
+  build opens an **egui window** (status, shop table, session journal,
+  Start/Stop buttons, live filter/limits editors — edits are session-only,
+  `config.toml` is not rewritten); the console mirrors the same lines.
 
-The relay starts **idle** (nothing is captured or forwarded): type `start`
-when opening the shop to arm the session, `stop` when done.
+The relay starts **idle** (nothing is captured or forwarded): press **Start**
+in the window (or type `start` in the console) when opening the shop to arm
+the session, **Stop** when done.
 
 ## Distribution — a single executable
 
@@ -80,8 +83,16 @@ a missing file falls back to the defaults.
 ## Running
 
 ```sh
-cargo run --release   # as administrator
+cargo run --release   # as administrator; opens the window (default features)
 ```
 
-Runtime commands: `start` arms the session, `stop` ends it, `[Enter]` toggles
-start/stop, `Ctrl+C` to quit.
+Control from the window (Start / Stop / Toggle buttons, filter & limits
+editors) or from the console: `start` arms the session, `stop` ends it,
+`[Enter]` toggles start/stop. Close the window to quit; `Ctrl+C` in the
+console only ends the capture session — the window stays open and says so.
+
+Console-only build (no window, `Ctrl+C` quits):
+
+```sh
+cargo run --release --no-default-features --features windivert-backend
+```

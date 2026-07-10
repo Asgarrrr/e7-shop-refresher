@@ -57,17 +57,28 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
 /// killing the window.
 #[cfg(feature = "gui")]
 fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use arkyve_refresh_shop::ui;
 
-    // The editors start from the same criteria the controller was built with.
-    let editor = ui::EditorState::new(config.filter.clone(), config.limits.clone());
     let (session, handles) = app::setup(config);
     let error = ui::SessionErrorSlot::default();
-    let slot = error.clone();
+    let failed = Arc::new(AtomicBool::new(false));
+    let (slot, flag) = (error.clone(), failed.clone());
     runtime.spawn(async move {
-        let outcome = match session.run().await {
-            Ok(()) => "session ended — restart the app to reconnect".to_owned(),
-            Err(err) => format!("session error: {err}"),
+        // Inner task: a panic in the session must land in the banner too,
+        // not vanish with a discarded JoinHandle.
+        let outcome = match tokio::spawn(session.run()).await {
+            Ok(Ok(())) => "session ended — restart the app to reconnect".to_owned(),
+            Ok(Err(err)) => {
+                flag.store(true, Ordering::Relaxed);
+                format!("session error: {err}")
+            }
+            Err(panic) => {
+                flag.store(true, Ordering::Relaxed);
+                format!("session crashed: {panic}")
+            }
         };
         *slot.lock().expect("error slot poisoned") = Some(outcome);
     });
@@ -78,13 +89,16 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
             viewport: eframe::egui::ViewportBuilder::default().with_inner_size([640.0, 640.0]),
             ..Default::default()
         },
-        Box::new(move |_cc| Ok(Box::new(ui::ShopApp::new(handles, error, editor)))),
+        Box::new(move |_cc| Ok(Box::new(ui::ShopApp::new(handles, error)))),
     );
     // Not a plain drop: tokio::io::stdin parks a blocking thread, and dropping
     // the runtime would hang window close until the player presses Enter.
     runtime.shutdown_background();
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        // A dead session is a failure even when the window closed cleanly:
+        // scripts and smoke checks read the exit code.
+        Ok(()) if !failed.load(Ordering::Relaxed) => ExitCode::SUCCESS,
+        Ok(()) => ExitCode::FAILURE,
         Err(err) => {
             eprintln!("GUI error: {err}");
             ExitCode::FAILURE

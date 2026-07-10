@@ -164,6 +164,13 @@ impl Controller {
         &self.filter
     }
 
+    /// The refresh meta the stop logic enforces: server-sent, locally debited
+    /// per advised refresh, discarded as stale on `Start`. This — not the raw
+    /// snapshot — is what a view must display.
+    pub fn refresh_meta(&self) -> Option<RefreshMeta> {
+        self.refresh_meta
+    }
+
     /// Matched-but-unbought catalog ids; untrackable matches (id 0, sold
     /// out) never enter it.
     pub fn checklist(&self) -> &[u32] {
@@ -348,7 +355,7 @@ impl Controller {
     }
 
     /// Spend tracking never waits for a snapshot that carries meta.
-    fn refresh_cost(&self) -> u32 {
+    pub fn refresh_cost(&self) -> u32 {
         self.refresh_meta
             .map_or(REFRESH_COST_CRYSTALS, |meta| meta.cost)
     }

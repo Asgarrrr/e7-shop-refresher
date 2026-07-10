@@ -77,10 +77,12 @@ impl EventLog {
         }
     }
 
+    /// Poison-tolerant: the GUI reads this after a session panic and must
+    /// still show the history that led there.
     pub fn entries(&self) -> Vec<LogLine> {
         self.entries
             .lock()
-            .expect("journal mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .cloned()
             .collect()
@@ -331,10 +333,23 @@ async fn session_loop(
                 dispatch(controller, gate, journal, Event::Tick { now_ms }, now_ms);
             }
             _ = &mut ctrl_c => {
-                println!("\n>> Ctrl+C, stopping");
+                emit(journal, now_ms(), &[">> Ctrl+C, stopping".to_owned()]);
                 break;
             }
         }
+    }
+    // The window (GUI build) outlives the loop: leave an honest state behind
+    // — controller stopped, gate (and thus capture) off, a journal line
+    // saying why. Idempotent when the controller is already stopped.
+    dispatch(controller, gate, journal, Event::Stop, now_ms());
+}
+
+/// Single sink for player-facing lines: the journal and the console stay in
+/// step by construction — never print session lines around it.
+fn emit(journal: &EventLog, now_ms: u64, lines: &[String]) {
+    journal.push(now_ms, lines);
+    for line in lines {
+        println!("{line}");
     }
 }
 
@@ -348,10 +363,7 @@ fn on_command(
     now_ms: u64,
 ) {
     let lines = handle_command(controller, gate, command, now_ms);
-    journal.push(now_ms, &lines);
-    for line in lines {
-        println!("{line}");
-    }
+    emit(journal, now_ms, &lines);
 }
 
 /// The command logic behind [`on_command`], returning the lines to print
@@ -373,9 +385,18 @@ fn handle_command(
         // Retunes echo their own confirmation: the transition logic below
         // only reads status changes, which these never cause.
         Command::SetFilter(filter) => {
+            let paused = ctrl.status() == Status::Paused;
             let actions = ctrl.handle(Event::FilterChanged(filter));
             let mut lines = apply(&actions, &ctrl, gate);
             lines.push(">> filter updated — applies from the next shop".to_owned());
+            if paused {
+                // The pending pause still waits on the *previous* filter's
+                // matches; the new criteria cannot retroactively clear it.
+                lines.push(
+                    ">> still paused on earlier matches — buy them or wait for a new shop"
+                        .to_owned(),
+                );
+            }
             return lines;
         }
         Command::SetLimits(limits) => {
@@ -439,10 +460,7 @@ fn on_message(
         }
         ServerMessage::Purchase(notice) => {
             let lines = handle_purchase(controller, gate, &notice, now_ms);
-            journal.push(now_ms, &lines);
-            for line in lines {
-                println!("{line}");
-            }
+            emit(journal, now_ms, &lines);
         }
     }
 }
@@ -498,10 +516,7 @@ fn dispatch(
     let actions = ctrl.handle(event);
     let lines = apply(&actions, &ctrl, gate);
     drop(ctrl);
-    journal.push(now_ms, &lines);
-    for line in &lines {
-        println!("{line}");
-    }
+    emit(journal, now_ms, &lines);
 }
 
 /// Applies the controller's decisions: drives the capture gate and renders
@@ -678,6 +693,51 @@ mod tests {
             .commands
             .try_send(Command::Toggle)
             .expect("channel open");
+    }
+
+    #[tokio::test]
+    async fn session_loop_exit_stops_controller_and_gate() {
+        let gate = WatchGate::new(false);
+        let journal = EventLog::default();
+        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
+        on_command(&controller, &gate, &journal, Command::Start, 0);
+        assert!(gate.is_enabled());
+
+        let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
+        let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(1);
+        drop(message_tx); // uplink gone: the loop must exit and tear down.
+        session_loop(&controller, &gate, &journal, command_rx, message_rx).await;
+
+        assert_eq!(
+            controller.lock().unwrap().status(),
+            Status::Stopped(StopReason::PlayerStopped)
+        );
+        assert!(!gate.is_enabled());
+    }
+
+    #[test]
+    fn set_filter_while_paused_warns_about_stale_matches() {
+        let gate = WatchGate::new(false);
+        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
+        handle_command(&controller, &gate, Command::Start, 0);
+        dispatch(
+            &controller,
+            &gate,
+            &EventLog::default(),
+            Event::Snapshot {
+                snapshot: one_item_shop(),
+                now_ms: 1,
+            },
+            1,
+        );
+        assert_eq!(controller.lock().unwrap().status(), Status::Paused);
+
+        let filter = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            ..Filter::default()
+        };
+        let lines = handle_command(&controller, &gate, Command::SetFilter(filter), 2);
+        assert!(lines.iter().any(|line| line.contains("still paused")));
     }
 
     #[test]

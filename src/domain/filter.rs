@@ -85,12 +85,13 @@ impl Filter {
 
     /// `true` when no criterion is set — such a filter matches every
     /// available item; the relay treats that as a configuration error.
-    /// (`include_sold_out` widens, it does not restrict.)
+    /// (`include_sold_out` widens, it does not restrict; `min_substats: 0`
+    /// constrains nothing and must not count as a criterion either.)
     pub fn is_unrestricted(&self) -> bool {
         self.kinds.is_empty()
             && self.names.is_empty()
             && self.sets.is_empty()
-            && self.min_substats.is_none()
+            && self.min_substats.is_none_or(|min| min == 0)
             && self.required_substats.is_empty()
             && self.max_price.is_none()
     }
@@ -175,6 +176,22 @@ mod tests {
     #[test]
     fn empty_filter_matches_available_item() {
         assert!(Filter::default().matches(&equip()));
+    }
+
+    #[test]
+    fn min_substats_zero_counts_as_unrestricted() {
+        // Some(0) matches everything: it must not satisfy the mandatory-filter
+        // check (the GUI editor can produce it with two clicks).
+        let noop = Filter {
+            min_substats: Some(0),
+            ..Filter::default()
+        };
+        assert!(noop.is_unrestricted());
+        let real = Filter {
+            min_substats: Some(1),
+            ..Filter::default()
+        };
+        assert!(!real.is_unrestricted());
     }
 
     #[test]
