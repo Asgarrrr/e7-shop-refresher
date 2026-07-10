@@ -17,6 +17,8 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod stream;
+#[cfg(feature = "gui")]
+pub mod ui;
 pub mod uplink;
 pub mod watch;
 

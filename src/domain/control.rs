@@ -152,6 +152,11 @@ impl Controller {
         self.progress
     }
 
+    /// The configured stop limits (immutable for the session).
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
     /// Matched-but-unbought catalog ids; untrackable matches (id 0, sold
     /// out) never enter it.
     pub fn checklist(&self) -> &[u32] {
