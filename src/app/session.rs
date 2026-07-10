@@ -44,12 +44,9 @@ pub(super) async fn session_loop(
                 Some(message) => on_message(controller, gate, journal, message, now_ms()),
                 None => break, // uplink gone.
             },
-            _ = ticker.tick() => {
-                let now_ms = now_ms();
-                dispatch(controller, gate, journal, Event::Tick { now_ms }, now_ms);
-            }
+            _ = ticker.tick() => dispatch(controller, gate, journal, Event::Tick { now_ms: now_ms() }),
             _ = &mut ctrl_c => {
-                emit(journal, now_ms(), &[">> Ctrl+C, stopping".to_owned()]);
+                emit(journal, &[">> Ctrl+C, stopping".to_owned()]);
                 break;
             }
         }
@@ -57,13 +54,13 @@ pub(super) async fn session_loop(
     // The window (GUI build) outlives the loop: leave an honest state behind
     // — controller stopped, gate (and thus capture) off, a journal line
     // saying why. Idempotent when the controller is already stopped.
-    dispatch(controller, gate, journal, Event::Stop, now_ms());
+    dispatch(controller, gate, journal, Event::Stop);
 }
 
 /// Single sink for player-facing lines: the journal and the console stay in
 /// step by construction — never print session lines around it.
-fn emit(journal: &EventLog, now_ms: u64, lines: &[String]) {
-    journal.push(now_ms, lines);
+fn emit(journal: &EventLog, lines: &[String]) {
+    journal.push(lines);
     for line in lines {
         println!("{line}");
     }
@@ -79,7 +76,7 @@ fn on_command(
     now_ms: u64,
 ) {
     let lines = handle_command(controller, gate, command, now_ms);
-    emit(journal, now_ms, &lines);
+    emit(journal, &lines);
 }
 
 /// The command logic behind [`on_command`], returning the lines to print
@@ -175,12 +172,11 @@ fn on_message(
                 gate,
                 journal,
                 Event::Snapshot { snapshot, now_ms },
-                now_ms,
             );
         }
         ServerMessage::Purchase(notice) => {
             let lines = handle_purchase(controller, gate, &notice, now_ms);
-            emit(journal, now_ms, &lines);
+            emit(journal, &lines);
         }
     }
 }
@@ -225,18 +221,12 @@ fn purchase_line(controller: &Controller, notice: &PurchaseNotice) -> String {
 }
 
 /// Locks, handles, applies; printing happens after the guard is released.
-fn dispatch(
-    controller: &Mutex<Controller>,
-    gate: &WatchGate,
-    journal: &EventLog,
-    event: Event,
-    now_ms: u64,
-) {
+fn dispatch(controller: &Mutex<Controller>, gate: &WatchGate, journal: &EventLog, event: Event) {
     let mut ctrl = controller.lock().expect("controller mutex poisoned");
     let actions = ctrl.handle(event);
     let lines = apply(&actions, &ctrl, gate);
     drop(ctrl);
-    emit(journal, now_ms, &lines);
+    emit(journal, &lines);
 }
 
 /// Applies the controller's decisions: drives the capture gate and renders
@@ -335,7 +325,6 @@ mod tests {
                 snapshot: one_item_shop(),
                 now_ms: 1,
             },
-            1,
         );
         assert_eq!(controller.lock().unwrap().status(), Status::Paused);
 
@@ -398,7 +387,6 @@ mod tests {
         on_command(&controller, &gate, &journal, Command::Start, 1_000);
         let entries = journal.entries();
         assert!(entries.iter().any(|line| line.text.contains("watching")));
-        assert!(entries.iter().all(|line| line.at_ms == 1_000));
     }
 
     #[test]
@@ -475,7 +463,6 @@ mod tests {
                 snapshot: one_item_shop(),
                 now_ms: 3,
             },
-            3,
         );
         on_command(&controller, &gate, &journal, Command::Toggle, 4); // Paused -> Stop
         assert_eq!(
@@ -611,7 +598,6 @@ mod tests {
                 snapshot: one_item_shop(),
                 now_ms: 1,
             },
-            1,
         );
         let lines = handle_command(&controller, &gate, Command::Start, 2);
         assert!(lines.iter().any(|line| line.contains("buy, then refresh")));
@@ -637,7 +623,6 @@ mod tests {
                 snapshot: one_item_shop(),
                 now_ms: 2,
             },
-            2,
         );
         let lines = handle_command(&controller, &gate, Command::Start, 3);
         assert!(lines.iter().any(|line| line.contains("not replayed")));
@@ -657,7 +642,6 @@ mod tests {
                 snapshot: one_item_shop(),
                 now_ms: 1,
             },
-            1,
         );
         assert_eq!(controller.lock().unwrap().status(), Status::Paused);
 

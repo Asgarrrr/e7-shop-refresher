@@ -29,6 +29,30 @@ fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Fallback window for errors raised before any session exists (bad
+/// config.toml): a double-clicked exe must not flash a console and vanish.
+pub fn show_fatal(message: String) -> eframe::Result {
+    eframe::run_native(
+        "Arkyve Refresh Shop — error",
+        eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default().with_inner_size([560.0, 140.0]),
+            ..Default::default()
+        },
+        Box::new(move |_cc| Ok(Box::new(FatalApp(message)))),
+    )
+}
+
+struct FatalApp(String);
+
+impl eframe::App for FatalApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.colored_label(ui.visuals().error_fg_color, &self.0);
+            ui.weak("fix config.toml and restart");
+        });
+    }
+}
+
 /// The eframe application: a thin shell around the session handles.
 pub struct ShopApp {
     handles: SessionHandles,
@@ -195,13 +219,16 @@ fn render(
     ui.separator();
 
     ui.label(egui::RichText::new("Journal").strong());
+    // show_rows: only the visible slice is laid out — a full 500-line journal
+    // must not tax every repaint.
+    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
     egui::ScrollArea::vertical()
         .id_salt("journal")
         .stick_to_bottom(true)
         .max_height(180.0)
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for line in journal {
+        .show_rows(ui, row_height, journal.len(), |ui, rows| {
+            for line in &journal[rows] {
                 ui.monospace(format!("[{}] {}", timestamp(line.at_ms), line.text));
             }
         });

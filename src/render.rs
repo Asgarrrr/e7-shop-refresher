@@ -13,14 +13,16 @@ pub(crate) fn kind_label(kind: ItemKind) -> &'static str {
     }
 }
 
+// "Start" reads as both the button and the typed command: the label is
+// shared by the window and the console.
 pub(crate) fn status_label(controller: &Controller) -> &'static str {
     match controller.status() {
-        Status::Idle => "idle (`start` arms the watch)",
+        Status::Idle => "idle (Start arms the watch)",
         Status::Watching => "watching",
         // An empty checklist never auto-resumes.
         Status::Paused if controller.checklist().is_empty() => "paused (buy, then refresh)",
         Status::Paused => "paused (buy — auto-resumes)",
-        Status::Stopped(_) => "stopped (`start` re-arms)",
+        Status::Stopped(_) => "stopped (Start re-arms)",
     }
 }
 

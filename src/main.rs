@@ -21,6 +21,10 @@ fn main() -> ExitCode {
         Ok(config) => config,
         Err(err) => {
             eprintln!("Invalid configuration: {err}");
+            // In the windowed build the console may not be readable (or
+            // visible at all): show the error where the player looks.
+            #[cfg(feature = "gui")]
+            let _ = arkyve_refresh_shop::ui::show_fatal(format!("Invalid configuration: {err}"));
             return ExitCode::FAILURE;
         }
     };
