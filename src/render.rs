@@ -1,7 +1,7 @@
 //! Player-facing text for domain state: one wording shared by the console
 //! and the window.
 
-use crate::domain::control::{Controller, Status, StopReason};
+use crate::domain::control::{Controller, RefusalReason, Status, StopReason};
 use crate::domain::shop::{ItemKind, ShopItem, ShopSnapshot};
 
 pub(crate) fn kind_label(kind: ItemKind) -> &'static str {
@@ -14,15 +14,28 @@ pub(crate) fn kind_label(kind: ItemKind) -> &'static str {
 }
 
 // "Start" reads as both the button and the typed command: the label is
-// shared by the window and the console.
+// shared by the window and the console. The Start hint only appears when
+// Start would actually work — with an unrestricted filter the domain
+// refuses to arm, and the label must not promise otherwise.
 pub(crate) fn status_label(controller: &Controller) -> &'static str {
+    let unrestricted = controller.filter().is_unrestricted();
     match controller.status() {
+        Status::Idle if unrestricted => "idle (define a filter first)",
         Status::Idle => "idle (Start arms the watch)",
         Status::Watching => "watching",
         // An empty checklist never auto-resumes.
         Status::Paused if controller.checklist().is_empty() => "paused (buy, then refresh)",
         Status::Paused => "paused (buy — auto-resumes)",
+        Status::Stopped(_) if unrestricted => "stopped (define a filter first)",
         Status::Stopped(_) => "stopped (Start re-arms)",
+    }
+}
+
+pub(crate) fn refusal(reason: RefusalReason) -> &'static str {
+    match reason {
+        RefusalReason::UnrestrictedFilter => {
+            "define at least one filter criterion — an empty filter matches everything"
+        }
     }
 }
 
@@ -85,6 +98,8 @@ pub(crate) fn print_controls() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::control::{Controller, Event, Limits};
+    use crate::domain::filter::Filter;
 
     #[test]
     fn kind_label_names_each_kind() {
@@ -92,5 +107,18 @@ mod tests {
         assert_eq!(kind_label(ItemKind::Hero), "hero");
         assert_eq!(kind_label(ItemKind::Token), "token");
         assert_eq!(kind_label(ItemKind::Unknown), "?");
+    }
+
+    #[test]
+    fn status_label_never_promises_start_while_unrestricted() {
+        let mut ctrl = Controller::new(Filter::default(), Limits::default());
+        assert_eq!(status_label(&ctrl), "idle (define a filter first)");
+        ctrl.handle(Event::Stop);
+        assert_eq!(status_label(&ctrl), "stopped (define a filter first)");
+
+        let mut armed = Controller::new(Filter::matching_default_items(), Limits::default());
+        assert_eq!(status_label(&armed), "idle (Start arms the watch)");
+        armed.handle(Event::Stop);
+        assert_eq!(status_label(&armed), "stopped (Start re-arms)");
     }
 }

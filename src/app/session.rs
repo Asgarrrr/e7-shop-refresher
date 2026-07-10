@@ -2,13 +2,13 @@
 //! decisions to the capture gate, and echo every outcome to the player.
 
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use crate::domain::control::{Action, Controller, Event, Status};
 use crate::journal::EventLog;
-use crate::render::{describe, format_item, render_shop, status_label};
+use crate::render::{describe, format_item, refusal, render_shop, status_label};
 use crate::uplink::protocol::{PurchaseNotice, ServerMessage};
 use crate::watch::WatchGate;
 
@@ -26,8 +26,7 @@ pub(super) async fn session_loop(
     mut commands: mpsc::Receiver<Command>,
     mut messages: mpsc::Receiver<ServerMessage>,
 ) {
-    let base = Instant::now();
-    let now_ms = || u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let now_ms = || journal.now_ms();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -51,10 +50,20 @@ pub(super) async fn session_loop(
             }
         }
     }
-    // The window (GUI build) outlives the loop: leave an honest state behind
-    // — controller stopped, gate (and thus capture) off, a journal line
-    // saying why. Idempotent when the controller is already stopped.
-    dispatch(controller, gate, journal, Event::Stop);
+    // The window (GUI build) outlives the loop: if the session was armed,
+    // leave an honest state behind — controller stopped, gate (and thus
+    // capture) off, a journal line saying why. A never-armed controller
+    // stays Idle: it did not stop, it never ran.
+    let armed = matches!(
+        controller
+            .lock()
+            .expect("controller mutex poisoned")
+            .status(),
+        Status::Watching | Status::Paused
+    );
+    if armed {
+        dispatch(controller, gate, journal, Event::Stop);
+    }
 }
 
 /// Single sink for player-facing lines: the journal and the console stay in
@@ -96,40 +105,37 @@ fn handle_command(
             Status::Idle | Status::Stopped(_) => Event::Start { now_ms },
         },
         // Retunes echo their own confirmation: the transition logic below
-        // only reads status changes, which these never cause.
+        // only reads status changes, which these never cause. The success
+        // line is gated on the domain's decision — a refused swap renders
+        // the refusal instead.
         Command::SetFilter(filter) => {
-            // The domain rejects unrestricted swaps; do not claim "updated".
-            if filter.is_unrestricted() {
-                return vec![">> filter ignored — at least one criterion required".to_owned()];
-            }
             let paused = ctrl.status() == Status::Paused;
             let actions = ctrl.handle(Event::FilterChanged(filter));
+            let accepted = actions.is_empty();
             let mut lines = apply(&actions, &ctrl, gate);
-            lines.push(">> filter updated — applies from the next shop".to_owned());
-            if paused {
-                // The pending pause still waits on the *previous* filter's
-                // matches; the new criteria cannot retroactively clear it.
-                lines.push(
-                    ">> still paused on earlier matches — buy them or wait for a new shop"
-                        .to_owned(),
-                );
+            if accepted {
+                lines.push(">> filter updated — applies from the next shop".to_owned());
+                if paused {
+                    // The pending pause still waits on the *previous* filter's
+                    // matches; the new criteria cannot retroactively clear it.
+                    lines.push(
+                        ">> still paused on earlier matches — buy them or wait for a new shop"
+                            .to_owned(),
+                    );
+                }
             }
             return lines;
         }
         Command::SetLimits(limits) => {
             let actions = ctrl.handle(Event::LimitsChanged(limits));
+            let accepted = actions.is_empty();
             let mut lines = apply(&actions, &ctrl, gate);
-            lines.push(">> limits updated — checked before the next refresh".to_owned());
+            if accepted {
+                lines.push(">> limits updated — checked before the next refresh".to_owned());
+            }
             return lines;
         }
     };
-    // Arming an unrestricted filter would advise buying everything: refuse
-    // with advice instead of dispatching (the console build already fails
-    // fast at startup; this guards the GUI build, where the filter is edited
-    // live).
-    if matches!(event, Event::Start { .. }) && ctrl.filter().is_unrestricted() {
-        return vec![">> no filter criteria set — define a filter first".to_owned()];
-    }
     let before = ctrl.status();
     let actions = ctrl.handle(event);
     let mut lines = apply(&actions, &ctrl, gate);
@@ -245,6 +251,7 @@ fn apply(actions: &[Action], controller: &Controller, gate: &WatchGate) -> Vec<S
             Action::Refresh => lines.push(">> → refresh the shop now".to_owned()),
             Action::Alert { slots } => render_alert(&mut lines, slots, controller),
             Action::Halt(reason) => lines.push(format!(">> stopped: {}", describe(*reason))),
+            Action::Refused(reason) => lines.push(format!(">> refused: {}", refusal(*reason))),
         }
     }
     gate.set(matches!(
@@ -290,13 +297,16 @@ mod tests {
     use super::*;
     use crate::domain::control::{Limits, StopReason};
     use crate::domain::filter::Filter;
-    use crate::domain::shop::{ItemKind, ShopItem, ShopSnapshot};
+    use crate::domain::shop::{ShopItem, ShopSnapshot};
 
     #[tokio::test]
     async fn session_loop_exit_stops_controller_and_gate() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
-        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
         on_command(&controller, &gate, &journal, Command::Start, 0);
         assert!(gate.is_enabled());
 
@@ -312,10 +322,34 @@ mod tests {
         assert!(!gate.is_enabled());
     }
 
+    #[tokio::test]
+    async fn session_loop_exit_leaves_never_armed_controller_idle() {
+        let gate = WatchGate::new(false);
+        let journal = EventLog::default();
+        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+
+        let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
+        let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(1);
+        drop(message_tx);
+        session_loop(&controller, &gate, &journal, command_rx, message_rx).await;
+
+        // A session that never ran must not report "player stopped".
+        assert_eq!(controller.lock().unwrap().status(), Status::Idle);
+        assert!(
+            journal
+                .entries()
+                .iter()
+                .all(|line| !line.text.contains("stopped"))
+        );
+    }
+
     #[test]
     fn set_filter_while_paused_warns_about_stale_matches() {
         let gate = WatchGate::new(false);
-        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
         handle_command(&controller, &gate, Command::Start, 0);
         dispatch(
             &controller,
@@ -341,12 +375,12 @@ mod tests {
         let gate = WatchGate::new(false);
         let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
         let lines = handle_command(&controller, &gate, Command::Start, 0);
-        assert!(lines.iter().any(|line| line.contains("define a filter")));
+        assert!(lines.iter().any(|line| line.contains(">> refused:")));
         assert_eq!(controller.lock().unwrap().status(), Status::Idle);
         assert!(!gate.is_enabled());
-        // Toggle resolves to Start and hits the same guard.
+        // Toggle resolves to Start and the domain refuses it the same way.
         let lines = handle_command(&controller, &gate, Command::Toggle, 1);
-        assert!(lines.iter().any(|line| line.contains("define a filter")));
+        assert!(lines.iter().any(|line| line.contains(">> refused:")));
         assert_eq!(controller.lock().unwrap().status(), Status::Idle);
     }
 
@@ -383,7 +417,10 @@ mod tests {
     fn journal_receives_command_lines() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
-        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
         on_command(&controller, &gate, &journal, Command::Start, 1_000);
         let entries = journal.entries();
         assert!(entries.iter().any(|line| line.text.contains("watching")));
@@ -392,7 +429,7 @@ mod tests {
     #[test]
     fn gate_follows_controller_status() {
         let gate = WatchGate::new(false);
-        let mut ctrl = Controller::new(match_default_filter(), Limits::default());
+        let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
         apply(&[], &ctrl, &gate);
         assert!(!gate.is_enabled()); // Idle
 
@@ -419,15 +456,6 @@ mod tests {
         assert!(!gate.is_enabled()); // Stopped
     }
 
-    /// Restricted (passes the arming guard) yet still matching
-    /// `ShopItem::default()` (kind `Unknown`).
-    fn match_default_filter() -> Filter {
-        Filter {
-            kinds: vec![ItemKind::Unknown],
-            ..Filter::default()
-        }
-    }
-
     fn one_item_shop() -> ShopSnapshot {
         ShopSnapshot {
             merchant: None,
@@ -440,7 +468,10 @@ mod tests {
     fn toggle_resolves_against_status() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
-        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
 
         on_command(&controller, &gate, &journal, Command::Toggle, 0); // Idle -> Start
         assert_eq!(controller.lock().unwrap().status(), Status::Watching);
@@ -476,7 +507,10 @@ mod tests {
     fn purchase_message_auto_resumes_controller() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
-        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
         on_command(&controller, &gate, &journal, Command::Start, 0);
         let mut snapshot = one_item_shop();
         snapshot.slots[0].id = 42;
@@ -559,7 +593,7 @@ mod tests {
     #[test]
     fn alert_hint_warns_when_some_matches_untracked() {
         let gate = WatchGate::new(false);
-        let mut ctrl = Controller::new(match_default_filter(), Limits::default());
+        let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
         ctrl.handle(Event::Start { now_ms: 0 });
         // Two matches, only one trackable: the first slot keeps the id-0
         // sentinel, so auto-resume would refresh over it.
@@ -586,7 +620,10 @@ mod tests {
     fn paused_label_reflects_manual_flow_when_checklist_empty() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
-        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
         on_command(&controller, &gate, &journal, Command::Start, 0);
         // Paused on an untrackable (id-0) match: a no-effect command's echo
         // must advise manual resume, not a phantom auto-resume.
@@ -607,7 +644,10 @@ mod tests {
     #[test]
     fn start_hint_printed_only_when_shop_stored() {
         let gate = WatchGate::new(false);
-        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
         // Nothing stored yet: plain watching line, no hint.
         let lines = handle_command(&controller, &gate, Command::Start, 0);
         assert!(lines.iter().any(|line| line.contains("watching")));
@@ -632,7 +672,10 @@ mod tests {
     fn ignored_command_leaves_state_and_gate_unchanged() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
-        let controller = Mutex::new(Controller::new(match_default_filter(), Limits::default()));
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
         on_command(&controller, &gate, &journal, Command::Start, 0);
         dispatch(
             &controller,

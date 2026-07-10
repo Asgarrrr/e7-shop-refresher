@@ -97,6 +97,19 @@ impl Filter {
     }
 }
 
+#[cfg(test)]
+impl Filter {
+    /// Restricted (passes the arming invariant) yet still matching
+    /// `ShopItem::default()` (kind `Unknown`) — the shared fixture for tests
+    /// that arm the loop against default items.
+    pub(crate) fn matching_default_items() -> Self {
+        Self {
+            kinds: vec![ItemKind::Unknown],
+            ..Self::default()
+        }
+    }
+}
+
 impl SubstatReq {
     /// Scans *all* substats of the matching name, not just the first: an item
     /// may list the same stat twice (e.g. a blank entry then a rolled value).

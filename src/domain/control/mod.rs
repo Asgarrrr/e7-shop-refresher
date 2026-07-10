@@ -95,6 +95,15 @@ pub enum Action {
         slots: Vec<u8>,
     },
     Halt(StopReason),
+    /// The event was rejected; nothing changed. Callers render the reason —
+    /// enforcement and messaging come from the same decision.
+    Refused(RefusalReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// Arming with — or swapping to — a filter that matches everything.
+    UnrestrictedFilter,
 }
 
 /// Counters exposed to the view.
@@ -194,9 +203,10 @@ impl Controller {
                 // match every slot of every shop. Accepted swaps apply from
                 // the next *new* snapshot: neither the stored snapshot nor a
                 // duplicate re-send is re-evaluated.
-                if !filter.is_unrestricted() {
-                    self.filter = filter;
+                if filter.is_unrestricted() {
+                    return vec![Action::Refused(RefusalReason::UnrestrictedFilter)];
                 }
+                self.filter = filter;
                 Vec::new()
             }
             Event::LimitsChanged(limits) => {
@@ -218,7 +228,7 @@ impl Controller {
             return Vec::new();
         }
         if self.filter.is_unrestricted() {
-            return Vec::new();
+            return vec![Action::Refused(RefusalReason::UnrestrictedFilter)];
         }
         self.progress = Progress::default();
         self.started_at = Some(now_ms);

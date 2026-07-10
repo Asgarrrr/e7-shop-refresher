@@ -83,18 +83,22 @@ fn start_arms_watching_without_refresh() {
 #[test]
 fn start_refused_while_filter_unrestricted() {
     // The invariant lives here, not in the callers: no command producer
-    // may arm a hunt-everything loop.
+    // may arm a hunt-everything loop, and the refusal is explicit so the
+    // caller can render the reason.
     let mut ctrl = Controller::new(Filter::default(), Limits::default());
-    assert!(ctrl.handle(Event::Start { now_ms: 0 }).is_empty());
+    assert_eq!(
+        ctrl.handle(Event::Start { now_ms: 0 }),
+        vec![Action::Refused(RefusalReason::UnrestrictedFilter)]
+    );
     assert_eq!(ctrl.status(), Status::Idle);
 }
 
 #[test]
 fn unrestricted_filter_swap_is_ignored() {
     let mut ctrl = started(Limits::default());
-    assert!(
-        ctrl.handle(Event::FilterChanged(Filter::default()))
-            .is_empty()
+    assert_eq!(
+        ctrl.handle(Event::FilterChanged(Filter::default())),
+        vec![Action::Refused(RefusalReason::UnrestrictedFilter)]
     );
     assert!(!ctrl.filter().is_unrestricted());
     // The old criteria keep hunting: slot 3 still matches.
