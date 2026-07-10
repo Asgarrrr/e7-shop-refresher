@@ -8,7 +8,7 @@ use crate::capture::{Direction, PacketSource, Segment};
 use crate::config::ForwardConfig;
 use crate::domain::shop::{ItemKind, ShopItem, ShopSnapshot};
 use crate::stream::Reassembler;
-use crate::uplink::protocol::{Alert, ServerMessage};
+use crate::uplink::protocol::ServerMessage;
 use crate::watch::WatchGate;
 use crate::{Config, Result};
 
@@ -166,7 +166,6 @@ fn render(message: &ServerMessage) {
     match message {
         ServerMessage::Ack | ServerMessage::Unknown => {}
         ServerMessage::Shop(snapshot) => render_shop(snapshot),
-        ServerMessage::Alert(alert) => render_alert(alert),
     }
 }
 
@@ -174,13 +173,6 @@ fn render_shop(snapshot: &ShopSnapshot) {
     let merchant = snapshot.merchant.as_deref().unwrap_or("Secret Shop");
     println!("\n[{merchant}]");
     for item in &snapshot.slots {
-        println!("  {}", format_item(item));
-    }
-}
-
-fn render_alert(alert: &Alert) {
-    println!("\n[ALERT] {}", alert.message);
-    for item in &alert.items {
         println!("  {}", format_item(item));
     }
 }
@@ -219,9 +211,6 @@ fn format_item(item: &ShopItem) -> String {
     }
     if let Some(limit) = item.limit {
         line.push_str(&format!(" · {}/{}", limit.remaining, limit.total));
-    }
-    if item.interesting {
-        line.push_str(" (interesting)");
     }
     line
 }

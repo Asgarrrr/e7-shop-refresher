@@ -4,7 +4,7 @@
 
 use serde::Deserialize;
 
-use crate::domain::shop::{ShopItem, ShopSnapshot};
+use crate::domain::shop::ShopSnapshot;
 
 /// Downstream message from the server to the relay.
 #[derive(Debug, Clone, Deserialize)]
@@ -12,18 +12,10 @@ use crate::domain::shop::{ShopItem, ShopSnapshot};
 pub enum ServerMessage {
     /// Acknowledges a batch of bytes.
     Ack,
-    /// Full shop snapshot decoded by the server.
+    /// Full shop snapshot; the player's [`crate::domain::filter::Filter`]
+    /// decides interest.
     Shop(ShopSnapshot),
-    /// One or more items worth the player's attention.
-    Alert(Alert),
     /// Unknown type — ignored (forward compatibility).
     #[serde(other)]
     Unknown,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Alert {
-    pub message: String,
-    #[serde(default)]
-    pub items: Vec<ShopItem>,
 }

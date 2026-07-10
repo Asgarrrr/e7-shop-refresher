@@ -44,6 +44,10 @@ fn refresh_or_none<'de, D: Deserializer<'de>>(de: D) -> Result<Option<RefreshMet
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ShopItem {
+    /// Wire item id; `0` if the server omits it. Lets a purchase confirmation
+    /// (whose `item` is this id) be tied back to the slot the player wanted.
+    #[serde(default)]
+    pub id: u32,
     /// Shop slot (1..=6); `0` if the server omits it.
     #[serde(default)]
     pub slot: u8,
@@ -68,11 +72,6 @@ pub struct ShopItem {
     pub required_level: Option<u8>,
     #[serde(default)]
     pub limit: Option<PurchaseLimit>,
-    /// Legacy server verdict; the client-side [`crate::domain::filter::Filter`]
-    /// is now authoritative. Slated for removal once the controller computes
-    /// interest locally.
-    #[serde(default)]
-    pub interesting: bool,
 }
 
 impl ShopItem {

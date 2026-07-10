@@ -4,8 +4,7 @@
 //!
 //! Purity: time is injected through the events' `now_ms` (assumed monotonic)
 //! and the controller performs no I/O — executing the returned [`Action`]s is
-//! the caller's job. The legacy server verdict (`ShopItem::interesting`) is
-//! never read; the client-side [`Filter`] is authoritative.
+//! the caller's job. The client-side [`Filter`] is authoritative.
 
 use crate::domain::filter::Filter;
 use crate::domain::shop::{RefreshMeta, ShopSnapshot};

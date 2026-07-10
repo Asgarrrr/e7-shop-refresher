@@ -89,6 +89,7 @@ mod tests {
 
     fn equip() -> ShopItem {
         ShopItem {
+            id: 4562,
             slot: 1,
             kind: ItemKind::Equipment,
             name: None,
@@ -102,7 +103,6 @@ mod tests {
             ],
             required_level: None,
             limit: None,
-            interesting: false,
         }
     }
 
