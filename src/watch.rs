@@ -1,8 +1,8 @@
-//! The "Shop Watch" switch.
+//! The "Shop Watch" capture gate.
 //!
-//! While off, the captured stream is not forwarded: the player turns it on when
-//! opening the shop and off when done. Shared lock-free between the capture
-//! thread and the interactive control.
+//! While off, the captured stream is not forwarded. The gate is a projection
+//! of the controller's status with a single writer — `app::apply` turns it on
+//! for `Watching | Paused` — and is read lock-free by the capture thread.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,16 +25,5 @@ impl WatchGate {
 
     pub fn set(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
-    }
-
-    /// Flips the state and returns the new value.
-    pub fn toggle(&self) -> bool {
-        !self.enabled.fetch_xor(true, Ordering::Relaxed)
-    }
-}
-
-impl Default for WatchGate {
-    fn default() -> Self {
-        Self::new(true)
     }
 }

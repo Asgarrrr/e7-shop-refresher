@@ -79,6 +79,21 @@ impl ShopItem {
     pub fn is_sold_out(&self) -> bool {
         self.limit.is_some_and(|limit| limit.remaining == 0)
     }
+
+    /// Player-facing slot number: the wire slot, or the 1-based position when
+    /// the server omitted it (`slot == 0`), clamped so an oversized shop
+    /// cannot wrap back into the `0` sentinel.
+    ///
+    /// Not injective on malformed shops: a fallback number can collide with
+    /// another item's wire slot, so callers matching items by this number may
+    /// over-select there.
+    pub fn effective_slot(&self, index: usize) -> u8 {
+        if self.slot == 0 {
+            u8::try_from(index + 1).unwrap_or(u8::MAX)
+        } else {
+            self.slot
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]

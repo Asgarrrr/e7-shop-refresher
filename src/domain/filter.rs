@@ -2,6 +2,8 @@
 //! worth stopping the refresh loop to buy. Kept on the client so they can be
 //! tuned live from the UI.
 
+use serde::Deserialize;
+
 use crate::domain::shop::{ItemKind, ShopItem};
 
 /// Player criteria, all ANDed; an empty `Vec` or `None` field does not
@@ -10,7 +12,12 @@ use crate::domain::shop::{ItemKind, ShopItem};
 /// Missing data is handled asymmetrically on purpose: `max_price` is
 /// fail-closed (an unknown price never satisfies a cap), while sold-out is
 /// fail-open (a missing `limit` counts as buyable).
-#[derive(Debug, Clone, Default)]
+///
+/// Deserialized from the config file's `[filter]` section. Unlike the wire
+/// models, unknown keys are rejected: a typo here silently loosens the
+/// criteria the refresh loop spends crystals against.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Filter {
     /// Kept item kinds (any-of); empty keeps all, including `Unknown`.
     pub kinds: Vec<ItemKind>,
@@ -28,9 +35,14 @@ pub struct Filter {
 
 /// One required substat, by exact internal name (`speed`, `cri`, ...). `min` is
 /// an inclusive threshold; `None` means presence is enough.
-#[derive(Debug, Clone)]
+///
+/// `name` is deliberately required (no container default): a nameless
+/// requirement would silently match nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubstatReq {
     pub name: String,
+    #[serde(default)]
     pub min: Option<f64>,
 }
 

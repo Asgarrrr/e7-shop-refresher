@@ -5,6 +5,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::domain::control::Limits;
+use crate::domain::filter::Filter;
+use crate::domain::shop::ItemKind;
 use crate::error::Result;
 
 /// TCP port of the Epic Seven game server (`msg://`).
@@ -27,6 +30,13 @@ pub struct Config {
 
     /// Low-level capture settings.
     pub capture: CaptureConfig,
+
+    /// Player interest criteria; the default (empty) filter matches every
+    /// available item.
+    pub filter: Filter,
+
+    /// Refresh-loop stop limits; the default sets none.
+    pub limits: Limits,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -64,6 +74,8 @@ impl Default for Config {
             forward: ForwardConfig::default(),
             reconnect: ReconnectConfig::default(),
             capture: CaptureConfig::default(),
+            filter: Filter::default(),
+            limits: Limits::default(),
         }
     }
 }
@@ -123,6 +135,13 @@ impl Config {
         if self.server_url.trim().is_empty() {
             return Err(crate::Error::Config("server_url is empty".into()));
         }
+        // `ItemKind` is wire-tolerant (`serde(other)` -> Unknown), which in a
+        // config file would let a typo silently match nothing: reject it here.
+        if self.filter.kinds.contains(&ItemKind::Unknown) {
+            return Err(crate::Error::Config(
+                "unrecognized kind in [filter] kinds (expected: equipment, hero, token)".into(),
+            ));
+        }
         // A segment's direction is inferred by comparing its ports to
         // `game_port`: a custom filter capturing a different port delivers
         // traffic nothing can classify — zero segments, no error.
@@ -160,5 +179,113 @@ impl Config {
 
     pub fn reconnect_max(&self) -> Duration {
         Duration::from_millis(self.reconnect.max_ms.max(self.reconnect.initial_ms))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn misspelled_kind_value_is_rejected() {
+        // serde(other) folds unknown kind strings into Unknown; validate()
+        // must catch it or the typo silently matches nothing.
+        let config: Config =
+            toml::from_str("[filter]\nkinds = [\"equipement\"]").expect("parses tolerant");
+        assert_eq!(config.filter.kinds, vec![ItemKind::Unknown]);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn full_filter_and_limits_sections_parse() {
+        let config: Config = toml::from_str(
+            r#"
+            [filter]
+            kinds = ["equipment", "hero"]
+            sets = ["set_speed", "set_counter"]
+            min_substats = 3
+            max_price = 300000
+            include_sold_out = true
+
+            [[filter.required_substats]]
+            name = "speed"
+            min = 8.0
+
+            [[filter.required_substats]]
+            name = "cri"
+
+            [limits]
+            max_refreshes = 100
+            max_spend = 300
+            max_matches = 5
+            max_duration_ms = 3600000
+            "#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            config.filter.kinds,
+            vec![ItemKind::Equipment, ItemKind::Hero]
+        );
+        assert_eq!(config.filter.sets, vec!["set_speed", "set_counter"]);
+        assert_eq!(config.filter.min_substats, Some(3));
+        assert_eq!(config.filter.max_price, Some(300_000));
+        assert!(config.filter.include_sold_out);
+        assert_eq!(config.filter.required_substats.len(), 2);
+        assert_eq!(config.filter.required_substats[0].name, "speed");
+        assert_eq!(config.filter.required_substats[0].min, Some(8.0));
+        assert_eq!(config.filter.required_substats[1].name, "cri");
+        assert_eq!(config.filter.required_substats[1].min, None);
+
+        assert_eq!(config.limits.max_refreshes, Some(100));
+        assert_eq!(config.limits.max_spend, Some(300));
+        assert_eq!(config.limits.max_matches, Some(5));
+        assert_eq!(config.limits.max_duration_ms, Some(3_600_000));
+    }
+
+    #[test]
+    fn missing_filter_and_limits_sections_default() {
+        let config: Config = toml::from_str("game_port = 3333").expect("config should parse");
+        assert!(config.filter.kinds.is_empty());
+        assert!(config.filter.required_substats.is_empty());
+        assert_eq!(config.filter.max_price, None);
+        assert_eq!(config.limits.max_refreshes, None);
+        assert_eq!(config.limits.max_spend, None);
+    }
+
+    #[test]
+    fn partial_sections_leave_other_fields_default() {
+        let config: Config = toml::from_str(
+            r#"
+            [filter]
+            min_substats = 4
+
+            [limits]
+            max_spend = 50
+            "#,
+        )
+        .expect("config should parse");
+        assert_eq!(config.filter.min_substats, Some(4));
+        assert!(config.filter.kinds.is_empty());
+        assert_eq!(config.limits.max_spend, Some(50));
+        assert_eq!(config.limits.max_refreshes, None);
+    }
+
+    #[test]
+    fn misspelled_limit_key_is_rejected() {
+        // A silently ignored typo would mean a limit that never triggers.
+        assert!(toml::from_str::<Config>("[limits]\nmax_refresh = 10").is_err());
+        assert!(toml::from_str::<Config>("[filter]\nmax_prices = 10").is_err());
+    }
+
+    #[test]
+    fn required_substat_without_name_is_rejected() {
+        let result = toml::from_str::<Config>(
+            r#"
+            [[filter.required_substats]]
+            min = 8.0
+            "#,
+        );
+        assert!(result.is_err());
     }
 }

@@ -6,11 +6,17 @@
 //! and the controller performs no I/O — executing the returned [`Action`]s is
 //! the caller's job. The client-side [`Filter`] is authoritative.
 
+use serde::Deserialize;
+
 use crate::domain::filter::Filter;
 use crate::domain::shop::{RefreshMeta, ShopSnapshot};
 
 /// Stop limits, all optional; the loop halts at the first one reached.
-#[derive(Debug, Clone, Default)]
+///
+/// Deserialized from the config file's `[limits]` section; unknown keys are
+/// rejected because a misspelled limit is a limit that never triggers.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_refreshes: Option<u32>,
     /// Crystal budget — a hard ceiling: a refresh that would cross it is
@@ -194,15 +200,7 @@ impl Controller {
             .iter()
             .enumerate()
             .filter(|(_, item)| self.filter.matches(item))
-            .map(|(index, item)| {
-                // Position fallback when the server omits the slot; clamped
-                // so an oversized shop cannot wrap back into the `0` sentinel.
-                if item.slot == 0 {
-                    u8::try_from(index + 1).unwrap_or(u8::MAX)
-                } else {
-                    item.slot
-                }
-            })
+            .map(|(index, item)| item.effective_slot(index))
             .collect();
         self.last_snapshot = Some(snapshot);
 

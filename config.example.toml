@@ -20,3 +20,25 @@ max_ms = 30000
 [capture]
 buffer_size = 65535
 # filter = "tcp and tcp.SrcPort == 3333"   # manual WinDivert filter override
+
+[filter]
+# Player interest criteria, all ANDed. Every key is optional; an empty or
+# missing [filter] matches every available item.
+# kinds = ["equipment"]                 # any-of: equipment, hero, token
+# sets = ["set_speed", "set_counter"]   # any-of, exact internal set ids
+# min_substats = 3                      # minimum substat count
+# max_price = 300000                    # inclusive gold cap; unknown price fails it
+# include_sold_out = false              # keep sold-out items (default drops them)
+
+# Substats that must all be present; `min` is an inclusive threshold,
+# omit it for presence alone.
+# [[filter.required_substats]]
+# name = "speed"
+# min = 8.0
+
+[limits]
+# Refresh-loop stop limits. Every key is optional; absent means no limit.
+# max_refreshes = 100        # paid refreshes per session
+# max_spend = 300            # crystal budget — hard ceiling, never crossed
+# max_matches = 5            # cumulative alerted items (not purchases)
+# max_duration_ms = 3600000  # session timeout (here: 1 hour)

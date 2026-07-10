@@ -20,11 +20,15 @@ WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ Web
 - **Forwarding**: the raw server → client stream is sent as-is to the analysis
   server. Decryption and interpretation happen **server-side** — the client
   decrypts nothing.
-- **Display**: server messages (shop snapshot, alerts) are rendered in the
-  console.
+- **Display & control**: each decoded shop snapshot is rendered in the console
+  and fed to the refresh-loop controller, which checks it against the
+  `[filter]` criteria from `config.toml`: no match → it advises a refresh (the
+  relay stays passive — nothing is sent to the game); match → it alerts with
+  the item details and pauses until `resume`; a `[limits]` threshold reached →
+  it stops the session.
 
-The **Shop Watch** switch (on by default) stops forwarding while the player is
-not in the shop.
+The relay starts **idle** (nothing is captured or forwarded): type `start`
+when opening the shop to arm the session, `stop` when done.
 
 ## Distribution — a single executable
 
@@ -68,6 +72,8 @@ a missing file falls back to the defaults.
 | `server_url` | `ws://127.0.0.1:3001/refresh-shop` | Analysis server |
 | `forward.server_to_client` | `true` | Forward responses (shop contents) |
 | `forward.client_to_server` | `false` | Forward requests (context) |
+| `[filter]` | matches everything | Item interest criteria (kinds, sets, substats, price) |
+| `[limits]` | no limits | Session stop limits (refreshes, crystals, matches, duration) |
 
 ## Running
 
@@ -75,4 +81,6 @@ a missing file falls back to the defaults.
 cargo run --release   # as administrator
 ```
 
-Runtime commands: `[Enter]` toggles Shop Watch, `on`, `off`, `Ctrl+C` to quit.
+Runtime commands: `start` arms the session, `stop` ends it, `resume` (`r`)
+relaunches the hunt after buying an alerted item, `[Enter]` toggles
+start/stop, `Ctrl+C` to quit.
