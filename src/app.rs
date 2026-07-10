@@ -12,7 +12,7 @@ use crate::config::ForwardConfig;
 use crate::domain::control::{Action, Controller, Event, Status, StopReason};
 use crate::domain::shop::{ItemKind, ShopItem, ShopSnapshot};
 use crate::stream::Reassembler;
-use crate::uplink::protocol::ServerMessage;
+use crate::uplink::protocol::{PurchaseNotice, ServerMessage};
 use crate::watch::WatchGate;
 use crate::{Config, Result};
 
@@ -217,10 +217,22 @@ async fn session_loop(
     }
 }
 
-/// Translates a player command into a controller event (`Toggle` resolves
-/// against the current status) and echoes an outcome: a command is never
-/// silent, even when the controller ignores it.
+/// Translates a player command into a controller event and echoes an outcome:
+/// a command is never silent, even when the controller ignores it.
 fn on_command(controller: &Mutex<Controller>, gate: &WatchGate, command: Command, now_ms: u64) {
+    for line in handle_command(controller, gate, command, now_ms) {
+        println!("{line}");
+    }
+}
+
+/// The command logic behind [`on_command`], returning the lines to print
+/// (`Toggle` resolves against the current status).
+fn handle_command(
+    controller: &Mutex<Controller>,
+    gate: &WatchGate,
+    command: Command,
+    now_ms: u64,
+) -> Vec<String> {
     let mut ctrl = controller.lock().expect("controller mutex poisoned");
     let event = match command {
         Command::Start => Event::Start { now_ms },
@@ -235,22 +247,26 @@ fn on_command(controller: &Mutex<Controller>, gate: &WatchGate, command: Command
     let actions = ctrl.handle(event);
     let mut lines = apply(&actions, &ctrl, gate);
     let after = ctrl.status();
+    let has_stored_shop = ctrl.last_snapshot().is_some();
+    let label = status_label(&ctrl);
     drop(ctrl);
     if actions.is_empty() {
         // `Start` yields no action, and ignored commands yield nothing at all:
         // synthesize the feedback from the status transition.
         if before != after && after == Status::Watching {
             lines.push(">> watching — open the shop".to_owned());
+            if has_stored_shop {
+                lines.push(">> the stored shop is not replayed — re-open it in game".to_owned());
+            }
         } else if before == after {
-            lines.push(format!(">> no effect — status: {}", status_label(after)));
+            lines.push(format!(">> no effect — status: {label}"));
         }
     }
-    for line in &lines {
-        println!("{line}");
-    }
+    lines
 }
 
-/// Renders a shop and feeds it to the controller; other messages are silent.
+/// Renders a shop or a purchase and feeds it to the controller; acks and
+/// unknown messages are silent.
 fn on_message(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
@@ -263,6 +279,50 @@ fn on_message(
             render_shop(&snapshot);
             dispatch(controller, gate, Event::Snapshot { snapshot, now_ms });
         }
+        ServerMessage::Purchase(notice) => {
+            for line in handle_purchase(controller, gate, &notice, now_ms) {
+                println!("{line}");
+            }
+        }
+    }
+}
+
+/// One lock for the whole purchase: the bought line is rendered against the
+/// same state the event is applied to, and comes first so the auto-resume
+/// refresh advice reads in causal order.
+fn handle_purchase(
+    controller: &Mutex<Controller>,
+    gate: &WatchGate,
+    notice: &PurchaseNotice,
+    now_ms: u64,
+) -> Vec<String> {
+    let mut ctrl = controller.lock().expect("controller mutex poisoned");
+    let mut lines = vec![purchase_line(&ctrl, notice)];
+    let actions = ctrl.handle(Event::Purchase {
+        item: notice.item,
+        now_ms,
+    });
+    lines.extend(apply(&actions, &ctrl, gate));
+    lines
+}
+
+/// An omitted-id notice never resolves a name: `catalog_id()` is never
+/// `Some(0)`.
+fn purchase_line(controller: &Controller, notice: &PurchaseNotice) -> String {
+    let name = controller.last_snapshot().and_then(|snapshot| {
+        snapshot
+            .slots
+            .iter()
+            .find(|item| item.catalog_id() == Some(notice.item))
+            .and_then(|item| item.name.as_deref())
+    });
+    let label = match name {
+        Some(name) => name.to_owned(),
+        None => format!("item {}", notice.item),
+    };
+    match notice.gold {
+        Some(gold) => format!(">> bought: {label} ({gold} gold)"),
+        None => format!(">> bought: {label}"),
     }
 }
 
@@ -306,13 +366,21 @@ fn apply(actions: &[Action], controller: &Controller, gate: &WatchGate) -> Vec<S
 /// alert (the controller stored it before emitting).
 fn render_alert(lines: &mut Vec<String>, slots: &[u8], controller: &Controller) {
     let list: Vec<String> = slots.iter().map(u8::to_string).collect();
-    // Alerted + still Paused means the loop waits on a purchase; on the
-    // max-matches path a Halt follows in the same batch and `resume` would
-    // be dead advice.
-    let hint = if controller.status() == Status::Paused {
-        ": buy in game, then `resume`"
-    } else {
+    // Alerted + still Paused means the loop waits on purchases; on the
+    // max-matches path a Halt follows in the same batch and any buy advice
+    // would be dead.
+    let hint = if controller.status() != Status::Paused {
         ""
+    } else if controller.checklist().is_empty() {
+        // Every match is untrackable (sold out or id omitted): no purchase
+        // echo can clear them, so the manual flow stays.
+        ": buy in game, then `resume`"
+    } else if controller.checklist().len() < slots.len() {
+        // Some matches are untrackable: auto-resume only waits on the
+        // tracked ones and would refresh over the rest.
+        ": buy in game — some items aren't tracked, finish with `resume`"
+    } else {
+        ": buy in game — resumes automatically (`resume` skips)"
     };
     lines.push(format!(">> MATCH — slot(s) {}{hint}", list.join(", ")));
     let Some(snapshot) = controller.last_snapshot() else {
@@ -325,11 +393,13 @@ fn render_alert(lines: &mut Vec<String>, slots: &[u8], controller: &Controller) 
     }
 }
 
-fn status_label(status: Status) -> &'static str {
-    match status {
+fn status_label(controller: &Controller) -> &'static str {
+    match controller.status() {
         Status::Idle => "idle (`start` arms the watch)",
         Status::Watching => "watching",
-        Status::Paused => "paused (buy, then `resume`)",
+        // An empty checklist never auto-resumes.
+        Status::Paused if controller.checklist().is_empty() => "paused (buy, then `resume`)",
+        Status::Paused => "paused (buy — auto-resumes; `resume` skips)",
         Status::Stopped(_) => "stopped (`start` re-arms)",
     }
 }
@@ -513,6 +583,146 @@ mod tests {
             Status::Stopped(StopReason::PlayerStopped)
         );
         assert!(!gate.is_enabled());
+    }
+
+    #[test]
+    fn purchase_message_auto_resumes_controller() {
+        let gate = WatchGate::new(false);
+        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        on_command(&controller, &gate, Command::Start, 0);
+        let mut snapshot = one_item_shop();
+        snapshot.slots[0].id = 42;
+        // Default filter matches the default item -> Paused, checklist [42].
+        on_message(&controller, &gate, ServerMessage::Shop(snapshot), 1);
+        assert_eq!(controller.lock().unwrap().status(), Status::Paused);
+
+        let notice = PurchaseNotice {
+            item: 42,
+            gold: Some(100),
+        };
+        on_message(&controller, &gate, ServerMessage::Purchase(notice), 2);
+        assert_eq!(controller.lock().unwrap().status(), Status::Watching);
+        assert!(gate.is_enabled());
+    }
+
+    /// A controller that stored a one-item shop whose slot carries id 42 and
+    /// a name.
+    fn controller_with_named_item() -> Controller {
+        let mut controller = Controller::new(Filter::default(), Limits::default());
+        let mut snapshot = one_item_shop();
+        snapshot.slots[0].id = 42;
+        snapshot.slots[0].name = Some("Reforged Sword".to_owned());
+        controller.handle(Event::Snapshot {
+            snapshot,
+            now_ms: 0,
+        });
+        controller
+    }
+
+    #[test]
+    fn purchase_line_names_item_from_snapshot() {
+        let notice = PurchaseNotice {
+            item: 42,
+            gold: Some(250_000),
+        };
+        assert_eq!(
+            purchase_line(&controller_with_named_item(), &notice),
+            ">> bought: Reforged Sword (250000 gold)"
+        );
+    }
+
+    #[test]
+    fn purchase_line_falls_back_to_id_when_name_unknown() {
+        let controller = Controller::new(Filter::default(), Limits::default());
+        let notice = PurchaseNotice {
+            item: 7,
+            gold: Some(100),
+        };
+        assert_eq!(
+            purchase_line(&controller, &notice),
+            ">> bought: item 7 (100 gold)"
+        );
+    }
+
+    #[test]
+    fn purchase_line_omits_missing_gold() {
+        let notice = PurchaseNotice {
+            item: 42,
+            gold: None,
+        };
+        assert_eq!(
+            purchase_line(&controller_with_named_item(), &notice),
+            ">> bought: Reforged Sword"
+        );
+    }
+
+    #[test]
+    fn alert_hint_warns_when_some_matches_untracked() {
+        let gate = WatchGate::new(false);
+        let mut ctrl = Controller::new(Filter::default(), Limits::default());
+        ctrl.handle(Event::Start { now_ms: 0 });
+        // Two matches, only one trackable: the first slot keeps the id-0
+        // sentinel, so auto-resume would refresh over it.
+        let snapshot = ShopSnapshot {
+            merchant: None,
+            slots: vec![
+                ShopItem::default(),
+                ShopItem {
+                    id: 42,
+                    ..ShopItem::default()
+                },
+            ],
+            refresh: None,
+        };
+        let actions = ctrl.handle(Event::Snapshot {
+            snapshot,
+            now_ms: 1,
+        });
+        let lines = apply(&actions, &ctrl, &gate);
+        assert!(lines.iter().any(|line| line.contains("aren't tracked")));
+    }
+
+    #[test]
+    fn paused_label_reflects_manual_flow_when_checklist_empty() {
+        let gate = WatchGate::new(false);
+        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        on_command(&controller, &gate, Command::Start, 0);
+        // Paused on an untrackable (id-0) match: a no-effect command's echo
+        // must advise manual resume, not a phantom auto-resume.
+        dispatch(
+            &controller,
+            &gate,
+            Event::Snapshot {
+                snapshot: one_item_shop(),
+                now_ms: 1,
+            },
+        );
+        let lines = handle_command(&controller, &gate, Command::Start, 2);
+        assert!(lines.iter().any(|line| line.contains("buy, then `resume`")));
+        assert!(!lines.iter().any(|line| line.contains("auto-resumes")));
+    }
+
+    #[test]
+    fn start_hint_printed_only_when_shop_stored() {
+        let gate = WatchGate::new(false);
+        let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+        // Nothing stored yet: plain watching line, no hint.
+        let lines = handle_command(&controller, &gate, Command::Start, 0);
+        assert!(lines.iter().any(|line| line.contains("watching")));
+        assert!(!lines.iter().any(|line| line.contains("not replayed")));
+
+        // Stop, receive a shop (stored, not evaluated), restart: hint appears.
+        handle_command(&controller, &gate, Command::Stop, 1);
+        dispatch(
+            &controller,
+            &gate,
+            Event::Snapshot {
+                snapshot: one_item_shop(),
+                now_ms: 2,
+            },
+        );
+        let lines = handle_command(&controller, &gate, Command::Start, 3);
+        assert!(lines.iter().any(|line| line.contains("not replayed")));
     }
 
     #[test]

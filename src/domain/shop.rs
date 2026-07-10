@@ -11,8 +11,9 @@ pub struct ShopSnapshot {
     #[serde(default)]
     pub slots: Vec<ShopItem>,
     /// Refresh-session facts (balance, cost) — grouped apart because they are
-    /// not shop *contents*. Present means both are known; absent means neither
-    /// is, which makes crystal limits unenforceable.
+    /// not shop *contents*. Present means both are known; absent, the cost
+    /// falls back to the game constant and only out-of-funds detection is
+    /// lost.
     #[serde(default, deserialize_with = "refresh_or_none")]
     pub refresh: Option<RefreshMeta>,
 }
@@ -80,6 +81,13 @@ impl ShopItem {
         self.limit.is_some_and(|limit| limit.remaining == 0)
     }
 
+    /// The global catalog id, or `None` when the server omitted it
+    /// (`id == 0`). The only place the 0 sentinel is interpreted — do not
+    /// re-derive the comparison.
+    pub fn catalog_id(&self) -> Option<u32> {
+        (self.id != 0).then_some(self.id)
+    }
+
     /// Player-facing slot number: the wire slot, or the 1-based position when
     /// the server omitted it (`slot == 0`), clamped so an oversized shop
     /// cannot wrap back into the `0` sentinel.
@@ -107,7 +115,7 @@ pub enum ItemKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SubStat {
     pub name: String,
     #[serde(default)]

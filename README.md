@@ -24,8 +24,10 @@ WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ Web
   and fed to the refresh-loop controller, which checks it against the
   `[filter]` criteria from `config.toml`: no match → it advises a refresh (the
   relay stays passive — nothing is sent to the game); match → it alerts with
-  the item details and pauses until `resume`; a `[limits]` threshold reached →
-  it stops the session.
+  the item details and pauses. The purchase confirmations decoded from the
+  traffic check the matched items off, and the loop resumes on its own once
+  the last one is bought — `resume` skips the wait and abandons whatever is
+  left. A `[limits]` threshold reached → it stops the session.
 
 The relay starts **idle** (nothing is captured or forwarded): type `start`
 when opening the shop to arm the session, `stop` when done.
@@ -82,5 +84,5 @@ cargo run --release   # as administrator
 ```
 
 Runtime commands: `start` arms the session, `stop` ends it, `resume` (`r`)
-relaunches the hunt after buying an alerted item, `[Enter]` toggles
+skips a pause and abandons unbought matches, `[Enter]` toggles
 start/stop, `Ctrl+C` to quit.

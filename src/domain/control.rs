@@ -9,7 +9,10 @@
 use serde::Deserialize;
 
 use crate::domain::filter::Filter;
-use crate::domain::shop::{RefreshMeta, ShopSnapshot};
+use crate::domain::shop::{RefreshMeta, ShopSnapshot, SubStat};
+
+/// A refresh always costs 3 crystals (game fact); a wire-sent cost overrides.
+const REFRESH_COST_CRYSTALS: u32 = 3;
 
 /// Stop limits, all optional; the loop halts at the first one reached.
 ///
@@ -41,7 +44,8 @@ pub enum StopReason {
 pub enum Status {
     Idle,
     Watching,
-    /// A slot matched; waiting for the player to buy, then `Resume`.
+    /// A slot matched; waiting for purchases. Auto-resumes when the last
+    /// checklist item is bought; `resume` overrides (abandons the rest).
     Paused,
     Stopped(StopReason),
 }
@@ -54,12 +58,20 @@ pub enum Event {
         now_ms: u64,
     },
     Stop,
-    /// After a purchase: back to the hunt.
+    /// The player's override while `Paused`: abandons the unbought checklist
+    /// remainder and refreshes on (purchases auto-resume on their own).
     Resume {
         now_ms: u64,
     },
     Snapshot {
         snapshot: ShopSnapshot,
+        now_ms: u64,
+    },
+    /// A server-confirmed buy: checks the item off the checklist; clearing
+    /// the last entry auto-resumes the loop.
+    Purchase {
+        /// Global catalog id, same space as `ShopItem::id`; `0` when omitted.
+        item: u32,
         now_ms: u64,
     },
     FilterChanged(Filter),
@@ -92,8 +104,10 @@ pub struct Progress {
 }
 
 /// Invariant: the relay stays passive — a refresh is only requested in
-/// reaction to a no-match snapshot or an explicit `Resume`; snapshots received
-/// outside `Watching` never trigger one (they are still stored for the view).
+/// reaction to a no-match snapshot, an explicit `Resume`, or the purchase
+/// clearing the last checklist entry; duplicate snapshots and snapshots
+/// received while unarmed (`Idle`/`Stopped`) never trigger one (they are
+/// still stored for the view).
 pub struct Controller {
     filter: Filter,
     limits: Limits,
@@ -105,6 +119,14 @@ pub struct Controller {
     /// server-sent meta overwrites the estimate. Forgotten on `Start`.
     refresh_meta: Option<RefreshMeta>,
     last_snapshot: Option<ShopSnapshot>,
+    /// Matched-but-unbought catalog ids from the last evaluated snapshot.
+    checklist: Vec<u32>,
+    /// Identity of the last snapshot evaluated while armed
+    /// (`Watching | Paused`): an identical re-arrival is stored for the view
+    /// but never re-evaluated, so it cannot double-bill a refresh. Cleared
+    /// on `Start` only — surviving `Resume` is what mutes a re-open right
+    /// after a buy.
+    acted_fingerprint: Option<Vec<SlotIdentity>>,
 }
 
 impl Controller {
@@ -117,6 +139,8 @@ impl Controller {
             progress: Progress::default(),
             refresh_meta: None,
             last_snapshot: None,
+            checklist: Vec::new(),
+            acted_fingerprint: None,
         }
     }
 
@@ -132,11 +156,10 @@ impl Controller {
         self.progress
     }
 
-    /// `false` when `max_spend` is set but no snapshot has carried a
-    /// [`RefreshMeta`] yet: with the cost unknown, spend cannot be tracked
-    /// (and `OutOfFunds` cannot trigger either).
-    pub fn limits_enforceable(&self) -> bool {
-        self.limits.max_spend.is_none() || self.refresh_meta.is_some()
+    /// Matched-but-unbought catalog ids; untrackable matches (id 0, sold
+    /// out) never enter it.
+    pub fn checklist(&self) -> &[u32] {
+        &self.checklist
     }
 
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
@@ -145,8 +168,10 @@ impl Controller {
             Event::Stop => self.on_stop(),
             Event::Resume { now_ms } => self.on_resume(now_ms),
             Event::Snapshot { snapshot, now_ms } => self.on_snapshot(snapshot, now_ms),
+            Event::Purchase { item, now_ms } => self.on_purchase(item, now_ms),
             Event::FilterChanged(filter) => {
-                // Applies from the next snapshot; no re-evaluation of the last.
+                // Applies from the next *new* snapshot: neither the stored
+                // snapshot nor a duplicate re-send is re-evaluated.
                 self.filter = filter;
                 Vec::new()
             }
@@ -163,6 +188,9 @@ impl Controller {
         self.progress = Progress::default();
         self.started_at = Some(now_ms);
         self.refresh_meta = None; // a stale balance must not stop the new session
+        self.checklist.clear();
+        // A stale identity must not mute the new session's first snapshot.
+        self.acted_fingerprint = None;
         // last_snapshot is kept: restarting the watch does not change the shop.
         self.status = Status::Watching;
         Vec::new()
@@ -176,13 +204,11 @@ impl Controller {
         self.halt(StopReason::PlayerStopped)
     }
 
-    /// The refresh is blind by design: snapshots that arrived while `Paused`
-    /// were stored for the view but not re-matched — resuming asserts the
-    /// player is done with the current shop.
     fn on_resume(&mut self, now_ms: u64) -> Vec<Action> {
         if self.status != Status::Paused {
             return Vec::new();
         }
+        self.checklist.clear();
         self.status = Status::Watching;
         self.refresh_or_halt(now_ms)
     }
@@ -191,20 +217,56 @@ impl Controller {
         if snapshot.refresh.is_some() {
             self.refresh_meta = snapshot.refresh;
         }
-        if self.status != Status::Watching {
+        if !matches!(self.status, Status::Watching | Status::Paused) {
             self.last_snapshot = Some(snapshot);
             return Vec::new();
         }
-        let matched: Vec<u8> = snapshot
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| self.filter.matches(item))
-            .map(|(index, item)| item.effective_slot(index))
-            .collect();
+        // A slotless snapshot is a degraded message, not shop content.
+        if snapshot.slots.is_empty() {
+            self.last_snapshot = Some(snapshot);
+            return Vec::new();
+        }
+        // Already acted on: a duplicate must never bill a second refresh
+        // or re-alert.
+        let fingerprint = fingerprint(&snapshot);
+        if fingerprint.is_some() && fingerprint == self.acted_fingerprint {
+            self.last_snapshot = Some(snapshot);
+            return Vec::new();
+        }
+        if fingerprint.is_none() && self.status == Status::Paused {
+            // Unidentifiable shop (an id is 0): a duplicate cannot be told
+            // from a new shop, so never re-evaluate over a pending purchase.
+            self.last_snapshot = Some(snapshot);
+            return Vec::new();
+        }
+        if fingerprint.is_some() {
+            // A fail-open arrival must not erase the last valid identity:
+            // a later verbatim duplicate of that shop must still be muted.
+            self.acted_fingerprint = fingerprint;
+        }
+
+        let mut matched: Vec<u8> = Vec::new();
+        let mut checklist: Vec<u32> = Vec::new();
+        for (index, item) in snapshot.slots.iter().enumerate() {
+            if self.filter.matches(item) {
+                matched.push(item.effective_slot(index));
+                // Only ids a purchase echo can actually name: the id-0
+                // sentinel never appears in one, and a sold-out slot cannot
+                // be bought at all — neither may hold the checklist open.
+                if let Some(id) = item.catalog_id()
+                    && !item.is_sold_out()
+                {
+                    checklist.push(id);
+                }
+            }
+        }
         self.last_snapshot = Some(snapshot);
+        self.checklist = checklist;
 
         if matched.is_empty() {
+            // A new no-match shop also unpauses (the hourly auto-refresh
+            // replaced the matches).
+            self.status = Status::Watching;
             return self.refresh_or_halt(now_ms);
         }
         // A match means a purchase to make: never refresh over it.
@@ -225,6 +287,25 @@ impl Controller {
             self.status = Status::Paused;
             vec![alert]
         }
+    }
+
+    /// A server-confirmed buy. Only meaningful while `Paused`: checks the
+    /// item off the checklist; the buy clearing the last entry resumes
+    /// through [`Self::on_resume`], the exact path of the player command.
+    fn on_purchase(&mut self, item: u32, now_ms: u64) -> Vec<Action> {
+        if self.status != Status::Paused {
+            return Vec::new();
+        }
+        // Not on the checklist: an unmatched buy, a replayed echo of a
+        // consumed purchase, or the id-0 sentinel.
+        let Some(position) = self.checklist.iter().position(|&id| id == item) else {
+            return Vec::new();
+        };
+        self.checklist.swap_remove(position);
+        if !self.checklist.is_empty() {
+            return Vec::new();
+        }
+        self.on_resume(now_ms)
     }
 
     fn on_tick(&mut self, now_ms: u64) -> Vec<Action> {
@@ -248,16 +329,23 @@ impl Controller {
     }
 
     /// Single emission point: every refresh, including the one after a
-    /// `Resume`, is counted before it goes out.
+    /// `Resume`, is counted and debited before it goes out.
     fn emit_refresh(&mut self) -> Action {
         self.progress.refreshes += 1;
+        let cost = self.refresh_cost();
+        self.progress.spent = self.progress.spent.saturating_add(cost);
         if let Some(meta) = self.refresh_meta.as_mut() {
-            self.progress.spent = self.progress.spent.saturating_add(meta.cost);
             // Keeps the affordability estimate fresh across snapshots that
             // omit meta; a server-sent meta overwrites it with truth.
-            meta.crystal_balance = meta.crystal_balance.saturating_sub(meta.cost);
+            meta.crystal_balance = meta.crystal_balance.saturating_sub(cost);
         }
         Action::Refresh
+    }
+
+    /// Spend tracking never waits for a snapshot that carries meta.
+    fn refresh_cost(&self) -> u32 {
+        self.refresh_meta
+            .map_or(REFRESH_COST_CRYSTALS, |meta| meta.cost)
     }
 
     fn halt(&mut self, reason: StopReason) -> Vec<Action> {
@@ -280,12 +368,11 @@ impl Controller {
         // Hard ceiling: also stop when the *next* refresh would cross it.
         if let Some(max) = self.limits.max_spend
             && (self.progress.spent >= max
-                || self.refresh_meta.is_some_and(|meta| {
-                    self.progress
-                        .spent
-                        .checked_add(meta.cost)
-                        .is_none_or(|next| next > max)
-                }))
+                || self
+                    .progress
+                    .spent
+                    .checked_add(self.refresh_cost())
+                    .is_none_or(|next| next > max))
         {
             return Some(StopReason::MaxSpend);
         }
@@ -310,11 +397,44 @@ impl Controller {
     }
 }
 
+/// One slot's contribution to a snapshot's identity: the catalog id plus the
+/// per-roll fields the filter can match on — a re-roll redrawing the same
+/// catalog ids is improbable but possible, and must read as a new shop.
+/// `limit` is deliberately excluded: re-opening the shop after a buy
+/// re-delivers the same roll with `remaining` decremented, and that must
+/// still count as the same shop.
+#[derive(PartialEq)]
+struct SlotIdentity {
+    id: u32,
+    price: Option<u32>,
+    grade: Option<u8>,
+    set: Option<String>,
+    substats: Vec<SubStat>,
+}
+
+/// Snapshot identity for dedup: the ordered [`SlotIdentity`]s. `None` when
+/// any id is the 0 sentinel — omitted ids make shops indistinguishable.
+fn fingerprint(snapshot: &ShopSnapshot) -> Option<Vec<SlotIdentity>> {
+    snapshot
+        .slots
+        .iter()
+        .map(|item| {
+            item.catalog_id().map(|id| SlotIdentity {
+                id,
+                price: item.price,
+                grade: item.grade,
+                set: item.set.clone(),
+                substats: item.substats.clone(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::shop::ItemKind::{self, Equipment, Token};
-    use crate::domain::shop::ShopItem;
+    use crate::domain::shop::{PurchaseLimit, ShopItem};
 
     fn item(slot: u8, kind: ItemKind) -> ShopItem {
         ShopItem {
@@ -353,8 +473,21 @@ mod tests {
         }
     }
 
+    /// Assigns stable non-zero catalog ids (`100 + index`) so dedup and the
+    /// checklist engage; `hit_shop`'s matching slot 3 gets id 102.
+    fn with_ids(mut snapshot: ShopSnapshot) -> ShopSnapshot {
+        for (index, item) in snapshot.slots.iter_mut().enumerate() {
+            item.id = 100 + index as u32;
+        }
+        snapshot
+    }
+
     fn snap(snapshot: ShopSnapshot, now_ms: u64) -> Event {
         Event::Snapshot { snapshot, now_ms }
+    }
+
+    fn buy(item: u32, now_ms: u64) -> Event {
+        Event::Purchase { item, now_ms }
     }
 
     fn controller(limits: Limits) -> Controller {
@@ -418,15 +551,322 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_ignored_while_paused() {
+    fn purchase_clears_one_item_stays_paused() {
         let mut ctrl = started(Limits::default());
-        ctrl.handle(snap(hit_shop(None), 1));
-        let actions = ctrl.handle(snap(dud_shop(None), 2));
-        assert!(actions.is_empty());
+        let two_hits = with_ids(shop(
+            &[Equipment, Token, Equipment, Token, Token, Token],
+            None,
+        ));
+        ctrl.handle(snap(two_hits, 1));
         assert_eq!(ctrl.status(), Status::Paused);
+        assert!(ctrl.handle(buy(100, 2)).is_empty());
+        assert_eq!(ctrl.status(), Status::Paused);
+        assert_eq!(ctrl.checklist(), &[102]);
+    }
+
+    #[test]
+    fn last_purchase_auto_resumes_with_refresh() {
+        let mut ctrl = started(Limits::default());
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+        assert_eq!(ctrl.status(), Status::Paused);
+        let actions = ctrl.handle(buy(102, 2));
+        assert_eq!(actions, vec![Action::Refresh]);
+        assert_eq!(ctrl.status(), Status::Watching);
+        assert_eq!(ctrl.progress().refreshes, 1);
+    }
+
+    #[test]
+    fn auto_resume_respects_limits() {
+        let mut ctrl = started(Limits {
+            max_refreshes: Some(0),
+            ..Limits::default()
+        });
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+        let actions = ctrl.handle(buy(102, 2));
+        assert_eq!(actions, vec![Action::Halt(StopReason::MaxRefreshes)]);
         assert_eq!(ctrl.progress().refreshes, 0);
+    }
+
+    #[test]
+    fn purchase_of_unknown_id_ignored() {
+        let mut ctrl = started(Limits::default());
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+        assert!(ctrl.handle(buy(999, 2)).is_empty());
+        assert_eq!(ctrl.status(), Status::Paused);
+        assert_eq!(ctrl.checklist(), &[102]);
+    }
+
+    #[test]
+    fn purchase_ignored_unless_paused() {
+        let mut watching = started(Limits::default());
+        assert!(watching.handle(buy(102, 1)).is_empty());
+        assert_eq!(watching.status(), Status::Watching);
+        assert_eq!(watching.progress().refreshes, 0);
+
+        let mut idle = controller(Limits::default());
+        assert!(idle.handle(buy(102, 1)).is_empty());
+        assert_eq!(idle.status(), Status::Idle);
+    }
+
+    #[test]
+    fn replayed_echo_of_consumed_purchase_is_ignored() {
+        let mut ctrl = started(Limits::default());
+        let two_hits = with_ids(shop(
+            &[Equipment, Token, Equipment, Token, Token, Token],
+            None,
+        ));
+        ctrl.handle(snap(two_hits, 1));
+        assert!(ctrl.handle(buy(100, 2)).is_empty());
+        // The wire may replay an echo: the id already left the checklist,
+        // so the duplicate must not stand in for the remaining item's buy.
+        assert!(ctrl.handle(buy(100, 3)).is_empty());
+        assert_eq!(ctrl.status(), Status::Paused);
+        assert_eq!(ctrl.checklist(), &[102]);
+    }
+
+    #[test]
+    fn resume_override_clears_checklist() {
+        let mut ctrl = started(Limits::default());
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+        let actions = ctrl.handle(Event::Resume { now_ms: 2 });
+        assert_eq!(actions, vec![Action::Refresh]);
+        assert!(ctrl.checklist().is_empty());
+        // The late echo of the abandoned buy must not double-refresh.
+        assert!(ctrl.handle(buy(102, 3)).is_empty());
+        assert_eq!(ctrl.progress().refreshes, 1);
+    }
+
+    #[test]
+    fn zero_id_matches_keep_manual_resume_flow() {
+        let mut ctrl = started(Limits::default());
+        ctrl.handle(snap(hit_shop(None), 1)); // fixture ids are all 0
+        assert_eq!(ctrl.status(), Status::Paused);
+        assert!(ctrl.checklist().is_empty());
+        assert!(ctrl.handle(buy(0, 2)).is_empty());
+        assert_eq!(ctrl.status(), Status::Paused);
+        let actions = ctrl.handle(Event::Resume { now_ms: 3 });
+        assert_eq!(actions, vec![Action::Refresh]);
+    }
+
+    #[test]
+    fn duplicate_snapshot_while_armed_emits_nothing() {
+        let mut ctrl = started(Limits::default());
+        assert_eq!(
+            ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
+            vec![Action::Refresh]
+        );
+        let mut resend = with_ids(dud_shop(None));
+        resend.merchant = Some("resend".to_owned());
+        assert!(ctrl.handle(snap(resend, 2)).is_empty());
+        assert_eq!(ctrl.progress().refreshes, 1);
         // Still stored for the view.
-        assert_eq!(ctrl.last_snapshot().unwrap().slots[2].kind, Token);
+        assert_eq!(
+            ctrl.last_snapshot().unwrap().merchant.as_deref(),
+            Some("resend")
+        );
+    }
+
+    #[test]
+    fn duplicate_snapshot_still_absorbs_refresh_meta() {
+        let mut ctrl = started(Limits::default());
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+        // The deduped re-send still carries truth: a balance too low to
+        // refresh must gate the resume that follows.
+        let actions = ctrl.handle(snap(with_ids(hit_shop(Some(meta(2, 3)))), 2));
+        assert!(actions.is_empty()); // deduped
+        let actions = ctrl.handle(Event::Resume { now_ms: 3 });
+        assert_eq!(actions, vec![Action::Halt(StopReason::OutOfFunds)]);
+    }
+
+    #[test]
+    fn duplicate_hit_shop_while_paused_does_not_realert() {
+        let mut ctrl = started(Limits::default());
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+        assert_eq!(ctrl.progress().matches_found, 1);
+        assert!(ctrl.handle(snap(with_ids(hit_shop(None)), 2)).is_empty());
+        assert_eq!(ctrl.progress().matches_found, 1);
+        assert_eq!(ctrl.checklist(), &[102]);
+        assert_eq!(ctrl.status(), Status::Paused);
+    }
+
+    #[test]
+    fn reopened_shop_after_buy_does_not_double_refresh() {
+        let mut ctrl = started(Limits::default());
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+        assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
+        // Re-opening the shop after the buy re-delivers the same roll with
+        // the bought slot decremented: same identity (limit is excluded),
+        // so the fingerprint that survived the auto-resume mutes it.
+        let mut reopened = with_ids(hit_shop(None));
+        reopened.slots[2].limit = Some(PurchaseLimit {
+            remaining: 0,
+            total: 1,
+        });
+        assert!(ctrl.handle(snap(reopened, 3)).is_empty());
+        assert_eq!(ctrl.progress().refreshes, 1);
+    }
+
+    #[test]
+    fn zero_id_slot_disables_dedup() {
+        let mut ctrl = started(Limits::default());
+        let mut holed = with_ids(dud_shop(None));
+        holed.slots[5].id = 0;
+        assert_eq!(ctrl.handle(snap(holed.clone(), 1)), vec![Action::Refresh]);
+        // No usable identity: the identical re-send evaluates again (fail open).
+        assert_eq!(ctrl.handle(snap(holed, 2)), vec![Action::Refresh]);
+        assert_eq!(ctrl.progress().refreshes, 2);
+    }
+
+    #[test]
+    fn new_shop_while_paused_no_match_refreshes() {
+        let mut ctrl = started(Limits::default());
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+        assert_eq!(ctrl.status(), Status::Paused);
+        // Hourly auto-refresh replaced the shop: different ids, no match.
+        let mut fresh = with_ids(dud_shop(None));
+        for item in &mut fresh.slots {
+            item.id += 100;
+        }
+        let actions = ctrl.handle(snap(fresh, 2));
+        assert_eq!(actions, vec![Action::Refresh]);
+        assert_eq!(ctrl.status(), Status::Watching);
+    }
+
+    #[test]
+    fn new_shop_while_paused_rebuilds_checklist() {
+        let mut ctrl = started(Limits::default());
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1)); // checklist [102]
+        let mut fresh = with_ids(hit_shop(None));
+        for item in &mut fresh.slots {
+            item.id += 100; // new shop, matching slot now id 202
+        }
+        let actions = ctrl.handle(snap(fresh, 2));
+        assert_eq!(actions, vec![Action::Alert { slots: vec![3] }]);
+        assert_eq!(ctrl.checklist(), &[202]);
+        // The stale id is gone; only the new one clears the pause.
+        assert!(ctrl.handle(buy(102, 3)).is_empty());
+        assert_eq!(ctrl.status(), Status::Paused);
+        assert_eq!(ctrl.handle(buy(202, 4)), vec![Action::Refresh]);
+        assert_eq!(ctrl.status(), Status::Watching);
+    }
+
+    #[test]
+    fn pre_start_snapshot_then_identical_after_start_is_evaluated() {
+        let mut ctrl = controller(Limits::default());
+        assert!(ctrl.handle(snap(with_ids(dud_shop(None)), 1)).is_empty());
+        ctrl.handle(Event::Start { now_ms: 2 });
+        // Stored but never acted on: the same shop must evaluate after start.
+        let actions = ctrl.handle(snap(with_ids(dud_shop(None)), 3));
+        assert_eq!(actions, vec![Action::Refresh]);
+    }
+
+    #[test]
+    fn restart_evaluates_same_shop_again() {
+        let mut ctrl = started(Limits::default());
+        assert_eq!(
+            ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
+            vec![Action::Refresh]
+        );
+        ctrl.handle(Event::Stop);
+        ctrl.handle(Event::Start { now_ms: 2 });
+        // `Start` cleared the fingerprint: the same shop opens the new session.
+        let actions = ctrl.handle(snap(with_ids(dud_shop(None)), 3));
+        assert_eq!(actions, vec![Action::Refresh]);
+    }
+
+    fn empty_shop() -> ShopSnapshot {
+        ShopSnapshot {
+            merchant: None,
+            slots: Vec::new(),
+            refresh: None,
+        }
+    }
+
+    #[test]
+    fn empty_snapshot_while_paused_is_stored_not_evaluated() {
+        let mut ctrl = started(Limits::default());
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+        assert_eq!(ctrl.status(), Status::Paused);
+        // A degraded slotless message must not wipe the pending checklist.
+        assert!(ctrl.handle(snap(empty_shop(), 2)).is_empty());
+        assert_eq!(ctrl.status(), Status::Paused);
+        assert_eq!(ctrl.checklist(), &[102]);
+        // Still stored for the view.
+        assert!(ctrl.last_snapshot().unwrap().slots.is_empty());
+    }
+
+    #[test]
+    fn empty_snapshot_never_advises_refresh() {
+        let mut ctrl = started(Limits::default());
+        assert!(ctrl.handle(snap(empty_shop(), 1)).is_empty());
+        assert_eq!(ctrl.progress().refreshes, 0);
+    }
+
+    #[test]
+    fn unidentifiable_snapshot_while_paused_stored_only() {
+        let mut ctrl = started(Limits::default());
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+        assert_eq!(ctrl.status(), Status::Paused);
+        // All ids omitted: a duplicate cannot be told from a new shop, so
+        // nothing may be re-evaluated over the pending purchase.
+        assert!(ctrl.handle(snap(dud_shop(None), 2)).is_empty());
+        assert_eq!(ctrl.status(), Status::Paused);
+        assert_eq!(ctrl.checklist(), &[102]);
+        assert_eq!(ctrl.progress().refreshes, 0);
+    }
+
+    #[test]
+    fn same_ids_new_roll_is_evaluated() {
+        let mut ctrl = started(Limits::default());
+        assert_eq!(
+            ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
+            vec![Action::Refresh]
+        );
+        // A paid re-roll can redraw the same catalog ids: a changed per-roll
+        // field (here the price) makes it a new shop, not a duplicate.
+        let mut reroll = with_ids(dud_shop(None));
+        reroll.slots[0].price = Some(120_000);
+        assert_eq!(ctrl.handle(snap(reroll, 2)), vec![Action::Refresh]);
+        assert_eq!(ctrl.progress().refreshes, 2);
+    }
+
+    #[test]
+    fn fail_open_snapshot_keeps_last_identity() {
+        let mut ctrl = started(Limits::default());
+        assert_eq!(
+            ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
+            vec![Action::Refresh]
+        );
+        // An unidentifiable shop evaluates (fail open) but must not erase
+        // the remembered identity...
+        let mut holed = with_ids(dud_shop(None));
+        holed.slots[5].id = 0;
+        assert_eq!(ctrl.handle(snap(holed, 2)), vec![Action::Refresh]);
+        // ...so a stale verbatim duplicate of the first shop is still muted.
+        assert!(ctrl.handle(snap(with_ids(dud_shop(None)), 3)).is_empty());
+        assert_eq!(ctrl.progress().refreshes, 2);
+    }
+
+    #[test]
+    fn sold_out_match_excluded_from_checklist() {
+        // A sold-out slot can match (include_sold_out) but can never produce
+        // a purchase echo: it must not hold the checklist open.
+        let filter = Filter {
+            kinds: vec![Equipment],
+            include_sold_out: true,
+            ..Filter::default()
+        };
+        let mut ctrl = Controller::new(filter, Limits::default());
+        ctrl.handle(Event::Start { now_ms: 0 });
+        let mut shop = with_ids(hit_shop(None));
+        shop.slots[2].limit = Some(PurchaseLimit {
+            remaining: 0,
+            total: 1,
+        });
+        let actions = ctrl.handle(snap(shop, 1));
+        assert_eq!(actions, vec![Action::Alert { slots: vec![3] }]);
+        assert_eq!(ctrl.status(), Status::Paused);
+        assert!(ctrl.checklist().is_empty()); // manual `resume` flow
     }
 
     #[test]
@@ -606,33 +1046,34 @@ mod tests {
     }
 
     #[test]
-    fn spend_limit_unenforceable_when_refresh_meta_absent() {
+    fn max_spend_enforced_without_meta_via_constant_cost() {
+        // Budget 7, no meta ever: the constant 3-crystal cost tracks spend
+        // from the very first refresh — two fit, a third would cross.
         let mut ctrl = started(Limits {
-            max_spend: Some(6),
+            max_spend: Some(7),
             ..Limits::default()
         });
-        assert!(!ctrl.limits_enforceable());
-        // Cost unknown: refreshes flow, spend cannot be tracked.
-        for now in 1..=5 {
-            assert_eq!(
-                ctrl.handle(snap(dud_shop(None), now)),
-                vec![Action::Refresh]
-            );
-        }
-        assert_eq!(ctrl.progress().spent, 0);
+        assert_eq!(ctrl.handle(snap(dud_shop(None), 1)), vec![Action::Refresh]);
+        assert_eq!(ctrl.handle(snap(dud_shop(None), 2)), vec![Action::Refresh]);
+        assert_eq!(ctrl.progress().spent, 6);
+        let actions = ctrl.handle(snap(dud_shop(None), 3));
+        assert_eq!(actions, vec![Action::Halt(StopReason::MaxSpend)]);
+    }
 
-        // The first snapshot carrying the cost engages the limit.
+    #[test]
+    fn wire_cost_overrides_the_constant() {
+        // A server-sent cost of 5 replaces the constant: one refresh fits
+        // the budget of 7, the next would cross.
+        let mut ctrl = started(Limits {
+            max_spend: Some(7),
+            ..Limits::default()
+        });
         assert_eq!(
-            ctrl.handle(snap(dud_shop(Some(meta(100, 3))), 6)),
+            ctrl.handle(snap(dud_shop(Some(meta(100, 5))), 1)),
             vec![Action::Refresh]
         );
-        assert!(ctrl.limits_enforceable());
-        assert_eq!(ctrl.progress().spent, 3);
-        assert_eq!(
-            ctrl.handle(snap(dud_shop(Some(meta(97, 3))), 7)),
-            vec![Action::Refresh]
-        );
-        let actions = ctrl.handle(snap(dud_shop(Some(meta(94, 3))), 8));
+        assert_eq!(ctrl.progress().spent, 5);
+        let actions = ctrl.handle(snap(dud_shop(Some(meta(95, 5))), 2));
         assert_eq!(actions, vec![Action::Halt(StopReason::MaxSpend)]);
     }
 
