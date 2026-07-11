@@ -57,7 +57,11 @@ fn fatal(message: String) -> ExitCode {
 /// Console-only build: the session blocks the main thread, as before.
 #[cfg(not(feature = "gui"))]
 fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
-    match runtime.block_on(app::run(config)) {
+    let outcome = runtime.block_on(app::run(config));
+    // Not a plain drop: tokio::io::stdin parks an uncancelable blocking read,
+    // and dropping the runtime would hang exit until the player presses Enter.
+    runtime.shutdown_background();
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("Fatal error: {err}");
