@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use crate::domain::control::{Action, Controller, Event, Status};
 use crate::journal::EventLog;
 use crate::render::{describe, format_item, refusal, render_shop, status_label};
+use crate::uplink::UplinkEvent;
 use crate::uplink::protocol::{PurchaseNotice, ServerMessage};
 use crate::watch::WatchGate;
 
@@ -27,7 +28,7 @@ pub(super) async fn session_loop(
     gate: &WatchGate,
     journal: &EventLog,
     mut commands: mpsc::Receiver<Command>,
-    mut messages: mpsc::Receiver<ServerMessage>,
+    mut messages: mpsc::Receiver<UplinkEvent>,
     mut capture_errors: mpsc::Receiver<String>,
 ) -> Option<String> {
     let now_ms = || journal.now_ms();
@@ -47,7 +48,18 @@ pub(super) async fn session_loop(
                 None => commands_open = false,
             },
             message = messages.recv() => match message {
-                Some(message) => on_message(controller, gate, journal, message, now_ms()),
+                Some(UplinkEvent::Message(message)) => {
+                    on_message(controller, gate, journal, message, now_ms());
+                }
+                // An armed watch with a dead link looks exactly like a closed
+                // shop: without these lines the player cannot tell them apart.
+                Some(UplinkEvent::LinkDown(reason)) => emit(
+                    journal,
+                    &[format!(">> server link down: {reason} — retrying, no shop can arrive")],
+                ),
+                Some(UplinkEvent::LinkUp) => {
+                    emit(journal, &[">> server link restored".to_owned()]);
+                }
                 None => break, // uplink gone.
             },
             error = capture_errors.recv(), if capture_open => match error {
@@ -330,7 +342,7 @@ mod tests {
         assert!(gate.is_enabled());
 
         let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
-        let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(1);
+        let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
         let (_error_tx, error_rx) = mpsc::channel::<String>(1);
         drop(message_tx); // uplink gone: the loop must exit and tear down.
         let failure = session_loop(
@@ -352,6 +364,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uplink_outage_and_recovery_reach_the_journal() {
+        let gate = WatchGate::new(false);
+        let journal = EventLog::default();
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
+
+        let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
+        let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(4);
+        let (_error_tx, error_rx) = mpsc::channel::<String>(1);
+        message_tx
+            .send(UplinkEvent::LinkDown("connection refused".to_owned()))
+            .await
+            .unwrap();
+        message_tx.send(UplinkEvent::LinkUp).await.unwrap();
+        drop(message_tx); // then the loop exits.
+        session_loop(
+            &controller,
+            &gate,
+            &journal,
+            command_rx,
+            message_rx,
+            error_rx,
+        )
+        .await;
+
+        let entries = journal.entries();
+        assert!(
+            entries
+                .iter()
+                .any(|line| line.text.contains("server link down: connection refused"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|line| line.text.contains("server link restored"))
+        );
+    }
+
+    #[tokio::test]
     async fn capture_failure_reaches_journal_gate_and_caller() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
@@ -365,7 +418,7 @@ mod tests {
         let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
         // Kept alive: the loop must exit through the capture error, not a
         // channel cascade.
-        let (_message_tx, message_rx) = mpsc::channel::<ServerMessage>(1);
+        let (_message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
         let (error_tx, error_rx) = mpsc::channel::<String>(1);
         error_tx.send("driver gone".to_owned()).await.unwrap();
 
@@ -396,7 +449,7 @@ mod tests {
         let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
 
         let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
-        let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(1);
+        let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
         let (_error_tx, error_rx) = mpsc::channel::<String>(1);
         drop(message_tx);
         session_loop(

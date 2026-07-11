@@ -11,6 +11,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::{debug, info, warn};
 
+use super::UplinkEvent;
 use super::protocol::ServerMessage;
 
 /// Outcome of one connection session.
@@ -28,24 +29,42 @@ enum Outcome {
 pub async fn run(
     url: String,
     mut outbound: mpsc::Receiver<Vec<u8>>,
-    inbound: mpsc::Sender<ServerMessage>,
+    inbound: mpsc::Sender<UplinkEvent>,
     initial_backoff: Duration,
     max_backoff: Duration,
 ) {
     let floor = initial_backoff.max(Duration::from_millis(100));
     let mut backoff = floor;
+    // The player only hears transitions: the first failure reports the outage,
+    // each retry stays a tracing detail, recovery reports once.
+    let mut outage_reported = false;
 
     loop {
         match connect_async(&url).await {
             Ok((stream, _response)) => {
                 info!(url = %url, "server link established");
+                if std::mem::take(&mut outage_reported) {
+                    let _ = inbound.send(UplinkEvent::LinkUp).await;
+                }
                 backoff = floor;
                 match pump(stream, &mut outbound, &inbound).await {
                     Outcome::Shutdown => return,
-                    Outcome::Disconnected => warn!("server link interrupted"),
+                    Outcome::Disconnected => {
+                        warn!("server link interrupted");
+                        outage_reported = true;
+                        let _ = inbound
+                            .send(UplinkEvent::LinkDown("connection interrupted".to_owned()))
+                            .await;
+                    }
                 }
             }
-            Err(err) => warn!(url = %url, error = %err, "server connection failed"),
+            Err(err) => {
+                warn!(url = %url, error = %err, "server connection failed");
+                if !outage_reported {
+                    outage_reported = true;
+                    let _ = inbound.send(UplinkEvent::LinkDown(err.to_string())).await;
+                }
+            }
         }
 
         if outbound.is_closed() {
@@ -92,7 +111,7 @@ async fn drain_until(outbound: &mut mpsc::Receiver<Vec<u8>>, wait: Duration) -> 
 async fn pump<S>(
     stream: S,
     outbound: &mut mpsc::Receiver<Vec<u8>>,
-    inbound: &mpsc::Sender<ServerMessage>,
+    inbound: &mpsc::Sender<UplinkEvent>,
 ) -> Outcome
 where
     S: Stream<Item = Result<Message, WsError>> + Sink<Message, Error = WsError> + Unpin,
@@ -124,10 +143,10 @@ where
 }
 
 /// Decodes a server message and pushes it downstream (undecodable ones dropped).
-async fn forward(payload: &[u8], inbound: &mpsc::Sender<ServerMessage>) {
+async fn forward(payload: &[u8], inbound: &mpsc::Sender<UplinkEvent>) {
     match serde_json::from_slice::<ServerMessage>(payload) {
         Ok(message) => {
-            let _ = inbound.send(message).await;
+            let _ = inbound.send(UplinkEvent::Message(message)).await;
         }
         Err(err) => debug!(error = %err, "unrecognized server message, ignored"),
     }

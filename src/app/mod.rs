@@ -15,7 +15,7 @@ use crate::domain::filter::Filter;
 use crate::journal::EventLog;
 use crate::render::print_controls;
 use crate::stream::Reassembler;
-use crate::uplink::protocol::ServerMessage;
+use crate::uplink::UplinkEvent;
 use crate::watch::WatchGate;
 use crate::{Config, Result};
 
@@ -122,7 +122,7 @@ impl Session {
         } = handles;
         let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(8_192);
         let (raw_tx, raw_rx) = mpsc::channel::<Vec<u8>>(1_024);
-        let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(256);
+        let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(256);
         let (capture_error_tx, capture_error_rx) = mpsc::channel::<String>(1);
 
         // Blocking capture on a dedicated thread (WinDivert::recv is synchronous).
