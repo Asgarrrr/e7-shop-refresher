@@ -4,6 +4,8 @@
 //! the job the moment the world changes underneath it.
 
 pub mod plan;
+#[cfg(all(windows, feature = "actuator"))]
+pub mod win;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

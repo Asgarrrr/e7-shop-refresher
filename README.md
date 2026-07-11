@@ -1,16 +1,17 @@
 # Arkyve — Refresh Shop
 
-Local relay for Epic Seven's Secret Shop. **Strictly passive and read-only**: it
-observes a copy of the game's traffic, forwards the raw stream to an analysis
-server, and displays the alerts it gets back. It automates nothing, sends no
-data to the game, and never alters its communications.
+Local relay for Epic Seven's Secret Shop. The capture side is read-only: it
+observes a copy of the game's traffic and forwards the raw stream to an
+analysis server; the game's network traffic is never altered. On Windows the
+tool drives the shop itself from the decoded snapshots — it refreshes and
+buys matched items via click emulation.
 
 ## How it works
 
 ```
 WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket ─▶ server
    (blocking)                       (ordered/dedup)                  ▲         │
-                                                                 alerts ◀──────┘
+                                                              snapshots ◀──────┘
 ```
 
 - **Capture**: WinDivert in `SNIFF` + `RECV_ONLY` mode yields a *copy* of the
@@ -20,17 +21,19 @@ WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ Web
 - **Forwarding**: the raw server → client stream is sent as-is to the analysis
   server. Decryption and interpretation happen **server-side** — the client
   decrypts nothing.
-- **Display & control**: each decoded shop snapshot is fed to the refresh-loop
+- **Control**: each decoded shop snapshot is fed to the refresh-loop
   controller, which checks it against the `[filter]` criteria from
-  `config.toml`: no match → it advises a refresh (the relay stays passive —
-  nothing is sent to the game); match → it alerts with the item details and
-  pauses. The purchase confirmations decoded from the traffic check the
-  matched items off, and the loop resumes on its own once the last one is
-  bought. A `[limits]` threshold reached → it stops the session. The default
-  build opens an **egui window** (status, shop table, session journal,
-  Start/Stop buttons, live filter/limits editors — edits are session-only,
-  `config.toml` is not rewritten); there is no console beside the window —
-  the journal carries every session line.
+  `config.toml`: no match → the tool clicks Refresh (and its confirmation) in
+  the game window; match → it shows the item details, pauses the refreshes,
+  and buys the matched items the same way. The purchase confirmations decoded
+  from the traffic check the matched items off, and the loop resumes on its
+  own once the last one is bought. A `[limits]` threshold reached → it stops
+  the session. `[actuator] dry_run = true` journals the planned clicks
+  instead of sending them. The default build opens an **egui window**
+  (status, shop table, session journal, Start/Stop buttons, live
+  filter/limits editors — edits are session-only, `config.toml` is not
+  rewritten); there is no console beside the window — the journal carries
+  every session line.
 
 The relay starts **idle** (nothing is captured or forwarded): press **Start**
 in the window (or type `start` in the console) when opening the shop to arm
@@ -80,6 +83,7 @@ a missing file falls back to the defaults.
 | `forward.client_to_server` | `false` | Forward requests (context) |
 | `[filter]` | matches everything | Item interest criteria (kinds, sets, substats, price) |
 | `[limits]` | no limits | Session stop limits (refreshes, crystals, matches, duration) |
+| `[actuator]` | live | `dry_run = true` journals planned clicks without sending input |
 
 ## Running
 

@@ -98,8 +98,19 @@ pub fn setup(config: Config) -> (Session, SessionHandles) {
     (session, handles)
 }
 
-/// No input backend is wired yet: decisions stay advice whatever the config
+/// Live clicking unless the config asks for a dry run.
+#[cfg(all(windows, feature = "actuator"))]
+fn actuator_mode(config: &Config) -> Mode {
+    if config.actuator.dry_run {
+        Mode::DryRun
+    } else {
+        Mode::Live
+    }
+}
+
+/// No input backend compiled: decisions stay advice whatever the config
 /// says.
+#[cfg(not(all(windows, feature = "actuator")))]
 fn actuator_mode(_config: &Config) -> Mode {
     Mode::Off
 }
@@ -182,11 +193,27 @@ impl Session {
             tokio::spawn(reassemble_loop(segment_rx, raw_tx, config.forward.clone())),
         );
 
+        // Click jobs -> the game window; without an input backend they are
+        // drained and dropped.
+        #[cfg(all(windows, feature = "actuator"))]
+        supervise_task(
+            "actuator",
+            &fatal_tx,
+            tokio::spawn(crate::actuator::run_executor(
+                crate::actuator::win::WinSurface,
+                job_rx,
+                gate.clone(),
+                actuator.epoch.clone(),
+                journal.clone(),
+                commands.clone(),
+                actuator.mode == Mode::DryRun,
+            )),
+        );
+        #[cfg(not(all(windows, feature = "actuator")))]
+        supervise_task("actuator", &fatal_tx, tokio::spawn(drain_jobs(job_rx)));
+
         // Keyboard input, decoupled from the session loop through the channel.
         supervise_task("stdin", &fatal_tx, tokio::spawn(stdin_loop(commands)));
-
-        // Click jobs; without an input backend they are drained and dropped.
-        supervise_task("actuator", &fatal_tx, tokio::spawn(drain_jobs(job_rx)));
 
         info!(server = %config.server_url, "relay started — idle, `start` arms the watch");
         print_controls();
@@ -213,6 +240,7 @@ impl Session {
 
 /// No input backend compiled: consume queued click jobs so submitters never
 /// see a full queue for the wrong reason.
+#[cfg(not(all(windows, feature = "actuator")))]
 async fn drain_jobs(mut jobs: mpsc::Receiver<plan::Job>) {
     while jobs.recv().await.is_some() {}
 }

@@ -1,14 +1,15 @@
 //! Secret Shop relay.
 //!
-//! A fully passive pipeline: it *observes* a copy of the game's traffic,
-//! reassembles it into an ordered stream, and forwards the raw bytes to the
-//! analysis server, which interprets them. The relay never alters
-//! the game's communications and never sends anything back to the game.
+//! The capture side *observes* a copy of the game's traffic, reassembles it
+//! into an ordered stream, and forwards the raw bytes to the analysis
+//! server, which interprets them; the game's network traffic is never
+//! altered. On Windows the tool also drives the Secret Shop itself via
+//! click emulation (refresh and buy), steered by the decoded snapshots.
 //!
 //! ```text
 //! WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket ─▶ server
 //!    (blocking)                       (ordered/dedup)                  ▲         │
-//!                                                                  alerts ◀──────┘
+//!                                                               snapshots ◀──────┘
 //! ```
 
 pub mod actuator;

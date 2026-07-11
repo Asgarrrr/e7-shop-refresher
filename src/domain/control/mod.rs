@@ -143,11 +143,11 @@ pub struct Progress {
     pub matches_found: u32,
 }
 
-/// Invariant: the relay stays passive — a refresh is only requested in
-/// reaction to a no-match snapshot or the purchase clearing the last
-/// checklist entry; duplicate snapshots and snapshots received while
-/// unarmed (`Idle`/`Stopped`) never trigger one (they are still stored for
-/// the view).
+/// Invariant: refreshes are reactive — one is only requested in reaction to
+/// a no-match snapshot or the purchase clearing the last checklist entry;
+/// duplicate snapshots and snapshots received while unarmed
+/// (`Idle`/`Stopped`) never trigger one (they are still stored for the
+/// view).
 pub struct Controller {
     filter: Filter,
     limits: Limits,

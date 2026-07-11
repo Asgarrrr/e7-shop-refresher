@@ -3,18 +3,21 @@ name = "arkyve-refresh-shop"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Passive local relay that captures Epic Seven Secret Shop traffic and forwards it to the analysis server."
+description = "Local relay that captures Epic Seven Secret Shop traffic, forwards it to the analysis server, and drives the refresh loop by clicking the game window."
 license = "MIT"
 publish = false
 
 [features]
-default = ["windivert-backend", "gui"]
+default = ["windivert-backend", "gui", "actuator"]
 # Native Windows capture backend (WinDivert). Disable to build/test the pipeline
 # (reassembly, uplink, models) without the WinDivert SDK.
 windivert-backend = ["dep:windivert"]
 # egui window over the session (dashboard + player commands). Disable for the
 # console-only build.
 gui = ["dep:eframe"]
+# Click-emulation input backend (SendInput). Only acts on Windows; elsewhere
+# the executor is replaced by a job-draining stub.
+actuator = ["dep:windows-sys"]
 
 [dependencies]
 tokio = { version = "1", features = [
@@ -50,6 +53,13 @@ eframe = { version = "0.35", optional = true, default-features = false, features
 
 [target.'cfg(windows)'.dependencies]
 windivert = { version = "0.7.0-beta.4", optional = true }
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 # Headless widget-interaction tests for the ui module (no renderer needed).
