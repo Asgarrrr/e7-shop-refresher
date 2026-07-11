@@ -35,10 +35,10 @@ pub fn parse_segment(bytes: &[u8], game_port: u16) -> Option<Segment> {
         return None;
     };
 
-    // Skip pure ACKs (no data, no SYN/FIN): they carry no stream bytes and are
-    // ~half the packets on an active connection. SYN/FIN are kept (baseline /
-    // teardown signal).
-    if tcp.payload().is_empty() && !tcp.syn() && !tcp.fin() {
+    // Skip control packets that carry no stream bytes (pure ACKs, and pure
+    // FINs — reassembly never tears a half-stream down on FIN). Only SYN, which
+    // anchors the baseline, and data-bearing segments matter.
+    if tcp.payload().is_empty() && !tcp.syn() {
         return None;
     }
 
@@ -70,7 +70,6 @@ pub fn parse_segment(bytes: &[u8], game_port: u16) -> Option<Segment> {
         direction,
         seq: tcp.sequence_number(),
         syn: tcp.syn(),
-        fin: tcp.fin(),
         payload: tcp.payload().to_vec(),
     })
 }

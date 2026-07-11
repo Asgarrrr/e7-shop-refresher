@@ -37,7 +37,6 @@ pub struct Segment {
     /// TCP sequence number of the first byte of `payload`.
     pub seq: u32,
     pub syn: bool,
-    pub fin: bool,
     pub payload: Vec<u8>,
 }
 

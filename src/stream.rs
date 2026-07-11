@@ -43,9 +43,10 @@ impl Reassembler {
     /// Integrates a segment and returns the newly contiguous (ordered) bytes.
     ///
     /// Returns an empty vector when the segment is a duplicate, partially fills
-    /// a gap, or still waits on a missing segment. The half-stream is never torn
-    /// down on FIN: a reordered FIN arriving before a gap-filling segment must
-    /// not discard already-buffered data.
+    /// a gap, or still waits on a missing segment. FIN is not modelled: a
+    /// half-stream is never torn down, so a segment reordered ahead of a gap
+    /// (a FIN-flagged one included) keeps its buffered payload until the gap
+    /// fills.
     pub fn push(&mut self, segment: &Segment) -> Vec<u8> {
         let key = (segment.flow, segment.direction);
         self.clock += 1;
@@ -209,25 +210,23 @@ mod tests {
         }
     }
 
-    fn seg(seq: u32, syn: bool, fin: bool, payload: &[u8]) -> Segment {
+    fn seg(seq: u32, syn: bool, payload: &[u8]) -> Segment {
         Segment {
             flow: flow(),
             direction: Direction::ServerToClient,
             seq,
             syn,
-            fin,
             payload: payload.to_vec(),
         }
     }
 
-    /// A plain data segment on a given flow (no SYN/FIN): for multi-flow tests.
+    /// A plain data segment on a given flow (no SYN): for multi-flow tests.
     fn seg_on(flow: FlowKey, seq: u32, payload: &[u8]) -> Segment {
         Segment {
             flow,
             direction: Direction::ServerToClient,
             seq,
             syn: false,
-            fin: false,
             payload: payload.to_vec(),
         }
     }
@@ -235,79 +234,69 @@ mod tests {
     #[test]
     fn in_order() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
-        assert_eq!(r.push(&seg(1002, false, false, b"CD")), b"CD");
+        assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
+        assert_eq!(r.push(&seg(1002, false, b"CD")), b"CD");
     }
 
     #[test]
     fn reordering_flushes_multiple_buffered_segments() {
         let mut r = Reassembler::new();
         // Baseline is set by the first observed segment.
-        assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
+        assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
         // Two future segments arrive out of order: nothing deliverable yet.
-        assert!(r.push(&seg(1006, false, false, b"GH")).is_empty());
-        assert!(r.push(&seg(1004, false, false, b"EF")).is_empty());
+        assert!(r.push(&seg(1006, false, b"GH")).is_empty());
+        assert!(r.push(&seg(1004, false, b"EF")).is_empty());
         // Filling the gap flushes everything buffered, in order.
-        assert_eq!(r.push(&seg(1002, false, false, b"CD")), b"CDEFGH");
+        assert_eq!(r.push(&seg(1002, false, b"CD")), b"CDEFGH");
     }
 
     #[test]
     fn retransmission_is_ignored() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
-        assert!(r.push(&seg(1000, false, false, b"AB")).is_empty());
+        assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
+        assert!(r.push(&seg(1000, false, b"AB")).is_empty());
     }
 
     #[test]
     fn overlapping_segment_keeps_only_fresh_tail() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(&seg(1000, false, false, b"ABCD")), b"ABCD");
+        assert_eq!(r.push(&seg(1000, false, b"ABCD")), b"ABCD");
         // Overlaps "CD" (already seen) and brings "EF".
-        assert_eq!(r.push(&seg(1002, false, false, b"CDEF")), b"EF");
+        assert_eq!(r.push(&seg(1002, false, b"CDEF")), b"EF");
     }
 
     #[test]
     fn syn_sets_the_baseline() {
         let mut r = Reassembler::new();
         // The SYN (seq 999, no data) anchors the origin at 1000.
-        assert!(r.push(&seg(999, true, false, b"")).is_empty());
-        assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
+        assert!(r.push(&seg(999, true, b"")).is_empty());
+        assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
     }
 
     #[test]
     fn gap_filled_out_of_order() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
-        assert!(r.push(&seg(1004, false, false, b"EF")).is_empty()); // gap.
-        assert_eq!(r.push(&seg(1002, false, false, b"CD")), b"CDEF");
-    }
-
-    #[test]
-    fn fin_does_not_discard_buffered_data() {
-        let mut r = Reassembler::new();
-        assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
-        // A reordered FIN, ahead of a gap, must not drop its payload.
-        assert!(r.push(&seg(1004, false, true, b"EF")).is_empty());
-        // The gap-filling segment flushes the FIN's data too.
-        assert_eq!(r.push(&seg(1002, false, false, b"CD")), b"CDEF");
+        assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
+        assert!(r.push(&seg(1004, false, b"EF")).is_empty()); // gap.
+        assert_eq!(r.push(&seg(1002, false, b"CD")), b"CDEF");
     }
 
     #[test]
     fn reassembles_across_sequence_wrap() {
         let mut r = Reassembler::new();
         // Baseline just before the u32 sequence space wraps.
-        assert_eq!(r.push(&seg(0xFFFF_FFFE, false, false, b"AB")), b"AB");
+        assert_eq!(r.push(&seg(0xFFFF_FFFE, false, b"AB")), b"AB");
         // The next segment is at 0x0000_0000 (wrap): still contiguous.
-        assert_eq!(r.push(&seg(0x0000_0000, false, false, b"CD")), b"CD");
+        assert_eq!(r.push(&seg(0x0000_0000, false, b"CD")), b"CD");
     }
 
     #[test]
     fn reordering_across_wrap_is_ordered_correctly() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(&seg(0xFFFF_FFFE, false, false, b"AB")), b"AB");
+        assert_eq!(r.push(&seg(0xFFFF_FFFE, false, b"AB")), b"AB");
         // A post-wrap future segment is buffered, then the gap is filled.
-        assert!(r.push(&seg(0x0000_0002, false, false, b"EF")).is_empty());
-        assert_eq!(r.push(&seg(0x0000_0000, false, false, b"CD")), b"CDEF");
+        assert!(r.push(&seg(0x0000_0002, false, b"EF")).is_empty());
+        assert_eq!(r.push(&seg(0x0000_0000, false, b"CD")), b"CDEF");
     }
 
     #[test]
@@ -355,10 +344,10 @@ mod tests {
     #[test]
     fn clear_resets_baseline_for_resync() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push(&seg(1000, false, false, b"AB")), b"AB");
+        assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
         // After a pause the state is wiped: a far-ahead segment becomes a new
         // origin instead of being buffered forever.
         r.clear();
-        assert_eq!(r.push(&seg(9000, false, false, b"XY")), b"XY");
+        assert_eq!(r.push(&seg(9000, false, b"XY")), b"XY");
     }
 }
