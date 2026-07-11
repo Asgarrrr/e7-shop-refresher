@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn format_item_slot_falls_back_to_position_like_the_table() {
         // A slot-omitting item (slot 0) at position 1 must read "slot 2", the
-        // same number the alert header and the GUI table derive — no more
+        // same number the match header and the GUI table derive — no more
         // "slot 0" in the detail line beside a "slot 2" header.
         let item = ShopItem::default();
         assert_eq!(item.slot, 0);

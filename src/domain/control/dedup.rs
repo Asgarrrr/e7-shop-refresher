@@ -1,5 +1,5 @@
 //! Snapshot identity for duplicate suppression: an identical re-arrival of
-//! an already-acted-on shop must never double-bill a refresh or re-alert.
+//! an already-acted-on shop must never double-bill a refresh or re-buy.
 
 use crate::domain::shop::{ShopSnapshot, SubStat};
 

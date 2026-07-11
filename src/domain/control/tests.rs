@@ -213,7 +213,7 @@ fn tick_while_paused_ignores_non_timeout_limits() {
 }
 
 #[test]
-fn snapshot_match_alerts_and_pauses_without_refresh() {
+fn snapshot_match_pauses_without_refresh() {
     let mut ctrl = started(Limits::default());
     let actions = ctrl.handle(snap(hit_shop(None), 1));
     assert_eq!(
@@ -404,7 +404,7 @@ fn duplicate_snapshot_still_absorbs_refresh_meta() {
 }
 
 #[test]
-fn duplicate_hit_shop_while_paused_does_not_realert() {
+fn duplicate_hit_shop_while_paused_does_not_rematch() {
     let mut ctrl = started(Limits::default());
     ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     assert_eq!(ctrl.progress().matches_found, 1);

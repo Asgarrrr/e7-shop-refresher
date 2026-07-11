@@ -78,6 +78,12 @@ const SCROLL_ZONE: Zone = Zone {
     anchor: Anchor::Right,
 };
 
+/// The clickable 0-based row of a 1-based display slot; `None` for anything
+/// a degraded shop put outside the six rows — never a click.
+pub fn row_for_slot(slot: u8) -> Option<u8> {
+    slot.checked_sub(1).filter(|&row| row <= 5)
+}
+
 /// The Buy button of a 0-based row. Rows 0..=3 are clickable at scroll-top;
 /// 4..=5 only at scroll-bottom, where the whole list sits 217 design px
 /// higher.
@@ -469,6 +475,14 @@ mod tests {
         let first = jitter.point_in(REFRESH);
         let second = jitter.point_in(REFRESH);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn row_for_slot_maps_the_six_slots_and_rejects_the_rest() {
+        assert_eq!(row_for_slot(1), Some(0));
+        assert_eq!(row_for_slot(6), Some(5));
+        assert_eq!(row_for_slot(0), None);
+        assert_eq!(row_for_slot(7), None);
     }
 
     #[test]

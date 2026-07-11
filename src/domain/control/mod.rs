@@ -144,7 +144,7 @@ pub struct Progress {
     pub refreshes: u32,
     /// Crystals committed to refreshes.
     pub spent: u32,
-    /// Items matched (alerted), not purchases.
+    /// Items matched, not purchases.
     pub matches_found: u32,
 }
 
@@ -330,36 +330,7 @@ impl Controller {
             self.acted_fingerprint = fingerprint;
         }
 
-        let mut targets: Vec<BuyTarget> = Vec::new();
-        // Buys are planned against the last echoed gold balance, debited in
-        // click order: the second 184k bookmark of a 200k purse must not be
-        // clicked. An unknown balance or price fails open.
-        let mut gold = self.gold_balance;
-        let mut buyable = false;
-        for (index, item) in snapshot.slots.iter().enumerate() {
-            if !self.filter.matches(item) {
-                continue;
-            }
-            let affordable = match (gold, item.price) {
-                (Some(balance), Some(price)) => price <= balance,
-                _ => true,
-            };
-            // In reach of a buy — the tool's or the player's: in stock and
-            // within the known gold.
-            let in_reach = !item.is_sold_out() && affordable;
-            if in_reach && let (Some(balance), Some(price)) = (gold, item.price) {
-                gold = Some(balance - price);
-            }
-            buyable |= in_reach;
-            targets.push(BuyTarget {
-                slot: item.effective_slot(index),
-                // Only ids a purchase echo can actually name AND a buy can
-                // actually land: the id-0 sentinel never appears in an echo,
-                // and a sold-out or unaffordable slot cannot be bought —
-                // none may hold the checklist open (nor be clicked).
-                id: item.catalog_id().filter(|_| in_reach),
-            });
-        }
+        let (targets, buyable) = self.plan_targets(snapshot);
         // Alignment by construction: the checklist is exactly the clickable
         // targets, so an actuator buying `id: Some` targets clears the pause.
         self.checklist = targets.iter().filter_map(|target| target.id).collect();
@@ -390,6 +361,40 @@ impl Controller {
         // next gate, which re-checks every stop reason.
         self.status = Status::Paused;
         vec![Action::Buy { targets }]
+    }
+
+    /// The matched slots, each clickable or display-only, planned against
+    /// the last echoed gold balance debited in click order (the second 184k
+    /// bookmark of a 200k purse is out of reach). An unknown balance or
+    /// price fails open. The flag says whether anything at all is in reach
+    /// of a buy — the tool's or the player's.
+    fn plan_targets(&self, snapshot: &ShopSnapshot) -> (Vec<BuyTarget>, bool) {
+        let mut targets = Vec::new();
+        let mut gold = self.gold_balance;
+        let mut buyable = false;
+        for (index, item) in snapshot.slots.iter().enumerate() {
+            if !self.filter.matches(item) {
+                continue;
+            }
+            let affordable = match (gold, item.price) {
+                (Some(balance), Some(price)) => price <= balance,
+                _ => true,
+            };
+            let in_reach = !item.is_sold_out() && affordable;
+            if in_reach && let (Some(balance), Some(price)) = (gold, item.price) {
+                gold = Some(balance - price);
+            }
+            buyable |= in_reach;
+            targets.push(BuyTarget {
+                slot: item.effective_slot(index),
+                // Only ids a purchase echo can actually name AND a buy can
+                // actually land: the id-0 sentinel never appears in an echo,
+                // and a sold-out or unaffordable slot cannot be bought —
+                // none may hold the checklist open (nor be clicked).
+                id: item.catalog_id().filter(|_| in_reach),
+            });
+        }
+        (targets, buyable)
     }
 
     /// A server-confirmed buy: records the echoed gold balance, then — only

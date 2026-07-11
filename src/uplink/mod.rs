@@ -1,4 +1,5 @@
-//! Link to the analysis server: forwards the raw stream, receives alerts.
+//! Link to the analysis server: forwards the raw stream, receives the
+//! decoded shop snapshots and purchase echoes.
 
 mod websocket;
 

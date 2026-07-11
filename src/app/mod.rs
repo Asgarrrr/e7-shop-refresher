@@ -193,8 +193,7 @@ impl Session {
             tokio::spawn(reassemble_loop(segment_rx, raw_tx, config.forward.clone())),
         );
 
-        // Click jobs -> the game window; without an input backend they are
-        // drained and dropped.
+        // Click jobs -> the game window.
         #[cfg(all(windows, feature = "actuator"))]
         supervise_task(
             "actuator",
@@ -209,8 +208,9 @@ impl Session {
                 actuator.mode == Mode::DryRun,
             )),
         );
+        // Without an input backend the mode is Off and nothing ever submits.
         #[cfg(not(all(windows, feature = "actuator")))]
-        supervise_task("actuator", &fatal_tx, tokio::spawn(drain_jobs(job_rx)));
+        drop(job_rx);
 
         // Keyboard input, decoupled from the session loop through the channel.
         supervise_task("stdin", &fatal_tx, tokio::spawn(stdin_loop(commands)));
@@ -236,13 +236,6 @@ impl Session {
             None => Ok(()),
         }
     }
-}
-
-/// No input backend compiled: consume queued click jobs so submitters never
-/// see a full queue for the wrong reason.
-#[cfg(not(all(windows, feature = "actuator")))]
-async fn drain_jobs(mut jobs: mpsc::Receiver<plan::Job>) {
-    while jobs.recv().await.is_some() {}
 }
 
 /// Watches a worker task and reports a *panic* as a fatal message. A normal

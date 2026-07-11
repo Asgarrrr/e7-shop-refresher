@@ -333,6 +333,15 @@ fn apply(
     lines
 }
 
+/// The trigger to plan a job against; `None` when nothing may be clicked —
+/// the actuator is off, or the path cannot name the game's animation.
+fn active_trigger(actuator: &ActuatorHandle, trigger: Option<Trigger>) -> Option<Trigger> {
+    match actuator.mode {
+        Mode::Off => None,
+        Mode::DryRun | Mode::Live => trigger,
+    }
+}
+
 /// A refresh decision: a click job when the actuator is on (the job's
 /// pre-wait covers the animation `trigger` names), the advice line
 /// otherwise.
@@ -342,12 +351,9 @@ fn submit_refresh(
     trigger: Option<Trigger>,
     now_ms: u64,
 ) {
-    let trigger = match (actuator.mode, trigger) {
-        (Mode::Off, _) | (_, None) => {
-            lines.push(">> → refresh the shop now".to_owned());
-            return;
-        }
-        (_, Some(trigger)) => trigger,
+    let Some(trigger) = active_trigger(actuator, trigger) else {
+        lines.push(">> → refresh the shop now".to_owned());
+        return;
     };
     let submitted = actuator.submit(plan::refresh_job(trigger, actuator.epoch.current(), now_ms));
     lines.push(if actuator.mode == Mode::Live {
@@ -376,16 +382,13 @@ fn submit_buys(
     if controller.status() != Status::Paused {
         return;
     }
-    let trigger = match (actuator.mode, trigger) {
-        (Mode::Off, _) | (_, None) => return,
-        (_, Some(trigger)) => trigger,
+    let Some(trigger) = active_trigger(actuator, trigger) else {
+        return;
     };
-    // `slot` is 1-based; anything outside 1..=6 is a degraded shop's
-    // fallback number, not a clickable row.
     let rows: Vec<u8> = targets
         .iter()
-        .filter(|target| target.id.is_some() && (1..=6).contains(&target.slot))
-        .map(|target| target.slot - 1)
+        .filter(|target| target.id.is_some())
+        .filter_map(|target| plan::row_for_slot(target.slot))
         .collect();
     if rows.is_empty() {
         return;
@@ -417,12 +420,12 @@ fn render_match(lines: &mut Vec<String>, targets: &[BuyTarget], controller: &Con
     let hint = if controller.status() != Status::Paused {
         ""
     } else if clickable == 0 {
-        // Every match is untrackable (sold out or id omitted): no purchase
-        // echo can clear them, only a fresh shop unpauses.
+        // Buyable in game but untrackable (id omitted): no purchase echo
+        // can clear them, only a fresh shop unpauses.
         ": buy in game, then refresh"
     } else if clickable < targets.len() {
-        // Some matches are untrackable: auto-resume only waits on the
-        // tracked ones and would refresh over the rest.
+        // Some matches won't be clicked (untrackable, dead stock):
+        // auto-resume only waits on the tracked ones.
         ": buy in game — some items aren't tracked, refresh when done"
     } else {
         ": buy in game — resumes automatically"
@@ -752,7 +755,7 @@ mod tests {
         apply(&[], &ctrl, &gate, &off(), None, 0);
         assert!(gate.is_enabled()); // Watching
 
-        // Default filter matches the default item: Alert -> Paused, gate stays on.
+        // Default filter matches the default item: Buy -> Paused, gate stays on.
         let snapshot = ShopSnapshot {
             merchant: None,
             slots: vec![ShopItem::default()],
@@ -910,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn alert_hint_warns_when_some_matches_untracked() {
+    fn match_hint_warns_when_some_matches_untracked() {
         let gate = WatchGate::new(false);
         let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
         ctrl.handle(Event::Start { now_ms: 0 });
