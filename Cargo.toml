@@ -35,7 +35,6 @@ toml = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-anyhow = "1"
 # glow renderer only: targets are Windows (player) and macOS (dev); the
 # default wgpu/x11/wayland stacks would only slow the build down.
 eframe = { version = "0.35", optional = true, default-features = false, features = [

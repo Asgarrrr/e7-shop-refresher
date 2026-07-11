@@ -83,8 +83,6 @@ pub struct ShopItem {
     /// criterion anyway.
     #[serde(default, deserialize_with = "lenient_elements")]
     pub substats: Vec<SubStat>,
-    #[serde(default)]
-    pub required_level: Option<u8>,
     /// Fail-open like an absent field: a partial or mistyped limit degrades
     /// to `None` (buyable), matching the server's own omission semantics.
     #[serde(default, deserialize_with = "object_or_none")]

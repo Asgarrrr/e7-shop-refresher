@@ -15,12 +15,6 @@ pub enum Error {
     #[error("network capture: {0}")]
     Capture(String),
 
-    #[error("server link: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
-
-    #[error("JSON: {0}")]
-    Json(#[from] serde_json::Error),
-
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
 }

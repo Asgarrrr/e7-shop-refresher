@@ -150,7 +150,6 @@ mod tests {
                 substat("cri", Some(0.03)),
                 substat("att", Some(40.0)),
             ],
-            required_level: None,
             limit: None,
         }
     }
