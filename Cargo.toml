@@ -51,6 +51,8 @@ windivert = { version = "0.7.0-beta.4", optional = true }
 # Dev-deps cannot be feature-gated: the console-only test lane builds egui
 # once too; the kittest tests themselves are behind the `gui` feature.
 egui_kittest = { version = "0.35", default-features = false }
+# Paused-clock tests (`start_paused`) for the uplink send timeout.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

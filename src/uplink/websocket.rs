@@ -14,6 +14,12 @@ use tracing::{debug, info, warn};
 use super::UplinkEvent;
 use super::protocol::ServerMessage;
 
+/// A send that cannot finish within this window means a stalled peer (TCP
+/// zero-window): the socket stays "connected" but nothing moves, backpressure
+/// parks the capture thread, and the kernel starts dropping packet copies.
+/// Dropping the connection turns the stall into a normal reconnect cycle.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Outcome of one connection session.
 enum Outcome {
     /// The outbound channel is closed: shutdown requested.
@@ -122,8 +128,14 @@ where
         tokio::select! {
             outgoing = outbound.recv() => match outgoing {
                 Some(bytes) => {
-                    if write.send(Message::Binary(bytes.into())).await.is_err() {
-                        return Outcome::Disconnected;
+                    let send = write.send(Message::Binary(bytes.into()));
+                    match tokio::time::timeout(SEND_TIMEOUT, send).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return Outcome::Disconnected,
+                        Err(_elapsed) => {
+                            warn!("server send stalled — dropping the connection");
+                            return Outcome::Disconnected;
+                        }
                     }
                 }
                 None => return Outcome::Shutdown,
@@ -149,5 +161,50 @@ async fn forward(payload: &[u8], inbound: &mpsc::Sender<UplinkEvent>) {
             let _ = inbound.send(UplinkEvent::Message(message)).await;
         }
         Err(err) => debug!(error = %err, "unrecognized server message, ignored"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    /// A connected-but-frozen peer: reads pend forever, sends never become
+    /// ready (TCP zero-window).
+    struct StalledLink;
+
+    impl Stream for StalledLink {
+        type Item = Result<Message, WsError>;
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl Sink<Message> for StalledLink {
+        type Error = WsError;
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Pending
+        }
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), WsError> {
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Pending
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_send_disconnects_instead_of_hanging() {
+        let (raw_tx, mut raw_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (event_tx, _event_rx) = mpsc::channel::<UplinkEvent>(4);
+        raw_tx.send(vec![1, 2, 3]).await.unwrap();
+
+        let outcome = pump(StalledLink, &mut raw_rx, &event_tx).await;
+        assert!(matches!(outcome, Outcome::Disconnected));
     }
 }
