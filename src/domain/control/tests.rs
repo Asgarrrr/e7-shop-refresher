@@ -551,6 +551,34 @@ fn stop_is_idempotent_when_stopped() {
 }
 
 #[test]
+fn stop_while_idle_is_a_no_op() {
+    // A session that never ran did not stop: no Stop producer (console, GUI
+    // button, teardown) may turn Idle into "stopped: player stopped".
+    let mut ctrl = controller(Limits::default());
+    assert!(ctrl.handle(Event::Stop).is_empty());
+    assert_eq!(ctrl.status(), Status::Idle);
+    assert!(ctrl.handle(Event::Shutdown).is_empty());
+    assert_eq!(ctrl.status(), Status::Idle);
+}
+
+#[test]
+fn shutdown_halts_with_an_honest_label() {
+    // The pipeline dying underneath an armed loop is not the player's stop.
+    let mut ctrl = started(Limits::default());
+    assert_eq!(
+        ctrl.handle(Event::Shutdown),
+        vec![Action::Halt(StopReason::SessionEnded)]
+    );
+    assert_eq!(ctrl.status(), Status::Stopped(StopReason::SessionEnded));
+
+    // And like Stop, it never relabels an existing reason.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(Event::Stop);
+    assert!(ctrl.handle(Event::Shutdown).is_empty());
+    assert_eq!(ctrl.status(), Status::Stopped(StopReason::PlayerStopped));
+}
+
+#[test]
 fn max_refreshes_emits_exactly_n_then_halts() {
     let mut ctrl = started(Limits {
         max_refreshes: Some(3),

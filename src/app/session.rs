@@ -41,6 +41,7 @@ pub(super) async fn session_loop(
     let mut commands_open = true;
     let mut capture_open = true;
     let mut capture_failure = None;
+    let mut player_exit = false;
     loop {
         tokio::select! {
             command = commands.recv(), if commands_open => match command {
@@ -76,24 +77,21 @@ pub(super) async fn session_loop(
             _ = ticker.tick() => dispatch(controller, gate, journal, Event::Tick { now_ms: now_ms() }),
             _ = &mut ctrl_c => {
                 emit(journal, &[">> Ctrl+C, stopping".to_owned()]);
+                player_exit = true;
                 break;
             }
         }
     }
-    // The window (GUI build) outlives the loop: if the session was armed,
-    // leave an honest state behind — controller stopped, gate (and thus
-    // capture) off, a journal line saying why. A never-armed controller
-    // stays Idle: it did not stop, it never ran.
-    let armed = matches!(
-        controller
-            .lock()
-            .expect("controller mutex poisoned")
-            .status(),
-        Status::Watching | Status::Paused
-    );
-    if armed {
-        dispatch(controller, gate, journal, Event::Stop);
-    }
+    // The window (GUI build) outlives the loop: leave an honest state behind
+    // — controller stopped, gate (and thus capture) off, a journal line
+    // saying why. Only Ctrl+C is the player's own stop; a pipeline death is
+    // a shutdown. The domain ignores both for a never-armed controller.
+    let teardown = if player_exit {
+        Event::Stop
+    } else {
+        Event::Shutdown
+    };
+    dispatch(controller, gate, journal, teardown);
     capture_failure
 }
 
@@ -356,11 +354,25 @@ mod tests {
         .await;
 
         assert_eq!(failure, None);
+        // The pipeline died on its own: the player did not stop anything.
         assert_eq!(
             controller.lock().unwrap().status(),
-            Status::Stopped(StopReason::PlayerStopped)
+            Status::Stopped(StopReason::SessionEnded)
         );
         assert!(!gate.is_enabled());
+    }
+
+    #[test]
+    fn stop_while_idle_reports_no_effect() {
+        let gate = WatchGate::new(false);
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
+        let lines = handle_command(&controller, &gate, Command::Stop, 0);
+        assert!(lines.iter().any(|line| line.contains("no effect")));
+        assert!(!lines.iter().any(|line| line.contains("player stopped")));
+        assert_eq!(controller.lock().unwrap().status(), Status::Idle);
     }
 
     #[tokio::test]

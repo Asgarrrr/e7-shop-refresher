@@ -39,6 +39,9 @@ pub struct Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     PlayerStopped,
+    /// The relay pipeline ended (capture or uplink gone) while armed: the
+    /// player did not stop the hunt and must not be told they did.
+    SessionEnded,
     OutOfFunds,
     MaxRefreshes,
     MaxSpend,
@@ -64,7 +67,11 @@ pub enum Event {
     Start {
         now_ms: u64,
     },
+    /// The player asked to stop.
     Stop,
+    /// The relay is going away underneath the loop (uplink or capture gone):
+    /// same halt as `Stop`, honest label.
+    Shutdown,
     Snapshot {
         snapshot: ShopSnapshot,
         now_ms: u64,
@@ -195,7 +202,8 @@ impl Controller {
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::Start { now_ms } => self.on_start(now_ms),
-            Event::Stop => self.on_stop(),
+            Event::Stop => self.on_halt_request(StopReason::PlayerStopped),
+            Event::Shutdown => self.on_halt_request(StopReason::SessionEnded),
             Event::Snapshot { snapshot, now_ms } => self.on_snapshot(snapshot, now_ms),
             Event::Purchase { item, now_ms } => self.on_purchase(item, now_ms),
             Event::FilterChanged(filter) => {
@@ -241,12 +249,15 @@ impl Controller {
         Vec::new()
     }
 
-    /// Idempotent once stopped: the original reason is not relabelled.
-    fn on_stop(&mut self) -> Vec<Action> {
-        if matches!(self.status, Status::Stopped(_)) {
+    /// Idempotent once stopped (the original reason is not relabelled), and a
+    /// no-op while Idle: a session that never ran did not stop — the
+    /// invariant lives here, not at the callers, so every Stop producer
+    /// (console, GUI button, teardown) gets it for free.
+    fn on_halt_request(&mut self, reason: StopReason) -> Vec<Action> {
+        if !matches!(self.status, Status::Watching | Status::Paused) {
             return Vec::new();
         }
-        self.halt(StopReason::PlayerStopped)
+        self.halt(reason)
     }
 
     fn on_snapshot(&mut self, snapshot: ShopSnapshot, now_ms: u64) -> Vec<Action> {

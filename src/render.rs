@@ -26,7 +26,9 @@ pub(crate) fn status_label(controller: &Controller) -> &'static str {
         // An empty checklist never auto-resumes.
         Status::Paused if controller.checklist().is_empty() => "paused (buy, then refresh)",
         Status::Paused => "paused (buy — auto-resumes)",
-        Status::Stopped(_) if unrestricted => "stopped (define a filter first)",
+        // Stopped implies the loop once armed, and arming requires a
+        // restricted filter that no swap can un-restrict: unlike Idle, no
+        // "define a filter first" variant is reachable here.
         Status::Stopped(_) => "stopped (Start re-arms)",
     }
 }
@@ -42,6 +44,7 @@ pub(crate) fn refusal(reason: RefusalReason) -> &'static str {
 pub(crate) fn describe(reason: StopReason) -> &'static str {
     match reason {
         StopReason::PlayerStopped => "player stopped",
+        StopReason::SessionEnded => "session ended",
         StopReason::OutOfFunds => "out of crystals",
         StopReason::MaxRefreshes => "refresh limit reached",
         StopReason::MaxSpend => "crystal budget reached",
@@ -111,13 +114,12 @@ mod tests {
 
     #[test]
     fn status_label_never_promises_start_while_unrestricted() {
-        let mut ctrl = Controller::new(Filter::default(), Limits::default());
+        let ctrl = Controller::new(Filter::default(), Limits::default());
         assert_eq!(status_label(&ctrl), "idle (define a filter first)");
-        ctrl.handle(Event::Stop);
-        assert_eq!(status_label(&ctrl), "stopped (define a filter first)");
 
         let mut armed = Controller::new(Filter::matching_default_items(), Limits::default());
         assert_eq!(status_label(&armed), "idle (Start arms the watch)");
+        armed.handle(Event::Start { now_ms: 0 });
         armed.handle(Event::Stop);
         assert_eq!(status_label(&armed), "stopped (Start re-arms)");
     }
