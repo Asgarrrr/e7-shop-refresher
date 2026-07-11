@@ -14,7 +14,7 @@ pub struct ShopSnapshot {
     /// not shop *contents*. Present means both are known; absent, the cost
     /// falls back to the game constant and only out-of-funds detection is
     /// lost.
-    #[serde(default, deserialize_with = "refresh_or_none")]
+    #[serde(default, deserialize_with = "object_or_none")]
     pub refresh: Option<RefreshMeta>,
 }
 
@@ -26,21 +26,33 @@ pub struct RefreshMeta {
     pub cost: u32,
 }
 
-/// Degrades a partial `refresh` object (or `null`) to `None` rather than
-/// failing the whole snapshot, like the rest of the model.
-fn refresh_or_none<'de, D: Deserializer<'de>>(de: D) -> Result<Option<RefreshMeta>, D::Error> {
-    #[derive(Default, Deserialize)]
-    #[serde(default)]
-    struct Partial {
-        crystal_balance: Option<u32>,
-        cost: Option<u32>,
-    }
-    Ok(Option::<Partial>::deserialize(de)?.and_then(|partial| {
-        Some(RefreshMeta {
-            crystal_balance: partial.crystal_balance?,
-            cost: partial.cost?,
-        })
-    }))
+/// Tolerant optional side-channel object (`refresh`, `limit`): a partial,
+/// `null`, or mistyped value degrades to `None` rather than failing the whole
+/// snapshot. The value is consumed wholesale first — a bare `?` on the typed
+/// parse would abort the surrounding message mid-stream.
+fn object_or_none<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(de)?;
+    Ok(serde_json::from_value::<T>(value).ok())
+}
+
+/// Tolerant wire collection (`substats`): an undecodable element is dropped,
+/// a non-array value degrades to empty — the containing message survives.
+fn lenient_elements<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let serde_json::Value::Array(values) = serde_json::Value::deserialize(de)? else {
+        return Ok(Vec::new());
+    };
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -66,12 +78,16 @@ pub struct ShopItem {
     /// Gear set, by internal id (`set_speed`, `set_immune`, ...).
     #[serde(default)]
     pub set: Option<String>,
-    /// Substats and their values, keyed by internal stat name.
-    #[serde(default)]
+    /// Substats and their values, keyed by internal stat name. A nameless or
+    /// mistyped entry is dropped, not fatal: it could never match a name-keyed
+    /// criterion anyway.
+    #[serde(default, deserialize_with = "lenient_elements")]
     pub substats: Vec<SubStat>,
     #[serde(default)]
     pub required_level: Option<u8>,
-    #[serde(default)]
+    /// Fail-open like an absent field: a partial or mistyped limit degrades
+    /// to `None` (buyable), matching the server's own omission semantics.
+    #[serde(default, deserialize_with = "object_or_none")]
     pub limit: Option<PurchaseLimit>,
 }
 
@@ -123,7 +139,7 @@ pub struct SubStat {
 }
 
 /// Purchase limit, e.g. "0/1" (sold out) or "1/1" (available).
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct PurchaseLimit {
     pub remaining: u32,
     pub total: u32,
@@ -161,5 +177,44 @@ mod tests {
     fn refresh_null_or_absent_is_none() {
         assert_eq!(parse(r#"{"refresh":null}"#).refresh, None);
         assert_eq!(parse("{}").refresh, None);
+    }
+
+    #[test]
+    fn refresh_mistyped_degrades_to_none() {
+        // The degrade contract covers wrong types, not just partial objects.
+        assert_eq!(parse(r#"{"refresh":5,"slots":[{}]}"#).refresh, None);
+        assert_eq!(parse(r#"{"refresh":"n/a"}"#).refresh, None);
+        assert_eq!(parse(r#"{"refresh":[]}"#).refresh, None);
+    }
+
+    #[test]
+    fn partial_limit_degrades_to_buyable() {
+        // Fail-open like an absent limit: the item stays buyable and the
+        // snapshot survives.
+        let snapshot = parse(r#"{"slots":[{"id":5,"limit":{"remaining":0}}]}"#);
+        assert_eq!(snapshot.slots[0].limit, None);
+        assert!(!snapshot.slots[0].is_sold_out());
+    }
+
+    #[test]
+    fn full_limit_still_parses() {
+        let snapshot = parse(r#"{"slots":[{"limit":{"remaining":0,"total":1}}]}"#);
+        assert!(snapshot.slots[0].is_sold_out());
+    }
+
+    #[test]
+    fn bad_substat_entry_is_dropped_not_fatal() {
+        let snapshot =
+            parse(r#"{"slots":[{"substats":[{"value":4.0},{"name":"speed","value":8.0},7]}]}"#);
+        let substats = &snapshot.slots[0].substats;
+        assert_eq!(substats.len(), 1);
+        assert_eq!(substats[0].name, "speed");
+    }
+
+    #[test]
+    fn mistyped_substats_degrade_to_empty() {
+        let snapshot = parse(r#"{"slots":[{"id":9,"substats":"corrupt"}]}"#);
+        assert!(snapshot.slots[0].substats.is_empty());
+        assert_eq!(snapshot.slots[0].id, 9);
     }
 }
