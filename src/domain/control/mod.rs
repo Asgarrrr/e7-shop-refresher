@@ -44,6 +44,9 @@ pub enum StopReason {
     /// The relay pipeline ended (capture or uplink gone) while armed: the
     /// player did not stop the hunt and must not be told they did.
     SessionEnded,
+    /// The click executor could not act safely (game window gone, moved,
+    /// input undeliverable): a machine fault, not the player's stop.
+    ActuatorFailed,
     OutOfFunds,
     MaxRefreshes,
     MaxSpend,
@@ -74,6 +77,9 @@ pub enum Event {
     /// The relay is going away underneath the loop (uplink or capture gone):
     /// same halt as `Stop`, honest label.
     Shutdown,
+    /// The click executor reported it cannot act safely: same halt, honest
+    /// label.
+    ActuatorFailed,
     Snapshot {
         snapshot: ShopSnapshot,
         now_ms: u64,
@@ -234,6 +240,7 @@ impl Controller {
             Event::Start { now_ms } => self.on_start(now_ms),
             Event::Stop => self.on_halt_request(StopReason::PlayerStopped),
             Event::Shutdown => self.on_halt_request(StopReason::SessionEnded),
+            Event::ActuatorFailed => self.on_halt_request(StopReason::ActuatorFailed),
             Event::Snapshot { snapshot, now_ms } => self.on_snapshot(snapshot, now_ms),
             Event::Purchase { item, gold, now_ms } => self.on_purchase(item, gold, now_ms),
             Event::FilterChanged(filter) => {

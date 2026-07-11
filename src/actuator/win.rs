@@ -1,6 +1,6 @@
-//! Input backends driving the Epic Seven window: [`WinSurface`] (`SendInput`,
-//! real cursor, foreground) and [`MessageSurface`] (`PostMessageW`, synthetic
-//! messages, background).
+//! Input backends driving the Epic Seven window: [`MessageSurface`]
+//! (`PostMessageW`, background, shielded — the default) and [`WinSurface`]
+//! (`SendInput`, real cursor, foreground — the fallback).
 //!
 //! No window is ever resized: the anchor-aware transform in [`super::plan`]
 //! covers any aspect from 16:9 up, and `to_screen` refuses narrower ones.
@@ -19,13 +19,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetClientRect, GetCursorPos, GetForegroundWindow, GetSystemMetrics, PostMessageW,
+    FindWindowW, GetClientRect, GetForegroundWindow, GetSystemMetrics, PostMessageW,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SetForegroundWindow, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
 };
 
-use super::Surface;
 use super::plan::ClientRect;
+use super::{Surface, shield};
 
 const GAME_WINDOW_TITLE: &str = "Epic Seven";
 /// One wheel notch, Win32 convention.
@@ -34,12 +34,6 @@ const WHEEL_DELTA: i32 = 120;
 const MOVE_SETTLE_MS: u64 = 30;
 /// The foreground switch is asynchronous: give it a beat before verifying.
 const FOCUS_SETTLE_MS: u64 = 100;
-/// How long a posted input waits for the player's mouse to leave the game
-/// window. The engine tracks its cursor through move messages, so a real
-/// mouse over the window drags posted clicks onto itself; camping past this
-/// budget stops the loop rather than stalling past the epoch/gate guarantees.
-const CURSOR_VACATE_MS: u64 = 2_000;
-const CURSOR_POLL_MS: u64 = 50;
 
 /// Marks the process DPI-aware once, so client rects come back in physical
 /// pixels. winit already sets this in gui builds; the console build needs it
@@ -166,19 +160,26 @@ fn send_input(mi: MOUSEINPUT) {
 /// straight to the game window. No focus is stolen and the real cursor never
 /// moves — the player keeps the mouse — but it only works because the engine
 /// honors window messages (live-validated; [`WinSurface`] is the fallback).
+///
+/// The engine tracks its cursor through move messages, so the player's real
+/// mouse over the game window would drag posted clicks onto itself: the
+/// first input of every job raises the [`shield`](super::shield) over the
+/// game, absorbing the player's mouse there until [`release`](Surface).
 #[derive(Default)]
 pub struct MessageSurface {
     /// Refreshed by `acquire`, consumed by the inputs of the same job. The
     /// executor holds the surface across awaits, so the window handle is
     /// stored as an integer to keep the future `Send`.
     target: Option<Target>,
+    /// Shield raised for the current job; lowered by `release`.
+    engaged: bool,
 }
 
 #[derive(Clone, Copy)]
 struct Target {
     hwnd: isize,
     /// Client area in screen pixels: locates the client coordinates button
-    /// messages carry, and bounds the player-cursor guard.
+    /// messages carry, and positions the shield.
     rect: ClientRect,
 }
 
@@ -187,21 +188,29 @@ impl Target {
         (at.0 - self.rect.left, at.1 - self.rect.top)
     }
 
-    /// Posts the position move once the player's mouse is out of the way and
-    /// re-checks after the settle: a real move slipping in between would
-    /// drag the tracked position — and the input — onto the player's cursor.
-    fn settle_position(self, lparam: isize) -> Result<(), String> {
-        for _ in 0..2 {
-            if !vacate_cursor(self.rect) {
-                break;
-            }
-            post(self.hwnd, WM_MOUSEMOVE, 0, lparam);
-            std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
-            if cursor_clear(self.rect) {
-                return Ok(());
-            }
+    /// The window must still be where the job was planned: coordinates and
+    /// the shield's position all derive from the acquire-time rect, so a
+    /// moved, resized or vanished window halts the job instead of landing
+    /// clicks nobody aimed.
+    fn verify(self) -> Result<(), String> {
+        if client_rect(self.hwnd as HWND)? != self.rect {
+            return Err("the game window moved mid-job".to_owned());
         }
-        Err("the mouse stays over the game window — posted clicks would land on it".to_owned())
+        Ok(())
+    }
+}
+
+impl MessageSurface {
+    /// Runs before every input: re-verifies the window and, on the job's
+    /// first input, raises the shield so the player's mouse cannot contest
+    /// the posted position.
+    fn engage(&mut self, target: Target) -> Result<(), String> {
+        target.verify()?;
+        if !self.engaged {
+            shield::raise(target.hwnd as HWND, target.rect)?;
+            self.engaged = true;
+        }
+        Ok(())
     }
 }
 
@@ -219,8 +228,10 @@ impl Surface for MessageSurface {
 
     fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String> {
         let target = self.target.expect("acquire() before click");
+        self.engage(target)?;
         let lparam = pack_point(target.to_client(at));
-        target.settle_position(lparam)?;
+        post(target.hwnd, WM_MOUSEMOVE, 0, lparam);
+        std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
         post(target.hwnd, WM_LBUTTONDOWN, MK_LBUTTON as usize, lparam);
         std::thread::sleep(Duration::from_millis(press_ms));
         post(target.hwnd, WM_LBUTTONUP, 0, lparam);
@@ -229,7 +240,14 @@ impl Surface for MessageSurface {
 
     fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String> {
         let target = self.target.expect("acquire() before scroll");
-        target.settle_position(pack_point(target.to_client(at)))?;
+        self.engage(target)?;
+        post(
+            target.hwnd,
+            WM_MOUSEMOVE,
+            0,
+            pack_point(target.to_client(at)),
+        );
+        std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
         // WM_MOUSEWHEEL carries screen coordinates, unlike the button
         // messages; the delta rides the high word of wParam.
         let delta = notches.saturating_mul(WHEEL_DELTA);
@@ -241,34 +259,13 @@ impl Surface for MessageSurface {
         );
         Ok(())
     }
-}
 
-/// Whether the player's mouse is outside the game's client area. Windows
-/// routes real mouse messages to the window under the cursor: outside the
-/// rect the game receives none, and the posted position stands uncontested.
-fn cursor_clear(rect: ClientRect) -> bool {
-    let mut point = POINT { x: 0, y: 0 };
-    if unsafe { GetCursorPos(&mut point) } == 0 {
-        return true; // cannot know — proceed as before the guard existed
-    }
-    point.x < rect.left
-        || point.x >= rect.left + rect.width
-        || point.y < rect.top
-        || point.y >= rect.top + rect.height
-}
-
-/// Polls until the player's mouse leaves the game window; `false` once the
-/// budget is spent.
-fn vacate_cursor(rect: ClientRect) -> bool {
-    let mut waited = 0;
-    while !cursor_clear(rect) {
-        if waited >= CURSOR_VACATE_MS {
-            return false;
+    fn release(&mut self) {
+        if self.engaged {
+            shield::hide();
+            self.engaged = false;
         }
-        std::thread::sleep(Duration::from_millis(CURSOR_POLL_MS));
-        waited += CURSOR_POLL_MS;
     }
-    true
 }
 
 /// `MAKELPARAM`: x in the low word, y in the high word, both signed 16-bit.

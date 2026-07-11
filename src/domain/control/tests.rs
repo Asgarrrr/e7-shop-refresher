@@ -816,6 +816,26 @@ fn shutdown_halts_with_an_honest_label() {
 }
 
 #[test]
+fn actuator_failure_halts_with_an_honest_label() {
+    // The clicker refusing to act is not the player's stop.
+    let mut ctrl = started(Limits::default());
+    assert_eq!(
+        ctrl.handle(Event::ActuatorFailed),
+        vec![Action::Halt(StopReason::ActuatorFailed)]
+    );
+    assert_eq!(ctrl.status(), Status::Stopped(StopReason::ActuatorFailed));
+
+    // Like Stop and Shutdown: never relabels, no-ops while Idle.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(Event::Stop);
+    assert!(ctrl.handle(Event::ActuatorFailed).is_empty());
+    assert_eq!(ctrl.status(), Status::Stopped(StopReason::PlayerStopped));
+    let mut ctrl = controller(Limits::default());
+    assert!(ctrl.handle(Event::ActuatorFailed).is_empty());
+    assert_eq!(ctrl.status(), Status::Idle);
+}
+
+#[test]
 fn max_refreshes_emits_exactly_n_then_halts() {
     let mut ctrl = started(Limits {
         max_refreshes: Some(3),

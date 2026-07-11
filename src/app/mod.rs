@@ -32,9 +32,10 @@ enum CaptureEvent {
     Resync,
 }
 
-/// A player command, decoupled from its source: the stdin task and the GUI
-/// push the same values through the same channel (stdin never produces the
-/// `Set*` variants).
+/// A command into the session loop, decoupled from its source: the stdin
+/// task and the GUI push the same values through the same channel (stdin
+/// never produces the `Set*` variants); the actuator produces only
+/// `ActuatorFailed`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Start,
@@ -45,6 +46,9 @@ pub enum Command {
     SetFilter(Filter),
     /// Live limits retune; checked before the next refresh.
     SetLimits(Limits),
+    /// The click executor cannot act safely: halt with the honest label,
+    /// never "player stopped".
+    ActuatorFailed,
 }
 
 /// Cheap clones of the shared session state, for a view (the GUI) running

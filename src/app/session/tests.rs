@@ -81,6 +81,25 @@ fn stop_while_idle_reports_no_effect() {
     assert_eq!(controller.lock().unwrap().status(), Status::Idle);
 }
 
+#[test]
+fn actuator_failure_command_halts_with_the_clicker_label() {
+    let gate = WatchGate::new(false);
+    let controller = Mutex::new(Controller::new(
+        Filter::matching_default_items(),
+        Limits::default(),
+    ));
+    handle_command(&controller, &gate, &off(), Command::Start, 0);
+    assert!(gate.is_enabled());
+    let lines = handle_command(&controller, &gate, &off(), Command::ActuatorFailed, 1);
+    assert!(lines.iter().any(|line| line.contains("clicker failed")));
+    assert!(!lines.iter().any(|line| line.contains("player stopped")));
+    assert_eq!(
+        controller.lock().unwrap().status(),
+        Status::Stopped(StopReason::ActuatorFailed)
+    );
+    assert!(!gate.is_enabled());
+}
+
 #[tokio::test]
 async fn uplink_outage_and_recovery_reach_the_journal() {
     let gate = WatchGate::new(false);

@@ -5,6 +5,8 @@
 
 pub mod plan;
 #[cfg(all(windows, feature = "actuator"))]
+mod shield;
+#[cfg(all(windows, feature = "actuator"))]
 pub mod win;
 
 use std::sync::Arc;
@@ -73,10 +75,13 @@ pub trait Surface {
     /// brought to the foreground is backend-specific. An `Err` means any
     /// click would be blind: the executor stops the loop.
     fn acquire(&mut self) -> Result<plan::ClientRect, String>;
-    /// An `Err` means the input could not be delivered safely (e.g. the
-    /// player's mouse would hijack it): the executor stops the loop.
+    /// An `Err` means the input could not be delivered safely (e.g. the game
+    /// window moved or vanished mid-job): the executor stops the loop.
     fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String>;
     fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String>;
+    /// The job is over (completed or aborted): drop whatever the inputs set
+    /// up (the message backend lowers its input shield). Default: nothing.
+    fn release(&mut self) {}
 }
 
 /// Replays queued jobs step by step. Before every act it re-checks the gate
@@ -148,6 +153,9 @@ pub async fn run_executor(
                 break;
             }
         }
+        // Every exit from the steps loop lands here — completion, abort,
+        // failure: the surface must never stay engaged between jobs.
+        surface.release();
     }
 }
 
@@ -164,10 +172,11 @@ fn drop_reason(job: &Job, epoch: &SnapshotEpoch, gate: &WatchGate) -> Option<&'s
 }
 
 /// An actuator that cannot act safely stops the whole loop: a hunt that
-/// keeps refreshing without its clicker is spend without effect.
+/// keeps refreshing without its clicker is spend without effect. The halt
+/// carries its own label (`StopReason::ActuatorFailed`), never the player's.
 fn fail(journal: &EventLog, commands: &mpsc::Sender<Command>, reason: &str) {
     journal.emit(&[format!(">> actuator: {reason} — stopping the loop")]);
-    let _ = commands.try_send(Command::Stop);
+    let _ = commands.try_send(Command::ActuatorFailed);
 }
 
 #[cfg(test)]
@@ -183,13 +192,14 @@ mod tests {
     }
 
     /// Records every input; `on_input` runs after each one (to flip the gate
-    /// or bump the epoch mid-job); `input_error` makes every input fail
-    /// undelivered.
+    /// or bump the epoch mid-job); `deny_after` fails every input once `n`
+    /// inputs have landed (`n = 0` = fail the first).
     struct FakeSurface {
         rect: Result<ClientRect, String>,
         events: Arc<Mutex<Vec<Recorded>>>,
         on_input: Box<dyn FnMut() + Send>,
-        input_error: Option<String>,
+        deny_after: Option<(usize, String)>,
+        releases: Arc<Mutex<usize>>,
     }
 
     impl FakeSurface {
@@ -199,9 +209,17 @@ mod tests {
                 rect,
                 events: events.clone(),
                 on_input: Box::new(|| {}),
-                input_error: None,
+                deny_after: None,
+                releases: Arc::new(Mutex::new(0)),
             };
             (surface, events)
+        }
+
+        fn deny(&self) -> Result<(), String> {
+            match &self.deny_after {
+                Some((n, reason)) if self.events.lock().unwrap().len() >= *n => Err(reason.clone()),
+                _ => Ok(()),
+            }
         }
     }
 
@@ -211,9 +229,7 @@ mod tests {
         }
 
         fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String> {
-            if let Some(reason) = &self.input_error {
-                return Err(reason.clone());
-            }
+            self.deny()?;
             self.events
                 .lock()
                 .unwrap()
@@ -223,15 +239,17 @@ mod tests {
         }
 
         fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String> {
-            if let Some(reason) = &self.input_error {
-                return Err(reason.clone());
-            }
+            self.deny()?;
             self.events
                 .lock()
                 .unwrap()
                 .push(Recorded::Scroll(at, notches));
             (self.on_input)();
             Ok(())
+        }
+
+        fn release(&mut self) {
+            *self.releases.lock().unwrap() += 1;
         }
     }
 
@@ -408,7 +426,7 @@ mod tests {
         )
         .await;
         assert!(events.lock().unwrap().is_empty());
-        assert_eq!(rig.command_rx.try_recv(), Ok(Command::Stop));
+        assert_eq!(rig.command_rx.try_recv(), Ok(Command::ActuatorFailed));
         assert!(journal.entries().iter().any(|line| {
             line.text
                 .contains("actuator: game window not found — stopping the loop")
@@ -417,12 +435,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_stops_the_loop_when_an_input_fails() {
-        // A surface that cannot deliver an input safely (e.g. the player's
-        // mouse camping over the game window) must halt the hunt, not click
-        // blind or skip silently.
+        // A surface that cannot deliver an input safely (e.g. the game window
+        // moved mid-job) must halt the hunt with the actuator's own label,
+        // not click blind or skip silently.
         let mut rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
-        surface.input_error = Some("the mouse stays over the game window".to_owned());
+        surface.deny_after = Some((0, "the game window moved".to_owned()));
         rig.job_tx
             .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
             .await
@@ -440,11 +458,84 @@ mod tests {
         )
         .await;
         assert!(events.lock().unwrap().is_empty());
-        assert_eq!(rig.command_rx.try_recv(), Ok(Command::Stop));
+        assert_eq!(rig.command_rx.try_recv(), Ok(Command::ActuatorFailed));
         assert!(journal.entries().iter().any(|line| {
             line.text
-                .contains("the mouse stays over the game window — stopping the loop")
+                .contains("the game window moved — stopping the loop")
         }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_keeps_landed_inputs_and_stops_once_on_a_mid_job_failure() {
+        // Rows 0 and 4: scroll-top, buy row 0, confirm, then the bottom
+        // scroll fails. The three landed inputs stay recorded, exactly one
+        // halt command goes out, and the surface is still released.
+        let mut rig = rig();
+        let (mut surface, events) = FakeSurface::new(design_rect());
+        surface.deny_after = Some((3, "the game window moved".to_owned()));
+        let releases = surface.releases.clone();
+        rig.job_tx
+            .send(plan::buy_job(Trigger::ShopOpened, 0, &[0, 4], 42))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        let journal = rig.journal.clone();
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        assert_eq!(events.lock().unwrap().len(), 3);
+        assert_eq!(rig.command_rx.try_recv(), Ok(Command::ActuatorFailed));
+        assert!(
+            rig.command_rx.try_recv().is_err(),
+            "one halt, not one per step"
+        );
+        assert_eq!(*releases.lock().unwrap(), 1);
+        assert!(
+            journal
+                .entries()
+                .iter()
+                .any(|line| line.text.contains("stopping the loop"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_releases_the_surface_after_every_acquired_job() {
+        // Completion and mid-job abort both end with a release; a job dropped
+        // before acquire never engaged anything, so nothing to release.
+        let rig = rig();
+        let (mut surface, _events) = FakeSurface::new(design_rect());
+        let releases = surface.releases.clone();
+        let gate = rig.gate.clone();
+        surface.on_input = Box::new(move || gate.set(false));
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .await
+            .unwrap();
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 2))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        // Job 1 aborts mid-steps (gate off after its first input) and is
+        // released; job 2 is dropped by the gate before acquire — no release.
+        assert_eq!(*releases.lock().unwrap(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -473,7 +564,7 @@ mod tests {
         )
         .await;
         assert!(events.lock().unwrap().is_empty());
-        assert_eq!(rig.command_rx.try_recv(), Ok(Command::Stop));
+        assert_eq!(rig.command_rx.try_recv(), Ok(Command::ActuatorFailed));
         assert!(
             journal
                 .entries()

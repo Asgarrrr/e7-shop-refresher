@@ -45,6 +45,7 @@ pub(crate) fn describe(reason: StopReason) -> &'static str {
     match reason {
         StopReason::PlayerStopped => "player stopped",
         StopReason::SessionEnded => "session ended",
+        StopReason::ActuatorFailed => "clicker failed — see the journal",
         StopReason::OutOfFunds => "out of crystals",
         StopReason::MaxRefreshes => "refresh limit reached",
         StopReason::MaxSpend => "crystal budget reached",

@@ -128,6 +128,7 @@ fn handle_command(
     let event = match command {
         Command::Start => Event::Start { now_ms },
         Command::Stop => Event::Stop,
+        Command::ActuatorFailed => Event::ActuatorFailed,
         Command::Toggle => match ctrl.status() {
             Status::Watching | Status::Paused => Event::Stop,
             Status::Idle | Status::Stopped(_) => Event::Start { now_ms },
