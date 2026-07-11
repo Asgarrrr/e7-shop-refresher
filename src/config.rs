@@ -77,12 +77,13 @@ pub struct ActuatorConfig {
 #[serde(rename_all = "snake_case")]
 pub enum ActuatorBackend {
     /// `SendInput`: drives the real cursor and forces the game window to the
-    /// foreground. Works whatever the engine reads input from.
-    #[default]
+    /// foreground. Works whatever the engine reads input from — the fallback
+    /// if a game update stops honoring posted messages.
     Input,
     /// `PostMessageW`: posts synthetic mouse messages to the window — no
-    /// focus stolen, the player keeps the mouse. Only works when the engine
-    /// honors window messages.
+    /// focus stolen, the player keeps the mouse. Live-validated against the
+    /// game (refresh, buys, wheel scroll, unfocused window).
+    #[default]
     Message,
 }
 
@@ -319,14 +320,15 @@ mod tests {
     }
 
     #[test]
-    fn actuator_backend_parses_and_defaults_to_input() {
+    fn actuator_backend_parses_and_defaults_to_message() {
         let config: Config =
-            toml::from_str("[actuator]\nbackend = \"message\"").expect("config should parse");
-        assert_eq!(config.actuator.backend, ActuatorBackend::Message);
-        // Absent key: the SendInput backend, the one that works everywhere.
-        let config: Config = toml::from_str("[actuator]").expect("config should parse");
+            toml::from_str("[actuator]\nbackend = \"input\"").expect("config should parse");
         assert_eq!(config.actuator.backend, ActuatorBackend::Input);
-        assert_eq!(Config::default().actuator.backend, ActuatorBackend::Input);
+        // Absent key: the live-validated message backend — the player keeps
+        // the mouse.
+        let config: Config = toml::from_str("[actuator]").expect("config should parse");
+        assert_eq!(config.actuator.backend, ActuatorBackend::Message);
+        assert_eq!(Config::default().actuator.backend, ActuatorBackend::Message);
     }
 
     #[test]

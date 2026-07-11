@@ -154,10 +154,10 @@ fn send_input(mi: MOUSEINPUT) {
     unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
 }
 
-/// `PostMessageW` backend: posts synthetic mouse messages straight to the
-/// game window. No focus is stolen and the real cursor never moves — the
-/// player keeps the mouse — but it only works because the engine honors
-/// window messages (player-validated; `SendInput` remains the default).
+/// `PostMessageW` backend (the default): posts synthetic mouse messages
+/// straight to the game window. No focus is stolen and the real cursor never
+/// moves — the player keeps the mouse — but it only works because the engine
+/// honors window messages (live-validated; [`WinSurface`] is the fallback).
 #[derive(Default)]
 pub struct MessageSurface {
     /// Refreshed by `acquire`, consumed by the inputs of the same job. The
