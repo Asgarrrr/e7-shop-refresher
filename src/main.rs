@@ -14,6 +14,13 @@ use arkyve_refresh_shop::{Config, app};
 const CONFIG_PATH: &str = "config.toml";
 
 fn main() -> ExitCode {
+    // rustls 0.23 needs a process-level CryptoProvider installed before the
+    // first TLS handshake, or connect_async panics on any wss:// URL. Install
+    // it explicitly (the enabled feature set alone doesn't auto-select one).
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install the rustls ring CryptoProvider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
