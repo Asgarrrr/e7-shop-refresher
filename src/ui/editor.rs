@@ -182,10 +182,13 @@ fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input: &mut Strin
     });
 }
 
-/// Checkbox-gated numeric criterion: unchecked means "no constraint". The
-/// seed must be non-zero and the widget clamps at 1 — a zero limit halts the
-/// session at the next check-point and a zero criterion constrains nothing;
-/// "no constraint" is the unchecked box, never a 0.
+/// Checkbox-gated numeric criterion: unchecked means "no constraint",
+/// expressed by the unchecked box — never a 0. A freshly checked box seeds a
+/// non-zero value and dragging is floored at 1, but `clamp_existing_to_range`
+/// is off: a value already present (e.g. a `max_refreshes = 0` seeded from
+/// config.toml) is shown as-is, not silently rewritten to 1 on the first
+/// render — which would desync the draft and make Apply send a value the
+/// player never chose.
 fn optional_value<T: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     label: &str,
@@ -197,7 +200,9 @@ fn optional_value<T: egui::emath::Numeric>(
         ui.checkbox(&mut on, label);
         if on {
             ui.add(
-                egui::DragValue::new(value.get_or_insert(seed)).range(T::from_f64(1.0)..=T::MAX),
+                egui::DragValue::new(value.get_or_insert(seed))
+                    .range(T::from_f64(1.0)..=T::MAX)
+                    .clamp_existing_to_range(false),
             );
         } else {
             *value = None;
@@ -289,6 +294,25 @@ mod tests {
         harness.run();
         drop(harness);
         assert_eq!(editor.filter.kinds, vec![ItemKind::Token]);
+    }
+
+    #[test]
+    fn seeded_zero_limit_is_not_silently_clamped() {
+        // A config-seeded 0 (max_refreshes = 0 halts at the first check) must
+        // survive rendering unchanged; the old DragValue clamp rewrote it to
+        // 1, so Apply sent a limit the player never set.
+        let limits = Limits {
+            max_refreshes: Some(0),
+            ..Limits::default()
+        };
+        let mut editor = EditorState::new(named_filter(), limits);
+        let mut harness = Harness::new_ui(|ui| {
+            edit_limits(ui, &mut editor);
+        });
+        harness.get_by_label("Limits").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.limits.max_refreshes, Some(0));
     }
 
     #[test]
