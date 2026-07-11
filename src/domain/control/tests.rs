@@ -289,14 +289,24 @@ fn stop_clears_the_checklist() {
 }
 
 #[test]
-fn limit_halt_clears_the_checklist() {
+fn max_matches_halts_after_the_goal_item_is_bought() {
     let mut ctrl = started(Limits {
         max_matches: Some(1),
         ..Limits::default()
     });
-    // The match trips max_matches: Alert then Halt in the same batch.
+    // The match trips max_matches, but the found item is the point of the
+    // hunt: pause and buy it first.
     let actions = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
-    assert!(matches!(actions.last(), Some(Action::Halt(_))));
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(3, Some(102))]
+        }]
+    );
+    assert_eq!(ctrl.status(), Status::Paused);
+    // The buy clears the pause; the resume gate halts instead of refreshing.
+    let actions = ctrl.handle(buy(102, 2));
+    assert_eq!(actions, vec![Action::Halt(StopReason::MaxMatches)]);
     assert!(ctrl.checklist().is_empty());
 }
 
@@ -845,37 +855,50 @@ fn max_matches_boundary_uses_ge() {
     let actions = ctrl.handle(snap(second, 3));
     assert_eq!(
         actions,
-        vec![
-            Action::Buy {
-                targets: vec![target(3, Some(202))]
-            },
-            Action::Halt(StopReason::MaxMatches),
-        ]
+        vec![Action::Buy {
+            targets: vec![target(3, Some(202))]
+        }]
+    );
+    assert_eq!(ctrl.status(), Status::Paused);
+    assert_eq!(
+        ctrl.handle(buy(202, 4)),
+        vec![Action::Halt(StopReason::MaxMatches)]
     );
     assert_eq!(ctrl.status(), Status::Stopped(StopReason::MaxMatches));
 }
 
 #[test]
-fn single_shop_multi_match_stops() {
+fn single_shop_multi_match_overshoot_halts_at_next_gate() {
     let mut ctrl = started(Limits {
         max_matches: Some(2),
         ..Limits::default()
     });
-    let triple = shop(
+    let triple = with_ids(shop(
         &[Equipment, Equipment, Equipment, Token, Token, Token],
         None,
-    );
+    ));
+    // Three matches overshoot the limit of two, but the pause still comes
+    // first: the found items must be buyable before the loop stops.
     let actions = ctrl.handle(snap(triple, 1));
     assert_eq!(
         actions,
-        vec![
-            Action::Buy {
-                targets: vec![target(1, None), target(2, None), target(3, None)]
-            },
-            Action::Halt(StopReason::MaxMatches),
-        ]
+        vec![Action::Buy {
+            targets: vec![
+                target(1, Some(100)),
+                target(2, Some(101)),
+                target(3, Some(102))
+            ]
+        }]
     );
     assert_eq!(ctrl.progress().matches_found, 3);
+    assert_eq!(ctrl.status(), Status::Paused);
+    ctrl.handle(buy(100, 2));
+    ctrl.handle(buy(101, 3));
+    // The last buy resumes through the gate, which trips the exceeded limit.
+    assert_eq!(
+        ctrl.handle(buy(102, 4)),
+        vec![Action::Halt(StopReason::MaxMatches)]
+    );
 }
 
 #[test]

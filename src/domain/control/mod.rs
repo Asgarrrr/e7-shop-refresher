@@ -31,7 +31,9 @@ pub struct Limits {
     /// Crystal budget — a hard ceiling: a refresh that would cross it is
     /// never issued.
     pub max_spend: Option<u32>,
-    /// Matched (alerted) items, cumulative — not purchases.
+    /// Matched items, cumulative — not purchases. Reached by a match, the
+    /// halt waits for that match's pause to resolve: the found items are
+    /// bought, then the loop stops instead of resuming.
     pub max_matches: Option<u32>,
     pub max_duration_ms: Option<u64>,
 }
@@ -102,8 +104,8 @@ pub struct BuyTarget {
     pub id: Option<u32>,
 }
 
-/// Actions are to be consumed in order: on the max-matches path a `Buy`
-/// precedes the `Halt` and both matter.
+/// Actions are to be consumed in order: a `Buy` can precede another action
+/// in the same batch and both matter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Refresh,
@@ -342,24 +344,17 @@ impl Controller {
             self.status = Status::Watching;
             return self.refresh_or_halt(now_ms);
         }
-        // A match means a purchase to make: never refresh over it.
+        // A match means a purchase to make: never refresh over it — and
+        // never halt over it either. The matched items are the hunt's very
+        // goal, so a reached `max_matches` does not fire here: the pause
+        // resolves first (the items get bought) and the limit lands at the
+        // next gate, which re-checks every stop reason.
         self.progress.matches_found = self
             .progress
             .matches_found
             .saturating_add(targets.len() as u32);
-        let buy = Action::Buy { targets };
-        if self
-            .limits
-            .max_matches
-            .is_some_and(|max| self.progress.matches_found >= max)
-        {
-            let mut actions = vec![buy];
-            actions.extend(self.halt(StopReason::MaxMatches));
-            actions
-        } else {
-            self.status = Status::Paused;
-            vec![buy]
-        }
+        self.status = Status::Paused;
+        vec![Action::Buy { targets }]
     }
 
     /// A server-confirmed buy. Only meaningful while `Paused`: checks the
