@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetClientRect, GetForegroundWindow, GetSystemMetrics, PostMessageW,
+    FindWindowW, GetClientRect, GetCursorPos, GetForegroundWindow, GetSystemMetrics, PostMessageW,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SetForegroundWindow, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
 };
@@ -34,6 +34,12 @@ const WHEEL_DELTA: i32 = 120;
 const MOVE_SETTLE_MS: u64 = 30;
 /// The foreground switch is asynchronous: give it a beat before verifying.
 const FOCUS_SETTLE_MS: u64 = 100;
+/// How long a posted input waits for the player's mouse to leave the game
+/// window. The engine tracks its cursor through move messages, so a real
+/// mouse over the window drags posted clicks onto itself; camping past this
+/// budget stops the loop rather than stalling past the epoch/gate guarantees.
+const CURSOR_VACATE_MS: u64 = 2_000;
+const CURSOR_POLL_MS: u64 = 50;
 
 /// Marks the process DPI-aware once, so client rects come back in physical
 /// pixels. winit already sets this in gui builds; the console build needs it
@@ -55,18 +61,20 @@ impl Surface for WinSurface {
         client_rect(hwnd)
     }
 
-    fn click(&mut self, at: (i32, i32), press_ms: u64) {
+    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String> {
         move_cursor(at);
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
         send_mouse(0, MOUSEEVENTF_LEFTDOWN);
         std::thread::sleep(Duration::from_millis(press_ms));
         send_mouse(0, MOUSEEVENTF_LEFTUP);
+        Ok(())
     }
 
-    fn scroll(&mut self, at: (i32, i32), notches: i32) {
+    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String> {
         move_cursor(at);
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
         send_mouse(notches.saturating_mul(WHEEL_DELTA), MOUSEEVENTF_WHEEL);
+        Ok(())
     }
 }
 
@@ -169,14 +177,31 @@ pub struct MessageSurface {
 #[derive(Clone, Copy)]
 struct Target {
     hwnd: isize,
-    /// Client-area origin in screen pixels: button messages carry client
-    /// coordinates, and the executor hands out screen ones.
-    origin: (i32, i32),
+    /// Client area in screen pixels: locates the client coordinates button
+    /// messages carry, and bounds the player-cursor guard.
+    rect: ClientRect,
 }
 
 impl Target {
     fn to_client(self, at: (i32, i32)) -> (i32, i32) {
-        (at.0 - self.origin.0, at.1 - self.origin.1)
+        (at.0 - self.rect.left, at.1 - self.rect.top)
+    }
+
+    /// Posts the position move once the player's mouse is out of the way and
+    /// re-checks after the settle: a real move slipping in between would
+    /// drag the tracked position — and the input — onto the player's cursor.
+    fn settle_position(self, lparam: isize) -> Result<(), String> {
+        for _ in 0..2 {
+            if !vacate_cursor(self.rect) {
+                break;
+            }
+            post(self.hwnd, WM_MOUSEMOVE, 0, lparam);
+            std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
+            if cursor_clear(self.rect) {
+                return Ok(());
+            }
+        }
+        Err("the mouse stays over the game window — posted clicks would land on it".to_owned())
     }
 }
 
@@ -187,30 +212,24 @@ impl Surface for MessageSurface {
         let rect = client_rect(hwnd)?;
         self.target = Some(Target {
             hwnd: hwnd as isize,
-            origin: (rect.left, rect.top),
+            rect,
         });
         Ok(rect)
     }
 
-    fn click(&mut self, at: (i32, i32), press_ms: u64) {
+    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String> {
         let target = self.target.expect("acquire() before click");
         let lparam = pack_point(target.to_client(at));
-        post(target.hwnd, WM_MOUSEMOVE, 0, lparam);
-        std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
+        target.settle_position(lparam)?;
         post(target.hwnd, WM_LBUTTONDOWN, MK_LBUTTON as usize, lparam);
         std::thread::sleep(Duration::from_millis(press_ms));
         post(target.hwnd, WM_LBUTTONUP, 0, lparam);
+        Ok(())
     }
 
-    fn scroll(&mut self, at: (i32, i32), notches: i32) {
+    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String> {
         let target = self.target.expect("acquire() before scroll");
-        post(
-            target.hwnd,
-            WM_MOUSEMOVE,
-            0,
-            pack_point(target.to_client(at)),
-        );
-        std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
+        target.settle_position(pack_point(target.to_client(at)))?;
         // WM_MOUSEWHEEL carries screen coordinates, unlike the button
         // messages; the delta rides the high word of wParam.
         let delta = notches.saturating_mul(WHEEL_DELTA);
@@ -220,7 +239,36 @@ impl Surface for MessageSurface {
             ((delta as u32) << 16) as usize,
             pack_point(at),
         );
+        Ok(())
     }
+}
+
+/// Whether the player's mouse is outside the game's client area. Windows
+/// routes real mouse messages to the window under the cursor: outside the
+/// rect the game receives none, and the posted position stands uncontested.
+fn cursor_clear(rect: ClientRect) -> bool {
+    let mut point = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        return true; // cannot know — proceed as before the guard existed
+    }
+    point.x < rect.left
+        || point.x >= rect.left + rect.width
+        || point.y < rect.top
+        || point.y >= rect.top + rect.height
+}
+
+/// Polls until the player's mouse leaves the game window; `false` once the
+/// budget is spent.
+fn vacate_cursor(rect: ClientRect) -> bool {
+    let mut waited = 0;
+    while !cursor_clear(rect) {
+        if waited >= CURSOR_VACATE_MS {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(CURSOR_POLL_MS));
+        waited += CURSOR_POLL_MS;
+    }
+    true
 }
 
 /// `MAKELPARAM`: x in the low word, y in the high word, both signed 16-bit.

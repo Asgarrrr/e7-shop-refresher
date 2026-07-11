@@ -73,8 +73,10 @@ pub trait Surface {
     /// brought to the foreground is backend-specific. An `Err` means any
     /// click would be blind: the executor stops the loop.
     fn acquire(&mut self) -> Result<plan::ClientRect, String>;
-    fn click(&mut self, at: (i32, i32), press_ms: u64);
-    fn scroll(&mut self, at: (i32, i32), notches: i32);
+    /// An `Err` means the input could not be delivered safely (e.g. the
+    /// player's mouse would hijack it): the executor stops the loop.
+    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String>;
+    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String>;
 }
 
 /// Replays queued jobs step by step. Before every act it re-checks the gate
@@ -117,15 +119,16 @@ pub async fn run_executor(
                     break;
                 }
             };
-            match step.input {
+            let delivered = match step.input {
                 Input::Click { press_ms, .. } => {
                     if dry_run {
                         journal.emit(&[format!(
                             ">> dry-run: click ({}, {}) after {} ms, hold {press_ms} ms",
                             at.0, at.1, step.wait_ms
                         )]);
+                        Ok(())
                     } else {
-                        surface.click(at, press_ms);
+                        surface.click(at, press_ms)
                     }
                 }
                 Input::Scroll { notches, .. } => {
@@ -134,10 +137,15 @@ pub async fn run_executor(
                             ">> dry-run: scroll {notches} at ({}, {}) after {} ms",
                             at.0, at.1, step.wait_ms
                         )]);
+                        Ok(())
                     } else {
-                        surface.scroll(at, notches);
+                        surface.scroll(at, notches)
                     }
                 }
+            };
+            if let Err(reason) = delivered {
+                fail(&journal, &commands, &reason);
+                break;
             }
         }
     }
@@ -175,11 +183,13 @@ mod tests {
     }
 
     /// Records every input; `on_input` runs after each one (to flip the gate
-    /// or bump the epoch mid-job).
+    /// or bump the epoch mid-job); `input_error` makes every input fail
+    /// undelivered.
     struct FakeSurface {
         rect: Result<ClientRect, String>,
         events: Arc<Mutex<Vec<Recorded>>>,
         on_input: Box<dyn FnMut() + Send>,
+        input_error: Option<String>,
     }
 
     impl FakeSurface {
@@ -189,6 +199,7 @@ mod tests {
                 rect,
                 events: events.clone(),
                 on_input: Box::new(|| {}),
+                input_error: None,
             };
             (surface, events)
         }
@@ -199,20 +210,28 @@ mod tests {
             self.rect.clone()
         }
 
-        fn click(&mut self, at: (i32, i32), press_ms: u64) {
+        fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String> {
+            if let Some(reason) = &self.input_error {
+                return Err(reason.clone());
+            }
             self.events
                 .lock()
                 .unwrap()
                 .push(Recorded::Click(at, press_ms));
             (self.on_input)();
+            Ok(())
         }
 
-        fn scroll(&mut self, at: (i32, i32), notches: i32) {
+        fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String> {
+            if let Some(reason) = &self.input_error {
+                return Err(reason.clone());
+            }
             self.events
                 .lock()
                 .unwrap()
                 .push(Recorded::Scroll(at, notches));
             (self.on_input)();
+            Ok(())
         }
     }
 
@@ -393,6 +412,38 @@ mod tests {
         assert!(journal.entries().iter().any(|line| {
             line.text
                 .contains("actuator: game window not found — stopping the loop")
+        }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_stops_the_loop_when_an_input_fails() {
+        // A surface that cannot deliver an input safely (e.g. the player's
+        // mouse camping over the game window) must halt the hunt, not click
+        // blind or skip silently.
+        let mut rig = rig();
+        let (mut surface, events) = FakeSurface::new(design_rect());
+        surface.input_error = Some("the mouse stays over the game window".to_owned());
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        let journal = rig.journal.clone();
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(rig.command_rx.try_recv(), Ok(Command::Stop));
+        assert!(journal.entries().iter().any(|line| {
+            line.text
+                .contains("the mouse stays over the game window — stopping the loop")
         }));
     }
 

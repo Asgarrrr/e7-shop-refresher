@@ -57,6 +57,9 @@ names = ["ticketrare_name", "ticketspecial_name"]
 # How clicks reach the game. "message" (default) posts the clicks straight
 # to the window: no focus stolen, you keep the mouse — but the game window
 # must stay open and restored (behind other windows is fine; minimizing it
-# stops the loop). "input" drives the real cursor instead (steals focus and
-# mouse) — the fallback if a game update stops honoring posted clicks.
+# stops the loop). Keep your mouse off the game window while it clicks: the
+# game follows whichever cursor moved last, so jobs wait up to 2 s for yours
+# to leave, then stop the loop. "input" drives the real cursor instead
+# (steals focus and mouse) — the fallback if a game update stops honoring
+# posted clicks.
 # backend = "message"
