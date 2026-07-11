@@ -2,7 +2,7 @@
 name = "arkyve-refresh-shop"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Passive local relay that captures Epic Seven Secret Shop traffic and forwards it to the analysis server."
 license = "MIT"
 publish = false
