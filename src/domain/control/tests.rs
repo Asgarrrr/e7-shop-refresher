@@ -796,6 +796,8 @@ fn stop_while_idle_is_a_no_op() {
     assert_eq!(ctrl.status(), Status::Idle);
     assert!(ctrl.handle(Event::Shutdown).is_empty());
     assert_eq!(ctrl.status(), Status::Idle);
+    assert!(ctrl.handle(Event::ActuatorFailed).is_empty());
+    assert_eq!(ctrl.status(), Status::Idle);
 }
 
 #[test]
@@ -825,14 +827,11 @@ fn actuator_failure_halts_with_an_honest_label() {
     );
     assert_eq!(ctrl.status(), Status::Stopped(StopReason::ActuatorFailed));
 
-    // Like Stop and Shutdown: never relabels, no-ops while Idle.
+    // Like Stop and Shutdown: never relabels an earlier reason.
     let mut ctrl = started(Limits::default());
     ctrl.handle(Event::Stop);
     assert!(ctrl.handle(Event::ActuatorFailed).is_empty());
     assert_eq!(ctrl.status(), Status::Stopped(StopReason::PlayerStopped));
-    let mut ctrl = controller(Limits::default());
-    assert!(ctrl.handle(Event::ActuatorFailed).is_empty());
-    assert_eq!(ctrl.status(), Status::Idle);
 }
 
 #[test]

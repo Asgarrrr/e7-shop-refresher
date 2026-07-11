@@ -34,6 +34,16 @@ const WHEEL_DELTA: i32 = 120;
 const MOVE_SETTLE_MS: u64 = 30;
 /// The foreground switch is asynchronous: give it a beat before verifying.
 const FOCUS_SETTLE_MS: u64 = 100;
+/// After the shield is (re)placed, the game may still hold real mouse moves
+/// in its queue — and posted messages are retrieved *before* hardware input,
+/// so a stale real move would override our posted position. Give the game a
+/// few frames to drain while the shield already blocks new ones.
+const SHIELD_DRAIN_MS: u64 = 50;
+
+/// Null-terminated UTF-16, the shape every W-suffixed Win32 call wants.
+pub(super) fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain([0]).collect()
+}
 
 /// Marks the process DPI-aware once, so client rects come back in physical
 /// pixels. winit already sets this in gui builds; the console build needs it
@@ -73,7 +83,7 @@ impl Surface for WinSurface {
 }
 
 fn find_game_window() -> Result<HWND, String> {
-    let title: Vec<u16> = GAME_WINDOW_TITLE.encode_utf16().chain([0]).collect();
+    let title = wide(GAME_WINDOW_TITLE);
     let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
     if hwnd.is_null() {
         return Err(format!("no \"{GAME_WINDOW_TITLE}\" window found"));
@@ -162,17 +172,16 @@ fn send_input(mi: MOUSEINPUT) {
 /// honors window messages (live-validated; [`WinSurface`] is the fallback).
 ///
 /// The engine tracks its cursor through move messages, so the player's real
-/// mouse over the game window would drag posted clicks onto itself: the
-/// first input of every job raises the [`shield`](super::shield) over the
-/// game, absorbing the player's mouse there until [`release`](Surface).
+/// mouse over the game window would drag posted clicks onto itself: every
+/// input re-asserts the [`shield`](super::shield) over the game — the player
+/// can raise the game above it mid-job (title bar, alt-tab) — and it stays
+/// up, absorbing the player's mouse there, until [`release`](Surface).
 #[derive(Default)]
 pub struct MessageSurface {
     /// Refreshed by `acquire`, consumed by the inputs of the same job. The
     /// executor holds the surface across awaits, so the window handle is
     /// stored as an integer to keep the future `Send`.
     target: Option<Target>,
-    /// Shield raised for the current job; lowered by `release`.
-    engaged: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -188,29 +197,31 @@ impl Target {
         (at.0 - self.rect.left, at.1 - self.rect.top)
     }
 
-    /// The window must still be where the job was planned: coordinates and
-    /// the shield's position all derive from the acquire-time rect, so a
-    /// moved, resized or vanished window halts the job instead of landing
-    /// clicks nobody aimed.
-    fn verify(self) -> Result<(), String> {
-        if client_rect(self.hwnd as HWND)? != self.rect {
-            return Err("the game window moved mid-job".to_owned());
+    /// Runs before every input: the window must still be where the job was
+    /// planned (coordinates and the shield's position derive from the
+    /// acquire-time rect) and the shield must still sit directly above it.
+    /// A shield that had to be (re)placed gets the drain beat: the game must
+    /// consume the real moves it already held before our move posts.
+    fn engage(self) -> Result<(), String> {
+        self.verify()?;
+        if shield::raise(self.hwnd as HWND, self.rect)? {
+            std::thread::sleep(Duration::from_millis(SHIELD_DRAIN_MS));
         }
         Ok(())
     }
-}
 
-impl MessageSurface {
-    /// Runs before every input: re-verifies the window and, on the job's
-    /// first input, raises the shield so the player's mouse cannot contest
-    /// the posted position.
-    fn engage(&mut self, target: Target) -> Result<(), String> {
-        target.verify()?;
-        if !self.engaged {
-            shield::raise(target.hwnd as HWND, target.rect)?;
-            self.engaged = true;
+    /// A moved, resized, minimized or vanished window halts the job instead
+    /// of landing clicks nobody aimed — each with its honest label.
+    fn verify(self) -> Result<(), String> {
+        let rect = client_rect(self.hwnd as HWND)?;
+        if rect == self.rect {
+            return Ok(());
         }
-        Ok(())
+        Err(if rect.width <= 0 || rect.height <= 0 {
+            "the game window was minimized mid-job".to_owned()
+        } else {
+            "the game window moved or resized mid-job".to_owned()
+        })
     }
 }
 
@@ -228,7 +239,7 @@ impl Surface for MessageSurface {
 
     fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String> {
         let target = self.target.expect("acquire() before click");
-        self.engage(target)?;
+        target.engage()?;
         let lparam = pack_point(target.to_client(at));
         post(target.hwnd, WM_MOUSEMOVE, 0, lparam);
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
@@ -240,7 +251,7 @@ impl Surface for MessageSurface {
 
     fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String> {
         let target = self.target.expect("acquire() before scroll");
-        self.engage(target)?;
+        target.engage()?;
         post(
             target.hwnd,
             WM_MOUSEMOVE,
@@ -261,10 +272,7 @@ impl Surface for MessageSurface {
     }
 
     fn release(&mut self) {
-        if self.engaged {
-            shield::hide();
-            self.engaged = false;
-        }
+        shield::hide();
     }
 }
 
