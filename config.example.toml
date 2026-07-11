@@ -54,3 +54,9 @@ names = ["ticketrare_name", "ticketspecial_name"]
 # waits) without sending any input — use it to check the coordinates before
 # going live.
 # dry_run = false
+# How clicks reach the game. "input" (default) drives the real cursor and
+# brings the game window to the foreground. "message" posts the clicks
+# straight to the window: no focus stolen, you keep the mouse — but the game
+# window must stay open and restored (behind other windows is fine;
+# minimizing it stops the loop).
+# backend = "input"

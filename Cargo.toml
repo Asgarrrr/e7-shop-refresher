@@ -15,8 +15,8 @@ windivert-backend = ["dep:windivert"]
 # egui window over the session (dashboard + player commands). Disable for the
 # console-only build.
 gui = ["dep:eframe"]
-# Click-emulation input backend (SendInput). Only acts on Windows; elsewhere
-# the executor is replaced by a job-draining stub.
+# Click-emulation input backends (SendInput / PostMessageW). Only act on
+# Windows; elsewhere the executor is replaced by a job-draining stub.
 actuator = ["dep:windows-sys"]
 
 [dependencies]
@@ -56,6 +56,7 @@ windivert = { version = "0.7.0-beta.4", optional = true }
 windows-sys = { version = "0.61", optional = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_System_SystemServices",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

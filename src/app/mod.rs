@@ -193,21 +193,35 @@ impl Session {
             tokio::spawn(reassemble_loop(segment_rx, raw_tx, config.forward.clone())),
         );
 
-        // Click jobs -> the game window.
+        // Click jobs -> the game window, through the configured backend.
         #[cfg(all(windows, feature = "actuator"))]
-        supervise_task(
-            "actuator",
-            &fatal_tx,
-            tokio::spawn(crate::actuator::run_executor(
-                crate::actuator::win::WinSurface,
-                job_rx,
-                gate.clone(),
-                actuator.epoch.clone(),
-                journal.clone(),
-                commands.clone(),
-                actuator.mode == Mode::DryRun,
-            )),
-        );
+        {
+            use crate::actuator::run_executor;
+            use crate::actuator::win::{MessageSurface, WinSurface};
+            use crate::config::ActuatorBackend;
+            let dry_run = actuator.mode == Mode::DryRun;
+            let task = match config.actuator.backend {
+                ActuatorBackend::Input => tokio::spawn(run_executor(
+                    WinSurface,
+                    job_rx,
+                    gate.clone(),
+                    actuator.epoch.clone(),
+                    journal.clone(),
+                    commands.clone(),
+                    dry_run,
+                )),
+                ActuatorBackend::Message => tokio::spawn(run_executor(
+                    MessageSurface::default(),
+                    job_rx,
+                    gate.clone(),
+                    actuator.epoch.clone(),
+                    journal.clone(),
+                    commands.clone(),
+                    dry_run,
+                )),
+            };
+            supervise_task("actuator", &fatal_tx, task);
+        }
         // Without an input backend the mode is Off and nothing ever submits.
         #[cfg(not(all(windows, feature = "actuator")))]
         drop(job_rx);

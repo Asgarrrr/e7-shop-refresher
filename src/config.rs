@@ -67,6 +67,23 @@ pub struct ActuatorConfig {
     /// Journal the planned clicks (screen coordinates and waits) without
     /// sending any input to the game.
     pub dry_run: bool,
+
+    /// How clicks reach the game window.
+    pub backend: ActuatorBackend,
+}
+
+/// Input backend of the Windows build.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActuatorBackend {
+    /// `SendInput`: drives the real cursor and forces the game window to the
+    /// foreground. Works whatever the engine reads input from.
+    #[default]
+    Input,
+    /// `PostMessageW`: posts synthetic mouse messages to the window — no
+    /// focus stolen, the player keeps the mouse. Only works when the engine
+    /// honors window messages.
+    Message,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -299,6 +316,24 @@ mod tests {
     fn misspelled_actuator_key_is_rejected() {
         // A silently ignored `dry_run` typo would send real clicks.
         assert!(toml::from_str::<Config>("[actuator]\ndryrun = true").is_err());
+    }
+
+    #[test]
+    fn actuator_backend_parses_and_defaults_to_input() {
+        let config: Config =
+            toml::from_str("[actuator]\nbackend = \"message\"").expect("config should parse");
+        assert_eq!(config.actuator.backend, ActuatorBackend::Message);
+        // Absent key: the SendInput backend, the one that works everywhere.
+        let config: Config = toml::from_str("[actuator]").expect("config should parse");
+        assert_eq!(config.actuator.backend, ActuatorBackend::Input);
+        assert_eq!(Config::default().actuator.backend, ActuatorBackend::Input);
+    }
+
+    #[test]
+    fn unknown_actuator_backend_is_rejected() {
+        // A silently defaulted typo would steal the mouse the player asked
+        // to keep.
+        assert!(toml::from_str::<Config>("[actuator]\nbackend = \"postmessage\"").is_err());
     }
 
     #[test]

@@ -69,8 +69,9 @@ impl ActuatorHandle {
 /// The input backend the executor drives: real input on Windows, a recorder
 /// in tests.
 pub trait Surface {
-    /// Finds and focuses the game window, returning its client area. An
-    /// `Err` means any click would be blind: the executor stops the loop.
+    /// Locates the game window, returning its client area — whether it is
+    /// brought to the foreground is backend-specific. An `Err` means any
+    /// click would be blind: the executor stops the loop.
     fn acquire(&mut self) -> Result<plan::ClientRect, String>;
     fn click(&mut self, at: (i32, i32), press_ms: u64);
     fn scroll(&mut self, at: (i32, i32), notches: i32);
