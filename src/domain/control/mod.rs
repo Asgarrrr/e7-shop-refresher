@@ -83,6 +83,9 @@ pub enum Event {
     Purchase {
         /// Global catalog id, same space as `ShopItem::id`; `0` when omitted.
         item: u32,
+        /// Gold balance after the buy — feeds the affordability planning of
+        /// the next matches.
+        gold: Option<u32>,
         now_ms: u64,
     },
     FilterChanged(Filter),
@@ -160,6 +163,10 @@ pub struct Controller {
     /// the affordability estimate survives snapshots that omit meta; a
     /// server-sent meta overwrites the estimate. Forgotten on `Start`.
     refresh_meta: Option<RefreshMeta>,
+    /// Last gold balance echoed by a purchase; the next matches' buys are
+    /// planned against it. `None` (nothing echoed yet) restricts nothing,
+    /// and `Start` forgets it — a stale balance must not veto buys.
+    gold_balance: Option<u32>,
     last_snapshot: Option<ShopSnapshot>,
     /// Matched-but-unbought catalog ids from the last evaluated snapshot.
     checklist: Vec<u32>,
@@ -180,6 +187,7 @@ impl Controller {
             started_at: None,
             progress: Progress::default(),
             refresh_meta: None,
+            gold_balance: None,
             last_snapshot: None,
             checklist: Vec::new(),
             acted_fingerprint: None,
@@ -227,7 +235,7 @@ impl Controller {
             Event::Stop => self.on_halt_request(StopReason::PlayerStopped),
             Event::Shutdown => self.on_halt_request(StopReason::SessionEnded),
             Event::Snapshot { snapshot, now_ms } => self.on_snapshot(snapshot, now_ms),
-            Event::Purchase { item, now_ms } => self.on_purchase(item, now_ms),
+            Event::Purchase { item, gold, now_ms } => self.on_purchase(item, gold, now_ms),
             Event::FilterChanged(filter) => {
                 // An unrestricted filter is never accepted — armed, it would
                 // match every slot of every shop. Accepted swaps apply from
@@ -263,6 +271,7 @@ impl Controller {
         self.progress = Progress::default();
         self.started_at = Some(now_ms);
         self.refresh_meta = None; // a stale balance must not stop the new session
+        self.gold_balance = None; // nor a stale purse veto its buys
         self.checklist.clear();
         // A stale identity must not mute the new session's first snapshot.
         self.acted_fingerprint = None;
@@ -322,17 +331,34 @@ impl Controller {
         }
 
         let mut targets: Vec<BuyTarget> = Vec::new();
+        // Buys are planned against the last echoed gold balance, debited in
+        // click order: the second 184k bookmark of a 200k purse must not be
+        // clicked. An unknown balance or price fails open.
+        let mut gold = self.gold_balance;
+        let mut buyable = false;
         for (index, item) in snapshot.slots.iter().enumerate() {
-            if self.filter.matches(item) {
-                targets.push(BuyTarget {
-                    slot: item.effective_slot(index),
-                    // Only ids a purchase echo can actually name: the id-0
-                    // sentinel never appears in one, and a sold-out slot
-                    // cannot be bought at all — neither may hold the
-                    // checklist open (nor be clicked).
-                    id: item.catalog_id().filter(|_| !item.is_sold_out()),
-                });
+            if !self.filter.matches(item) {
+                continue;
             }
+            let affordable = match (gold, item.price) {
+                (Some(balance), Some(price)) => price <= balance,
+                _ => true,
+            };
+            // In reach of a buy — the tool's or the player's: in stock and
+            // within the known gold.
+            let in_reach = !item.is_sold_out() && affordable;
+            if in_reach && let (Some(balance), Some(price)) = (gold, item.price) {
+                gold = Some(balance - price);
+            }
+            buyable |= in_reach;
+            targets.push(BuyTarget {
+                slot: item.effective_slot(index),
+                // Only ids a purchase echo can actually name AND a buy can
+                // actually land: the id-0 sentinel never appears in an echo,
+                // and a sold-out or unaffordable slot cannot be bought —
+                // none may hold the checklist open (nor be clicked).
+                id: item.catalog_id().filter(|_| in_reach),
+            });
         }
         // Alignment by construction: the checklist is exactly the clickable
         // targets, so an actuator buying `id: Some` targets clears the pause.
@@ -344,23 +370,37 @@ impl Controller {
             self.status = Status::Watching;
             return self.refresh_or_halt(now_ms);
         }
+        self.progress.matches_found = self
+            .progress
+            .matches_found
+            .saturating_add(targets.len() as u32);
+        if !buyable {
+            // Every match is dead stock — sold out or beyond the known gold:
+            // nobody can buy any of it, and pausing would park the loop until
+            // the hourly rotation. Show the match and keep hunting.
+            self.status = Status::Watching;
+            let mut actions = vec![Action::Buy { targets }];
+            actions.extend(self.refresh_or_halt(now_ms));
+            return actions;
+        }
         // A match means a purchase to make: never refresh over it — and
         // never halt over it either. The matched items are the hunt's very
         // goal, so a reached `max_matches` does not fire here: the pause
         // resolves first (the items get bought) and the limit lands at the
         // next gate, which re-checks every stop reason.
-        self.progress.matches_found = self
-            .progress
-            .matches_found
-            .saturating_add(targets.len() as u32);
         self.status = Status::Paused;
         vec![Action::Buy { targets }]
     }
 
-    /// A server-confirmed buy. Only meaningful while `Paused`: checks the
-    /// item off the checklist; the buy clearing the last entry resumes the
-    /// hunt through the limits gate.
-    fn on_purchase(&mut self, item: u32, now_ms: u64) -> Vec<Action> {
+    /// A server-confirmed buy: records the echoed gold balance, then — only
+    /// meaningful while `Paused` — checks the item off the checklist; the
+    /// buy clearing the last entry resumes the hunt through the limits gate.
+    fn on_purchase(&mut self, item: u32, gold: Option<u32>, now_ms: u64) -> Vec<Action> {
+        if gold.is_some() {
+            // The echoed balance is truth whatever the status: the next
+            // matches' buys are planned against it.
+            self.gold_balance = gold;
+        }
         if self.status != Status::Paused {
             return Vec::new();
         }

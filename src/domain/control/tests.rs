@@ -57,7 +57,19 @@ fn target(slot: u8, id: Option<u32>) -> BuyTarget {
 }
 
 fn buy(item: u32, now_ms: u64) -> Event {
-    Event::Purchase { item, now_ms }
+    Event::Purchase {
+        item,
+        gold: None,
+        now_ms,
+    }
+}
+
+fn buy_with_gold(item: u32, gold: u32, now_ms: u64) -> Event {
+    Event::Purchase {
+        item,
+        gold: Some(gold),
+        now_ms,
+    }
 }
 
 fn controller(limits: Limits) -> Controller {
@@ -566,9 +578,10 @@ fn fail_open_snapshot_keeps_last_identity() {
 }
 
 #[test]
-fn sold_out_match_excluded_from_checklist() {
-    // A sold-out slot can match (include_sold_out) but can never produce
-    // a purchase echo: it must not hold the checklist open.
+fn sold_out_only_match_keeps_hunting() {
+    // A sold-out slot can match (include_sold_out) but nobody can buy it:
+    // pausing would park the loop until the hourly rotation, so the match
+    // is shown and the hunt continues in the same batch.
     let filter = Filter {
         kinds: vec![Equipment],
         include_sold_out: true,
@@ -582,15 +595,160 @@ fn sold_out_match_excluded_from_checklist() {
         total: 1,
     });
     let actions = ctrl.handle(snap(shop, 1));
-    // Sold out: matched for display, but never clickable.
+    assert_eq!(
+        actions,
+        vec![
+            Action::Buy {
+                targets: vec![target(3, None)]
+            },
+            Action::Refresh,
+        ]
+    );
+    assert_eq!(ctrl.status(), Status::Watching);
+    assert!(ctrl.checklist().is_empty());
+}
+
+#[test]
+fn untrackable_but_in_stock_match_still_pauses() {
+    // One matched slot is sold out, the other has no id but is in stock:
+    // the player can still buy the latter, so the manual-flow pause stays.
+    let filter = Filter {
+        kinds: vec![Equipment],
+        include_sold_out: true,
+        ..Filter::default()
+    };
+    let mut ctrl = Controller::new(filter, Limits::default());
+    ctrl.handle(Event::Start { now_ms: 0 });
+    let mut two_hits = shop(&[Equipment, Equipment, Token, Token, Token, Token], None);
+    two_hits.slots[0].id = 100;
+    two_hits.slots[0].limit = Some(PurchaseLimit {
+        remaining: 0,
+        total: 1,
+    });
+    let actions = ctrl.handle(snap(two_hits, 1));
     assert_eq!(
         actions,
         vec![Action::Buy {
-            targets: vec![target(3, None)]
+            targets: vec![target(1, None), target(2, None)]
         }]
     );
     assert_eq!(ctrl.status(), Status::Paused);
-    assert!(ctrl.checklist().is_empty()); // only a new shop unpauses
+}
+
+#[test]
+fn echoed_gold_blocks_unaffordable_next_match() {
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    assert_eq!(ctrl.status(), Status::Paused);
+    // The buy echoes a 100k balance...
+    assert_eq!(
+        ctrl.handle(buy_with_gold(102, 100_000, 2)),
+        vec![Action::Refresh]
+    );
+    // ...so the next match, priced 184k, is beyond reach: shown, never
+    // clicked, and the hunt continues.
+    let mut pricey = with_ids(hit_shop(None));
+    for item in &mut pricey.slots {
+        item.id += 100;
+    }
+    pricey.slots[2].price = Some(184_000);
+    let actions = ctrl.handle(snap(pricey, 3));
+    assert_eq!(
+        actions,
+        vec![
+            Action::Buy {
+                targets: vec![target(3, None)]
+            },
+            Action::Refresh,
+        ]
+    );
+    assert_eq!(ctrl.status(), Status::Watching);
+    assert!(ctrl.checklist().is_empty());
+}
+
+#[test]
+fn gold_debits_cumulatively_within_one_shop() {
+    // 200k on hand, two 184k matches: the first is clickable, the second is
+    // not — the first buy will have spent the purse.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    ctrl.handle(buy_with_gold(102, 200_000, 2));
+    let mut twins = with_ids(shop(
+        &[Equipment, Equipment, Token, Token, Token, Token],
+        None,
+    ));
+    for item in &mut twins.slots {
+        item.id += 100;
+    }
+    twins.slots[0].price = Some(184_000);
+    twins.slots[1].price = Some(184_000);
+    let actions = ctrl.handle(snap(twins, 3));
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(1, Some(200)), target(2, None)]
+        }]
+    );
+    assert_eq!(ctrl.checklist(), &[200]);
+    assert_eq!(ctrl.status(), Status::Paused);
+}
+
+#[test]
+fn unknown_gold_restricts_nothing() {
+    // No echo yet: a priced match stays clickable — the estimate fails
+    // open, it never vetoes buys on ignorance.
+    let mut ctrl = started(Limits::default());
+    let mut priced = with_ids(hit_shop(None));
+    priced.slots[2].price = Some(999_999_999);
+    let actions = ctrl.handle(snap(priced, 1));
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(3, Some(102))]
+        }]
+    );
+    assert_eq!(ctrl.status(), Status::Paused);
+}
+
+#[test]
+fn unknown_price_with_known_gold_fails_open() {
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    ctrl.handle(buy_with_gold(102, 10, 2)); // 10 gold left, known
+    // The next match omits its price: it cannot be proven unaffordable,
+    // so it stays clickable.
+    let mut fresh = with_ids(hit_shop(None));
+    for item in &mut fresh.slots {
+        item.id += 100;
+    }
+    let actions = ctrl.handle(snap(fresh, 3));
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(3, Some(202))]
+        }]
+    );
+    assert_eq!(ctrl.status(), Status::Paused);
+}
+
+#[test]
+fn start_forgets_the_gold_estimate() {
+    // Stale gold from the previous session must not veto the new one's buys.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    ctrl.handle(buy_with_gold(102, 10, 2));
+    ctrl.handle(Event::Stop);
+    ctrl.handle(Event::Start { now_ms: 3 });
+    let mut pricey = with_ids(hit_shop(None));
+    pricey.slots[2].price = Some(184_000);
+    let actions = ctrl.handle(snap(pricey, 4));
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(3, Some(102))]
+        }]
+    );
+    assert_eq!(ctrl.status(), Status::Paused);
 }
 
 #[test]

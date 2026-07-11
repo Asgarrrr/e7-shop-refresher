@@ -242,6 +242,7 @@ fn handle_purchase(
     let mut lines = vec![purchase_line(&ctrl, notice)];
     let actions = ctrl.handle(Event::Purchase {
         item: notice.item,
+        gold: notice.gold,
         now_ms,
     });
     lines.extend(apply(
@@ -370,8 +371,8 @@ fn submit_buys(
     targets: &[BuyTarget],
     now_ms: u64,
 ) {
-    // On the max-matches path a Halt follows in the same batch: the gate
-    // goes off and nothing may be clicked.
+    // Not Paused means the domain decided nothing here is buyable (dead
+    // stock — the batch keeps hunting): nothing may be clicked.
     if controller.status() != Status::Paused {
         return;
     }
@@ -410,9 +411,9 @@ fn render_match(lines: &mut Vec<String>, targets: &[BuyTarget], controller: &Con
         .map(|target| target.slot.to_string())
         .collect();
     let clickable = targets.iter().filter(|target| target.id.is_some()).count();
-    // Matched + still Paused means the loop waits on purchases; on the
-    // max-matches path a Halt follows in the same batch and any buy advice
-    // would be dead.
+    // Matched + still Paused means the loop waits on purchases; a Buy with
+    // the loop not Paused is dead stock (nothing on it is buyable) and any
+    // buy advice would be wrong.
     let hint = if controller.status() != Status::Paused {
         ""
     } else if clickable == 0 {
@@ -449,7 +450,7 @@ mod tests {
     use crate::actuator::SnapshotEpoch;
     use crate::domain::control::{Limits, StopReason};
     use crate::domain::filter::Filter;
-    use crate::domain::shop::{ItemKind, ShopItem, ShopSnapshot};
+    use crate::domain::shop::{ItemKind, PurchaseLimit, ShopItem, ShopSnapshot};
 
     /// Off-mode actuator: decisions keep the advice wording, nothing is
     /// ever submitted.
@@ -1211,6 +1212,49 @@ mod tests {
         // Dry-run still submits: the executor journals the screen coords.
         assert!(jobs.try_recv().is_ok());
         assert!(jobs.try_recv().is_ok());
+    }
+
+    #[test]
+    fn dead_stock_match_keeps_refreshing_without_clicks() {
+        let gate = WatchGate::new(true);
+        let journal = EventLog::default();
+        let (actuator, mut jobs) = recording(Mode::Live);
+        let filter = Filter {
+            include_sold_out: true,
+            ..Filter::matching_default_items()
+        };
+        let controller = Mutex::new(Controller::new(filter, Limits::default()));
+        controller
+            .lock()
+            .unwrap()
+            .handle(Event::Start { now_ms: 0 });
+        // The only match is sold out: shown, never clicked, hunted over.
+        let snapshot = ShopSnapshot {
+            merchant: None,
+            slots: vec![ShopItem {
+                id: 42,
+                limit: Some(PurchaseLimit {
+                    remaining: 0,
+                    total: 1,
+                }),
+                ..ShopItem::default()
+            }],
+            refresh: None,
+        };
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            ServerMessage::Shop(snapshot),
+            1,
+        );
+        let job = jobs.try_recv().expect("refresh job");
+        assert_eq!(job.steps.len(), 2); // refresh + confirm — no buy clicks
+        assert!(jobs.try_recv().is_err());
+        let entries = journal.entries();
+        assert!(entries.iter().any(|line| line.text.contains("MATCH")));
+        assert!(!entries.iter().any(|line| line.text.contains("buying slot")));
     }
 
     #[test]
