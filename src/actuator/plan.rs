@@ -430,6 +430,10 @@ mod tests {
     fn to_screen_refuses_a_narrow_window() {
         let narrow = rect(0, 0, 1280, 800);
         assert!(to_screen(narrow, point(100.0, 100.0, Anchor::Left)).is_err());
+    }
+
+    #[test]
+    fn to_screen_refuses_a_degenerate_rect() {
         assert!(to_screen(rect(0, 0, 0, 0), point(0.0, 0.0, Anchor::Left)).is_err());
     }
 
@@ -441,6 +445,10 @@ mod tests {
             assert_eq!(a.point_in(REFRESH), b.point_in(REFRESH));
             assert_eq!(a.press_ms(), b.press_ms());
         }
+    }
+
+    #[test]
+    fn jitter_seeds_diverge() {
         let mut c = Jitter::new(8);
         assert_ne!(Jitter::new(7).point_in(REFRESH), c.point_in(REFRESH));
     }

@@ -90,8 +90,11 @@ pub async fn run_executor(
     dry_run: bool,
 ) {
     while let Some(job) = jobs.recv().await {
-        if job.epoch != epoch.current() || !gate.is_enabled() {
-            continue; // stale before it started: skip silently.
+        if let Some(reason) = drop_reason(&job, &epoch, &gate) {
+            // Dropping is correct; dropping silently is not — the submit
+            // side already journaled the promised click.
+            journal.emit(&[format!(">> actuator: {reason} — dropped planned clicks")]);
+            continue;
         }
         let rect = match surface.acquire() {
             Ok(rect) => rect,
@@ -102,8 +105,9 @@ pub async fn run_executor(
         };
         for step in &job.steps {
             tokio::time::sleep(Duration::from_millis(step.wait_ms)).await;
-            if job.epoch != epoch.current() || !gate.is_enabled() {
-                break; // the world changed mid-job.
+            if let Some(reason) = drop_reason(&job, &epoch, &gate) {
+                journal.emit(&[format!(">> actuator: {reason} — aborted remaining clicks")]);
+                break;
             }
             let at = match plan::to_screen(rect, step.input.at()) {
                 Ok(at) => at,
@@ -135,6 +139,18 @@ pub async fn run_executor(
                 }
             }
         }
+    }
+}
+
+/// Why a job (or its remainder) must not act: a newer shop invalidated the
+/// planned coordinates, or the watch is off. `None` means clear to act.
+fn drop_reason(job: &Job, epoch: &SnapshotEpoch, gate: &WatchGate) -> Option<&'static str> {
+    if job.epoch != epoch.current() {
+        Some("the shop changed")
+    } else if !gate.is_enabled() {
+        Some("the watch is off")
+    } else {
+        None
     }
 }
 
@@ -240,6 +256,7 @@ mod tests {
         rig.epoch.bump(); // a newer shop arrived before the job started
         rig.job_tx.send(job).await.unwrap();
         drop(rig.job_tx);
+        let journal = rig.journal.clone();
         run_executor(
             surface,
             rig.job_rx,
@@ -252,6 +269,11 @@ mod tests {
         .await;
         assert!(events.lock().unwrap().is_empty());
         assert!(rig.command_rx.try_recv().is_err());
+        // Dropped, but never silently: the submit side promised a click.
+        assert!(journal.entries().iter().any(|line| {
+            line.text
+                .contains("the shop changed — dropped planned clicks")
+        }));
     }
 
     #[tokio::test(start_paused = true)]
@@ -264,6 +286,7 @@ mod tests {
             .await
             .unwrap();
         drop(rig.job_tx);
+        let journal = rig.journal.clone();
         run_executor(
             surface,
             rig.job_rx,
@@ -276,6 +299,10 @@ mod tests {
         .await;
         assert!(events.lock().unwrap().is_empty());
         assert!(rig.command_rx.try_recv().is_err());
+        assert!(journal.entries().iter().any(|line| {
+            line.text
+                .contains("the watch is off — dropped planned clicks")
+        }));
     }
 
     #[tokio::test(start_paused = true)]
@@ -289,6 +316,7 @@ mod tests {
             .await
             .unwrap();
         drop(rig.job_tx);
+        let journal = rig.journal.clone();
         run_executor(
             surface,
             rig.job_rx,
@@ -299,8 +327,15 @@ mod tests {
             false,
         )
         .await;
-        // Two steps planned, only the first landed.
+        // Two steps planned, only the first landed — and the abort is
+        // journaled.
         assert_eq!(events.lock().unwrap().len(), 1);
+        assert!(
+            journal
+                .entries()
+                .iter()
+                .any(|line| line.text.contains("aborted remaining clicks"))
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -314,6 +349,7 @@ mod tests {
             .await
             .unwrap();
         drop(rig.job_tx);
+        let journal = rig.journal.clone();
         run_executor(
             surface,
             rig.job_rx,
@@ -325,6 +361,10 @@ mod tests {
         )
         .await;
         assert_eq!(events.lock().unwrap().len(), 1);
+        assert!(journal.entries().iter().any(|line| {
+            line.text
+                .contains("the shop changed — aborted remaining clicks")
+        }));
     }
 
     #[tokio::test(start_paused = true)]
