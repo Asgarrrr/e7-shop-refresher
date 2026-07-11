@@ -20,10 +20,19 @@ use crate::capture::{Direction, FlowKey, Segment};
 /// Cap on out-of-order bytes buffered per half-stream (memory guard).
 const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
+/// Cap on the number of tracked half-streams. One armed game connection needs
+/// two (a direction each); reconnections and — since capture is port-wide —
+/// any host landing a packet on the game port would otherwise mint keys
+/// without bound, each able to buffer up to `MAX_PENDING_BYTES`. Well above
+/// legitimate need; the stalest entry is evicted past it.
+const MAX_HALVES: usize = 64;
+
 /// Reassembles traffic from several connections, keyed by (flow, direction).
 #[derive(Default)]
 pub struct Reassembler {
     halves: HashMap<(FlowKey, Direction), HalfStream>,
+    /// Monotonic activity stamp, bumped per segment; the eviction clock.
+    clock: u64,
 }
 
 impl Reassembler {
@@ -38,11 +47,31 @@ impl Reassembler {
     /// down on FIN: a reordered FIN arriving before a gap-filling segment must
     /// not discard already-buffered data.
     pub fn push(&mut self, segment: &Segment) -> Vec<u8> {
-        let half = self
-            .halves
-            .entry((segment.flow, segment.direction))
-            .or_default();
+        let key = (segment.flow, segment.direction);
+        self.clock += 1;
+        // A genuinely new flow past the cap evicts the stalest one first, so a
+        // reconnect churn or a flood of forged source ports cannot grow the
+        // map without bound. An existing flow never triggers eviction.
+        if self.halves.len() >= MAX_HALVES && !self.halves.contains_key(&key) {
+            self.evict_stalest();
+        }
+        let clock = self.clock;
+        let half = self.halves.entry(key).or_default();
+        half.last_active = clock;
         half.push(segment.seq, segment.syn, &segment.payload)
+    }
+
+    /// Drops the least-recently-active half-stream. Called only when a new key
+    /// would exceed `MAX_HALVES`; the scan is over a small, capped map.
+    fn evict_stalest(&mut self) {
+        if let Some(&key) = self
+            .halves
+            .iter()
+            .min_by_key(|(_, half)| half.last_active)
+            .map(|(key, _)| key)
+        {
+            self.halves.remove(&key);
+        }
     }
 
     /// Resets all state so the next segment of each flow re-anchors a new
@@ -56,6 +85,9 @@ impl Reassembler {
 /// Reassembly state of one direction of a connection, in relative offsets.
 #[derive(Default)]
 struct HalfStream {
+    /// Last `Reassembler::clock` value at which this half-stream saw a segment;
+    /// the eviction key.
+    last_active: u64,
     /// Stream origin (sequence number of the first byte); `None` until first seen.
     baseline: Option<u32>,
     /// Offset (from `baseline`) of the next expected byte.
@@ -167,8 +199,12 @@ mod tests {
     use super::*;
 
     fn flow() -> FlowKey {
+        flow_from(51000)
+    }
+
+    fn flow_from(client_port: u16) -> FlowKey {
         FlowKey {
-            client: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), 51000)),
+            client: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), client_port)),
             server: SocketAddr::from((Ipv4Addr::new(104, 116, 20, 111), 3333)),
         }
     }
@@ -180,6 +216,18 @@ mod tests {
             seq,
             syn,
             fin,
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// A plain data segment on a given flow (no SYN/FIN): for multi-flow tests.
+    fn seg_on(flow: FlowKey, seq: u32, payload: &[u8]) -> Segment {
+        Segment {
+            flow,
+            direction: Direction::ServerToClient,
+            seq,
+            syn: false,
+            fin: false,
             payload: payload.to_vec(),
         }
     }
@@ -276,6 +324,32 @@ mod tests {
         assert_eq!(half.push(expected, false, b"AB"), b"AB");
         // And the following contiguous segment keeps flowing.
         assert_eq!(half.push(expected.wrapping_add(2), false, b"CD"), b"CD");
+    }
+
+    #[test]
+    fn half_stream_count_is_bounded() {
+        let mut r = Reassembler::new();
+        // Far more distinct flows than the cap (e.g. a forged-source-port
+        // flood on the game port): the map must not grow without bound.
+        for port in 0..(MAX_HALVES as u32 * 3) {
+            r.push(&seg_on(flow_from(port as u16), 1000, b"AB"));
+        }
+        assert_eq!(r.halves.len(), MAX_HALVES);
+    }
+
+    #[test]
+    fn eviction_keeps_the_active_flow() {
+        let mut r = Reassembler::new();
+        let hot = flow_from(1);
+        // Fill to the cap, keeping `hot` continuously active as newcomers
+        // arrive, so it is never the stalest and survives eviction.
+        r.push(&seg_on(hot, 1000, b"AB"));
+        for port in 100..(100 + MAX_HALVES as u32 * 2) {
+            r.push(&seg_on(flow_from(port as u16), 1000, b"XY"));
+            r.push(&seg_on(hot, 1002, b"CD")); // keep hot fresh
+        }
+        assert_eq!(r.halves.len(), MAX_HALVES);
+        assert!(r.halves.contains_key(&(hot, Direction::ServerToClient)));
     }
 
     #[test]
