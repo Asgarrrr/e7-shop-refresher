@@ -44,8 +44,8 @@ pub enum StopReason {
     /// The relay pipeline ended (capture or uplink gone) while armed: the
     /// player did not stop the hunt and must not be told they did.
     SessionEnded,
-    /// The click executor could not act safely (game window gone, moved,
-    /// input undeliverable): a machine fault, not the player's stop.
+    /// The click executor could not act safely: a machine fault, not the
+    /// player's stop.
     ActuatorFailed,
     OutOfFunds,
     MaxRefreshes,
@@ -77,8 +77,7 @@ pub enum Event {
     /// The relay is going away underneath the loop (uplink or capture gone):
     /// same halt as `Stop`, honest label.
     Shutdown,
-    /// The click executor reported it cannot act safely: same halt, honest
-    /// label.
+    /// The click executor cannot act safely: same halt, honest label.
     ActuatorFailed,
     Snapshot {
         snapshot: ShopSnapshot,

@@ -1,9 +1,7 @@
 //! Input backends driving the Epic Seven window: [`MessageSurface`]
 //! (`PostMessageW`, background, shielded — the default) and [`WinSurface`]
-//! (`SendInput`, real cursor, foreground — the fallback).
-//!
-//! No window is ever resized: the anchor-aware transform in [`super::plan`]
-//! covers any aspect from 16:9 up, and `to_screen` refuses narrower ones.
+//! (`SendInput`, real cursor, foreground — the fallback). No window is ever
+//! resized: `to_screen` covers any aspect from 16:9 up, refuses narrower.
 
 use std::sync::Once;
 use std::time::Duration;
@@ -34,13 +32,11 @@ const WHEEL_DELTA: i32 = 120;
 const MOVE_SETTLE_MS: u64 = 30;
 /// The foreground switch is asynchronous: give it a beat before verifying.
 const FOCUS_SETTLE_MS: u64 = 100;
-/// After the shield is (re)placed, the game may still hold real mouse moves
-/// in its queue — and posted messages are retrieved *before* hardware input,
-/// so a stale real move would override our posted position. Give the game a
-/// few frames to drain while the shield already blocks new ones.
+/// Posted messages are retrieved before queued hardware input: a freshly
+/// placed shield must let the game drain stale real moves before we post.
 const SHIELD_DRAIN_MS: u64 = 50;
 
-/// Null-terminated UTF-16, the shape every W-suffixed Win32 call wants.
+/// Null-terminated UTF-16, the shape W-suffixed Win32 calls want.
 pub(super) fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain([0]).collect()
 }
@@ -166,29 +162,21 @@ fn send_input(mi: MOUSEINPUT) {
     unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
 }
 
-/// `PostMessageW` backend (the default): posts synthetic mouse messages
-/// straight to the game window. No focus is stolen and the real cursor never
-/// moves — the player keeps the mouse — but it only works because the engine
-/// honors window messages (live-validated; [`WinSurface`] is the fallback).
-///
-/// The engine tracks its cursor through move messages, so the player's real
-/// mouse over the game window would drag posted clicks onto itself: every
-/// input re-asserts the [`shield`](super::shield) over the game — the player
-/// can raise the game above it mid-job (title bar, alt-tab) — and it stays
-/// up, absorbing the player's mouse there, until [`release`](Surface).
+/// `PostMessageW` backend (the default): posts synthetic mouse messages to
+/// the game window — no focus stolen, the player keeps the mouse. The engine
+/// tracks its cursor through move messages, so every input re-asserts the
+/// [`shield`](super::shield) over the game until [`release`](Surface).
 #[derive(Default)]
 pub struct MessageSurface {
-    /// Refreshed by `acquire`, consumed by the inputs of the same job. The
-    /// executor holds the surface across awaits, so the window handle is
-    /// stored as an integer to keep the future `Send`.
+    /// Job-scoped; the handle is stored as an integer so the executor's
+    /// future stays `Send` across awaits.
     target: Option<Target>,
 }
 
 #[derive(Clone, Copy)]
 struct Target {
     hwnd: isize,
-    /// Client area in screen pixels: locates the client coordinates button
-    /// messages carry, and positions the shield.
+    /// Client area in screen pixels.
     rect: ClientRect,
 }
 
@@ -197,11 +185,8 @@ impl Target {
         (at.0 - self.rect.left, at.1 - self.rect.top)
     }
 
-    /// Runs before every input: the window must still be where the job was
-    /// planned (coordinates and the shield's position derive from the
-    /// acquire-time rect) and the shield must still sit directly above it.
-    /// A shield that had to be (re)placed gets the drain beat: the game must
-    /// consume the real moves it already held before our move posts.
+    /// Before every input: the window must be where the job planned it and
+    /// the shield seated above it; a (re)placed shield gets the drain beat.
     fn engage(self) -> Result<(), String> {
         self.verify()?;
         if shield::raise(self.hwnd as HWND, self.rect)? {
@@ -210,8 +195,6 @@ impl Target {
         Ok(())
     }
 
-    /// A moved, resized, minimized or vanished window halts the job instead
-    /// of landing clicks nobody aimed — each with its honest label.
     fn verify(self) -> Result<(), String> {
         let rect = client_rect(self.hwnd as HWND)?;
         if rect == self.rect {
@@ -259,8 +242,8 @@ impl Surface for MessageSurface {
             pack_point(target.to_client(at)),
         );
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
-        // WM_MOUSEWHEEL carries screen coordinates, unlike the button
-        // messages; the delta rides the high word of wParam.
+        // WM_MOUSEWHEEL takes screen coordinates; the delta rides wParam's
+        // high word.
         let delta = notches.saturating_mul(WHEEL_DELTA);
         post(
             target.hwnd,

@@ -46,8 +46,7 @@ pub enum Command {
     SetFilter(Filter),
     /// Live limits retune; checked before the next refresh.
     SetLimits(Limits),
-    /// The click executor cannot act safely: halt with the honest label,
-    /// never "player stopped".
+    /// Actuator-side halt; the executor is its only producer.
     ActuatorFailed,
 }
 

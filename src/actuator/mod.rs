@@ -79,8 +79,7 @@ pub trait Surface {
     /// window moved or vanished mid-job): the executor stops the loop.
     fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String>;
     fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String>;
-    /// The job is over (completed or aborted): drop whatever the inputs set
-    /// up (the message backend lowers its input shield). Default: nothing.
+    /// Job over, completed or aborted: undo whatever the inputs set up.
     fn release(&mut self) {}
 }
 
@@ -153,8 +152,7 @@ pub async fn run_executor(
                 break;
             }
         }
-        // Every exit from the steps loop lands here — completion, abort,
-        // failure: the surface must never stay engaged between jobs.
+        // Completion, abort and failure all land here: never stay engaged.
         surface.release();
     }
 }
@@ -171,9 +169,8 @@ fn drop_reason(job: &Job, epoch: &SnapshotEpoch, gate: &WatchGate) -> Option<&'s
     }
 }
 
-/// An actuator that cannot act safely stops the whole loop: a hunt that
-/// keeps refreshing without its clicker is spend without effect. The halt
-/// carries its own label (`StopReason::ActuatorFailed`), never the player's.
+/// An actuator that cannot act safely stops the whole loop — with its own
+/// label, never the player's.
 fn fail(journal: &EventLog, commands: &mpsc::Sender<Command>, reason: &str) {
     journal.emit(&[format!(">> actuator: {reason} — stopping the loop")]);
     let _ = commands.try_send(Command::ActuatorFailed);
@@ -191,9 +188,8 @@ mod tests {
         Scroll((i32, i32), i32),
     }
 
-    /// Records every input; `on_input` runs after each one (to flip the gate
-    /// or bump the epoch mid-job); `deny_after` fails every input once `n`
-    /// inputs have landed (`n = 0` = fail the first).
+    /// Records every input; `on_input` runs after each; `deny_after` fails
+    /// every input once `n` have landed.
     struct FakeSurface {
         rect: Result<ClientRect, String>,
         events: Arc<Mutex<Vec<Recorded>>>,
@@ -435,9 +431,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_stops_the_loop_when_an_input_fails() {
-        // A surface that cannot deliver an input safely (e.g. the game window
-        // moved mid-job) must halt the hunt with the actuator's own label,
-        // not click blind or skip silently.
+        // An undeliverable input halts with the actuator's own label — never
+        // a blind click or a silent skip.
         let mut rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         surface.deny_after = Some((0, "the game window moved".to_owned()));
@@ -467,9 +462,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_keeps_landed_inputs_and_stops_once_on_a_mid_job_failure() {
-        // Rows 0 and 4: scroll-top, buy row 0, confirm, then the bottom
-        // scroll fails. The three landed inputs stay recorded, exactly one
-        // halt command goes out, and the surface is still released.
+        // Three inputs land, the fourth fails: landed inputs stay recorded,
+        // exactly one halt goes out, the surface is still released.
         let mut rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         surface.deny_after = Some((3, "the game window moved".to_owned()));
@@ -507,8 +501,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_releases_the_surface_after_every_acquired_job() {
-        // Completion and mid-job abort both end with a release; a job dropped
-        // before acquire never engaged anything, so nothing to release.
+        // Every acquired job releases; a job dropped before acquire never
+        // engaged anything.
         let rig = rig();
         let (mut surface, _events) = FakeSurface::new(design_rect());
         let releases = surface.releases.clone();
@@ -533,8 +527,6 @@ mod tests {
             false,
         )
         .await;
-        // Job 1 aborts mid-steps (gate off after its first input) and is
-        // released; job 2 is dropped by the gate before acquire — no release.
         assert_eq!(*releases.lock().unwrap(), 1);
     }
 
