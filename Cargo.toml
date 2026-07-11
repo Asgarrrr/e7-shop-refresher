@@ -26,7 +26,10 @@ tokio = { version = "1", features = [
     "io-util",
     "signal",
 ] }
-tokio-tungstenite = "0.29"
+# rustls + webpki-roots: the hosted server is wss:// behind Cloudflare, and a
+# single-file exe should not depend on the OS trust store. connect_async picks
+# up the rustls connector automatically once the feature is on.
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 etherparse = "0.20"
 serde = { version = "1", features = ["derive"] }
