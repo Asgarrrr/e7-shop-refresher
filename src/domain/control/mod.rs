@@ -264,26 +264,33 @@ impl Controller {
         if snapshot.refresh.is_some() {
             self.refresh_meta = snapshot.refresh;
         }
+        // Decide against a borrow, then store once: every snapshot is kept for
+        // the view whatever branch decided, so no per-path store can drift.
+        let actions = self.evaluate_snapshot(&snapshot, now_ms);
+        self.last_snapshot = Some(snapshot);
+        actions
+    }
+
+    /// The refresh/alert/mute decision for a snapshot already recognised as
+    /// current. Mutates loop state but never stores the snapshot — its caller
+    /// owns the single store point.
+    fn evaluate_snapshot(&mut self, snapshot: &ShopSnapshot, now_ms: u64) -> Vec<Action> {
         if !matches!(self.status, Status::Watching | Status::Paused) {
-            self.last_snapshot = Some(snapshot);
             return Vec::new();
         }
         // A slotless snapshot is a degraded message, not shop content.
         if snapshot.slots.is_empty() {
-            self.last_snapshot = Some(snapshot);
             return Vec::new();
         }
         // Already acted on: a duplicate must never bill a second refresh
         // or re-alert.
-        let fingerprint = fingerprint(&snapshot);
+        let fingerprint = fingerprint(snapshot);
         if fingerprint.is_some() && fingerprint == self.acted_fingerprint {
-            self.last_snapshot = Some(snapshot);
             return Vec::new();
         }
         if fingerprint.is_none() && self.status == Status::Paused {
             // Unidentifiable shop (an id is 0): a duplicate cannot be told
             // from a new shop, so never re-evaluate over a pending purchase.
-            self.last_snapshot = Some(snapshot);
             return Vec::new();
         }
         if fingerprint.is_some() {
@@ -307,7 +314,6 @@ impl Controller {
                 }
             }
         }
-        self.last_snapshot = Some(snapshot);
         self.checklist = checklist;
 
         if matched.is_empty() {
@@ -388,7 +394,7 @@ impl Controller {
     /// Single emission point: every refresh, including the auto-resume one,
     /// is counted and debited before it goes out.
     fn emit_refresh(&mut self) -> Action {
-        self.progress.refreshes += 1;
+        self.progress.refreshes = self.progress.refreshes.saturating_add(1);
         let cost = self.refresh_cost();
         self.progress.spent = self.progress.spent.saturating_add(cost);
         if let Some(meta) = self.refresh_meta.as_mut() {
