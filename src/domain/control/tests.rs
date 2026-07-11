@@ -52,6 +52,10 @@ fn snap(snapshot: ShopSnapshot, now_ms: u64) -> Event {
     Event::Snapshot { snapshot, now_ms }
 }
 
+fn target(slot: u8, id: Option<u32>) -> BuyTarget {
+    BuyTarget { slot, id }
+}
+
 fn buy(item: u32, now_ms: u64) -> Event {
     Event::Purchase { item, now_ms }
 }
@@ -105,7 +109,9 @@ fn unrestricted_filter_swap_is_ignored() {
     let actions = ctrl.handle(snap(hit_shop(None), 1));
     assert_eq!(
         actions,
-        vec![Action::Alert { slots: vec![3] }],
+        vec![Action::Buy {
+            targets: vec![target(3, None)]
+        }],
         "the equipment filter must still be active"
     );
 }
@@ -117,7 +123,12 @@ fn is_refusal_flags_only_the_refused_verdict() {
     // which contains no refusal) means the event applied.
     assert!(Action::Refused(RefusalReason::UnrestrictedFilter).is_refusal());
     assert!(!Action::Refresh.is_refusal());
-    assert!(!Action::Alert { slots: vec![1] }.is_refusal());
+    assert!(
+        !Action::Buy {
+            targets: vec![target(1, None)]
+        }
+        .is_refusal()
+    );
     assert!(!Action::Halt(StopReason::PlayerStopped).is_refusal());
 }
 
@@ -193,7 +204,12 @@ fn tick_while_paused_ignores_non_timeout_limits() {
 fn snapshot_match_alerts_and_pauses_without_refresh() {
     let mut ctrl = started(Limits::default());
     let actions = ctrl.handle(snap(hit_shop(None), 1));
-    assert_eq!(actions, vec![Action::Alert { slots: vec![3] }]);
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(3, None)]
+        }]
+    );
     assert_eq!(ctrl.status(), Status::Paused);
     assert_eq!(ctrl.progress().refreshes, 0);
 }
@@ -428,7 +444,12 @@ fn new_shop_while_paused_rebuilds_checklist() {
         item.id += 100; // new shop, matching slot now id 202
     }
     let actions = ctrl.handle(snap(fresh, 2));
-    assert_eq!(actions, vec![Action::Alert { slots: vec![3] }]);
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(3, Some(202))]
+        }]
+    );
     assert_eq!(ctrl.checklist(), &[202]);
     // The stale id is gone; only the new one clears the pause.
     assert!(ctrl.handle(buy(102, 3)).is_empty());
@@ -551,7 +572,13 @@ fn sold_out_match_excluded_from_checklist() {
         total: 1,
     });
     let actions = ctrl.handle(snap(shop, 1));
-    assert_eq!(actions, vec![Action::Alert { slots: vec![3] }]);
+    // Sold out: matched for display, but never clickable.
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(3, None)]
+        }]
+    );
     assert_eq!(ctrl.status(), Status::Paused);
     assert!(ctrl.checklist().is_empty()); // only a new shop unpauses
 }
@@ -786,7 +813,12 @@ fn matches_found_increments_by_matched_len() {
     let mut ctrl = started(Limits::default());
     let two_hits = shop(&[Equipment, Token, Equipment, Token, Token, Token], None);
     let actions = ctrl.handle(snap(two_hits, 1));
-    assert_eq!(actions, vec![Action::Alert { slots: vec![1, 3] }]);
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(1, None), target(3, None)]
+        }]
+    );
     assert_eq!(ctrl.progress().matches_found, 2);
 }
 
@@ -800,7 +832,9 @@ fn max_matches_boundary_uses_ge() {
     });
     assert_eq!(
         ctrl.handle(snap(with_ids(hit_shop(None)), 1)),
-        vec![Action::Alert { slots: vec![3] }]
+        vec![Action::Buy {
+            targets: vec![target(3, Some(102))]
+        }]
     );
     assert_eq!(ctrl.status(), Status::Paused);
     assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
@@ -812,7 +846,9 @@ fn max_matches_boundary_uses_ge() {
     assert_eq!(
         actions,
         vec![
-            Action::Alert { slots: vec![3] },
+            Action::Buy {
+                targets: vec![target(3, Some(202))]
+            },
             Action::Halt(StopReason::MaxMatches),
         ]
     );
@@ -833,8 +869,8 @@ fn single_shop_multi_match_stops() {
     assert_eq!(
         actions,
         vec![
-            Action::Alert {
-                slots: vec![1, 2, 3]
+            Action::Buy {
+                targets: vec![target(1, None), target(2, None), target(3, None)]
             },
             Action::Halt(StopReason::MaxMatches),
         ]
@@ -892,24 +928,29 @@ fn filter_changed_applies_next_snapshot_only() {
     let actions = ctrl.handle(snap(dud_shop(None), 2));
     assert_eq!(
         actions,
-        vec![Action::Alert {
-            slots: vec![1, 2, 3, 4, 5, 6]
+        vec![Action::Buy {
+            targets: (1..=6).map(|slot| target(slot, None)).collect()
         }]
     );
     assert_eq!(ctrl.status(), Status::Paused);
 }
 
 #[test]
-fn alert_slot_falls_back_to_position_when_zero() {
+fn buy_target_slot_falls_back_to_position_when_zero() {
     let mut ctrl = started(Limits::default());
     let mut shop = hit_shop(None);
     shop.slots[2].slot = 0; // server omitted the slot number
     let actions = ctrl.handle(snap(shop, 1));
-    assert_eq!(actions, vec![Action::Alert { slots: vec![3] }]);
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(3, None)]
+        }]
+    );
 }
 
 #[test]
-fn alert_slot_clamps_oversized_position() {
+fn buy_target_slot_clamps_oversized_position() {
     // The fallback must saturate, not overflow (debug panic) or wrap to 0.
     let mut ctrl = started(Limits::default());
     let mut slots: Vec<ShopItem> = (0..300).map(|_| item(0, Token)).collect();
@@ -922,8 +963,40 @@ fn alert_slot_clamps_oversized_position() {
     let actions = ctrl.handle(snap(oversized, 1));
     assert_eq!(
         actions,
-        vec![Action::Alert {
-            slots: vec![u8::MAX]
+        vec![Action::Buy {
+            targets: vec![target(u8::MAX, None)]
         }]
     );
+}
+
+#[test]
+fn buy_targets_align_with_checklist() {
+    // Three matches: trackable, id omitted, sold out. Exactly the targets
+    // with `id: Some` form the checklist — the actuator clicks what the
+    // auto-resume waits on, nothing else.
+    let filter = Filter {
+        kinds: vec![Equipment],
+        include_sold_out: true,
+        ..Filter::default()
+    };
+    let mut ctrl = Controller::new(filter, Limits::default());
+    ctrl.handle(Event::Start { now_ms: 0 });
+    let mut shop = shop(
+        &[Equipment, Equipment, Equipment, Token, Token, Token],
+        None,
+    );
+    shop.slots[0].id = 100;
+    shop.slots[2].limit = Some(PurchaseLimit {
+        remaining: 0,
+        total: 1,
+    });
+    shop.slots[2].id = 102;
+    let actions = ctrl.handle(snap(shop, 1));
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(1, Some(100)), target(2, None), target(3, None)]
+        }]
+    );
+    assert_eq!(ctrl.checklist(), &[100]);
 }

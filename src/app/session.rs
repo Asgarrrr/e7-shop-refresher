@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::domain::control::{Action, Controller, Event, Status};
+use crate::domain::control::{Action, BuyTarget, Controller, Event, Status};
 use crate::journal::EventLog;
 use crate::render::{describe, format_item, refusal, render_shop, status_label};
 use crate::uplink::UplinkEvent;
@@ -280,7 +280,7 @@ fn apply(actions: &[Action], controller: &Controller, gate: &WatchGate) -> Vec<S
     for action in actions {
         match action {
             Action::Refresh => lines.push(">> → refresh the shop now".to_owned()),
-            Action::Alert { slots } => render_alert(&mut lines, slots, controller),
+            Action::Buy { targets } => render_match(&mut lines, targets, controller),
             Action::Halt(reason) => lines.push(format!(">> stopped: {}", describe(*reason))),
             Action::Refused(reason) => lines.push(format!(">> refused: {}", refusal(*reason))),
         }
@@ -292,20 +292,24 @@ fn apply(actions: &[Action], controller: &Controller, gate: &WatchGate) -> Vec<S
     lines
 }
 
-/// Details of the matched slots, straight from the snapshot that raised the
-/// alert (the controller stored it before emitting).
-fn render_alert(lines: &mut Vec<String>, slots: &[u8], controller: &Controller) {
-    let list: Vec<String> = slots.iter().map(u8::to_string).collect();
-    // Alerted + still Paused means the loop waits on purchases; on the
+/// Details of the matched targets, straight from the snapshot that raised
+/// them (the controller stored it before emitting).
+fn render_match(lines: &mut Vec<String>, targets: &[BuyTarget], controller: &Controller) {
+    let list: Vec<String> = targets
+        .iter()
+        .map(|target| target.slot.to_string())
+        .collect();
+    let clickable = targets.iter().filter(|target| target.id.is_some()).count();
+    // Matched + still Paused means the loop waits on purchases; on the
     // max-matches path a Halt follows in the same batch and any buy advice
     // would be dead.
     let hint = if controller.status() != Status::Paused {
         ""
-    } else if controller.checklist().is_empty() {
+    } else if clickable == 0 {
         // Every match is untrackable (sold out or id omitted): no purchase
         // echo can clear them, only a fresh shop unpauses.
         ": buy in game, then refresh"
-    } else if controller.checklist().len() < slots.len() {
+    } else if clickable < targets.len() {
         // Some matches are untrackable: auto-resume only waits on the
         // tracked ones and would refresh over the rest.
         ": buy in game — some items aren't tracked, refresh when done"
@@ -316,8 +320,14 @@ fn render_alert(lines: &mut Vec<String>, slots: &[u8], controller: &Controller) 
     let Some(snapshot) = controller.last_snapshot() else {
         return;
     };
+    // Tracked targets resolve by identity; only the untracked keep the
+    // slot-number fallback (non-injective on a degraded shop).
     for (index, item) in snapshot.slots.iter().enumerate() {
-        if slots.contains(&item.effective_slot(index)) {
+        let shown = targets.iter().any(|target| match target.id {
+            Some(id) => item.catalog_id() == Some(id),
+            None => item.effective_slot(index) == target.slot,
+        });
+        if shown {
             lines.push(format!("   {}", format_item(item, index)));
         }
     }

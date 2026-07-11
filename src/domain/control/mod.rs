@@ -92,14 +92,24 @@ pub enum Event {
     },
 }
 
-/// Actions are to be consumed in order: on the max-matches path an `Alert`
+/// One matched slot. `slot` is the sorted display position (1..=6 on a
+/// well-formed shop; row = slot − 1). `id` is `Some` exactly when the item is
+/// buyable AND a purchase echo can name it — i.e. exactly the checklist
+/// entries; an `id: None` target is display-only, never clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuyTarget {
+    pub slot: u8,
+    pub id: Option<u32>,
+}
+
+/// Actions are to be consumed in order: on the max-matches path a `Buy`
 /// precedes the `Halt` and both matter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Refresh,
-    /// Shop slot numbers (1..=6 on a well-formed shop) that matched.
-    Alert {
-        slots: Vec<u8>,
+    /// The matched slots to buy.
+    Buy {
+        targets: Vec<BuyTarget>,
     },
     Halt(StopReason),
     /// The event was rejected; nothing changed. Callers render the reason —
@@ -281,7 +291,7 @@ impl Controller {
         actions
     }
 
-    /// The refresh/alert/mute decision for a snapshot already recognised as
+    /// The refresh/buy/mute decision for a snapshot already recognised as
     /// current. Mutates loop state but never stores the snapshot — its caller
     /// owns the single store point.
     fn evaluate_snapshot(&mut self, snapshot: &ShopSnapshot, now_ms: u64) -> Vec<Action> {
@@ -293,7 +303,7 @@ impl Controller {
             return Vec::new();
         }
         // Already acted on: a duplicate must never bill a second refresh
-        // or re-alert.
+        // or re-buy.
         let fingerprint = fingerprint(snapshot);
         if fingerprint.is_some() && fingerprint == self.acted_fingerprint {
             return Vec::new();
@@ -309,24 +319,24 @@ impl Controller {
             self.acted_fingerprint = fingerprint;
         }
 
-        let mut matched: Vec<u8> = Vec::new();
-        let mut checklist: Vec<u32> = Vec::new();
+        let mut targets: Vec<BuyTarget> = Vec::new();
         for (index, item) in snapshot.slots.iter().enumerate() {
             if self.filter.matches(item) {
-                matched.push(item.effective_slot(index));
-                // Only ids a purchase echo can actually name: the id-0
-                // sentinel never appears in one, and a sold-out slot cannot
-                // be bought at all — neither may hold the checklist open.
-                if let Some(id) = item.catalog_id()
-                    && !item.is_sold_out()
-                {
-                    checklist.push(id);
-                }
+                targets.push(BuyTarget {
+                    slot: item.effective_slot(index),
+                    // Only ids a purchase echo can actually name: the id-0
+                    // sentinel never appears in one, and a sold-out slot
+                    // cannot be bought at all — neither may hold the
+                    // checklist open (nor be clicked).
+                    id: item.catalog_id().filter(|_| !item.is_sold_out()),
+                });
             }
         }
-        self.checklist = checklist;
+        // Alignment by construction: the checklist is exactly the clickable
+        // targets, so an actuator buying `id: Some` targets clears the pause.
+        self.checklist = targets.iter().filter_map(|target| target.id).collect();
 
-        if matched.is_empty() {
+        if targets.is_empty() {
             // A new no-match shop also unpauses (the hourly auto-refresh
             // replaced the matches).
             self.status = Status::Watching;
@@ -336,19 +346,19 @@ impl Controller {
         self.progress.matches_found = self
             .progress
             .matches_found
-            .saturating_add(matched.len() as u32);
-        let alert = Action::Alert { slots: matched };
+            .saturating_add(targets.len() as u32);
+        let buy = Action::Buy { targets };
         if self
             .limits
             .max_matches
             .is_some_and(|max| self.progress.matches_found >= max)
         {
-            let mut actions = vec![alert];
+            let mut actions = vec![buy];
             actions.extend(self.halt(StopReason::MaxMatches));
             actions
         } else {
             self.status = Status::Paused;
-            vec![alert]
+            vec![buy]
         }
     }
 
