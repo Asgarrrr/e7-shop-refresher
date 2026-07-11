@@ -52,7 +52,8 @@ names = ["ticketrare_name", "ticketspecial_name"]
 # Windows build only: the tool refreshes and buys by clicking the game window
 # itself. dry_run = true journals the planned clicks (screen coordinates and
 # waits) without sending any input — use it to check the coordinates before
-# going live.
+# going live. It validates coordinates only: the shield and the mid-job
+# window re-checks run on live clicks alone.
 # dry_run = false
 # How clicks reach the game. "message" (default) posts the clicks straight
 # to the window: no focus stolen, you keep the mouse — but the game window
