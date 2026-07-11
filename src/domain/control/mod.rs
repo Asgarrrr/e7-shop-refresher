@@ -356,14 +356,23 @@ impl Controller {
         self.refresh_or_halt(now_ms)
     }
 
+    /// A tick is a check-point: a limit tightened mid-session (or an elapsed
+    /// timer) takes effect here, without waiting for the next snapshot.
+    ///
+    /// While `Watching`, every stop reason applies — an already-exceeded
+    /// `max_refreshes`/`max_spend`/`max_matches` must not linger with the gate
+    /// on. While `Paused` the loop is waiting on a purchase, so only the
+    /// timeout applies; the other limits are re-checked when the buy or a new
+    /// shop resumes the hunt (`refresh_or_halt`), which avoids abandoning a
+    /// still-buyable pause on, say, an out-of-crystals estimate.
     fn on_tick(&mut self, now_ms: u64) -> Vec<Action> {
-        if !matches!(self.status, Status::Watching | Status::Paused) {
-            return Vec::new();
-        }
-        if self.duration_elapsed(now_ms) {
-            self.halt(StopReason::Timeout)
-        } else {
-            Vec::new()
+        match self.status {
+            Status::Watching => match self.stop_reason(now_ms) {
+                Some(reason) => self.halt(reason),
+                None => Vec::new(),
+            },
+            Status::Paused if self.duration_elapsed(now_ms) => self.halt(StopReason::Timeout),
+            _ => Vec::new(),
         }
     }
 

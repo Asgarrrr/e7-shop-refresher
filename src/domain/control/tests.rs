@@ -148,6 +148,37 @@ fn limits_changed_never_halts_immediately() {
 }
 
 #[test]
+fn tick_enforces_a_tightened_count_limit_while_watching() {
+    let mut ctrl = started(Limits::default());
+    // One refresh done, then the player tightens the ceiling below it.
+    assert_eq!(ctrl.handle(snap(dud_shop(None), 1)), vec![Action::Refresh]);
+    ctrl.handle(Event::LimitsChanged(Limits {
+        max_refreshes: Some(1),
+        ..Limits::default()
+    }));
+    assert_eq!(ctrl.status(), Status::Watching);
+    // Without any new shop, the next tick must halt: the gate can't linger on.
+    let actions = ctrl.handle(Event::Tick { now_ms: 2 });
+    assert_eq!(actions, vec![Action::Halt(StopReason::MaxRefreshes)]);
+    assert_eq!(ctrl.status(), Status::Stopped(StopReason::MaxRefreshes));
+}
+
+#[test]
+fn tick_while_paused_ignores_non_timeout_limits() {
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    assert_eq!(ctrl.status(), Status::Paused);
+    // Tightening a count limit must not abandon a buyable pause at a tick;
+    // the purchase/next-shop path re-checks it.
+    ctrl.handle(Event::LimitsChanged(Limits {
+        max_refreshes: Some(0),
+        ..Limits::default()
+    }));
+    assert!(ctrl.handle(Event::Tick { now_ms: 2 }).is_empty());
+    assert_eq!(ctrl.status(), Status::Paused);
+}
+
+#[test]
 fn snapshot_match_alerts_and_pauses_without_refresh() {
     let mut ctrl = started(Limits::default());
     let actions = ctrl.handle(snap(hit_shop(None), 1));
