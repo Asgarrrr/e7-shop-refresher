@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::actuator::plan::{self, Trigger};
+use crate::actuator::{ActuatorHandle, Mode};
 use crate::domain::control::{Action, BuyTarget, Controller, Event, Status};
 use crate::journal::EventLog;
 use crate::render::{describe, format_item, refusal, render_shop, status_label};
@@ -28,6 +30,7 @@ pub(super) async fn session_loop(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
     journal: &EventLog,
+    actuator: &ActuatorHandle,
     mut commands: mpsc::Receiver<Command>,
     mut messages: mpsc::Receiver<UplinkEvent>,
     mut fatal_errors: mpsc::Receiver<String>,
@@ -46,21 +49,20 @@ pub(super) async fn session_loop(
     loop {
         tokio::select! {
             command = commands.recv(), if commands_open => match command {
-                Some(command) => on_command(controller, gate, journal, command, now_ms()),
+                Some(command) => on_command(controller, gate, journal, actuator, command, now_ms()),
                 None => commands_open = false,
             },
             message = messages.recv() => match message {
                 Some(UplinkEvent::Message(message)) => {
-                    on_message(controller, gate, journal, message, now_ms());
+                    on_message(controller, gate, journal, actuator, message, now_ms());
                 }
                 // An armed watch with a dead link looks exactly like a closed
                 // shop: without these lines the player cannot tell them apart.
-                Some(UplinkEvent::LinkDown(reason)) => emit(
-                    journal,
+                Some(UplinkEvent::LinkDown(reason)) => journal.emit(
                     &[format!(">> server link down: {reason} — retrying, no shop can arrive")],
                 ),
                 Some(UplinkEvent::LinkUp) => {
-                    emit(journal, &[">> server link restored".to_owned()]);
+                    journal.emit(&[">> server link restored".to_owned()]);
                 }
                 None => break, // uplink gone.
             },
@@ -69,15 +71,18 @@ pub(super) async fn session_loop(
                     // Break immediately: the channel cascade can take tens of
                     // seconds to reach this loop, during which the window
                     // would keep claiming a healthy watch.
-                    emit(journal, &[format!(">> session aborted — {error}")]);
+                    journal.emit(&[format!(">> session aborted — {error}")]);
                     fatal_failure = Some(error);
                     break;
                 }
                 None => fatal_open = false,
             },
-            _ = ticker.tick() => dispatch(controller, gate, journal, Event::Tick { now_ms: now_ms() }),
+            _ = ticker.tick() => {
+                let now = now_ms();
+                dispatch(controller, gate, journal, actuator, Event::Tick { now_ms: now }, now);
+            }
             _ = &mut ctrl_c => {
-                emit(journal, &[">> Ctrl+C, stopping".to_owned()]);
+                journal.emit(&[">> Ctrl+C, stopping".to_owned()]);
                 player_exit = true;
                 break;
             }
@@ -92,17 +97,8 @@ pub(super) async fn session_loop(
     } else {
         Event::Shutdown
     };
-    dispatch(controller, gate, journal, teardown);
+    dispatch(controller, gate, journal, actuator, teardown, now_ms());
     fatal_failure
-}
-
-/// Single sink for player-facing lines: the journal and the console stay in
-/// step by construction — never print session lines around it.
-fn emit(journal: &EventLog, lines: &[String]) {
-    journal.push(lines);
-    for line in lines {
-        println!("{line}");
-    }
 }
 
 /// Translates a player command into a controller event and echoes an outcome:
@@ -111,11 +107,12 @@ fn on_command(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
     journal: &EventLog,
+    actuator: &ActuatorHandle,
     command: Command,
     now_ms: u64,
 ) {
-    let lines = handle_command(controller, gate, command, now_ms);
-    emit(journal, &lines);
+    let lines = handle_command(controller, gate, actuator, command, now_ms);
+    journal.emit(&lines);
 }
 
 /// The command logic behind [`on_command`], returning the lines to print
@@ -123,6 +120,7 @@ fn on_command(
 fn handle_command(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
+    actuator: &ActuatorHandle,
     command: Command,
     now_ms: u64,
 ) -> Vec<String> {
@@ -143,7 +141,7 @@ fn handle_command(
             let paused = ctrl.status() == Status::Paused;
             let actions = ctrl.handle(Event::FilterChanged(filter));
             let accepted = !actions.iter().any(Action::is_refusal);
-            let mut lines = apply(&actions, &ctrl, gate);
+            let mut lines = apply(&actions, &ctrl, gate, actuator, None, now_ms);
             if accepted {
                 lines.push(">> filter updated — applies from the next shop".to_owned());
                 if paused {
@@ -160,7 +158,7 @@ fn handle_command(
         Command::SetLimits(limits) => {
             let actions = ctrl.handle(Event::LimitsChanged(limits));
             let accepted = !actions.iter().any(Action::is_refusal);
-            let mut lines = apply(&actions, &ctrl, gate);
+            let mut lines = apply(&actions, &ctrl, gate, actuator, None, now_ms);
             if accepted {
                 lines.push(">> limits updated — checked before the next refresh".to_owned());
             }
@@ -169,7 +167,7 @@ fn handle_command(
     };
     let before = ctrl.status();
     let actions = ctrl.handle(event);
-    let mut lines = apply(&actions, &ctrl, gate);
+    let mut lines = apply(&actions, &ctrl, gate, actuator, None, now_ms);
     let after = ctrl.status();
     let has_stored_shop = ctrl.last_snapshot().is_some();
     let label = status_label(&ctrl);
@@ -195,6 +193,7 @@ fn on_message(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
     journal: &EventLog,
+    actuator: &ActuatorHandle,
     message: ServerMessage,
     now_ms: u64,
 ) {
@@ -204,16 +203,27 @@ fn on_message(
             // The full item dump stays console-only: the GUI table shows the
             // same snapshot; the journal only carries the decisions.
             render_shop(&snapshot);
-            dispatch(
-                controller,
-                gate,
-                journal,
-                Event::Snapshot { snapshot, now_ms },
-            );
+            // Every shop message bumps, duplicates included: a re-send means
+            // the player touched the game, so aborting in-flight clicks is
+            // the safe reading.
+            actuator.epoch.bump();
+            let mut ctrl = controller.lock().expect("controller mutex poisoned");
+            // Read before handling: an advised refresh counts itself into
+            // `refreshes`, so after `handle` the very first shop would
+            // already look refreshed.
+            let trigger = if ctrl.progress().refreshes == 0 {
+                Trigger::ShopOpened
+            } else {
+                Trigger::Refreshed
+            };
+            let actions = ctrl.handle(Event::Snapshot { snapshot, now_ms });
+            let lines = apply(&actions, &ctrl, gate, actuator, Some(trigger), now_ms);
+            drop(ctrl);
+            journal.emit(&lines);
         }
         ServerMessage::Purchase(notice) => {
-            let lines = handle_purchase(controller, gate, &notice, now_ms);
-            emit(journal, &lines);
+            let lines = handle_purchase(controller, gate, actuator, &notice, now_ms);
+            journal.emit(&lines);
         }
     }
 }
@@ -224,6 +234,7 @@ fn on_message(
 fn handle_purchase(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
+    actuator: &ActuatorHandle,
     notice: &PurchaseNotice,
     now_ms: u64,
 ) -> Vec<String> {
@@ -233,7 +244,14 @@ fn handle_purchase(
         item: notice.item,
         now_ms,
     });
-    lines.extend(apply(&actions, &ctrl, gate));
+    lines.extend(apply(
+        &actions,
+        &ctrl,
+        gate,
+        actuator,
+        Some(Trigger::PurchaseResumed),
+        now_ms,
+    ));
     lines
 }
 
@@ -258,29 +276,51 @@ fn purchase_line(controller: &Controller, notice: &PurchaseNotice) -> String {
 }
 
 /// Locks, handles, applies; printing happens after the guard is released.
-fn dispatch(controller: &Mutex<Controller>, gate: &WatchGate, journal: &EventLog, event: Event) {
+/// No trigger reaches the actuator from here: the callers (ticks, teardown,
+/// test setup) are not shop or purchase arrivals.
+fn dispatch(
+    controller: &Mutex<Controller>,
+    gate: &WatchGate,
+    journal: &EventLog,
+    actuator: &ActuatorHandle,
+    event: Event,
+    now_ms: u64,
+) {
     let mut ctrl = controller.lock().expect("controller mutex poisoned");
     let actions = ctrl.handle(event);
-    let lines = apply(&actions, &ctrl, gate);
+    let lines = apply(&actions, &ctrl, gate, actuator, None, now_ms);
     drop(ctrl);
-    emit(journal, &lines);
+    journal.emit(&lines);
 }
 
-/// Applies the controller's decisions: drives the capture gate and renders
-/// the actions into lines. Callers print them once the guard is dropped —
-/// console I/O can block or panic (closed stdout) and must not stall or
-/// poison the controller the GUI will share.
+/// Applies the controller's decisions: drives the capture gate, translates
+/// refresh/buy decisions into click jobs when the actuator is on, and
+/// renders everything into lines. Callers print them once the guard is
+/// dropped — console I/O can block or panic (closed stdout) and must not
+/// stall or poison the controller the GUI will share.
 ///
-/// No actuator yet (tranche 5): `Refresh` is advice printed to the player,
-/// not an action taken. The gate follows the status — capture only flows
+/// `trigger` names the animation the game plays when the actions land; the
+/// paths that cannot advise a refresh or a buy today (commands, ticks,
+/// teardown) pass `None` — if one ever does, the advice line still renders
+/// and no job is queued. The gate follows the status — capture only flows
 /// while the session is live, and the off -> on transition retriggers the
 /// capture thread's existing resync.
-fn apply(actions: &[Action], controller: &Controller, gate: &WatchGate) -> Vec<String> {
+fn apply(
+    actions: &[Action],
+    controller: &Controller,
+    gate: &WatchGate,
+    actuator: &ActuatorHandle,
+    trigger: Option<Trigger>,
+    now_ms: u64,
+) -> Vec<String> {
     let mut lines = Vec::new();
     for action in actions {
         match action {
-            Action::Refresh => lines.push(">> → refresh the shop now".to_owned()),
-            Action::Buy { targets } => render_match(&mut lines, targets, controller),
+            Action::Refresh => submit_refresh(&mut lines, actuator, trigger, now_ms),
+            Action::Buy { targets } => {
+                render_match(&mut lines, targets, controller);
+                submit_buys(&mut lines, controller, actuator, trigger, targets, now_ms);
+            }
             Action::Halt(reason) => lines.push(format!(">> stopped: {}", describe(*reason))),
             Action::Refused(reason) => lines.push(format!(">> refused: {}", refusal(*reason))),
         }
@@ -290,6 +330,76 @@ fn apply(actions: &[Action], controller: &Controller, gate: &WatchGate) -> Vec<S
         Status::Watching | Status::Paused
     ));
     lines
+}
+
+/// A refresh decision: a click job when the actuator is on (the job's
+/// pre-wait covers the animation `trigger` names), the advice line
+/// otherwise.
+fn submit_refresh(
+    lines: &mut Vec<String>,
+    actuator: &ActuatorHandle,
+    trigger: Option<Trigger>,
+    now_ms: u64,
+) {
+    let trigger = match (actuator.mode, trigger) {
+        (Mode::Off, _) | (_, None) => {
+            lines.push(">> → refresh the shop now".to_owned());
+            return;
+        }
+        (_, Some(trigger)) => trigger,
+    };
+    let submitted = actuator.submit(plan::refresh_job(trigger, actuator.epoch.current(), now_ms));
+    lines.push(if actuator.mode == Mode::Live {
+        ">> → refresh clicked".to_owned()
+    } else {
+        ">> → refresh planned (dry-run)".to_owned()
+    });
+    if !submitted {
+        lines.push(">> actuator queue full — refresh dropped".to_owned());
+    }
+}
+
+/// A buy decision: one job clicking every trackable target. Only `id: Some`
+/// targets are clicked — the purchase echo could never confirm the others,
+/// so a click there would spend gold the checklist cannot account for.
+fn submit_buys(
+    lines: &mut Vec<String>,
+    controller: &Controller,
+    actuator: &ActuatorHandle,
+    trigger: Option<Trigger>,
+    targets: &[BuyTarget],
+    now_ms: u64,
+) {
+    // On the max-matches path a Halt follows in the same batch: the gate
+    // goes off and nothing may be clicked.
+    if controller.status() != Status::Paused {
+        return;
+    }
+    let trigger = match (actuator.mode, trigger) {
+        (Mode::Off, _) | (_, None) => return,
+        (_, Some(trigger)) => trigger,
+    };
+    // `slot` is 1-based; anything outside 1..=6 is a degraded shop's
+    // fallback number, not a clickable row.
+    let rows: Vec<u8> = targets
+        .iter()
+        .filter(|target| target.id.is_some() && (1..=6).contains(&target.slot))
+        .map(|target| target.slot - 1)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    for row in &rows {
+        lines.push(if actuator.mode == Mode::Live {
+            format!(">> → buying slot {}", row + 1)
+        } else {
+            format!(">> → buy slot {} planned (dry-run)", row + 1)
+        });
+    }
+    let job = plan::buy_job(trigger, actuator.epoch.current(), &rows, now_ms);
+    if !actuator.submit(job) {
+        lines.push(">> actuator queue full — buys dropped".to_owned());
+    }
 }
 
 /// Details of the matched targets, straight from the snapshot that raised
@@ -336,9 +446,39 @@ fn render_match(lines: &mut Vec<String>, targets: &[BuyTarget], controller: &Con
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actuator::SnapshotEpoch;
     use crate::domain::control::{Limits, StopReason};
     use crate::domain::filter::Filter;
-    use crate::domain::shop::{ShopItem, ShopSnapshot};
+    use crate::domain::shop::{ItemKind, ShopItem, ShopSnapshot};
+
+    /// Off-mode actuator: decisions keep the advice wording, nothing is
+    /// ever submitted.
+    fn off() -> ActuatorHandle {
+        ActuatorHandle::new(Mode::Off, SnapshotEpoch::default(), mpsc::channel(8).0)
+    }
+
+    /// An actuator whose submitted jobs the test inspects.
+    fn recording(mode: Mode) -> (ActuatorHandle, mpsc::Receiver<plan::Job>) {
+        let (jobs, rx) = mpsc::channel(8);
+        (
+            ActuatorHandle::new(mode, SnapshotEpoch::default(), jobs),
+            rx,
+        )
+    }
+
+    /// No match for `Filter::matching_default_items()` (kind `Unknown`):
+    /// the controller advises a refresh.
+    fn dud_shop(id: u32) -> ShopSnapshot {
+        ShopSnapshot {
+            merchant: None,
+            slots: vec![ShopItem {
+                id,
+                kind: ItemKind::Equipment,
+                ..ShopItem::default()
+            }],
+            refresh: None,
+        }
+    }
 
     #[tokio::test]
     async fn session_loop_exit_stops_controller_and_gate() {
@@ -348,7 +488,7 @@ mod tests {
             Filter::matching_default_items(),
             Limits::default(),
         ));
-        on_command(&controller, &gate, &journal, Command::Start, 0);
+        on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
         assert!(gate.is_enabled());
 
         let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
@@ -359,6 +499,7 @@ mod tests {
             &controller,
             &gate,
             &journal,
+            &off(),
             command_rx,
             message_rx,
             error_rx,
@@ -381,7 +522,7 @@ mod tests {
             Filter::matching_default_items(),
             Limits::default(),
         ));
-        let lines = handle_command(&controller, &gate, Command::Stop, 0);
+        let lines = handle_command(&controller, &gate, &off(), Command::Stop, 0);
         assert!(lines.iter().any(|line| line.contains("no effect")));
         assert!(!lines.iter().any(|line| line.contains("player stopped")));
         assert_eq!(controller.lock().unwrap().status(), Status::Idle);
@@ -409,6 +550,7 @@ mod tests {
             &controller,
             &gate,
             &journal,
+            &off(),
             command_rx,
             message_rx,
             error_rx,
@@ -436,7 +578,7 @@ mod tests {
             Filter::matching_default_items(),
             Limits::default(),
         ));
-        on_command(&controller, &gate, &journal, Command::Start, 0);
+        on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
         assert!(gate.is_enabled());
 
         let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
@@ -453,6 +595,7 @@ mod tests {
             &controller,
             &gate,
             &journal,
+            &off(),
             command_rx,
             message_rx,
             fatal_rx,
@@ -483,6 +626,7 @@ mod tests {
             &controller,
             &gate,
             &journal,
+            &off(),
             command_rx,
             message_rx,
             error_rx,
@@ -506,15 +650,17 @@ mod tests {
             Filter::matching_default_items(),
             Limits::default(),
         ));
-        handle_command(&controller, &gate, Command::Start, 0);
+        handle_command(&controller, &gate, &off(), Command::Start, 0);
         dispatch(
             &controller,
             &gate,
             &EventLog::default(),
+            &off(),
             Event::Snapshot {
                 snapshot: one_item_shop(),
                 now_ms: 1,
             },
+            1,
         );
         assert_eq!(controller.lock().unwrap().status(), Status::Paused);
 
@@ -522,7 +668,7 @@ mod tests {
             names: vec!["ticketrare_name".to_owned()],
             ..Filter::default()
         };
-        let lines = handle_command(&controller, &gate, Command::SetFilter(filter), 2);
+        let lines = handle_command(&controller, &gate, &off(), Command::SetFilter(filter), 2);
         assert!(lines.iter().any(|line| line.contains("still paused")));
     }
 
@@ -530,12 +676,12 @@ mod tests {
     fn start_refused_while_filter_unrestricted() {
         let gate = WatchGate::new(false);
         let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
-        let lines = handle_command(&controller, &gate, Command::Start, 0);
+        let lines = handle_command(&controller, &gate, &off(), Command::Start, 0);
         assert!(lines.iter().any(|line| line.contains(">> refused:")));
         assert_eq!(controller.lock().unwrap().status(), Status::Idle);
         assert!(!gate.is_enabled());
         // Toggle resolves to Start and the domain refuses it the same way.
-        let lines = handle_command(&controller, &gate, Command::Toggle, 1);
+        let lines = handle_command(&controller, &gate, &off(), Command::Toggle, 1);
         assert!(lines.iter().any(|line| line.contains(">> refused:")));
         assert_eq!(controller.lock().unwrap().status(), Status::Idle);
     }
@@ -548,10 +694,16 @@ mod tests {
             names: vec!["ticketrare_name".to_owned()],
             ..Filter::default()
         };
-        let lines = handle_command(&controller, &gate, Command::SetFilter(filter.clone()), 0);
+        let lines = handle_command(
+            &controller,
+            &gate,
+            &off(),
+            Command::SetFilter(filter.clone()),
+            0,
+        );
         assert!(lines.iter().any(|line| line.contains("filter updated")));
         assert_eq!(controller.lock().unwrap().filter(), &filter);
-        let lines = handle_command(&controller, &gate, Command::Start, 1);
+        let lines = handle_command(&controller, &gate, &off(), Command::Start, 1);
         assert!(lines.iter().any(|line| line.contains("watching")));
         assert_eq!(controller.lock().unwrap().status(), Status::Watching);
     }
@@ -564,7 +716,13 @@ mod tests {
             max_refreshes: Some(5),
             ..Limits::default()
         };
-        let lines = handle_command(&controller, &gate, Command::SetLimits(limits.clone()), 0);
+        let lines = handle_command(
+            &controller,
+            &gate,
+            &off(),
+            Command::SetLimits(limits.clone()),
+            0,
+        );
         assert!(lines.iter().any(|line| line.contains("limits updated")));
         assert_eq!(controller.lock().unwrap().limits(), &limits);
     }
@@ -577,7 +735,7 @@ mod tests {
             Filter::matching_default_items(),
             Limits::default(),
         ));
-        on_command(&controller, &gate, &journal, Command::Start, 1_000);
+        on_command(&controller, &gate, &journal, &off(), Command::Start, 1_000);
         let entries = journal.entries();
         assert!(entries.iter().any(|line| line.text.contains("watching")));
     }
@@ -586,11 +744,11 @@ mod tests {
     fn gate_follows_controller_status() {
         let gate = WatchGate::new(false);
         let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
-        apply(&[], &ctrl, &gate);
+        apply(&[], &ctrl, &gate, &off(), None, 0);
         assert!(!gate.is_enabled()); // Idle
 
         ctrl.handle(Event::Start { now_ms: 0 });
-        apply(&[], &ctrl, &gate);
+        apply(&[], &ctrl, &gate, &off(), None, 0);
         assert!(gate.is_enabled()); // Watching
 
         // Default filter matches the default item: Alert -> Paused, gate stays on.
@@ -603,12 +761,12 @@ mod tests {
             snapshot,
             now_ms: 1,
         });
-        apply(&actions, &ctrl, &gate);
+        apply(&actions, &ctrl, &gate, &off(), None, 0);
         assert_eq!(ctrl.status(), Status::Paused);
         assert!(gate.is_enabled());
 
         let actions = ctrl.handle(Event::Stop);
-        apply(&actions, &ctrl, &gate);
+        apply(&actions, &ctrl, &gate, &off(), None, 0);
         assert!(!gate.is_enabled()); // Stopped
     }
 
@@ -629,29 +787,31 @@ mod tests {
             Limits::default(),
         ));
 
-        on_command(&controller, &gate, &journal, Command::Toggle, 0); // Idle -> Start
+        on_command(&controller, &gate, &journal, &off(), Command::Toggle, 0); // Idle -> Start
         assert_eq!(controller.lock().unwrap().status(), Status::Watching);
         assert!(gate.is_enabled());
 
-        on_command(&controller, &gate, &journal, Command::Toggle, 1); // Watching -> Stop
+        on_command(&controller, &gate, &journal, &off(), Command::Toggle, 1); // Watching -> Stop
         assert_eq!(
             controller.lock().unwrap().status(),
             Status::Stopped(StopReason::PlayerStopped)
         );
         assert!(!gate.is_enabled());
 
-        on_command(&controller, &gate, &journal, Command::Toggle, 2); // Stopped -> Start
+        on_command(&controller, &gate, &journal, &off(), Command::Toggle, 2); // Stopped -> Start
         // Default filter matches the default item -> Paused.
         dispatch(
             &controller,
             &gate,
             &journal,
+            &off(),
             Event::Snapshot {
                 snapshot: one_item_shop(),
                 now_ms: 3,
             },
+            3,
         );
-        on_command(&controller, &gate, &journal, Command::Toggle, 4); // Paused -> Stop
+        on_command(&controller, &gate, &journal, &off(), Command::Toggle, 4); // Paused -> Stop
         assert_eq!(
             controller.lock().unwrap().status(),
             Status::Stopped(StopReason::PlayerStopped)
@@ -667,7 +827,7 @@ mod tests {
             Filter::matching_default_items(),
             Limits::default(),
         ));
-        on_command(&controller, &gate, &journal, Command::Start, 0);
+        on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
         let mut snapshot = one_item_shop();
         snapshot.slots[0].id = 42;
         // Default filter matches the default item -> Paused, checklist [42].
@@ -675,6 +835,7 @@ mod tests {
             &controller,
             &gate,
             &journal,
+            &off(),
             ServerMessage::Shop(snapshot),
             1,
         );
@@ -688,6 +849,7 @@ mod tests {
             &controller,
             &gate,
             &journal,
+            &off(),
             ServerMessage::Purchase(notice),
             2,
         );
@@ -768,7 +930,7 @@ mod tests {
             snapshot,
             now_ms: 1,
         });
-        let lines = apply(&actions, &ctrl, &gate);
+        let lines = apply(&actions, &ctrl, &gate, &off(), None, 0);
         assert!(lines.iter().any(|line| line.contains("aren't tracked")));
     }
 
@@ -780,19 +942,21 @@ mod tests {
             Filter::matching_default_items(),
             Limits::default(),
         ));
-        on_command(&controller, &gate, &journal, Command::Start, 0);
+        on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
         // Paused on an untrackable (id-0) match: a no-effect command's echo
         // must advise manual resume, not a phantom auto-resume.
         dispatch(
             &controller,
             &gate,
             &journal,
+            &off(),
             Event::Snapshot {
                 snapshot: one_item_shop(),
                 now_ms: 1,
             },
+            1,
         );
-        let lines = handle_command(&controller, &gate, Command::Start, 2);
+        let lines = handle_command(&controller, &gate, &off(), Command::Start, 2);
         assert!(lines.iter().any(|line| line.contains("buy, then refresh")));
         assert!(!lines.iter().any(|line| line.contains("auto-resumes")));
     }
@@ -805,22 +969,24 @@ mod tests {
             Limits::default(),
         ));
         // Nothing stored yet: plain watching line, no hint.
-        let lines = handle_command(&controller, &gate, Command::Start, 0);
+        let lines = handle_command(&controller, &gate, &off(), Command::Start, 0);
         assert!(lines.iter().any(|line| line.contains("watching")));
         assert!(!lines.iter().any(|line| line.contains("not replayed")));
 
         // Stop, receive a shop (stored, not evaluated), restart: hint appears.
-        handle_command(&controller, &gate, Command::Stop, 1);
+        handle_command(&controller, &gate, &off(), Command::Stop, 1);
         dispatch(
             &controller,
             &gate,
             &EventLog::default(),
+            &off(),
             Event::Snapshot {
                 snapshot: one_item_shop(),
                 now_ms: 2,
             },
+            2,
         );
-        let lines = handle_command(&controller, &gate, Command::Start, 3);
+        let lines = handle_command(&controller, &gate, &off(), Command::Start, 3);
         assert!(lines.iter().any(|line| line.contains("not replayed")));
     }
 
@@ -832,23 +998,244 @@ mod tests {
             Filter::matching_default_items(),
             Limits::default(),
         ));
-        on_command(&controller, &gate, &journal, Command::Start, 0);
+        on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
         dispatch(
             &controller,
             &gate,
             &journal,
+            &off(),
             Event::Snapshot {
                 snapshot: one_item_shop(),
                 now_ms: 1,
             },
+            1,
         );
         assert_eq!(controller.lock().unwrap().status(), Status::Paused);
 
         // `start` mid-session is ignored by the controller: still Paused,
         // gate still on, counters untouched.
-        on_command(&controller, &gate, &journal, Command::Start, 2);
+        on_command(&controller, &gate, &journal, &off(), Command::Start, 2);
         assert_eq!(controller.lock().unwrap().status(), Status::Paused);
         assert_eq!(controller.lock().unwrap().progress().matches_found, 1);
         assert!(gate.is_enabled());
+    }
+
+    /// An armed controller matching `ShopItem::default()`.
+    fn armed() -> Mutex<Controller> {
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
+        controller
+            .lock()
+            .unwrap()
+            .handle(Event::Start { now_ms: 0 });
+        controller
+    }
+
+    #[test]
+    fn shop_jobs_carry_open_then_refresh_pre_waits_and_epochs() {
+        let gate = WatchGate::new(true);
+        let journal = EventLog::default();
+        let (actuator, mut jobs) = recording(Mode::Live);
+        let controller = armed();
+
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            ServerMessage::Shop(dud_shop(10)),
+            1,
+        );
+        let first = jobs.try_recv().expect("first refresh job");
+        assert_eq!(first.steps[0].wait_ms, 1_180); // shop-open animation
+        assert_eq!(first.epoch, 1);
+
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            ServerMessage::Shop(dud_shop(20)),
+            2,
+        );
+        let second = jobs.try_recv().expect("second refresh job");
+        assert_eq!(second.steps[0].wait_ms, 780); // refresh animation
+        assert_eq!(second.epoch, 2);
+        assert!(
+            journal
+                .entries()
+                .iter()
+                .any(|line| line.text.contains("refresh clicked"))
+        );
+    }
+
+    #[test]
+    fn purchase_resume_job_waits_for_the_post_buy_animation() {
+        let gate = WatchGate::new(true);
+        let journal = EventLog::default();
+        let (actuator, mut jobs) = recording(Mode::Live);
+        let controller = armed();
+        let mut snapshot = one_item_shop();
+        snapshot.slots[0].id = 42;
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            ServerMessage::Shop(snapshot),
+            1,
+        );
+        jobs.try_recv().expect("buy job");
+
+        let notice = PurchaseNotice {
+            item: 42,
+            gold: None,
+        };
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            ServerMessage::Purchase(notice),
+            2,
+        );
+        let resume = jobs.try_recv().expect("auto-resume refresh job");
+        assert_eq!(resume.steps[0].wait_ms, 400);
+        // A purchase never bumps the epoch: the shop is unchanged and the
+        // job must not be treated as stale.
+        assert_eq!(resume.epoch, 1);
+    }
+
+    #[test]
+    fn buy_job_clicks_only_trackable_targets() {
+        let gate = WatchGate::new(true);
+        let journal = EventLog::default();
+        let (actuator, mut jobs) = recording(Mode::Live);
+        let controller = armed();
+        // Two matches: only the id-carrying one may be clicked.
+        let snapshot = ShopSnapshot {
+            merchant: None,
+            slots: vec![
+                ShopItem {
+                    id: 42,
+                    ..ShopItem::default()
+                },
+                ShopItem::default(), // id 0: untrackable
+            ],
+            refresh: None,
+        };
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            ServerMessage::Shop(snapshot),
+            1,
+        );
+        let job = jobs.try_recv().expect("buy job");
+        // Scroll-to-top + one buy/confirm pair — nothing for the id-0 slot.
+        assert_eq!(job.steps.len(), 3);
+        let entries = journal.entries();
+        assert!(
+            entries
+                .iter()
+                .any(|line| line.text.contains("buying slot 1"))
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|line| line.text.contains("buying slot 2"))
+        );
+    }
+
+    #[test]
+    fn off_actuator_keeps_advice_and_submits_nothing() {
+        let gate = WatchGate::new(true);
+        let journal = EventLog::default();
+        let (actuator, mut jobs) = recording(Mode::Off);
+        let controller = armed();
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            ServerMessage::Shop(dud_shop(10)),
+            1,
+        );
+        assert!(
+            journal
+                .entries()
+                .iter()
+                .any(|line| line.text.contains("refresh the shop now"))
+        );
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn dry_run_wording_marks_planned_actions() {
+        let gate = WatchGate::new(true);
+        let journal = EventLog::default();
+        let (actuator, mut jobs) = recording(Mode::DryRun);
+        let controller = armed();
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            ServerMessage::Shop(dud_shop(10)),
+            1,
+        );
+        let mut hit = one_item_shop();
+        hit.slots[0].id = 42;
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            ServerMessage::Shop(hit),
+            2,
+        );
+        let entries = journal.entries();
+        assert!(
+            entries
+                .iter()
+                .any(|line| line.text.contains("refresh planned (dry-run)"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|line| line.text.contains("buy slot 1 planned (dry-run)"))
+        );
+        // Dry-run still submits: the executor journals the screen coords.
+        assert!(jobs.try_recv().is_ok());
+        assert!(jobs.try_recv().is_ok());
+    }
+
+    #[test]
+    fn full_job_queue_journals_the_drop() {
+        let gate = WatchGate::new(true);
+        let journal = EventLog::default();
+        let (job_tx, _job_rx) = mpsc::channel(1);
+        job_tx
+            .try_send(plan::refresh_job(Trigger::Refreshed, 0, 0))
+            .expect("fills the queue");
+        let actuator = ActuatorHandle::new(Mode::Live, SnapshotEpoch::default(), job_tx);
+        let controller = armed();
+        on_message(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            ServerMessage::Shop(dud_shop(10)),
+            1,
+        );
+        assert!(
+            journal
+                .entries()
+                .iter()
+                .any(|line| line.text.contains("queue full"))
+        );
     }
 }

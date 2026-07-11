@@ -37,6 +37,10 @@ pub struct Config {
 
     /// Refresh-loop stop limits; the default sets none.
     pub limits: Limits,
+
+    /// Click-emulation behavior (acted on by the Windows build; the section
+    /// always parses).
+    pub actuator: ActuatorConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +59,14 @@ pub struct ReconnectConfig {
     pub initial_ms: u64,
     /// Cap on the exponential backoff (milliseconds).
     pub max_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ActuatorConfig {
+    /// Journal the planned clicks (screen coordinates and waits) without
+    /// sending any input to the game.
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +88,7 @@ impl Default for Config {
             capture: CaptureConfig::default(),
             filter: Filter::default(),
             limits: Limits::default(),
+            actuator: ActuatorConfig::default(),
         }
     }
 }
@@ -269,6 +282,23 @@ mod tests {
         assert!(config.filter.kinds.is_empty());
         assert_eq!(config.limits.max_spend, Some(50));
         assert_eq!(config.limits.max_refreshes, None);
+    }
+
+    #[test]
+    fn actuator_section_parses_and_defaults_off() {
+        let config: Config =
+            toml::from_str("[actuator]\ndry_run = true").expect("config should parse");
+        assert!(config.actuator.dry_run);
+        // Absent section (and absent key) default to a live actuator.
+        let config: Config = toml::from_str("[actuator]").expect("config should parse");
+        assert!(!config.actuator.dry_run);
+        assert!(!Config::default().actuator.dry_run);
+    }
+
+    #[test]
+    fn misspelled_actuator_key_is_rejected() {
+        // A silently ignored `dry_run` typo would send real clicks.
+        assert!(toml::from_str::<Config>("[actuator]\ndryrun = true").is_err());
     }
 
     #[test]

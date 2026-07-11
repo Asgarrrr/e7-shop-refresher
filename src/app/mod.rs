@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use crate::actuator::{ActuatorHandle, Mode, SnapshotEpoch, plan};
 use crate::capture::{Direction, PacketSource, Segment};
 use crate::config::ForwardConfig;
 use crate::domain::control::{Controller, Limits};
@@ -62,6 +63,8 @@ pub struct Session {
     config: Config,
     handles: SessionHandles,
     command_rx: mpsc::Receiver<Command>,
+    actuator: ActuatorHandle,
+    job_rx: mpsc::Receiver<plan::Job>,
 }
 
 /// Builds the shared session state and hands out clones before any fallible
@@ -83,12 +86,22 @@ pub fn setup(config: Config) -> (Session, SessionHandles) {
         gate,
         journal,
     };
+    let (job_tx, job_rx) = mpsc::channel::<plan::Job>(8);
+    let actuator = ActuatorHandle::new(actuator_mode(&config), SnapshotEpoch::default(), job_tx);
     let session = Session {
         config,
         handles: handles.clone(),
         command_rx,
+        actuator,
+        job_rx,
     };
     (session, handles)
+}
+
+/// No input backend is wired yet: decisions stay advice whatever the config
+/// says.
+fn actuator_mode(_config: &Config) -> Mode {
+    Mode::Off
 }
 
 /// Console-only entry point: [`setup`] + [`Session::run`], discarding the
@@ -114,6 +127,8 @@ impl Session {
             config,
             handles,
             command_rx,
+            actuator,
+            job_rx,
         } = self;
         let SessionHandles {
             controller,
@@ -170,6 +185,9 @@ impl Session {
         // Keyboard input, decoupled from the session loop through the channel.
         supervise_task("stdin", &fatal_tx, tokio::spawn(stdin_loop(commands)));
 
+        // Click jobs; without an input backend they are drained and dropped.
+        supervise_task("actuator", &fatal_tx, tokio::spawn(drain_jobs(job_rx)));
+
         info!(server = %config.server_url, "relay started — idle, `start` arms the watch");
         print_controls();
 
@@ -177,6 +195,7 @@ impl Session {
             &controller,
             &gate,
             &journal,
+            &actuator,
             command_rx,
             message_rx,
             fatal_rx,
@@ -190,6 +209,12 @@ impl Session {
             None => Ok(()),
         }
     }
+}
+
+/// No input backend compiled: consume queued click jobs so submitters never
+/// see a full queue for the wrong reason.
+async fn drain_jobs(mut jobs: mpsc::Receiver<plan::Job>) {
+    while jobs.recv().await.is_some() {}
 }
 
 /// Watches a worker task and reports a *panic* as a fatal message. A normal

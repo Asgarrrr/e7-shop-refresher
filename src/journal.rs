@@ -45,6 +45,15 @@ impl EventLog {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    /// Single sink for player-facing lines: the journal and the console stay
+    /// in step by construction — never print session lines around it.
+    pub fn emit(&self, lines: &[String]) {
+        self.push(lines);
+        for line in lines {
+            println!("{line}");
+        }
+    }
+
     pub fn push(&self, lines: &[String]) {
         if lines.is_empty() {
             return;

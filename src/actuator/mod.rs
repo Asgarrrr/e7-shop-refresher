@@ -1,5 +1,459 @@
 //! The actuator: turns controller decisions into input driven into the game
-//! window. `plan` is the pure half (zones, transform, timed job builders);
-//! the executor and the Windows input backend arrive with the wiring.
+//! window. [`plan`] is the pure half (zones, transform, timed job builders);
+//! the executor below replays a job's steps against a [`Surface`], dropping
+//! the job the moment the world changes underneath it.
 
 pub mod plan;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use tokio::sync::mpsc;
+
+use crate::app::Command;
+use crate::journal::EventLog;
+use crate::watch::WatchGate;
+
+use plan::{Input, Job};
+
+/// Generation counter of the shop state, bumped on every shop message. A job
+/// carries the epoch it was planned against and the executor refuses to act
+/// on any other: clicks aimed at a shop that no longer exists must die, not
+/// land.
+#[derive(Clone, Default)]
+pub struct SnapshotEpoch(Arc<AtomicU64>);
+
+impl SnapshotEpoch {
+    pub fn bump(&self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn current(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// No input backend armed: decisions render as advice to the player.
+    Off,
+    /// Plans and journals the clicks (screen coords + waits), sends nothing.
+    DryRun,
+    /// Sends real input to the game window.
+    Live,
+}
+
+/// The session's grip on the executor: submit jobs, bump the epoch.
+#[derive(Clone)]
+pub struct ActuatorHandle {
+    pub mode: Mode,
+    pub epoch: SnapshotEpoch,
+    jobs: mpsc::Sender<Job>,
+}
+
+impl ActuatorHandle {
+    pub fn new(mode: Mode, epoch: SnapshotEpoch, jobs: mpsc::Sender<Job>) -> Self {
+        Self { mode, epoch, jobs }
+    }
+
+    /// Queues a job for the executor; `false` when the queue is full — the
+    /// caller journals the drop, a lost click must not be silent.
+    pub fn submit(&self, job: Job) -> bool {
+        self.jobs.try_send(job).is_ok()
+    }
+}
+
+/// The input backend the executor drives: real input on Windows, a recorder
+/// in tests.
+pub trait Surface {
+    /// Finds and focuses the game window, returning its client area. An
+    /// `Err` means any click would be blind: the executor stops the loop.
+    fn acquire(&mut self) -> Result<plan::ClientRect, String>;
+    fn click(&mut self, at: (i32, i32), press_ms: u64);
+    fn scroll(&mut self, at: (i32, i32), notches: i32);
+}
+
+/// Replays queued jobs step by step. Before every act it re-checks the gate
+/// and the epoch: a stop or a fresh shop mid-job aborts the remaining steps —
+/// never click blind. With `dry_run` the resolved screen input is journaled
+/// instead of sent.
+pub async fn run_executor(
+    mut surface: impl Surface,
+    mut jobs: mpsc::Receiver<Job>,
+    gate: WatchGate,
+    epoch: SnapshotEpoch,
+    journal: EventLog,
+    commands: mpsc::Sender<Command>,
+    dry_run: bool,
+) {
+    while let Some(job) = jobs.recv().await {
+        if job.epoch != epoch.current() || !gate.is_enabled() {
+            continue; // stale before it started: skip silently.
+        }
+        let rect = match surface.acquire() {
+            Ok(rect) => rect,
+            Err(reason) => {
+                fail(&journal, &commands, &reason);
+                continue;
+            }
+        };
+        for step in &job.steps {
+            tokio::time::sleep(Duration::from_millis(step.wait_ms)).await;
+            if job.epoch != epoch.current() || !gate.is_enabled() {
+                break; // the world changed mid-job.
+            }
+            let at = match plan::to_screen(rect, step.input.at()) {
+                Ok(at) => at,
+                Err(reason) => {
+                    fail(&journal, &commands, &reason);
+                    break;
+                }
+            };
+            match step.input {
+                Input::Click { press_ms, .. } => {
+                    if dry_run {
+                        journal.emit(&[format!(
+                            ">> dry-run: click ({}, {}) after {} ms, hold {press_ms} ms",
+                            at.0, at.1, step.wait_ms
+                        )]);
+                    } else {
+                        surface.click(at, press_ms);
+                    }
+                }
+                Input::Scroll { notches, .. } => {
+                    if dry_run {
+                        journal.emit(&[format!(
+                            ">> dry-run: scroll {notches} at ({}, {}) after {} ms",
+                            at.0, at.1, step.wait_ms
+                        )]);
+                    } else {
+                        surface.scroll(at, notches);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An actuator that cannot act safely stops the whole loop: a hunt that
+/// keeps refreshing without its clicker is spend without effect.
+fn fail(journal: &EventLog, commands: &mpsc::Sender<Command>, reason: &str) {
+    journal.emit(&[format!(">> actuator: {reason} — stopping the loop")]);
+    let _ = commands.try_send(Command::Stop);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plan::{ClientRect, Trigger};
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Recorded {
+        Click((i32, i32), u64),
+        Scroll((i32, i32), i32),
+    }
+
+    /// Records every input; `on_input` runs after each one (to flip the gate
+    /// or bump the epoch mid-job).
+    struct FakeSurface {
+        rect: Result<ClientRect, String>,
+        events: Arc<Mutex<Vec<Recorded>>>,
+        on_input: Box<dyn FnMut() + Send>,
+    }
+
+    impl FakeSurface {
+        fn new(rect: Result<ClientRect, String>) -> (Self, Arc<Mutex<Vec<Recorded>>>) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let surface = Self {
+                rect,
+                events: events.clone(),
+                on_input: Box::new(|| {}),
+            };
+            (surface, events)
+        }
+    }
+
+    impl Surface for FakeSurface {
+        fn acquire(&mut self) -> Result<ClientRect, String> {
+            self.rect.clone()
+        }
+
+        fn click(&mut self, at: (i32, i32), press_ms: u64) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(Recorded::Click(at, press_ms));
+            (self.on_input)();
+        }
+
+        fn scroll(&mut self, at: (i32, i32), notches: i32) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(Recorded::Scroll(at, notches));
+            (self.on_input)();
+        }
+    }
+
+    fn design_rect() -> Result<ClientRect, String> {
+        Ok(ClientRect {
+            left: 0,
+            top: 0,
+            width: 1280,
+            height: 720,
+        })
+    }
+
+    struct Rig {
+        job_tx: mpsc::Sender<Job>,
+        job_rx: mpsc::Receiver<Job>,
+        gate: WatchGate,
+        epoch: SnapshotEpoch,
+        journal: EventLog,
+        command_tx: mpsc::Sender<Command>,
+        command_rx: mpsc::Receiver<Command>,
+    }
+
+    fn rig() -> Rig {
+        let (job_tx, job_rx) = mpsc::channel(8);
+        let (command_tx, command_rx) = mpsc::channel(4);
+        Rig {
+            job_tx,
+            job_rx,
+            gate: WatchGate::new(true),
+            epoch: SnapshotEpoch::default(),
+            journal: EventLog::default(),
+            command_tx,
+            command_rx,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_skips_stale_epoch_jobs() {
+        let mut rig = rig();
+        let (surface, events) = FakeSurface::new(design_rect());
+        let job = plan::refresh_job(Trigger::Refreshed, rig.epoch.current(), 1);
+        rig.epoch.bump(); // a newer shop arrived before the job started
+        rig.job_tx.send(job).await.unwrap();
+        drop(rig.job_tx);
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        assert!(events.lock().unwrap().is_empty());
+        assert!(rig.command_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_skips_jobs_while_gate_off() {
+        let mut rig = rig();
+        rig.gate.set(false);
+        let (surface, events) = FakeSurface::new(design_rect());
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        assert!(events.lock().unwrap().is_empty());
+        assert!(rig.command_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_aborts_mid_job_when_gate_turns_off() {
+        let rig = rig();
+        let (mut surface, events) = FakeSurface::new(design_rect());
+        let gate = rig.gate.clone();
+        surface.on_input = Box::new(move || gate.set(false));
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        // Two steps planned, only the first landed.
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_aborts_mid_job_on_epoch_bump() {
+        let rig = rig();
+        let (mut surface, events) = FakeSurface::new(design_rect());
+        let epoch = rig.epoch.clone();
+        surface.on_input = Box::new(move || epoch.bump());
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_stops_the_loop_when_acquire_fails() {
+        let mut rig = rig();
+        let (surface, events) = FakeSurface::new(Err("game window not found".to_owned()));
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        let journal = rig.journal.clone();
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(rig.command_rx.try_recv(), Ok(Command::Stop));
+        assert!(journal.entries().iter().any(|line| {
+            line.text
+                .contains("actuator: game window not found — stopping the loop")
+        }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_stops_the_loop_on_a_narrow_window() {
+        let mut rig = rig();
+        let (surface, events) = FakeSurface::new(Ok(ClientRect {
+            left: 0,
+            top: 0,
+            width: 1280,
+            height: 800,
+        }));
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        let journal = rig.journal.clone();
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(rig.command_rx.try_recv(), Ok(Command::Stop));
+        assert!(
+            journal
+                .entries()
+                .iter()
+                .any(|line| line.text.contains("narrower than 16:9"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_dry_run_journals_without_input() {
+        let mut rig = rig();
+        let (surface, events) = FakeSurface::new(design_rect());
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        let journal = rig.journal.clone();
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            true,
+        )
+        .await;
+        assert!(events.lock().unwrap().is_empty());
+        let lines = journal.entries();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.text.contains("dry-run: click"))
+                .count(),
+            2
+        );
+        assert!(rig.command_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_replays_steps_in_order_at_screen_coords() {
+        let rig = rig();
+        let rect = ClientRect {
+            left: 10,
+            top: 20,
+            width: 1920,
+            height: 1080,
+        };
+        let (surface, events) = FakeSurface::new(Ok(rect));
+        let job = plan::buy_job(Trigger::ShopOpened, 0, &[1], 42);
+        let expected: Vec<Recorded> = job
+            .steps
+            .iter()
+            .map(|step| {
+                let at = plan::to_screen(rect, step.input.at()).unwrap();
+                match step.input {
+                    Input::Click { press_ms, .. } => Recorded::Click(at, press_ms),
+                    Input::Scroll { notches, .. } => Recorded::Scroll(at, notches),
+                }
+            })
+            .collect();
+        rig.job_tx.send(job).await.unwrap();
+        drop(rig.job_tx);
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        assert_eq!(*events.lock().unwrap(), expected);
+    }
+}

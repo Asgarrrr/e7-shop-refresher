@@ -47,3 +47,10 @@ names = ["ticketrare_name", "ticketspecial_name"]
 # max_spend = 300            # crystal budget — hard ceiling, never crossed
 # max_matches = 5            # cumulative alerted items (not purchases)
 # max_duration_ms = 3600000  # session timeout (here: 1 hour)
+
+[actuator]
+# Windows build only: the tool refreshes and buys by clicking the game window
+# itself. dry_run = true journals the planned clicks (screen coordinates and
+# waits) without sending any input — use it to check the coordinates before
+# going live.
+# dry_run = false
