@@ -15,6 +15,11 @@ pub enum Error {
     #[error("network capture: {0}")]
     Capture(String),
 
+    /// A supervised task died unexpectedly (panic or abnormal exit); the string
+    /// already names which one, so it renders as-is.
+    #[error("{0}")]
+    Fatal(String),
+
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
 }

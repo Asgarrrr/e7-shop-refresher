@@ -21,26 +21,27 @@ use super::Command;
 /// The mutex guard is only ever held across synchronous calls, never an
 /// `.await`. The wall clock is read here so the domain stays pure.
 ///
-/// Returns the capture failure, if one ended the session: the caller decides
-/// what a dead capture means (an error outcome), the loop only reports it.
+/// Returns the fatal failure, if one ended the session: the caller turns it
+/// into an error outcome (banner + exit code), the loop only reports it. The
+/// message is self-describing (`capture: …`, `uplink task panicked`).
 pub(super) async fn session_loop(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
     journal: &EventLog,
     mut commands: mpsc::Receiver<Command>,
     mut messages: mpsc::Receiver<UplinkEvent>,
-    mut capture_errors: mpsc::Receiver<String>,
+    mut fatal_errors: mpsc::Receiver<String>,
 ) -> Option<String> {
     let now_ms = || journal.now_ms();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     // Stdin closing (EOF) is not a shutdown: the branch is disabled instead of
-    // letting the drained channel spin the loop. Same for the capture thread
-    // exiting cleanly (pipeline closed): only a reported error is a failure.
+    // letting the drained channel spin the loop. Same for the fatal channel
+    // draining once every supervisor's sender is dropped.
     let mut commands_open = true;
-    let mut capture_open = true;
-    let mut capture_failure = None;
+    let mut fatal_open = true;
+    let mut fatal_failure = None;
     let mut player_exit = false;
     loop {
         tokio::select! {
@@ -63,16 +64,16 @@ pub(super) async fn session_loop(
                 }
                 None => break, // uplink gone.
             },
-            error = capture_errors.recv(), if capture_open => match error {
+            error = fatal_errors.recv(), if fatal_open => match error {
                 Some(error) => {
                     // Break immediately: the channel cascade can take tens of
                     // seconds to reach this loop, during which the window
                     // would keep claiming a healthy watch.
-                    emit(journal, &[format!(">> capture failed: {error}")]);
-                    capture_failure = Some(error);
+                    emit(journal, &[format!(">> session aborted — {error}")]);
+                    fatal_failure = Some(error);
                     break;
                 }
-                None => capture_open = false,
+                None => fatal_open = false,
             },
             _ = ticker.tick() => dispatch(controller, gate, journal, Event::Tick { now_ms: now_ms() }),
             _ = &mut ctrl_c => {
@@ -92,7 +93,7 @@ pub(super) async fn session_loop(
         Event::Shutdown
     };
     dispatch(controller, gate, journal, teardown);
-    capture_failure
+    fatal_failure
 }
 
 /// Single sink for player-facing lines: the journal and the console stay in
@@ -418,7 +419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_failure_reaches_journal_gate_and_caller() {
+    async fn fatal_failure_reaches_journal_gate_and_caller() {
         let gate = WatchGate::new(false);
         let journal = EventLog::default();
         let controller = Mutex::new(Controller::new(
@@ -429,11 +430,14 @@ mod tests {
         assert!(gate.is_enabled());
 
         let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
-        // Kept alive: the loop must exit through the capture error, not a
+        // Kept alive: the loop must exit through the fatal channel, not a
         // channel cascade.
         let (_message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
-        let (error_tx, error_rx) = mpsc::channel::<String>(1);
-        error_tx.send("driver gone".to_owned()).await.unwrap();
+        let (fatal_tx, fatal_rx) = mpsc::channel::<String>(4);
+        fatal_tx
+            .send("uplink task panicked".to_owned())
+            .await
+            .unwrap();
 
         let failure = session_loop(
             &controller,
@@ -441,16 +445,16 @@ mod tests {
             &journal,
             command_rx,
             message_rx,
-            error_rx,
+            fatal_rx,
         )
         .await;
 
-        assert_eq!(failure.as_deref(), Some("driver gone"));
+        assert_eq!(failure.as_deref(), Some("uplink task panicked"));
         assert!(
             journal
                 .entries()
                 .iter()
-                .any(|line| line.text.contains("capture failed"))
+                .any(|line| line.text.contains("session aborted") && line.text.contains("uplink"))
         );
         assert!(!gate.is_enabled());
     }

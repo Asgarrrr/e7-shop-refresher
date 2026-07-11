@@ -124,50 +124,91 @@ impl Session {
         let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(8_192);
         let (raw_tx, raw_rx) = mpsc::channel::<Vec<u8>>(1_024);
         let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(256);
-        let (capture_error_tx, capture_error_rx) = mpsc::channel::<String>(1);
+        // One fatal-failure channel, several producers: the capture thread
+        // (recv error or panic) and a supervisor per worker task. The session
+        // loop breaks on the first message and reports it.
+        let (fatal_tx, fatal_rx) = mpsc::channel::<String>(4);
 
         // Blocking capture on a dedicated thread (WinDivert::recv is synchronous).
+        // Wrapped in catch_unwind so a panic surfaces as a fatal message instead
+        // of a silently dropped sender (which reads as a clean "session ended").
         let source = build_source(&config)?;
         let capture_gate = gate.clone();
+        let capture_fatal = fatal_tx.clone();
         std::thread::Builder::new()
             .name("capture".to_owned())
-            .spawn(move || capture_loop(source, segment_tx, capture_gate, capture_error_tx))?;
+            .spawn(move || {
+                let fatal = capture_fatal.clone();
+                let run = std::panic::AssertUnwindSafe(|| {
+                    capture_loop(source, segment_tx, capture_gate, capture_fatal);
+                });
+                if std::panic::catch_unwind(run).is_err() {
+                    let _ = fatal.blocking_send("capture thread panicked".to_owned());
+                }
+            })?;
 
         // Server link with automatic reconnection.
-        tokio::spawn(crate::uplink::run(
-            config.server_url.clone(),
-            raw_rx,
-            message_tx,
-            config.reconnect_initial(),
-            config.reconnect_max(),
-        ));
+        supervise_task(
+            "uplink",
+            &fatal_tx,
+            tokio::spawn(crate::uplink::run(
+                config.server_url.clone(),
+                raw_rx,
+                message_tx,
+                config.reconnect_initial(),
+                config.reconnect_max(),
+            )),
+        );
 
         // Reassembly + filtering of the directions to forward.
-        tokio::spawn(reassemble_loop(segment_rx, raw_tx, config.forward.clone()));
+        supervise_task(
+            "reassembly",
+            &fatal_tx,
+            tokio::spawn(reassemble_loop(segment_rx, raw_tx, config.forward.clone())),
+        );
 
         // Keyboard input, decoupled from the session loop through the channel.
-        tokio::spawn(stdin_loop(commands));
+        supervise_task("stdin", &fatal_tx, tokio::spawn(stdin_loop(commands)));
 
         info!(server = %config.server_url, "relay started — idle, `start` arms the watch");
         print_controls();
 
-        let capture_failure = session_loop(
+        let fatal = session_loop(
             &controller,
             &gate,
             &journal,
             command_rx,
             message_rx,
-            capture_error_rx,
+            fatal_rx,
         )
         .await;
         info!("relay stopped");
-        // A dead capture is a failure, not a clean end: the banner and the
-        // exit code must say so instead of "session ended".
-        match capture_failure {
-            Some(error) => Err(crate::Error::Capture(error)),
+        // A supervised task dying is a failure, not a clean end: the banner and
+        // the exit code must say so instead of "session ended".
+        match fatal {
+            Some(error) => Err(crate::Error::Fatal(error)),
             None => Ok(()),
         }
     }
+}
+
+/// Watches a worker task and reports a *panic* as a fatal message. A normal
+/// return is not reported: a worker only ends when the pipeline is already
+/// shutting down, and the true cause (a capture failure, Ctrl+C) surfaces on
+/// its own — reporting the follow-on exit would just be noise.
+fn supervise_task(
+    name: &'static str,
+    fatal: &mpsc::Sender<String>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let fatal = fatal.clone();
+    tokio::spawn(async move {
+        if let Err(err) = handle.await
+            && err.is_panic()
+        {
+            let _ = fatal.send(format!("{name} task panicked")).await;
+        }
+    });
 }
 
 /// Awaits the session future (spawned so a panic is caught, not propagated)
@@ -229,14 +270,14 @@ fn should_forward(direction: Direction, forward: &ForwardConfig) -> bool {
 
 /// Capture loop (synchronous context). Stops when the pipeline closes.
 ///
-/// A recv error ends the loop AND is reported through `errors`: tracing is
+/// A recv error ends the loop AND is reported through `fatal`: tracing is
 /// inert in the windowed build, so the session loop must journal the failure
 /// and turn it into an error outcome the player can see.
 fn capture_loop(
     mut source: Box<dyn PacketSource>,
     tx: mpsc::Sender<CaptureEvent>,
     gate: WatchGate,
-    errors: mpsc::Sender<String>,
+    fatal: mpsc::Sender<String>,
 ) {
     let mut was_enabled = gate.is_enabled();
     loop {
@@ -244,7 +285,7 @@ fn capture_loop(
             Ok(segment) => segment,
             Err(err) => {
                 error!(error = %err, "capture interrupted");
-                let _ = errors.blocking_send(err.to_string());
+                let _ = fatal.blocking_send(format!("capture: {err}"));
                 break;
             }
         };
@@ -338,6 +379,26 @@ mod tests {
 
     async fn panicking_session() -> crate::Result<()> {
         panic!("boom")
+    }
+
+    #[tokio::test]
+    async fn supervise_task_reports_a_panic() {
+        let (fatal_tx, mut fatal_rx) = mpsc::channel::<String>(4);
+        supervise_task("uplink", &fatal_tx, tokio::spawn(async { panic!("boom") }));
+        assert_eq!(
+            fatal_rx.recv().await.as_deref(),
+            Some("uplink task panicked")
+        );
+    }
+
+    #[tokio::test]
+    async fn supervise_task_ignores_a_clean_exit() {
+        // A worker returning normally is the shutdown cascade, not a failure:
+        // it must not surface as a fatal message.
+        let (fatal_tx, mut fatal_rx) = mpsc::channel::<String>(4);
+        supervise_task("uplink", &fatal_tx, tokio::spawn(async {}));
+        drop(fatal_tx);
+        assert_eq!(fatal_rx.recv().await, None);
     }
 
     #[tokio::test]
