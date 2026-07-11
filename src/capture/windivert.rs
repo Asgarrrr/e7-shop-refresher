@@ -26,6 +26,11 @@ use crate::error::{Error, Result};
 const DRIVER_SYS: &[u8] = include_bytes!("../../vendor/windivert/WinDivert64.sys");
 const DRIVER_FILE: &str = "WinDivert64.sys";
 
+/// Largest packet WinDivert can deliver (`WINDIVERT_MTU_MAX`). Coalesced
+/// receives (RSC/LSO) routinely exceed the wire MTU, so anything smaller as a
+/// buffer makes `recv` fail on the first bulk transfer.
+const MAX_PACKET_BYTES: usize = 65_575;
+
 pub struct WinDivertSource {
     handle: WinDivert<NetworkLayer>,
     buffer: Vec<u8>,
@@ -43,7 +48,9 @@ impl WinDivertSource {
             .map_err(|err| Error::Capture(format!("WinDivert open: {err}")))?;
         Ok(Self {
             handle,
-            buffer: vec![0u8; buffer_size.max(1_500)],
+            // Floor at the driver's own maximum: a smaller buffer turns the
+            // first oversized packet into a recv error.
+            buffer: vec![0u8; buffer_size.max(MAX_PACKET_BYTES)],
             game_port,
         })
     }
@@ -52,10 +59,17 @@ impl WinDivertSource {
 impl PacketSource for WinDivertSource {
     fn next_segment(&mut self) -> Result<Segment> {
         loop {
-            let packet = self
-                .handle
-                .recv(&mut self.buffer)
-                .map_err(|err| Error::Capture(format!("recv: {err}")))?;
+            let packet = match self.handle.recv(&mut self.buffer) {
+                Ok(packet) => packet,
+                // The driver already dropped this copy: skipping one packet
+                // leaves a reassembly gap, while propagating would kill the
+                // capture for the rest of the session.
+                Err(WinDivertError::Recv(WinDivertRecvError::InsufficientBuffer)) => {
+                    warn!("packet larger than the capture buffer — skipped");
+                    continue;
+                }
+                Err(err) => return Err(Error::Capture(format!("recv: {err}"))),
+            };
 
             if let Some(segment) = parse_segment(&packet.data[..], self.game_port) {
                 return Ok(segment);

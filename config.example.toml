@@ -18,7 +18,9 @@ initial_ms = 1000
 max_ms = 30000
 
 [capture]
-buffer_size = 65535
+# Receive buffer per packet; values below 65575 (the WinDivert maximum,
+# reached by coalesced receives) are raised to it.
+buffer_size = 65575
 # filter = "tcp and tcp.SrcPort == 3333"   # manual WinDivert filter override
 
 [filter]
