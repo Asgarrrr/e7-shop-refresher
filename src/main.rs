@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use tracing_subscriber::EnvFilter;
 
-use arkyve_refresh_shop::{Config, app};
+use arkyve_refresh_shop::{Config, app, crash};
 
 const CONFIG_PATH: &str = "config.toml";
 
@@ -18,7 +18,7 @@ fn main() -> ExitCode {
     // build stdout/stderr are inert, and a panic on a worker task or the
     // capture thread would otherwise vanish (surfacing only as a bare
     // "session ended").
-    install_crash_logger();
+    crash::install();
 
     // rustls 0.23 needs a process-level CryptoProvider installed before the
     // first TLS handshake, or connect_async panics on any wss:// URL. Install
@@ -54,80 +54,6 @@ fn main() -> ExitCode {
         Err(err) => return fatal(format!("Failed to start the async runtime: {err}")),
     };
     run_mode(runtime, config)
-}
-
-/// Installs a global panic hook that appends every panic — on any thread,
-/// including tokio workers and the capture thread — to `crash.log` next to the
-/// exe, then chains the default hook (stderr, useful in the console build).
-fn install_crash_logger() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let thread = std::thread::current()
-            .name()
-            .unwrap_or("unnamed")
-            .to_owned();
-        let location = info
-            .location()
-            .map(|l| l.to_string())
-            .unwrap_or_else(|| "unknown".to_owned());
-        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
-        let entry = crash_entry(
-            epoch_secs(),
-            &thread,
-            &location,
-            &panic_message(info.payload()),
-            &backtrace,
-        );
-        let _ = append_crash_log(&crash_log_path(), &entry);
-        default_hook(info);
-    }));
-}
-
-/// The panic payload as text (panics carry `&str` or `String`).
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_owned())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "<non-string panic payload>".to_owned())
-}
-
-fn epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// One crash.log record. Pure (time passed in) so it can be tested.
-fn crash_entry(
-    epoch_secs: u64,
-    thread: &str,
-    location: &str,
-    message: &str,
-    backtrace: &str,
-) -> String {
-    format!(
-        "=== panic (epoch {epoch_secs}s) ===\nthread: {thread}\nlocation: {location}\nmessage: {message}\nbacktrace:\n{backtrace}\n\n"
-    )
-}
-
-fn crash_log_path() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("crash.log")))
-        .unwrap_or_else(|| std::path::PathBuf::from("crash.log"))
-}
-
-/// Appends one record, creating the file if needed. Best-effort: the panic
-/// hook must never itself panic.
-fn append_crash_log(path: &std::path::Path, entry: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    file.write_all(entry.as_bytes())
 }
 
 /// Every fatal error before the main window opens lands here: stderr always,
@@ -202,39 +128,5 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
             eprintln!("GUI error: {err}");
             ExitCode::FAILURE
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn crash_entry_captures_thread_location_and_message() {
-        let entry = crash_entry(
-            42,
-            "capture",
-            "src/capture/windivert.rs:60",
-            "recv failed",
-            "<backtrace>",
-        );
-        assert!(entry.contains("epoch 42s"));
-        assert!(entry.contains("thread: capture"));
-        assert!(entry.contains("location: src/capture/windivert.rs:60"));
-        assert!(entry.contains("message: recv failed"));
-        assert!(entry.contains("<backtrace>"));
-    }
-
-    #[test]
-    fn append_crash_log_creates_and_appends() {
-        let path =
-            std::env::temp_dir().join(format!("arkyve_crash_test_{}.log", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        append_crash_log(&path, "first\n").unwrap();
-        append_crash_log(&path, "second\n").unwrap();
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("first"));
-        assert!(body.contains("second"));
-        let _ = std::fs::remove_file(&path);
     }
 }

@@ -14,6 +14,7 @@
 pub mod app;
 pub mod capture;
 pub mod config;
+pub mod crash;
 pub mod domain;
 pub mod error;
 pub mod journal;
