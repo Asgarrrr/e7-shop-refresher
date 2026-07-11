@@ -11,6 +11,7 @@
 //!                                                                  alerts ◀──────┘
 //! ```
 
+pub mod actuator;
 pub mod app;
 pub mod capture;
 pub mod config;
