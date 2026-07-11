@@ -80,20 +80,14 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
     let error = ui::SessionErrorSlot::default();
     let failed = Arc::new(AtomicBool::new(false));
     let (slot, flag) = (error.clone(), failed.clone());
+    let gate = handles.gate.clone();
     runtime.spawn(async move {
-        // Inner task: a panic in the session must land in the banner too,
-        // not vanish with a discarded JoinHandle.
-        let outcome = match tokio::spawn(session.run()).await {
-            Ok(Ok(())) => "session ended — restart the app to reconnect".to_owned(),
-            Ok(Err(err)) => {
-                flag.store(true, Ordering::Relaxed);
-                format!("session error: {err}")
-            }
-            Err(panic) => {
-                flag.store(true, Ordering::Relaxed);
-                format!("session crashed: {panic}")
-            }
-        };
+        // app::supervise catches a session panic (it must land in the banner,
+        // not vanish with a discarded JoinHandle) and forces the gate off.
+        let (outcome, session_failed) = app::supervise(session.run(), gate).await;
+        if session_failed {
+            flag.store(true, Ordering::Relaxed);
+        }
         *slot.lock().expect("error slot poisoned") = Some(outcome);
     });
 

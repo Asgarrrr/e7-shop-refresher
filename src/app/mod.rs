@@ -2,6 +2,7 @@
 
 mod session;
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -169,6 +170,28 @@ impl Session {
     }
 }
 
+/// Awaits the session future (spawned so a panic is caught, not propagated)
+/// and translates its end into a banner line plus a failed flag.
+///
+/// The gate is forced off on every path: a panicking session never reaches
+/// the loop's own teardown, and capture must not keep streaming game traffic
+/// under a crash banner. Idempotent after a clean teardown.
+pub async fn supervise(
+    session: impl Future<Output = Result<()>> + Send + 'static,
+    gate: WatchGate,
+) -> (String, bool) {
+    let outcome = tokio::spawn(session).await;
+    gate.set(false);
+    match outcome {
+        Ok(Ok(())) => (
+            "session ended — restart the app to reconnect".to_owned(),
+            false,
+        ),
+        Ok(Err(err)) => (format!("session error: {err}"), true),
+        Err(panic) => (format!("session crashed: {panic}"), true),
+    }
+}
+
 /// Consumes capture events, reassembles, forwards the ordered stream.
 async fn reassemble_loop(
     mut events: mpsc::Receiver<CaptureEvent>,
@@ -311,6 +334,28 @@ mod tests {
             .commands
             .try_send(Command::Toggle)
             .expect("channel open");
+    }
+
+    async fn panicking_session() -> crate::Result<()> {
+        panic!("boom")
+    }
+
+    #[tokio::test]
+    async fn supervise_forces_gate_off_after_a_panic() {
+        let gate = WatchGate::new(true);
+        let (outcome, failed) = supervise(panicking_session(), gate.clone()).await;
+        assert!(!gate.is_enabled());
+        assert!(failed);
+        assert!(outcome.contains("session crashed"));
+    }
+
+    #[tokio::test]
+    async fn supervise_reports_clean_end_without_failure() {
+        let gate = WatchGate::new(true);
+        let (outcome, failed) = supervise(async { Ok(()) }, gate.clone()).await;
+        assert!(!gate.is_enabled());
+        assert!(!failed);
+        assert!(outcome.contains("session ended"));
     }
 
     #[test]
