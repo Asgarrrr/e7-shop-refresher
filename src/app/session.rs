@@ -15,24 +15,31 @@ use crate::watch::WatchGate;
 use super::Command;
 
 /// Owns the controller for the session: multiplexes player commands, server
-/// messages, a 1 s tick (time limits), and Ctrl+C.
+/// messages, a 1 s tick (time limits), capture failures, and Ctrl+C.
 ///
 /// The mutex guard is only ever held across synchronous calls, never an
 /// `.await`. The wall clock is read here so the domain stays pure.
+///
+/// Returns the capture failure, if one ended the session: the caller decides
+/// what a dead capture means (an error outcome), the loop only reports it.
 pub(super) async fn session_loop(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
     journal: &EventLog,
     mut commands: mpsc::Receiver<Command>,
     mut messages: mpsc::Receiver<ServerMessage>,
-) {
+    mut capture_errors: mpsc::Receiver<String>,
+) -> Option<String> {
     let now_ms = || journal.now_ms();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     // Stdin closing (EOF) is not a shutdown: the branch is disabled instead of
-    // letting the drained channel spin the loop.
+    // letting the drained channel spin the loop. Same for the capture thread
+    // exiting cleanly (pipeline closed): only a reported error is a failure.
     let mut commands_open = true;
+    let mut capture_open = true;
+    let mut capture_failure = None;
     loop {
         tokio::select! {
             command = commands.recv(), if commands_open => match command {
@@ -42,6 +49,17 @@ pub(super) async fn session_loop(
             message = messages.recv() => match message {
                 Some(message) => on_message(controller, gate, journal, message, now_ms()),
                 None => break, // uplink gone.
+            },
+            error = capture_errors.recv(), if capture_open => match error {
+                Some(error) => {
+                    // Break immediately: the channel cascade can take tens of
+                    // seconds to reach this loop, during which the window
+                    // would keep claiming a healthy watch.
+                    emit(journal, &[format!(">> capture failed: {error}")]);
+                    capture_failure = Some(error);
+                    break;
+                }
+                None => capture_open = false,
             },
             _ = ticker.tick() => dispatch(controller, gate, journal, Event::Tick { now_ms: now_ms() }),
             _ = &mut ctrl_c => {
@@ -64,6 +82,7 @@ pub(super) async fn session_loop(
     if armed {
         dispatch(controller, gate, journal, Event::Stop);
     }
+    capture_failure
 }
 
 /// Single sink for player-facing lines: the journal and the console stay in
@@ -312,12 +331,60 @@ mod tests {
 
         let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
         let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(1);
+        let (_error_tx, error_rx) = mpsc::channel::<String>(1);
         drop(message_tx); // uplink gone: the loop must exit and tear down.
-        session_loop(&controller, &gate, &journal, command_rx, message_rx).await;
+        let failure = session_loop(
+            &controller,
+            &gate,
+            &journal,
+            command_rx,
+            message_rx,
+            error_rx,
+        )
+        .await;
 
+        assert_eq!(failure, None);
         assert_eq!(
             controller.lock().unwrap().status(),
             Status::Stopped(StopReason::PlayerStopped)
+        );
+        assert!(!gate.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn capture_failure_reaches_journal_gate_and_caller() {
+        let gate = WatchGate::new(false);
+        let journal = EventLog::default();
+        let controller = Mutex::new(Controller::new(
+            Filter::matching_default_items(),
+            Limits::default(),
+        ));
+        on_command(&controller, &gate, &journal, Command::Start, 0);
+        assert!(gate.is_enabled());
+
+        let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
+        // Kept alive: the loop must exit through the capture error, not a
+        // channel cascade.
+        let (_message_tx, message_rx) = mpsc::channel::<ServerMessage>(1);
+        let (error_tx, error_rx) = mpsc::channel::<String>(1);
+        error_tx.send("driver gone".to_owned()).await.unwrap();
+
+        let failure = session_loop(
+            &controller,
+            &gate,
+            &journal,
+            command_rx,
+            message_rx,
+            error_rx,
+        )
+        .await;
+
+        assert_eq!(failure.as_deref(), Some("driver gone"));
+        assert!(
+            journal
+                .entries()
+                .iter()
+                .any(|line| line.text.contains("capture failed"))
         );
         assert!(!gate.is_enabled());
     }
@@ -330,8 +397,17 @@ mod tests {
 
         let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
         let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(1);
+        let (_error_tx, error_rx) = mpsc::channel::<String>(1);
         drop(message_tx);
-        session_loop(&controller, &gate, &journal, command_rx, message_rx).await;
+        session_loop(
+            &controller,
+            &gate,
+            &journal,
+            command_rx,
+            message_rx,
+            error_rx,
+        )
+        .await;
 
         // A session that never ran must not report "player stopped".
         assert_eq!(controller.lock().unwrap().status(), Status::Idle);

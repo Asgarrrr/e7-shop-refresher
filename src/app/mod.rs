@@ -123,13 +123,14 @@ impl Session {
         let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(8_192);
         let (raw_tx, raw_rx) = mpsc::channel::<Vec<u8>>(1_024);
         let (message_tx, message_rx) = mpsc::channel::<ServerMessage>(256);
+        let (capture_error_tx, capture_error_rx) = mpsc::channel::<String>(1);
 
         // Blocking capture on a dedicated thread (WinDivert::recv is synchronous).
         let source = build_source(&config)?;
         let capture_gate = gate.clone();
         std::thread::Builder::new()
             .name("capture".to_owned())
-            .spawn(move || capture_loop(source, segment_tx, capture_gate))?;
+            .spawn(move || capture_loop(source, segment_tx, capture_gate, capture_error_tx))?;
 
         // Server link with automatic reconnection.
         tokio::spawn(crate::uplink::run(
@@ -149,9 +150,22 @@ impl Session {
         info!(server = %config.server_url, "relay started — idle, `start` arms the watch");
         print_controls();
 
-        session_loop(&controller, &gate, &journal, command_rx, message_rx).await;
+        let capture_failure = session_loop(
+            &controller,
+            &gate,
+            &journal,
+            command_rx,
+            message_rx,
+            capture_error_rx,
+        )
+        .await;
         info!("relay stopped");
-        Ok(())
+        // A dead capture is a failure, not a clean end: the banner and the
+        // exit code must say so instead of "session ended".
+        match capture_failure {
+            Some(error) => Err(crate::Error::Capture(error)),
+            None => Ok(()),
+        }
     }
 }
 
@@ -191,10 +205,15 @@ fn should_forward(direction: Direction, forward: &ForwardConfig) -> bool {
 }
 
 /// Capture loop (synchronous context). Stops when the pipeline closes.
+///
+/// A recv error ends the loop AND is reported through `errors`: tracing is
+/// inert in the windowed build, so the session loop must journal the failure
+/// and turn it into an error outcome the player can see.
 fn capture_loop(
     mut source: Box<dyn PacketSource>,
     tx: mpsc::Sender<CaptureEvent>,
     gate: WatchGate,
+    errors: mpsc::Sender<String>,
 ) {
     let mut was_enabled = gate.is_enabled();
     loop {
@@ -202,6 +221,7 @@ fn capture_loop(
             Ok(segment) => segment,
             Err(err) => {
                 error!(error = %err, "capture interrupted");
+                let _ = errors.blocking_send(err.to_string());
                 break;
             }
         };
