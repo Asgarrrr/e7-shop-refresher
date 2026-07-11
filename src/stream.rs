@@ -6,10 +6,12 @@
 //! what the analysis server expects.
 //!
 //! All work is done in *relative offsets* from the stream origin (the first
-//! observed segment). TCP sequence numbers are `u32` and wrap (a connection
-//! whose ISN is near `2^32` wraps after a few hundred bytes); reasoning in
-//! `i64` offsets computed via `seq_diff` sidesteps that, keeping ordering and
-//! comparison monotonic.
+//! observed segment). TCP sequence numbers are `u32` and wrap; a segment's
+//! offset is derived from its distance to the *currently expected* byte, not
+//! to the fixed origin, so the signed `i32` sequence window tracks the stream
+//! as it advances. Anchoring the distance to the origin instead would break
+//! once a half-stream delivered 2 GiB: the distance would exceed `i32` range
+//! and every later segment would look like an already-delivered retransmission.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -67,8 +69,13 @@ impl HalfStream {
     fn push(&mut self, seq: u32, syn: bool, payload: &[u8]) -> Vec<u8> {
         // SYN consumes a sequence number: data starts at seq + 1.
         let data_seq = if syn { seq.wrapping_add(1) } else { seq };
-        let baseline = *self.baseline.get_or_insert(data_seq);
-        let offset = seq_diff(data_seq, baseline);
+        self.baseline.get_or_insert(data_seq);
+        // Measure from the currently expected byte, then shift back to an
+        // absolute offset. The distance stays within the TCP window (small),
+        // so the i32 span in `seq_diff` never overflows however far the stream
+        // has advanced.
+        let expected_seq = self.expected_seq();
+        let offset = self.next_off + seq_diff(data_seq, expected_seq);
 
         let mut out = Vec::new();
         self.absorb(offset, payload, &mut out);
@@ -120,6 +127,15 @@ impl HalfStream {
             self.pending_bytes -= payload.len();
             self.absorb(offset, &payload, out);
         }
+    }
+
+    /// Sequence number of the next expected byte: `baseline + next_off`, back
+    /// in the wrapping `u32` space. `baseline` is always set by the time this
+    /// runs (`push` inserts it first).
+    fn expected_seq(&self) -> u32 {
+        self.baseline
+            .unwrap_or(0)
+            .wrapping_add(self.next_off as u32)
     }
 
     /// Under memory pressure, *give up on the current gap*: jump `next_off` to
@@ -244,6 +260,22 @@ mod tests {
         // A post-wrap future segment is buffered, then the gap is filled.
         assert!(r.push(&seg(0x0000_0002, false, false, b"EF")).is_empty());
         assert_eq!(r.push(&seg(0x0000_0000, false, false, b"CD")), b"CDEF");
+    }
+
+    #[test]
+    fn delivers_far_past_two_gigabytes() {
+        // A half-stream that has already delivered 2^31 bytes: the next
+        // in-order segment must still be recognised, not dropped as a phantom
+        // retransmission (the old origin-anchored offset overflowed i32 here).
+        let mut half = HalfStream {
+            baseline: Some(0),
+            next_off: (1i64 << 31) + 1000,
+            ..Default::default()
+        };
+        let expected = half.expected_seq();
+        assert_eq!(half.push(expected, false, b"AB"), b"AB");
+        // And the following contiguous segment keeps flowing.
+        assert_eq!(half.push(expected.wrapping_add(2), false, b"CD"), b"CD");
     }
 
     #[test]
