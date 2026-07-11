@@ -10,6 +10,7 @@
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GW_HWNDPREV, GetMessageW, GetWindow,
@@ -89,6 +90,10 @@ fn create_window() -> Result<isize, String> {
         lpfnWndProc: Some(shield_proc),
         hInstance: instance,
         lpszClassName: class.as_ptr(),
+        // The surface must be painted: hit-testing a layered window follows
+        // its content, and an unpainted one can read as fully transparent —
+        // the player's mouse would fall straight through to the game.
+        hbrBackground: unsafe { GetStockObject(BLACK_BRUSH) },
         ..Default::default()
     };
     if unsafe { RegisterClassW(&wndclass) } == 0 {
@@ -113,8 +118,8 @@ fn create_window() -> Result<isize, String> {
     if hwnd.is_null() {
         return Err("could not create the shield window".to_owned());
     }
-    // Alpha 1: visually nothing, yet hit-testable — alpha 0 would let the
-    // player's mouse fall through to the game.
+    // Alpha 1 over the painted surface: visually nothing, yet hit-testable —
+    // alpha 0 would let the player's mouse fall through to the game.
     if unsafe { SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA) } == 0 {
         return Err("could not set the shield transparency".to_owned());
     }
