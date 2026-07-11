@@ -387,6 +387,11 @@ impl Controller {
 
     fn halt(&mut self, reason: StopReason) -> Vec<Action> {
         self.status = Status::Stopped(reason);
+        // A stopped hunt has no pending purchases: snapshots stored while
+        // Stopped are never evaluated, and catalog ids are stable per item,
+        // so a surviving checklist would keep painting yesterday's matches
+        // as "wanted" in the view.
+        self.checklist.clear();
         vec![Action::Halt(reason)]
     }
 

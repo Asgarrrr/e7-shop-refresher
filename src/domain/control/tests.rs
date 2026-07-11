@@ -219,6 +219,30 @@ fn auto_resume_respects_limits() {
 }
 
 #[test]
+fn stop_clears_the_checklist() {
+    // Catalog ids are stable per item and snapshots stored while Stopped are
+    // never evaluated: a checklist outliving the hunt would keep flagging
+    // yesterday's matches as "wanted" in the view.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    assert_eq!(ctrl.checklist(), &[102]);
+    ctrl.handle(Event::Stop);
+    assert!(ctrl.checklist().is_empty());
+}
+
+#[test]
+fn limit_halt_clears_the_checklist() {
+    let mut ctrl = started(Limits {
+        max_matches: Some(1),
+        ..Limits::default()
+    });
+    // The match trips max_matches: Alert then Halt in the same batch.
+    let actions = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    assert!(matches!(actions.last(), Some(Action::Halt(_))));
+    assert!(ctrl.checklist().is_empty());
+}
+
+#[test]
 fn purchase_of_unknown_id_ignored() {
     let mut ctrl = started(Limits::default());
     ctrl.handle(snap(with_ids(hit_shop(None)), 1));
