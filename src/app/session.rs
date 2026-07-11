@@ -316,7 +316,7 @@ fn render_alert(lines: &mut Vec<String>, slots: &[u8], controller: &Controller) 
     };
     for (index, item) in snapshot.slots.iter().enumerate() {
         if slots.contains(&item.effective_slot(index)) {
-            lines.push(format!("   {}", format_item(item)));
+            lines.push(format!("   {}", format_item(item, index)));
         }
     }
 }

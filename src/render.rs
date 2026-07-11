@@ -53,18 +53,26 @@ pub(crate) fn describe(reason: StopReason) -> &'static str {
     }
 }
 
+/// Merchant name, or the shared fallback when the snapshot omits it — the one
+/// place the default label lives, so the console dump and the GUI header never
+/// disagree.
+pub(crate) fn merchant_label(merchant: Option<&str>) -> &str {
+    merchant.unwrap_or("Secret Shop")
+}
+
 pub(crate) fn render_shop(snapshot: &ShopSnapshot) {
-    let merchant = snapshot.merchant.as_deref().unwrap_or("Secret Shop");
-    println!("\n[{merchant}]");
-    for item in &snapshot.slots {
-        println!("  {}", format_item(item));
+    println!("\n[{}]", merchant_label(snapshot.merchant.as_deref()));
+    for (index, item) in snapshot.slots.iter().enumerate() {
+        println!("  {}", format_item(item, index));
     }
 }
 
-pub(crate) fn format_item(item: &ShopItem) -> String {
+/// `index` is the item's 0-based position, needed for the player-facing slot
+/// number when the wire slot is omitted (`effective_slot`).
+pub(crate) fn format_item(item: &ShopItem, index: usize) -> String {
     let kind = kind_label(item.kind);
 
-    let mut line = format!("slot {} · {kind}", item.slot);
+    let mut line = format!("slot {} · {kind}", item.effective_slot(index));
     if let Some(name) = &item.name {
         line.push_str(&format!(" · {name}"));
     }
@@ -110,6 +118,22 @@ mod tests {
         assert_eq!(kind_label(ItemKind::Hero), "hero");
         assert_eq!(kind_label(ItemKind::Token), "token");
         assert_eq!(kind_label(ItemKind::Unknown), "?");
+    }
+
+    #[test]
+    fn format_item_slot_falls_back_to_position_like_the_table() {
+        // A slot-omitting item (slot 0) at position 1 must read "slot 2", the
+        // same number the alert header and the GUI table derive — no more
+        // "slot 0" in the detail line beside a "slot 2" header.
+        let item = ShopItem::default();
+        assert_eq!(item.slot, 0);
+        assert!(format_item(&item, 1).starts_with("slot 2 · "));
+    }
+
+    #[test]
+    fn merchant_label_falls_back_when_absent() {
+        assert_eq!(merchant_label(Some("Secret Shop VIP")), "Secret Shop VIP");
+        assert_eq!(merchant_label(None), "Secret Shop");
     }
 
     #[test]

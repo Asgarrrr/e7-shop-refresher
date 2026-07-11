@@ -2,7 +2,7 @@
 //! shows, copied under a single short lock.
 
 use crate::domain::control::{Controller, Limits, Progress, Status};
-use crate::render::{describe, format_item, kind_label, status_label};
+use crate::render::{describe, format_item, kind_label, merchant_label, status_label};
 
 /// Plain per-frame copy of everything the window shows; built under the
 /// controller lock, rendered after the guard is dropped.
@@ -55,7 +55,7 @@ pub fn view_state(controller: &Controller, capture_on: bool) -> ViewState {
                     price: item.price,
                     sold_out: item.is_sold_out(),
                     wanted: item.catalog_id().is_some_and(|id| checklist.contains(&id)),
-                    detail: format_item(item),
+                    detail: format_item(item, index),
                 })
                 .collect()
         })
@@ -66,9 +66,8 @@ pub fn view_state(controller: &Controller, capture_on: bool) -> ViewState {
         capture_on,
         progress: controller.progress(),
         limits: controller.limits().clone(),
-        merchant: snapshot
-            .and_then(|snapshot| snapshot.merchant.clone())
-            .unwrap_or_else(|| "Secret Shop".to_owned()),
+        merchant: merchant_label(snapshot.and_then(|snapshot| snapshot.merchant.as_deref()))
+            .to_owned(),
         crystal_balance: controller.refresh_meta().map(|meta| meta.crystal_balance),
         refresh_cost: controller.refresh_cost(),
         rows,
@@ -263,7 +262,7 @@ mod tests {
             price: Some(184_000),
             ..ShopItem::default()
         };
-        let expected = format_item(&item);
+        let expected = format_item(&item, 0);
         ctrl.handle(Event::Snapshot {
             snapshot: shop(vec![item]),
             now_ms: 0,
