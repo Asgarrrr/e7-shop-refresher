@@ -81,31 +81,25 @@ pub async fn run(
         // capture thread — the kernel then drops packets, creating real gaps that
         // can never be filled. Better to drop bytes while the server is
         // unreachable (it resyncs on reconnect).
-        if drain_until(&mut outbound, backoff).await == Drained::Closed {
-            return;
+        if drain_until(&mut outbound, backoff).await {
+            return; // outbound closed: shutdown requested.
         }
         backoff = (backoff * 2).min(max_backoff);
     }
 }
 
-#[derive(PartialEq, Eq)]
-enum Drained {
-    /// The delay elapsed; the channel is still open.
-    Elapsed,
-    /// The outbound channel closed: shutdown requested.
-    Closed,
-}
-
 /// Absorbs and discards outbound batches for `wait`, without stalling upstream.
-async fn drain_until(outbound: &mut mpsc::Receiver<Vec<u8>>, wait: Duration) -> Drained {
+/// Returns `true` if the outbound channel closed (shutdown), `false` if the
+/// delay simply elapsed.
+async fn drain_until(outbound: &mut mpsc::Receiver<Vec<u8>>, wait: Duration) -> bool {
     let deadline = tokio::time::sleep(wait);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            _ = &mut deadline => return Drained::Elapsed,
+            _ = &mut deadline => return false,
             batch = outbound.recv() => {
                 if batch.is_none() {
-                    return Drained::Closed;
+                    return true;
                 }
                 // batch dropped: server unreachable.
             }
