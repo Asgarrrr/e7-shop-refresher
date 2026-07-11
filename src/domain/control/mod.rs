@@ -107,6 +107,16 @@ pub enum Action {
     Refused(RefusalReason),
 }
 
+impl Action {
+    /// Whether this action is the domain's explicit rejection verdict. Callers
+    /// deciding "was the event applied?" test for this, never the emptiness of
+    /// the action list — an accepted event that grows an action later must not
+    /// silently read as refused.
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Action::Refused(_))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusalReason {
     /// Arming with — or swapping to — a filter that matches everything.

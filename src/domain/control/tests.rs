@@ -111,6 +111,17 @@ fn unrestricted_filter_swap_is_ignored() {
 }
 
 #[test]
+fn is_refusal_flags_only_the_refused_verdict() {
+    // The app reads acceptance from this verdict, not the action count: only
+    // Action::Refused is a refusal, everything else (including an empty list,
+    // which contains no refusal) means the event applied.
+    assert!(Action::Refused(RefusalReason::UnrestrictedFilter).is_refusal());
+    assert!(!Action::Refresh.is_refusal());
+    assert!(!Action::Alert { slots: vec![1] }.is_refusal());
+    assert!(!Action::Halt(StopReason::PlayerStopped).is_refusal());
+}
+
+#[test]
 fn first_snapshot_no_match_emits_single_refresh() {
     let mut ctrl = started(Limits::default());
     let actions = ctrl.handle(snap(dud_shop(Some(meta(100, 3))), 1));

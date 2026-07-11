@@ -134,13 +134,14 @@ fn handle_command(
             Status::Idle | Status::Stopped(_) => Event::Start { now_ms },
         },
         // Retunes echo their own confirmation: the transition logic below
-        // only reads status changes, which these never cause. The success
-        // line is gated on the domain's decision — a refused swap renders
-        // the refusal instead.
+        // only reads status changes, which these never cause. Acceptance is
+        // read from the domain's explicit verdict — the absence of an
+        // `Action::Refused`, not the emptiness of the list — so the
+        // confirmation survives an accepted retune that ever emits an action.
         Command::SetFilter(filter) => {
             let paused = ctrl.status() == Status::Paused;
             let actions = ctrl.handle(Event::FilterChanged(filter));
-            let accepted = actions.is_empty();
+            let accepted = !actions.iter().any(Action::is_refusal);
             let mut lines = apply(&actions, &ctrl, gate);
             if accepted {
                 lines.push(">> filter updated — applies from the next shop".to_owned());
@@ -157,7 +158,7 @@ fn handle_command(
         }
         Command::SetLimits(limits) => {
             let actions = ctrl.handle(Event::LimitsChanged(limits));
-            let accepted = actions.is_empty();
+            let accepted = !actions.iter().any(Action::is_refusal);
             let mut lines = apply(&actions, &ctrl, gate);
             if accepted {
                 lines.push(">> limits updated — checked before the next refresh".to_owned());
