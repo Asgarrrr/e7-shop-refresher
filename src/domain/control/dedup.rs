@@ -9,7 +9,7 @@ use crate::domain::shop::{ShopSnapshot, SubStat};
 /// `limit` is deliberately excluded: re-opening the shop after a buy
 /// re-delivers the same roll with `remaining` decremented, and that must
 /// still count as the same shop.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(super) struct SlotIdentity {
     id: u32,
     price: Option<u32>,

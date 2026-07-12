@@ -429,6 +429,112 @@ fn reopened_shop_after_buy_does_not_double_refresh() {
     });
     assert!(ctrl.handle(snap(reopened, 3)).is_empty());
     assert_eq!(ctrl.progress().refreshes, 1);
+    // Muted by dedup before the bought set is even consulted: no re-pause,
+    // no rebuilt checklist.
+    assert_eq!(ctrl.status(), Status::Watching);
+    assert!(ctrl.checklist().is_empty());
+}
+
+#[test]
+fn restart_reopen_does_not_rebuy_a_bought_item() {
+    // The wire never says sold-out and `Start` clears the dedup identity:
+    // without the roll-scoped bought set, re-opening the shop after a
+    // restart would re-click the already-bought slot.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
+    ctrl.handle(Event::Stop);
+    ctrl.handle(Event::Start { now_ms: 3 });
+    // Same roll re-delivered on re-open: the match still shows, but the
+    // bought slot is dead stock — display-only, hunted over.
+    let actions = ctrl.handle(snap(with_ids(hit_shop(None)), 4));
+    assert_eq!(
+        actions,
+        vec![
+            Action::Buy {
+                targets: vec![target(3, None)]
+            },
+            Action::Refresh,
+        ]
+    );
+    assert_eq!(ctrl.status(), Status::Watching);
+    assert!(ctrl.checklist().is_empty());
+}
+
+#[test]
+fn restart_reopen_keeps_unbought_match_clickable() {
+    let mut ctrl = started(Limits::default());
+    let two_hits = with_ids(shop(
+        &[Equipment, Token, Equipment, Token, Token, Token],
+        None,
+    ));
+    ctrl.handle(snap(two_hits.clone(), 1)); // checklist [100, 102]
+    assert!(ctrl.handle(buy(100, 2)).is_empty());
+    ctrl.handle(Event::Stop);
+    ctrl.handle(Event::Start { now_ms: 3 });
+    // Only the bought slot is excluded; the other match stays clickable.
+    let actions = ctrl.handle(snap(two_hits, 4));
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(1, None), target(3, Some(102))]
+        }]
+    );
+    assert_eq!(ctrl.status(), Status::Paused);
+    assert_eq!(ctrl.checklist(), &[102]);
+}
+
+#[test]
+fn new_roll_makes_a_bought_id_buyable_again() {
+    // Ids are stable per item type: a genuinely new roll relisting a bought
+    // id is fresh stock and must be buyable again.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
+    // Same catalog ids, changed per-roll field: a re-roll, not a re-open.
+    let mut reroll = with_ids(hit_shop(None));
+    reroll.slots[0].price = Some(120_000);
+    let actions = ctrl.handle(snap(reroll, 3));
+    assert_eq!(
+        actions,
+        vec![Action::Buy {
+            targets: vec![target(3, Some(102))]
+        }]
+    );
+    assert_eq!(ctrl.status(), Status::Paused);
+    assert_eq!(ctrl.checklist(), &[102]);
+}
+
+#[test]
+fn zero_id_echo_never_enters_the_bought_set() {
+    // `catalog_id()` is never `Some(0)`, so a stored 0 could never match a
+    // slot — but the sentinel must not accumulate as phantom state either.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(hit_shop(None), 1)); // untrackable match: Paused
+    assert!(ctrl.handle(buy(0, 2)).is_empty());
+    assert!(ctrl.bought.is_empty());
+}
+
+#[test]
+fn fail_open_reevaluation_does_not_rebuy() {
+    // An unidentifiable snapshot (an id is 0) re-evaluates while Watching,
+    // but it must neither reset the bought set nor re-click a bought slot.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
+    let mut holed = with_ids(hit_shop(None));
+    holed.slots[5].id = 0; // fingerprint gone: fail-open re-evaluation
+    let actions = ctrl.handle(snap(holed, 3));
+    assert_eq!(
+        actions,
+        vec![
+            Action::Buy {
+                targets: vec![target(3, None)]
+            },
+            Action::Refresh,
+        ]
+    );
+    assert_eq!(ctrl.progress().refreshes, 2);
 }
 
 #[test]

@@ -181,6 +181,15 @@ pub struct Controller {
     /// on `Start` only — surviving the post-buy auto-resume is what mutes a
     /// re-open right after a buy.
     acted_fingerprint: Option<Vec<SlotIdentity>>,
+    /// Catalog ids bought in the current roll. The wire never says sold-out
+    /// and ids are stable per item type, so this is the only guard against
+    /// re-buying an already-bought slot. Both fields survive `Start`: a
+    /// restart clears `acted_fingerprint`, and keying the clear off that
+    /// alone would let a same-roll re-open wrongly forget the buys.
+    bought: Vec<u32>,
+    /// The roll `bought` is scoped to; a snapshot with a different identity
+    /// is fresh stock and empties the set.
+    bought_fingerprint: Option<Vec<SlotIdentity>>,
 }
 
 impl Controller {
@@ -196,6 +205,8 @@ impl Controller {
             last_snapshot: None,
             checklist: Vec::new(),
             acted_fingerprint: None,
+            bought: Vec::new(),
+            bought_fingerprint: None,
         }
     }
 
@@ -334,6 +345,10 @@ impl Controller {
             // A fail-open arrival must not erase the last valid identity:
             // a later verbatim duplicate of that shop must still be muted.
             self.acted_fingerprint = fingerprint;
+            if self.acted_fingerprint != self.bought_fingerprint {
+                self.bought.clear(); // new roll = fresh stock
+                self.bought_fingerprint = self.acted_fingerprint.clone();
+            }
         }
 
         let (targets, buyable) = self.plan_targets(snapshot);
@@ -386,7 +401,10 @@ impl Controller {
                 (Some(balance), Some(price)) => price <= balance,
                 _ => true,
             };
-            let in_reach = !item.is_sold_out() && affordable;
+            let already_bought = item
+                .catalog_id()
+                .is_some_and(|id| self.bought.contains(&id));
+            let in_reach = !item.is_sold_out() && affordable && !already_bought;
             if in_reach && let (Some(balance), Some(price)) = (gold, item.price) {
                 gold = Some(balance - price);
             }
@@ -395,8 +413,9 @@ impl Controller {
                 slot: item.effective_slot(index),
                 // Only ids a purchase echo can actually name AND a buy can
                 // actually land: the id-0 sentinel never appears in an echo,
-                // and a sold-out or unaffordable slot cannot be bought —
-                // none may hold the checklist open (nor be clicked).
+                // and a sold-out, unaffordable or already-bought slot cannot
+                // be bought — none may hold the checklist open (nor be
+                // clicked).
                 id: item.catalog_id().filter(|_| in_reach),
             });
         }
@@ -411,6 +430,11 @@ impl Controller {
             // The echoed balance is truth whatever the status: the next
             // matches' buys are planned against it.
             self.gold_balance = gold;
+        }
+        // Like gold, a buy is truth whatever the status: the slot is spent
+        // for the rest of the roll. The id-0 sentinel never names an item.
+        if item != 0 && !self.bought.contains(&item) {
+            self.bought.push(item);
         }
         if self.status != Status::Paused {
             return Vec::new();
