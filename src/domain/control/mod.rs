@@ -302,6 +302,12 @@ impl Controller {
         &self.checklist
     }
 
+    /// Last gold balance echoed by a purchase this run, if any; `None` before
+    /// the first buy and again after `Start` clears it. What a view displays.
+    pub fn gold_balance(&self) -> Option<u32> {
+        self.gold_balance
+    }
+
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::Start { now_ms } => self.on_start(now_ms),
@@ -582,8 +588,10 @@ impl Controller {
         Action::Refresh
     }
 
-    /// Spend tracking never waits for a snapshot that carries meta.
-    pub fn refresh_cost(&self) -> u32 {
+    /// Spend tracking never waits for a snapshot that carries meta. Internal:
+    /// no view reads it since the top bar dropped the cost readout — re-expose
+    /// it when the Stats tab needs it again.
+    fn refresh_cost(&self) -> u32 {
         self.refresh_meta
             .map_or(REFRESH_COST_CRYSTALS, |meta| meta.cost)
     }

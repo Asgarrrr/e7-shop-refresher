@@ -119,7 +119,7 @@ impl eframe::App for ShopApp {
         ui.ctx().request_repaint_after(Duration::from_millis(250));
         let view = {
             let ctrl = lock_ignoring_poison(&self.handles.controller);
-            view_state(&ctrl, self.handles.gate.is_enabled())
+            view_state(&ctrl)
         };
         let generation = self.handles.journal.generation();
         if generation != self.journal_generation {
@@ -165,8 +165,9 @@ impl eframe::App for ShopApp {
     }
 }
 
-/// Top chrome: error banner, colored status dot + label, the one contextual
-/// button, and the counters line. Returns the command the player clicked.
+/// Top chrome: the error banner, then one row — colored state word and clause
+/// on the left, the skystone/gold readout and the Start/Stop button on the
+/// right — with the run counters on a second line. Returns the clicked command.
 fn render_status_bar(
     ui: &mut egui::Ui,
     view: &ViewState,
@@ -181,17 +182,16 @@ fn render_status_bar(
 
     ui.add_space(4.0);
     let color = theme::status_color(view.status_kind);
-    // Right-to-left rows, bounded by `horizontal` (a bare `with_layout`
-    // claims the panel's whole height): the edge element takes its width
-    // first, so at narrow widths the text truncates instead of running
-    // under it.
+    let armed = matches!(view.status_kind, Status::Watching | Status::Paused);
+    // Right-to-left, bounded by `horizontal`: the button takes its width
+    // first, then the currencies, so at narrow widths the status truncates
+    // into the space left instead of running under them.
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // One contextual button sending the explicit command, never
             // Toggle: the 4 Hz poll can show a label up to 250 ms stale, and
             // a toggle raced by an auto-stop would re-arm the loop. The
             // domain no-ops a redundant Stop and refuses a redundant Start.
-            let armed = matches!(view.status_kind, Status::Watching | Status::Paused);
             let (label, command) = if armed {
                 ("Stop", Command::Stop)
             } else {
@@ -202,48 +202,46 @@ fn render_status_bar(
                     clicked = Some(command);
                 }
             });
+            // gold then skystones; the game says "skystones", the code (whose
+            // meta feeds them) says "crystals".
+            currency(ui, "skystones", view.crystal_balance);
+            ui.add_space(10.0);
+            currency(ui, "gold", view.gold_balance);
+            ui.add_space(16.0);
+            // The status is the one element that fills the leftover width, so
+            // it truncates rather than pushing the currencies off-screen.
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot.center(), 5.0, color);
-                ui.add(egui::Label::new(theme::emphasis(view.status).color(theme::INK)).truncate());
-                if let Some(reason) = view.stop_reason {
-                    // The reason shares the dot's severity color: a red halt
-                    // must not explain itself in the faintest ink.
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(format!("({reason})")).color(color))
-                            .truncate(),
-                    );
+                ui.add(egui::Label::new(theme::emphasis(view.status_word).color(color)).truncate());
+                if let Some(hint) = view.status_hint {
+                    ui.add(egui::Label::new(egui::RichText::new(hint).weak()).truncate());
                 }
             });
         });
     });
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.weak(if view.capture_on {
-                "capture on"
-            } else {
-                "capture off"
-            });
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                let balance = match view.crystal_balance {
-                    Some(balance) => balance.to_string(),
-                    None => "—".to_owned(),
-                };
-                ui.add(
-                    egui::Label::new(format!(
-                        "refreshes {} · spent {} · matches {} · crystals {balance} (refresh costs {})",
-                        against(view.progress.refreshes, view.limits.max_refreshes),
-                        against(view.progress.spent, view.limits.max_spend),
-                        against(view.progress.matches_found, view.limits.max_matches),
-                        view.refresh_cost
-                    ))
-                    .truncate(),
-                );
-            });
-        });
-    });
+    // Shown from Watching onward, Stopped included, so the totals outlive an
+    // auto-stop; hidden while Idle, where they all read `0/—`.
+    if !matches!(view.status_kind, Status::Idle) {
+        ui.add_space(2.0);
+        ui.weak(format!(
+            "refreshes {} · spent {} · matches {}",
+            against(view.progress.refreshes, view.limits.max_refreshes),
+            against(view.progress.spent, view.limits.max_spend),
+            against(view.progress.matches_found, view.limits.max_matches),
+        ));
+    }
     ui.add_space(4.0);
     clicked
+}
+
+/// A balance readout: muted unit then bright value ("1,234,567 gold"), or "—"
+/// until known. Unit is added first so the pair reads left-to-right inside the
+/// bar's right-to-left row.
+fn currency(ui: &mut egui::Ui, unit: &str, value: Option<u32>) {
+    ui.add(egui::Label::new(egui::RichText::new(unit).weak()));
+    let text = value.map_or_else(|| "—".to_owned(), grouped);
+    ui.add(egui::Label::new(
+        egui::RichText::new(text).color(theme::INK),
+    ));
 }
 
 /// Tabbed center: the strip, then the active tab's content in its own
@@ -415,6 +413,21 @@ fn against(value: u32, limit: Option<u32>) -> String {
     }
 }
 
+/// Thousands-grouped decimal (`1234567` -> `1,234,567`); the stdlib has no
+/// locale-free grouping to lean on.
+fn grouped(n: u32) -> String {
+    let digits = n.to_string();
+    let len = digits.len();
+    let mut out = String::with_capacity(len + (len - 1) / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (len - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Session-relative `+m:ss` (hours appear once the session runs that long).
 fn timestamp(at_ms: u64) -> String {
     let secs = at_ms / 1000;
@@ -445,6 +458,14 @@ mod tests {
     }
 
     #[test]
+    fn grouped_inserts_thousands_separators() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(88), "88");
+        assert_eq!(grouped(1_000), "1,000");
+        assert_eq!(grouped(1_234_567), "1,234,567");
+    }
+
+    #[test]
     fn timestamp_rolls_into_hours() {
         assert_eq!(timestamp(59_000), "+0:59");
         assert_eq!(timestamp(61_000), "+1:01");
@@ -453,7 +474,7 @@ mod tests {
 
     fn idle_view() -> ViewState {
         let controller = Controller::new(Filter::default(), Limits::default());
-        view_state(&controller, false)
+        view_state(&controller)
     }
 
     fn captured_view() -> ViewState {
@@ -466,13 +487,13 @@ mod tests {
             },
             now_ms: 0,
         });
-        view_state(&controller, false)
+        view_state(&controller)
     }
 
     fn watching_view() -> ViewState {
         let mut controller = Controller::new(Filter::matching_default_items(), Limits::default());
         controller.handle(Event::Start { now_ms: 0 });
-        view_state(&controller, false)
+        view_state(&controller)
     }
 
     #[test]
@@ -483,6 +504,50 @@ mod tests {
         });
         assert!(harness.query_by_label("Stop").is_none());
         assert!(harness.query_by_label("Toggle").is_none());
+    }
+
+    #[test]
+    fn status_bar_shows_currencies_and_a_clean_status() {
+        let view = idle_view();
+        let harness = Harness::new_ui(|ui| {
+            render_status_bar(ui, &view, None, true);
+        });
+        // Both balances are labelled by their unit, the state word is
+        // title-cased, and its clause is a plain hint — no "(Start re-arms)".
+        harness.get_by_label("skystones");
+        harness.get_by_label("gold");
+        harness.get_by_label("Idle");
+        harness.get_by_label("define a filter first");
+    }
+
+    #[test]
+    fn counter_line_hidden_only_while_idle() {
+        let counters = "refreshes 0/— · spent 0/— · matches 0/—";
+
+        // Idle: every counter reads 0/—, so the line is suppressed.
+        let idle = idle_view();
+        let idle_bar = Harness::new_ui(|ui| {
+            render_status_bar(ui, &idle, None, true);
+        });
+        assert!(idle_bar.query_by_label(counters).is_none());
+
+        // Watching: a live run shows its progress.
+        let armed = watching_view();
+        let armed_bar = Harness::new_ui(|ui| {
+            render_status_bar(ui, &armed, None, true);
+        });
+        armed_bar.get_by_label(counters);
+
+        // Stopped: the final totals survive the stop (an auto-stop is exactly
+        // when the player wants to read them).
+        let mut controller = Controller::new(Filter::matching_default_items(), Limits::default());
+        controller.handle(Event::Start { now_ms: 0 });
+        controller.handle(Event::Stop);
+        let stopped = view_state(&controller);
+        let stopped_bar = Harness::new_ui(|ui| {
+            render_status_bar(ui, &stopped, None, true);
+        });
+        stopped_bar.get_by_label(counters);
     }
 
     #[test]
@@ -589,7 +654,7 @@ mod tests {
             },
             now_ms: 0,
         });
-        let view = view_state(&controller, false);
+        let view = view_state(&controller);
         let mut tab = Tab::Shop;
         let mut editor = EditorState::new(Filter::default(), Limits::default());
         let harness = Harness::new_ui(|ui| {

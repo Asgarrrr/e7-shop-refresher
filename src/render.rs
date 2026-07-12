@@ -13,23 +13,31 @@ pub(crate) fn kind_label(kind: ItemKind) -> &'static str {
     }
 }
 
-// "Start" reads as both the button and the typed command: the label is
-// shared by the window and the console. The Start hint only appears when
-// Start would actually work — with an unrestricted filter the domain
-// refuses to arm, and the label must not promise otherwise.
-pub(crate) fn status_label(controller: &Controller) -> &'static str {
+/// The state word (title-cased for display) and an optional clause, split so
+/// the window can weight them — word in the severity color, clause muted —
+/// while the console joins them via `status_label`. For `Stopped` the clause
+/// is the stop reason. The hint only offers "start" where the domain would
+/// actually arm: an unrestricted filter reads "define a filter first".
+pub(crate) fn status_summary(controller: &Controller) -> (&'static str, Option<&'static str>) {
     let unrestricted = controller.filter().is_unrestricted();
     match controller.status() {
-        Status::Idle if unrestricted => "idle (define a filter first)",
-        Status::Idle => "idle (Start arms the watch)",
-        Status::Watching => "watching",
+        Status::Idle if unrestricted => ("Idle", Some("define a filter first")),
+        Status::Idle => ("Idle", Some("ready to start")),
+        Status::Watching => ("Watching", None),
         // An empty checklist never auto-resumes.
-        Status::Paused if controller.checklist().is_empty() => "paused (buy, then refresh)",
-        Status::Paused => "paused (buy — auto-resumes)",
-        // Stopped implies the loop once armed, and arming requires a
-        // restricted filter that no swap can un-restrict: unlike Idle, no
-        // "define a filter first" variant is reachable here.
-        Status::Stopped(_) => "stopped (Start re-arms)",
+        Status::Paused if controller.checklist().is_empty() => {
+            ("Paused", Some("buy, then refresh"))
+        }
+        Status::Paused => ("Paused", Some("buy — auto-resumes")),
+        Status::Stopped(reason) => ("Stopped", Some(describe(reason))),
+    }
+}
+
+/// One-line status for the console: the summary, joined with an em dash.
+pub(crate) fn status_label(controller: &Controller) -> String {
+    match status_summary(controller) {
+        (word, Some(hint)) => format!("{word} — {hint}"),
+        (word, None) => word.to_owned(),
     }
 }
 
@@ -139,14 +147,28 @@ mod tests {
     }
 
     #[test]
-    fn status_label_never_promises_start_while_unrestricted() {
+    fn status_summary_never_promises_start_while_unrestricted() {
         let ctrl = Controller::new(Filter::default(), Limits::default());
-        assert_eq!(status_label(&ctrl), "idle (define a filter first)");
+        assert_eq!(
+            status_summary(&ctrl),
+            ("Idle", Some("define a filter first"))
+        );
 
         let mut armed = Controller::new(Filter::matching_default_items(), Limits::default());
-        assert_eq!(status_label(&armed), "idle (Start arms the watch)");
+        assert_eq!(status_summary(&armed), ("Idle", Some("ready to start")));
         armed.handle(Event::Start { now_ms: 0 });
         armed.handle(Event::Stop);
-        assert_eq!(status_label(&armed), "stopped (Start re-arms)");
+        // Stopped: the clause is the reason, not a redundant "(Start re-arms)".
+        assert_eq!(status_summary(&armed), ("Stopped", Some("player stopped")));
+    }
+
+    #[test]
+    fn status_label_joins_the_summary_for_the_console() {
+        let ctrl = Controller::new(Filter::default(), Limits::default());
+        assert_eq!(status_label(&ctrl), "Idle — define a filter first");
+
+        let mut armed = Controller::new(Filter::matching_default_items(), Limits::default());
+        armed.handle(Event::Start { now_ms: 0 });
+        assert_eq!(status_label(&armed), "Watching");
     }
 }

@@ -2,25 +2,29 @@
 //! shows, copied under a single short lock.
 
 use crate::domain::control::{Controller, Limits, Progress, Status};
-use crate::render::{describe, format_item, kind_label, merchant_label, status_label};
+use crate::render::{format_item, kind_label, merchant_label, status_summary};
 
 /// Plain per-frame copy of everything the window shows; built under the
 /// controller lock, rendered after the guard is dropped.
 pub struct ViewState {
-    pub status: &'static str,
+    /// State word (idle/watching/…), carrying the severity color in the bar.
+    pub status_word: &'static str,
+    /// Secondary clause beside the word: a hint, or the stop reason when
+    /// stopped. Muted in the bar. `None` while watching.
+    pub status_hint: Option<&'static str>,
     /// The raw status (with its `StopReason`), for the status color — the
-    /// label above stays the source of the wording.
+    /// word/hint above stay the source of the wording.
     pub status_kind: Status,
-    pub stop_reason: Option<&'static str>,
-    pub capture_on: bool,
     pub progress: Progress,
     pub limits: Limits,
     pub merchant: String,
     /// From the controller's enforced meta (debited per advised refresh,
-    /// cleared on restart) — not the raw snapshot, which can be stale.
+    /// cleared on restart) — not the raw snapshot, which can be stale. The
+    /// game calls these "skystones"; the code says "crystals".
     pub crystal_balance: Option<u32>,
-    /// Always known: wire meta, else the game constant.
-    pub refresh_cost: u32,
+    /// Last gold balance echoed by a purchase this run; `None` before the
+    /// first buy and again after `Start`.
+    pub gold_balance: Option<u32>,
     /// A shop has been captured this session — even a degraded slotless one.
     /// Gates the welcome screen: empty `rows` alone must not resurrect it
     /// mid-session.
@@ -42,11 +46,8 @@ pub struct SlotRow {
 }
 
 /// Pure extraction: the caller holds the controller lock only for this call.
-pub fn view_state(controller: &Controller, capture_on: bool) -> ViewState {
-    let stop_reason = match controller.status() {
-        Status::Stopped(reason) => Some(describe(reason)),
-        _ => None,
-    };
+pub fn view_state(controller: &Controller) -> ViewState {
+    let (status_word, status_hint) = status_summary(controller);
     let checklist = controller.checklist();
     let snapshot = controller.last_snapshot();
     let rows = snapshot
@@ -68,16 +69,15 @@ pub fn view_state(controller: &Controller, capture_on: bool) -> ViewState {
         })
         .unwrap_or_default();
     ViewState {
-        status: status_label(controller),
+        status_word,
+        status_hint,
         status_kind: controller.status(),
-        stop_reason,
-        capture_on,
         progress: controller.progress(),
         limits: controller.limits().clone(),
         merchant: merchant_label(snapshot.and_then(|snapshot| snapshot.merchant.as_deref()))
             .to_owned(),
         crystal_balance: controller.refresh_meta().map(|meta| meta.crystal_balance),
-        refresh_cost: controller.refresh_cost(),
+        gold_balance: controller.gold_balance(),
         has_snapshot: snapshot.is_some(),
         rows,
     }
@@ -104,23 +104,15 @@ mod tests {
 
     #[test]
     fn view_state_on_fresh_controller_is_idle_and_empty() {
-        let view = view_state(&controller(), false);
-        assert!(view.status.contains("idle"));
+        let view = view_state(&controller());
+        assert_eq!(view.status_word, "Idle");
+        assert_eq!(view.status_hint, Some("ready to start"));
         assert_eq!(view.status_kind, Status::Idle);
-        assert_eq!(view.stop_reason, None);
-        assert!(!view.capture_on);
         assert!(!view.has_snapshot);
         assert!(view.rows.is_empty());
         assert_eq!(view.merchant, "Secret Shop");
         assert_eq!(view.crystal_balance, None);
-        // No meta yet: the game-constant fallback, never an unknown cost.
-        assert_eq!(view.refresh_cost, 3);
-    }
-
-    #[test]
-    fn view_state_passes_capture_flag_through() {
-        assert!(view_state(&controller(), true).capture_on);
-        assert!(!view_state(&controller(), false).capture_on);
+        assert_eq!(view.gold_balance, None);
     }
 
     #[test]
@@ -142,7 +134,7 @@ mod tests {
             snapshot: shop(slots),
             now_ms: 0,
         });
-        let view = view_state(&ctrl, false);
+        let view = view_state(&ctrl);
         assert_eq!(view.rows[0].slot, 5);
         assert_eq!(view.rows[1].slot, 2);
     }
@@ -167,7 +159,7 @@ mod tests {
             snapshot: shop(slots),
             now_ms: 1,
         });
-        let view = view_state(&ctrl, true);
+        let view = view_state(&ctrl);
         assert!(view.rows[0].wanted);
         assert!(!view.rows[1].wanted);
     }
@@ -186,7 +178,7 @@ mod tests {
             snapshot: shop(slots),
             now_ms: 0,
         });
-        assert!(view_state(&ctrl, false).rows[0].sold_out);
+        assert!(view_state(&ctrl).rows[0].sold_out);
     }
 
     #[test]
@@ -204,10 +196,9 @@ mod tests {
             snapshot,
             now_ms: 0,
         });
-        let view = view_state(&ctrl, false);
+        let view = view_state(&ctrl);
         assert_eq!(view.merchant, "Secret Shop");
         assert_eq!(view.crystal_balance, Some(95));
-        assert_eq!(view.refresh_cost, 3);
     }
 
     #[test]
@@ -230,7 +221,7 @@ mod tests {
             snapshot: shop(vec![ShopItem::default()]),
             now_ms: 1,
         });
-        assert_eq!(view_state(&ctrl, false).crystal_balance, Some(95));
+        assert_eq!(view_state(&ctrl).crystal_balance, Some(95));
     }
 
     #[test]
@@ -250,7 +241,19 @@ mod tests {
             now_ms: 0,
         });
         ctrl.handle(Event::Start { now_ms: 1 });
-        assert_eq!(view_state(&ctrl, false).crystal_balance, None);
+        assert_eq!(view_state(&ctrl).crystal_balance, None);
+    }
+
+    #[test]
+    fn view_state_surfaces_gold_balance_from_a_purchase() {
+        let mut ctrl = controller();
+        assert_eq!(view_state(&ctrl).gold_balance, None);
+        ctrl.handle(Event::Purchase {
+            item: 42,
+            gold: Some(1_204_000),
+            now_ms: 0,
+        });
+        assert_eq!(view_state(&ctrl).gold_balance, Some(1_204_000));
     }
 
     #[test]
@@ -258,10 +261,11 @@ mod tests {
         let mut ctrl = controller();
         ctrl.handle(Event::Start { now_ms: 0 });
         ctrl.handle(Event::Stop);
-        let view = view_state(&ctrl, false);
-        assert!(view.status.contains("stopped"));
+        let view = view_state(&ctrl);
+        assert_eq!(view.status_word, "Stopped");
         assert_eq!(view.status_kind, Status::Stopped(StopReason::PlayerStopped));
-        assert_eq!(view.stop_reason, Some("player stopped"));
+        // The stop reason rides in the hint now, not a separate field.
+        assert_eq!(view.status_hint, Some("player stopped"));
     }
 
     #[test]
@@ -279,6 +283,6 @@ mod tests {
             snapshot: shop(vec![item]),
             now_ms: 0,
         });
-        assert_eq!(view_state(&ctrl, false).rows[0].detail, expected);
+        assert_eq!(view_state(&ctrl).rows[0].detail, expected);
     }
 }
