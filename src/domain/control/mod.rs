@@ -36,6 +36,50 @@ enum Expectation {
     Purchase { deadline_ms: u64, attempt: u8 },
 }
 
+impl Expectation {
+    /// A rung-zero snapshot expectation with a full deadline.
+    fn snapshot(now_ms: u64) -> Self {
+        Expectation::Snapshot {
+            deadline_ms: now_ms + EXPECT_SNAPSHOT_MS,
+            attempt: 0,
+        }
+    }
+
+    /// A rung-zero purchase expectation with a full deadline.
+    fn purchase(now_ms: u64) -> Self {
+        Expectation::Purchase {
+            deadline_ms: now_ms + EXPECT_PURCHASE_MS,
+            attempt: 0,
+        }
+    }
+
+    /// The same kind and rung with a fresh full deadline — for a restored
+    /// link, where the awaited proof may have been swallowed mid-flight.
+    fn regrant(self, now_ms: u64) -> Self {
+        match self {
+            Expectation::Snapshot { attempt, .. } => Expectation::Snapshot {
+                deadline_ms: now_ms + EXPECT_SNAPSHOT_MS,
+                attempt,
+            },
+            Expectation::Purchase { attempt, .. } => Expectation::Purchase {
+                deadline_ms: now_ms + EXPECT_PURCHASE_MS,
+                attempt,
+            },
+        }
+    }
+
+    /// One rung higher, fresh full deadline.
+    fn escalate(self, now_ms: u64) -> Self {
+        let mut next = self.regrant(now_ms);
+        match &mut next {
+            Expectation::Snapshot { attempt, .. } | Expectation::Purchase { attempt, .. } => {
+                *attempt += 1;
+            }
+        }
+        next
+    }
+}
+
 /// A watchdog-issued retry. Deliberately distinct from bare
 /// `Refresh`/`Buy`: recovery reaches the caller from a tick, which carries
 /// no game-animation trigger — bare variants there would render as advice
@@ -468,10 +512,7 @@ impl Controller {
         if self.recovery && !self.checklist.is_empty() {
             // Only echo-clearable pauses get a deadline: an untrackable
             // (empty-checklist) pause waits on the player, not the game.
-            self.expectation = Some(Expectation::Purchase {
-                deadline_ms: now_ms + EXPECT_PURCHASE_MS,
-                attempt: 0,
-            });
+            self.expectation = Some(Expectation::purchase(now_ms));
         }
         vec![Action::Buy { targets }]
     }
@@ -541,10 +582,7 @@ impl Controller {
             if self.recovery {
                 // Proof of life: the game is delivering echoes, so the
                 // remaining buys restart the ladder with a full deadline.
-                self.expectation = Some(Expectation::Purchase {
-                    deadline_ms: now_ms + EXPECT_PURCHASE_MS,
-                    attempt: 0,
-                });
+                self.expectation = Some(Expectation::purchase(now_ms));
             }
             return Vec::new();
         }
@@ -587,15 +625,14 @@ impl Controller {
             return Vec::new();
         }
         match self.expectation {
-            Some(Expectation::Snapshot {
-                deadline_ms,
-                attempt,
-            }) if now_ms >= deadline_ms => match attempt {
+            Some(
+                expectation @ Expectation::Snapshot {
+                    deadline_ms,
+                    attempt,
+                },
+            ) if now_ms >= deadline_ms => match attempt {
                 0 => {
-                    self.expectation = Some(Expectation::Snapshot {
-                        deadline_ms: now_ms + EXPECT_SNAPSHOT_MS,
-                        attempt: 1,
-                    });
+                    self.expectation = Some(expectation.escalate(now_ms));
                     vec![Action::Recover(Recovery::ConfirmRefresh)]
                 }
                 1 => {
@@ -614,31 +651,24 @@ impl Controller {
                     // emit_refresh armed a fresh rung-0 expectation: the
                     // ladder must not reset itself.
                     if matches!(self.expectation, Some(Expectation::Snapshot { .. })) {
-                        self.expectation = Some(Expectation::Snapshot {
-                            deadline_ms: now_ms + EXPECT_SNAPSHOT_MS,
-                            attempt: 2,
-                        });
+                        self.expectation = Some(expectation.escalate(now_ms));
                     }
                     actions
                 }
                 _ => self.halt(StopReason::Unresponsive),
             },
-            Some(Expectation::Purchase {
-                deadline_ms,
-                attempt,
-            }) if now_ms >= deadline_ms => match attempt {
+            Some(
+                expectation @ Expectation::Purchase {
+                    deadline_ms,
+                    attempt,
+                },
+            ) if now_ms >= deadline_ms => match attempt {
                 0 => {
-                    self.expectation = Some(Expectation::Purchase {
-                        deadline_ms: now_ms + EXPECT_PURCHASE_MS,
-                        attempt: 1,
-                    });
+                    self.expectation = Some(expectation.escalate(now_ms));
                     vec![Action::Recover(Recovery::ConfirmBuy)]
                 }
                 1 => {
-                    self.expectation = Some(Expectation::Purchase {
-                        deadline_ms: now_ms + EXPECT_PURCHASE_MS,
-                        attempt: 2,
-                    });
+                    self.expectation = Some(expectation.escalate(now_ms));
                     vec![Action::Recover(Recovery::Buy {
                         targets: self.recovery_buy_targets(),
                     })]
@@ -675,15 +705,8 @@ impl Controller {
     /// never got its answer must still escalate, not restart the ladder.
     fn on_link_up(&mut self, now_ms: u64) -> Vec<Action> {
         self.link_up = true;
-        if let Some(expectation) = &mut self.expectation {
-            match expectation {
-                Expectation::Snapshot { deadline_ms, .. } => {
-                    *deadline_ms = now_ms + EXPECT_SNAPSHOT_MS;
-                }
-                Expectation::Purchase { deadline_ms, .. } => {
-                    *deadline_ms = now_ms + EXPECT_PURCHASE_MS;
-                }
-            }
+        if let Some(expectation) = self.expectation {
+            self.expectation = Some(expectation.regrant(now_ms));
         }
         Vec::new()
     }
@@ -710,10 +733,7 @@ impl Controller {
             meta.crystal_balance = meta.crystal_balance.saturating_sub(cost);
         }
         if self.recovery {
-            self.expectation = Some(Expectation::Snapshot {
-                deadline_ms: now_ms + EXPECT_SNAPSHOT_MS,
-                attempt: 0,
-            });
+            self.expectation = Some(Expectation::snapshot(now_ms));
         }
         Action::Refresh
     }

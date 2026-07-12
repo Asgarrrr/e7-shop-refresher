@@ -366,13 +366,24 @@ fn submit_refresh(
         lines.push(">> → refresh the shop now".to_owned());
         return;
     };
-    let submitted = actuator.submit(plan::refresh_job(trigger, actuator.epoch.current(), now_ms));
     lines.push(if actuator.mode == Mode::Live {
         ">> → refresh clicked".to_owned()
     } else {
         ">> → refresh planned (dry-run)".to_owned()
     });
-    if !submitted {
+    queue_refresh(lines, actuator, trigger, now_ms);
+}
+
+/// The refresh-job submission core shared by the normal path and the
+/// watchdog re-issue: plan at the current epoch, journal a full queue.
+/// Callers narrate the attempt themselves.
+fn queue_refresh(
+    lines: &mut Vec<String>,
+    actuator: &ActuatorHandle,
+    trigger: Trigger,
+    now_ms: u64,
+) {
+    if !actuator.submit(plan::refresh_job(trigger, actuator.epoch.current(), now_ms)) {
         lines.push(">> actuator queue full — refresh dropped".to_owned());
     }
 }
@@ -398,14 +409,8 @@ fn submit_recovery(
         }
         Recovery::Refresh => {
             lines.push(">> watchdog: re-issuing the refresh".to_owned());
-            if active_trigger(actuator, Some(Trigger::Recovery)).is_some()
-                && !actuator.submit(plan::refresh_job(
-                    Trigger::Recovery,
-                    actuator.epoch.current(),
-                    now_ms,
-                ))
-            {
-                lines.push(">> actuator queue full — refresh dropped".to_owned());
+            if let Some(trigger) = active_trigger(actuator, Some(Trigger::Recovery)) {
+                queue_refresh(lines, actuator, trigger, now_ms);
             }
         }
         Recovery::Buy { targets } => {
@@ -462,6 +467,12 @@ fn submit_buys(
         .filter_map(|target| plan::row_for_slot(target.slot))
         .collect();
     if rows.is_empty() {
+        // Normal buys go quiet here (untrackable matches are advice-only),
+        // but a watchdog re-issue just announced itself: a degraded shop
+        // leaving nothing clickable must not read as a submitted retry.
+        if trigger == Trigger::Recovery {
+            lines.push(">> watchdog: no clickable slot for the outstanding buys".to_owned());
+        }
         return;
     }
     for row in &rows {

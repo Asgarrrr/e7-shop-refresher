@@ -119,7 +119,7 @@ pub async fn run_executor(
             Err(SurfaceError::Recoverable(reason)) => {
                 // Nothing engaged, nothing landed: drop the job and let the
                 // watchdog turn the silence into a retry.
-                journal.emit(&[format!(">> actuator: {reason} — aborted remaining clicks")]);
+                abort(&journal, &reason);
                 continue;
             }
             Err(SurfaceError::Fatal(reason)) => {
@@ -130,17 +130,17 @@ pub async fn run_executor(
         // A minimized window acquires with an empty client area: same fault
         // as minimized mid-job, same recoverable abort.
         if rect.width <= 0 || rect.height <= 0 {
-            journal.emit(&[format!(
-                ">> actuator: degenerate client area {}×{} — aborted remaining clicks",
-                rect.width, rect.height
-            )]);
+            abort(
+                &journal,
+                &format!("degenerate client area {}×{}", rect.width, rect.height),
+            );
             surface.release();
             continue;
         }
         for step in &job.steps {
             tokio::time::sleep(Duration::from_millis(step.wait_ms)).await;
             if let Some(reason) = drop_reason(&job, &epoch, &gate) {
-                journal.emit(&[format!(">> actuator: {reason} — aborted remaining clicks")]);
+                abort(&journal, reason);
                 break;
             }
             let at = match plan::to_screen(rect, step.input.at()) {
@@ -180,8 +180,7 @@ pub async fn run_executor(
                         // Landed inputs stay landed; the watchdog's retry
                         // re-acquires a fresh rect, so a dragged window
                         // self-heals instead of halting the loop.
-                        journal
-                            .emit(&[format!(">> actuator: {reason} — aborted remaining clicks")]);
+                        abort(&journal, &reason);
                     }
                     SurfaceError::Fatal(reason) => fail(&journal, &commands, &reason),
                 }
@@ -203,6 +202,12 @@ fn drop_reason(job: &Job, epoch: &SnapshotEpoch, gate: &WatchGate) -> Option<&'s
     } else {
         None
     }
+}
+
+/// A recoverable fault ends the job, never the loop: journaled, then the
+/// watchdog turns the silence into a retry.
+fn abort(journal: &EventLog, reason: &str) {
+    journal.emit(&[format!(">> actuator: {reason} — aborted remaining clicks")]);
 }
 
 /// An actuator that cannot act safely stops the whole loop — with its own

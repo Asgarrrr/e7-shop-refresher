@@ -1017,6 +1017,71 @@ fn watchdog_buy_reissue_clicks_only_outstanding_rows() {
 }
 
 #[test]
+fn watchdog_buy_reissue_without_clickable_rows_journals_the_gap() {
+    let gate = WatchGate::new(true);
+    let journal = EventLog::default();
+    let (actuator, mut jobs) = recording(Mode::Live);
+    let controller = armed_recovering();
+    // Seven slots, only the last one matches: trackable (id 42) so the
+    // purchase ladder arms, but position 7 sits beyond the six clickable
+    // rows — no buy job can target it.
+    let mut slots: Vec<ShopItem> = (0..6)
+        .map(|_| ShopItem {
+            kind: ItemKind::Equipment,
+            ..ShopItem::default()
+        })
+        .collect();
+    slots.push(ShopItem {
+        id: 42,
+        ..ShopItem::default()
+    });
+    let snapshot = ShopSnapshot {
+        merchant: None,
+        slots,
+        refresh: None,
+    };
+    on_message(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        ServerMessage::Shop(snapshot),
+        1,
+    );
+    assert_eq!(controller.lock().unwrap().status(), Status::Paused);
+    dispatch(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        Event::Tick { now_ms: 10_001 },
+        10_001,
+    );
+    jobs.try_recv().expect("confirm retry job");
+    // The re-issue rung finds nothing clickable: no job, but the journal
+    // must say so instead of ending on the announcement.
+    dispatch(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        Event::Tick { now_ms: 20_001 },
+        20_001,
+    );
+    assert!(jobs.try_recv().is_err(), "no job for row-less targets");
+    let entries = journal.entries();
+    assert!(
+        entries
+            .iter()
+            .any(|line| line.text.contains("re-issuing buys"))
+    );
+    assert!(entries.iter().any(|line| {
+        line.text
+            .contains("no clickable slot for the outstanding buys")
+    }));
+}
+
+#[test]
 fn unresponsive_halt_reaches_the_journal() {
     let gate = WatchGate::new(true);
     let journal = EventLog::default();
