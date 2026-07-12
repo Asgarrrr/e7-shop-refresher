@@ -29,3 +29,7 @@ pub mod watch;
 
 pub use config::Config;
 pub use error::{Error, Result};
+
+/// The one place the product name lives: window titles and the welcome
+/// screen must never disagree.
+pub const APP_NAME: &str = "Arkyve Refresh Shop";

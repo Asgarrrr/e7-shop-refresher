@@ -39,7 +39,7 @@ fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// config.toml): a double-clicked exe must not flash a console and vanish.
 pub fn show_fatal(message: String) -> eframe::Result {
     eframe::run_native(
-        "Arkyve Refresh Shop — error",
+        &format!("{} — error", crate::APP_NAME),
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default().with_inner_size([560.0, 260.0]),
             ..Default::default()
@@ -205,14 +205,7 @@ fn render_status_bar(
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                 ui.painter().circle_filled(dot.center(), 5.0, color);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(view.status)
-                            .size(15.0)
-                            .color(theme::INK),
-                    )
-                    .truncate(),
-                );
+                ui.add(egui::Label::new(theme::emphasis(view.status).color(theme::INK)).truncate());
                 if let Some(reason) = view.stop_reason {
                     // The reason shares the dot's severity color: a red halt
                     // must not explain itself in the faintest ink.
@@ -321,11 +314,17 @@ fn render_center(
 /// The Shop tab: merchant header + the slot table, or the welcome screen
 /// while nothing is captured yet.
 fn render_shop_tab(ui: &mut egui::Ui, view: &ViewState) {
-    if view.rows.is_empty() {
+    // Keyed on "no capture yet", not empty rows: a tolerated slotless
+    // snapshot mid-session must not resurrect first-run onboarding.
+    if !view.has_snapshot {
         render_quick_start(ui);
         return;
     }
     ui.heading(view.merchant.as_str());
+    if view.rows.is_empty() {
+        ui.weak("the last shop message carried no slots — re-open the shop in game");
+        return;
+    }
     egui::Grid::new("shop")
         .num_columns(4)
         .striped(true)
@@ -365,7 +364,7 @@ fn render_quick_start(ui: &mut egui::Ui) {
     ui.add_space(28.0);
     ui.vertical_centered(|ui| {
         ui.label(
-            egui::RichText::new("Arkyve Refresh Shop")
+            egui::RichText::new(crate::APP_NAME)
                 .size(22.0)
                 .color(theme::INK),
         );
@@ -373,17 +372,17 @@ fn render_quick_start(ui: &mut egui::Ui) {
     });
     ui.add_space(20.0);
     ui.label(theme::section("Quick start"));
-    for (index, step) in [
-        "Open the Secret Shop in game — the relay captures it live.",
-        "Setup tab — define what to hunt and when to stop.",
-        "Start — the loop refreshes and buys on its own.",
-    ]
-    .iter()
-    .enumerate()
-    {
+    for (number, step) in [
+        (
+            "1.",
+            "Open the Secret Shop in game — the relay captures it live.",
+        ),
+        ("2.", "Setup tab — define what to hunt and when to stop."),
+        ("3.", "Start — the loop refreshes and buys on its own."),
+    ] {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(format!("{}.", index + 1)).color(theme::ACCENT));
-            ui.label(*step);
+            ui.label(egui::RichText::new(number).color(theme::ACCENT));
+            ui.label(step);
         });
     }
 }
@@ -569,6 +568,28 @@ mod tests {
     #[test]
     fn captured_shop_replaces_the_quick_start() {
         let view = captured_view();
+        let mut tab = Tab::Shop;
+        let mut editor = EditorState::new(Filter::default(), Limits::default());
+        let harness = Harness::new_ui(|ui| {
+            render_center(ui, &view, &mut tab, &mut editor, true);
+        });
+        assert!(harness.query_by_label("QUICK START").is_none());
+    }
+
+    #[test]
+    fn slotless_snapshot_does_not_resurrect_the_quick_start() {
+        // A tolerated degraded shop message (slots dropped by lenient
+        // decoding) counts as captured: mid-session onboarding would lie.
+        let mut controller = Controller::new(Filter::default(), Limits::default());
+        controller.handle(Event::Snapshot {
+            snapshot: ShopSnapshot {
+                merchant: None,
+                slots: vec![],
+                refresh: None,
+            },
+            now_ms: 0,
+        });
+        let view = view_state(&controller, false);
         let mut tab = Tab::Shop;
         let mut editor = EditorState::new(Filter::default(), Limits::default());
         let harness = Harness::new_ui(|ui| {

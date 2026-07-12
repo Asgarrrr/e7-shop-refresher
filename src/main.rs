@@ -109,7 +109,7 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
     });
 
     let result = eframe::run_native(
-        "Arkyve Refresh Shop",
+        arkyve_refresh_shop::APP_NAME,
         eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_inner_size([720.0, 680.0])

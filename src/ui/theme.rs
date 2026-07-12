@@ -102,13 +102,21 @@ pub(super) fn apply(ctx: &egui::Context) {
 }
 
 /// Section header: small grey capitals, the quiet divider of the layout.
+/// `.small()`/`.weak()` so a retune of the Small style or the weak grey in
+/// `apply` carries over.
 pub(super) fn section(text: &str) -> egui::RichText {
-    egui::RichText::new(text.to_uppercase())
-        .size(11.5)
-        .color(INK_FAINT)
+    egui::RichText::new(text.to_uppercase()).small().weak()
 }
 
-/// The one saturated element on screen: accent fill, primary ink text.
+/// The one emphasis size, shared by the status label and the primary button.
+pub(super) fn emphasis(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text.into()).size(15.0)
+}
+
+/// The one saturated element on screen: accent fill. Text color comes from
+/// the themed `fg_stroke` (INK when enabled), so a disabled button still
+/// mutes properly; `active.bg_stroke` is kept — keyboard focus renders with
+/// the Active state and that stroke is the focus ring.
 pub(super) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.scope(|ui| {
         let widgets = &mut ui.style_mut().visuals.widgets;
@@ -116,11 +124,7 @@ pub(super) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         widgets.hovered.weak_bg_fill = ACCENT_HOVER;
         widgets.hovered.bg_stroke = Stroke::NONE;
         widgets.active.weak_bg_fill = ACCENT_PRESSED;
-        widgets.active.bg_stroke = Stroke::NONE;
-        ui.add(
-            egui::Button::new(egui::RichText::new(text).size(15.0).color(INK))
-                .min_size(egui::vec2(88.0, 30.0)),
-        )
+        ui.add(egui::Button::new(emphasis(text)).min_size(egui::vec2(88.0, 30.0)))
     })
     .inner
 }

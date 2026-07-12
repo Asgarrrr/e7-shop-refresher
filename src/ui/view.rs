@@ -21,6 +21,10 @@ pub struct ViewState {
     pub crystal_balance: Option<u32>,
     /// Always known: wire meta, else the game constant.
     pub refresh_cost: u32,
+    /// A shop has been captured this session — even a degraded slotless one.
+    /// Gates the welcome screen: empty `rows` alone must not resurrect it
+    /// mid-session.
+    pub has_snapshot: bool,
     pub rows: Vec<SlotRow>,
 }
 
@@ -74,6 +78,7 @@ pub fn view_state(controller: &Controller, capture_on: bool) -> ViewState {
             .to_owned(),
         crystal_balance: controller.refresh_meta().map(|meta| meta.crystal_balance),
         refresh_cost: controller.refresh_cost(),
+        has_snapshot: snapshot.is_some(),
         rows,
     }
 }
@@ -104,6 +109,7 @@ mod tests {
         assert_eq!(view.status_kind, Status::Idle);
         assert_eq!(view.stop_reason, None);
         assert!(!view.capture_on);
+        assert!(!view.has_snapshot);
         assert!(view.rows.is_empty());
         assert_eq!(view.merchant, "Secret Shop");
         assert_eq!(view.crystal_balance, None);
