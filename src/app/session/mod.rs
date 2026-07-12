@@ -468,8 +468,8 @@ fn submit_buys(
         .collect();
     if rows.is_empty() {
         // Normal buys go quiet here (untrackable matches are advice-only),
-        // but a watchdog re-issue just announced itself: a degraded shop
-        // leaving nothing clickable must not read as a submitted retry.
+        // but a watchdog re-issue just announced itself and must not end
+        // in silence.
         if trigger == Trigger::Recovery {
             lines.push(">> watchdog: no clickable slot for the outstanding buys".to_owned());
         }
