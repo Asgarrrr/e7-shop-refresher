@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::plan::ClientRect;
-use super::{Surface, shield};
+use super::{Surface, SurfaceError, shield};
 
 const GAME_WINDOW_TITLE: &str = "Epic Seven";
 /// One wheel notch, Win32 convention.
@@ -54,14 +54,14 @@ fn ensure_dpi_awareness() {
 pub struct WinSurface;
 
 impl Surface for WinSurface {
-    fn acquire(&mut self) -> Result<ClientRect, String> {
+    fn acquire(&mut self) -> Result<ClientRect, SurfaceError> {
         ensure_dpi_awareness();
         let hwnd = find_game_window()?;
         focus(hwnd)?;
         client_rect(hwnd)
     }
 
-    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String> {
+    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError> {
         move_cursor(at);
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
         send_mouse(0, MOUSEEVENTF_LEFTDOWN);
@@ -70,7 +70,7 @@ impl Surface for WinSurface {
         Ok(())
     }
 
-    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String> {
+    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError> {
         move_cursor(at);
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
         send_mouse(notches.saturating_mul(WHEEL_DELTA), MOUSEEVENTF_WHEEL);
@@ -78,31 +78,38 @@ impl Surface for WinSurface {
     }
 }
 
-fn find_game_window() -> Result<HWND, String> {
+/// No window at all: nothing to retry against — fatal.
+fn find_game_window() -> Result<HWND, SurfaceError> {
     let title = wide(GAME_WINDOW_TITLE);
     let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
     if hwnd.is_null() {
-        return Err(format!("no \"{GAME_WINDOW_TITLE}\" window found"));
+        return Err(SurfaceError::Fatal(format!(
+            "no \"{GAME_WINDOW_TITLE}\" window found"
+        )));
     }
     Ok(hwnd)
 }
 
 /// The game must own the foreground: `SendInput` lands wherever the focus
 /// is, and another window must never receive the game's clicks. A refused
-/// foreground switch (Windows foreground lock) is therefore a hard error.
-fn focus(hwnd: HWND) -> Result<(), String> {
+/// foreground switch (Windows foreground lock) is therefore fatal.
+fn focus(hwnd: HWND) -> Result<(), SurfaceError> {
     if unsafe { GetForegroundWindow() } == hwnd {
         return Ok(());
     }
     let _ = unsafe { SetForegroundWindow(hwnd) };
     std::thread::sleep(Duration::from_millis(FOCUS_SETTLE_MS));
     if unsafe { GetForegroundWindow() } != hwnd {
-        return Err("could not focus the game window".to_owned());
+        return Err(SurfaceError::Fatal(
+            "could not focus the game window".to_owned(),
+        ));
     }
     Ok(())
 }
 
-fn client_rect(hwnd: HWND) -> Result<ClientRect, String> {
+/// A failing rect API means the window handle itself died (closed mid-job):
+/// fatal — unlike a *changed* rect, which is the recoverable case.
+fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
     let mut rect = RECT {
         left: 0,
         top: 0,
@@ -110,11 +117,15 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, String> {
         bottom: 0,
     };
     if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
-        return Err("could not read the game window's client area".to_owned());
+        return Err(SurfaceError::Fatal(
+            "could not read the game window's client area".to_owned(),
+        ));
     }
     let mut origin = POINT { x: 0, y: 0 };
     if unsafe { ClientToScreen(hwnd, &mut origin) } == 0 {
-        return Err("could not locate the game window on screen".to_owned());
+        return Err(SurfaceError::Fatal(
+            "could not locate the game window on screen".to_owned(),
+        ));
     }
     Ok(ClientRect {
         left: origin.x,
@@ -187,29 +198,34 @@ impl Target {
 
     /// Before every input: the window must be where the job planned it and
     /// the shield seated above it; a (re)placed shield gets the drain beat.
-    fn engage(self) -> Result<(), String> {
+    /// A shield failure is fatal — never click shieldless.
+    fn engage(self) -> Result<(), SurfaceError> {
         self.verify()?;
-        if shield::raise(self.hwnd as HWND, self.rect)? {
+        if shield::raise(self.hwnd as HWND, self.rect).map_err(SurfaceError::Fatal)? {
             std::thread::sleep(Duration::from_millis(SHIELD_DRAIN_MS));
         }
         Ok(())
     }
 
-    fn verify(self) -> Result<(), String> {
+    fn verify(self) -> Result<(), SurfaceError> {
         let rect = client_rect(self.hwnd as HWND)?;
         if rect == self.rect {
             return Ok(());
         }
-        Err(if rect.width <= 0 || rect.height <= 0 {
-            "the game window was minimized mid-job".to_owned()
-        } else {
-            "the game window moved or resized mid-job".to_owned()
-        })
+        // The window is alive, just elsewhere: the next job's acquire()
+        // re-reads a fresh rect, so the watchdog's retry self-heals this.
+        Err(SurfaceError::Recoverable(
+            if rect.width <= 0 || rect.height <= 0 {
+                "the game window was minimized mid-job".to_owned()
+            } else {
+                "the game window moved or resized mid-job".to_owned()
+            },
+        ))
     }
 }
 
 impl Surface for MessageSurface {
-    fn acquire(&mut self) -> Result<ClientRect, String> {
+    fn acquire(&mut self) -> Result<ClientRect, SurfaceError> {
         ensure_dpi_awareness();
         let hwnd = find_game_window()?;
         let rect = client_rect(hwnd)?;
@@ -220,7 +236,7 @@ impl Surface for MessageSurface {
         Ok(rect)
     }
 
-    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String> {
+    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError> {
         let target = self.target.expect("acquire() before click");
         target.engage()?;
         let lparam = pack_point(target.to_client(at));
@@ -232,7 +248,7 @@ impl Surface for MessageSurface {
         Ok(())
     }
 
-    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String> {
+    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError> {
         let target = self.target.expect("acquire() before scroll");
         target.engage()?;
         post(

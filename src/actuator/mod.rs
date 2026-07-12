@@ -68,17 +68,28 @@ impl ActuatorHandle {
     }
 }
 
+/// How a surface failure must be handled. Classified at the error's birth
+/// site (the backend knows what broke), never blanket-mapped per trait
+/// method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceError {
+    /// The world moved under the job (window dragged, resized, minimized):
+    /// abort the remainder, keep the loop — the next job's `acquire()`
+    /// re-reads a fresh rect, so the watchdog's retry self-heals it.
+    Recoverable(String),
+    /// Acting again would be blind (window gone, shield unraisable): the
+    /// executor stops the whole loop.
+    Fatal(String),
+}
+
 /// The input backend the executor drives: real input on Windows, a recorder
 /// in tests.
 pub trait Surface {
     /// Locates the game window, returning its client area — whether it is
-    /// brought to the foreground is backend-specific. An `Err` means any
-    /// click would be blind: the executor stops the loop.
-    fn acquire(&mut self) -> Result<plan::ClientRect, String>;
-    /// An `Err` means the input could not be delivered safely (e.g. the game
-    /// window moved or vanished mid-job): the executor stops the loop.
-    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String>;
-    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String>;
+    /// brought to the foreground is backend-specific.
+    fn acquire(&mut self) -> Result<plan::ClientRect, SurfaceError>;
+    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError>;
+    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError>;
     /// Job over, completed or aborted: undo whatever the inputs set up.
     fn release(&mut self) {}
 }
@@ -105,11 +116,27 @@ pub async fn run_executor(
         }
         let rect = match surface.acquire() {
             Ok(rect) => rect,
-            Err(reason) => {
+            Err(SurfaceError::Recoverable(reason)) => {
+                // Nothing engaged, nothing landed: drop the job and let the
+                // watchdog turn the silence into a retry.
+                journal.emit(&[format!(">> actuator: {reason} — aborted remaining clicks")]);
+                continue;
+            }
+            Err(SurfaceError::Fatal(reason)) => {
                 fail(&journal, &commands, &reason);
                 continue;
             }
         };
+        // A minimized window acquires with an empty client area: same fault
+        // as minimized mid-job, same recoverable abort.
+        if rect.width <= 0 || rect.height <= 0 {
+            journal.emit(&[format!(
+                ">> actuator: degenerate client area {}×{} — aborted remaining clicks",
+                rect.width, rect.height
+            )]);
+            surface.release();
+            continue;
+        }
         for step in &job.steps {
             tokio::time::sleep(Duration::from_millis(step.wait_ms)).await;
             if let Some(reason) = drop_reason(&job, &epoch, &gate) {
@@ -147,8 +174,17 @@ pub async fn run_executor(
                     }
                 }
             };
-            if let Err(reason) = delivered {
-                fail(&journal, &commands, &reason);
+            if let Err(error) = delivered {
+                match error {
+                    SurfaceError::Recoverable(reason) => {
+                        // Landed inputs stay landed; the watchdog's retry
+                        // re-acquires a fresh rect, so a dragged window
+                        // self-heals instead of halting the loop.
+                        journal
+                            .emit(&[format!(">> actuator: {reason} — aborted remaining clicks")]);
+                    }
+                    SurfaceError::Fatal(reason) => fail(&journal, &commands, &reason),
+                }
                 break;
             }
         }
@@ -189,17 +225,18 @@ mod tests {
     }
 
     /// Records every input; `on_input` runs after each; `deny_after` fails
-    /// every input once `n` have landed.
+    /// the next input once `n` have landed (one-shot, so a later job can
+    /// succeed).
     struct FakeSurface {
-        rect: Result<ClientRect, String>,
+        rect: Result<ClientRect, SurfaceError>,
         events: Arc<Mutex<Vec<Recorded>>>,
         on_input: Box<dyn FnMut() + Send>,
-        deny_after: Option<(usize, String)>,
+        deny_after: Option<(usize, SurfaceError)>,
         releases: Arc<Mutex<usize>>,
     }
 
     impl FakeSurface {
-        fn new(rect: Result<ClientRect, String>) -> (Self, Arc<Mutex<Vec<Recorded>>>) {
+        fn new(rect: Result<ClientRect, SurfaceError>) -> (Self, Arc<Mutex<Vec<Recorded>>>) {
             let events = Arc::new(Mutex::new(Vec::new()));
             let surface = Self {
                 rect,
@@ -211,20 +248,24 @@ mod tests {
             (surface, events)
         }
 
-        fn deny(&self) -> Result<(), String> {
-            match &self.deny_after {
-                Some((n, reason)) if self.events.lock().unwrap().len() >= *n => Err(reason.clone()),
-                _ => Ok(()),
+        fn deny(&mut self) -> Result<(), SurfaceError> {
+            let due = self
+                .deny_after
+                .as_ref()
+                .is_some_and(|(n, _)| self.events.lock().unwrap().len() >= *n);
+            if due {
+                return Err(self.deny_after.take().expect("just checked").1);
             }
+            Ok(())
         }
     }
 
     impl Surface for FakeSurface {
-        fn acquire(&mut self) -> Result<ClientRect, String> {
+        fn acquire(&mut self) -> Result<ClientRect, SurfaceError> {
             self.rect.clone()
         }
 
-        fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), String> {
+        fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError> {
             self.deny()?;
             self.events
                 .lock()
@@ -234,7 +275,7 @@ mod tests {
             Ok(())
         }
 
-        fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), String> {
+        fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError> {
             self.deny()?;
             self.events
                 .lock()
@@ -249,7 +290,7 @@ mod tests {
         }
     }
 
-    fn design_rect() -> Result<ClientRect, String> {
+    fn design_rect() -> Result<ClientRect, SurfaceError> {
         Ok(ClientRect {
             left: 0,
             top: 0,
@@ -404,7 +445,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn executor_stops_the_loop_when_acquire_fails() {
         let mut rig = rig();
-        let (surface, events) = FakeSurface::new(Err("game window not found".to_owned()));
+        let (surface, events) =
+            FakeSurface::new(Err(SurfaceError::Fatal("game window not found".to_owned())));
         rig.job_tx
             .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
             .await
@@ -431,11 +473,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_stops_the_loop_when_an_input_fails() {
-        // An undeliverable input halts with the actuator's own label — never
-        // a blind click or a silent skip.
+        // A fatal input failure (e.g. the shield refused to raise) halts
+        // with the actuator's own label — never a blind click or a silent
+        // skip.
         let mut rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
-        surface.deny_after = Some((0, "the game window moved".to_owned()));
+        surface.deny_after = Some((
+            0,
+            SurfaceError::Fatal("could not raise the input shield".to_owned()),
+        ));
         rig.job_tx
             .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
             .await
@@ -456,17 +502,21 @@ mod tests {
         assert_eq!(rig.command_rx.try_recv(), Ok(Command::ActuatorFailed));
         assert!(journal.entries().iter().any(|line| {
             line.text
-                .contains("the game window moved — stopping the loop")
+                .contains("could not raise the input shield — stopping the loop")
         }));
     }
 
     #[tokio::test(start_paused = true)]
     async fn executor_keeps_landed_inputs_and_stops_once_on_a_mid_job_failure() {
-        // Three inputs land, the fourth fails: landed inputs stay recorded,
-        // exactly one halt goes out, the surface is still released.
+        // Three inputs land, the fourth fails fatally: landed inputs stay
+        // recorded, exactly one halt goes out, the surface is still
+        // released.
         let mut rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
-        surface.deny_after = Some((3, "the game window moved".to_owned()));
+        surface.deny_after = Some((
+            3,
+            SurfaceError::Fatal("could not raise the input shield".to_owned()),
+        ));
         let releases = surface.releases.clone();
         rig.job_tx
             .send(plan::buy_job(Trigger::ShopOpened, 0, &[0, 4], 42))
@@ -497,6 +547,120 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("stopping the loop"))
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_aborts_without_halt_on_a_recoverable_input_failure() {
+        // The window moved mid-job: landed inputs stay, the remainder is
+        // aborted without stopping the loop — the watchdog's retry
+        // re-acquires a fresh rect.
+        let mut rig = rig();
+        let (mut surface, events) = FakeSurface::new(design_rect());
+        surface.deny_after = Some((
+            3,
+            SurfaceError::Recoverable("the game window moved or resized mid-job".to_owned()),
+        ));
+        let releases = surface.releases.clone();
+        rig.job_tx
+            .send(plan::buy_job(Trigger::ShopOpened, 0, &[0, 4], 42))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        let journal = rig.journal.clone();
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        assert_eq!(events.lock().unwrap().len(), 3);
+        assert!(
+            rig.command_rx.try_recv().is_err(),
+            "no halt for a recoverable abort"
+        );
+        assert_eq!(*releases.lock().unwrap(), 1);
+        assert!(journal.entries().iter().any(|line| {
+            line.text
+                .contains("the game window moved or resized mid-job — aborted remaining clicks")
+        }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_serves_the_next_job_after_a_recoverable_abort() {
+        // A recoverable abort ends one job, not the loop: the next job runs
+        // against a freshly acquired rect.
+        let mut rig = rig();
+        let (mut surface, events) = FakeSurface::new(design_rect());
+        surface.deny_after = Some((
+            1,
+            SurfaceError::Recoverable("the game window moved or resized mid-job".to_owned()),
+        ));
+        let releases = surface.releases.clone();
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .await
+            .unwrap();
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 2))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        // First job: one landed click, then the abort. Second job: both.
+        assert_eq!(events.lock().unwrap().len(), 3);
+        assert!(rig.command_rx.try_recv().is_err());
+        assert_eq!(*releases.lock().unwrap(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn executor_aborts_without_halt_on_a_minimized_acquire() {
+        // A minimized window acquires with an empty client area: same fault
+        // as minimized mid-job, same recoverable abort — the loop halts only
+        // if the watchdog's retries stay broken.
+        let mut rig = rig();
+        let (surface, events) = FakeSurface::new(Ok(ClientRect {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+        }));
+        let releases = surface.releases.clone();
+        rig.job_tx
+            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        let journal = rig.journal.clone();
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rig.command_tx,
+            false,
+        )
+        .await;
+        assert!(events.lock().unwrap().is_empty());
+        assert!(rig.command_rx.try_recv().is_err());
+        assert_eq!(*releases.lock().unwrap(), 1);
+        assert!(journal.entries().iter().any(|line| {
+            line.text
+                .contains("degenerate client area 0×0 — aborted remaining clicks")
+        }));
     }
 
     #[tokio::test(start_paused = true)]
