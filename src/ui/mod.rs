@@ -131,7 +131,10 @@ impl eframe::App for ShopApp {
         // control whose click would otherwise vanish into a closed channel.
         let session_alive = outcome.is_none();
 
+        // Roomier margins than egui's stock 8px: the chrome needs to breathe.
+        let margin = egui::Margin::symmetric(16, 10);
         let mut clicked = egui::Panel::top("status_bar")
+            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
             .show(ui, |ui| {
                 render_status_bar(ui, &view, outcome.as_deref(), session_alive)
             })
@@ -143,10 +146,12 @@ impl eframe::App for ShopApp {
             .resizable(true)
             .default_size(200.0)
             .size_range(egui::Rangef::new(60.0, journal_max))
+            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
             .show(ui, |ui| render_journal(ui, &self.journal_cache));
         // The central panel always comes last: it takes whatever space the
         // chrome left over.
         let applied = egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(margin))
             .show(ui, |ui| {
                 render_center(ui, &view, &mut self.tab, &mut self.editor, session_alive)
             })
@@ -193,7 +198,7 @@ fn render_status_bar(
                 ("Start", Command::Start)
             };
             ui.add_enabled_ui(session_alive, |ui| {
-                if ui.button(theme::semibold_text(label)).clicked() {
+                if theme::primary_button(ui, label).clicked() {
                     clicked = Some(command);
                 }
             });
@@ -202,7 +207,7 @@ fn render_status_bar(
                 ui.painter().circle_filled(dot.center(), 5.0, color);
                 ui.add(
                     egui::Label::new(
-                        theme::semibold_text(view.status)
+                        egui::RichText::new(view.status)
                             .size(15.0)
                             .color(theme::INK),
                     )
@@ -269,12 +274,8 @@ fn render_center(
         visuals.widgets.active.weak_bg_fill = egui::Color32::TRANSPARENT;
         visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
         visuals.widgets.inactive.fg_stroke.color = theme::INK_MUTED;
-        let shop = ui
-            .selectable_value(tab, Tab::Shop, theme::semibold_text("Shop"))
-            .rect;
-        let setup = ui
-            .selectable_value(tab, Tab::Setup, theme::semibold_text("Setup"))
-            .rect;
+        let shop = ui.selectable_value(tab, Tab::Shop, "Shop").rect;
+        let setup = ui.selectable_value(tab, Tab::Setup, "Setup").rect;
         if *tab == Tab::Shop { shop } else { setup }
     });
     // The accent underline shares the hairline's y and paints second, so the
@@ -317,13 +318,14 @@ fn render_center(
     clicked
 }
 
-/// The Shop tab: merchant header + the slot table.
+/// The Shop tab: merchant header + the slot table, or the welcome screen
+/// while nothing is captured yet.
 fn render_shop_tab(ui: &mut egui::Ui, view: &ViewState) {
-    ui.heading(view.merchant.as_str());
     if view.rows.is_empty() {
-        ui.weak("no shop captured yet — open the Secret Shop in game");
+        render_quick_start(ui);
         return;
     }
+    ui.heading(view.merchant.as_str());
     egui::Grid::new("shop")
         .num_columns(4)
         .striped(true)
@@ -357,10 +359,39 @@ fn render_shop_tab(ui: &mut egui::Ui, view: &ViewState) {
         });
 }
 
+/// Welcome screen until the first snapshot lands: what the tool is, and the
+/// three steps that make it go.
+fn render_quick_start(ui: &mut egui::Ui) {
+    ui.add_space(28.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            egui::RichText::new("Arkyve Refresh Shop")
+                .size(22.0)
+                .color(theme::INK),
+        );
+        ui.weak("secret-shop relay — refresh + buy");
+    });
+    ui.add_space(20.0);
+    ui.label(theme::section("Quick start"));
+    for (index, step) in [
+        "Open the Secret Shop in game — the relay captures it live.",
+        "Setup tab — define what to hunt and when to stop.",
+        "Start — the loop refreshes and buys on its own.",
+    ]
+    .iter()
+    .enumerate()
+    {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("{}.", index + 1)).color(theme::ACCENT));
+            ui.label(*step);
+        });
+    }
+}
+
 /// Bottom chrome: the journal, filling whatever height the panel was
 /// resized to.
 fn render_journal(ui: &mut egui::Ui, journal: &[LogLine]) {
-    ui.label(theme::semibold_text("Journal"));
+    ui.label(theme::section("Journal"));
     // show_rows lays out only the visible slice; its uniform-row math
     // requires exactly one visual row per entry, so long lines extend into
     // a horizontal scroll instead of wrapping.
@@ -404,6 +435,7 @@ mod tests {
 
     use crate::domain::control::{Controller, Event, Limits};
     use crate::domain::filter::Filter;
+    use crate::domain::shop::{ShopItem, ShopSnapshot};
 
     use super::*;
 
@@ -420,26 +452,21 @@ mod tests {
         assert_eq!(timestamp(3_661_000), "+1:01:01");
     }
 
-    /// The kittest context starts un-themed and the status bar references the
-    /// semibold font family, which only `theme::apply` binds. Mirror the real
-    /// window (`ShopApp::new` themes before the first render): apply on the
-    /// construction frame, render from the next pass — where fonts land.
-    fn themed_harness<'a>(mut app: impl FnMut(&mut egui::Ui) + 'a) -> Harness<'a> {
-        let mut themed = false;
-        let mut harness = Harness::new_ui(move |ui| {
-            if themed {
-                app(ui);
-            } else {
-                theme::apply(ui.ctx());
-                themed = true;
-            }
-        });
-        harness.step();
-        harness
-    }
-
     fn idle_view() -> ViewState {
         let controller = Controller::new(Filter::default(), Limits::default());
+        view_state(&controller, false)
+    }
+
+    fn captured_view() -> ViewState {
+        let mut controller = Controller::new(Filter::default(), Limits::default());
+        controller.handle(Event::Snapshot {
+            snapshot: ShopSnapshot {
+                merchant: None,
+                slots: vec![ShopItem::default()],
+                refresh: None,
+            },
+            now_ms: 0,
+        });
         view_state(&controller, false)
     }
 
@@ -452,7 +479,7 @@ mod tests {
     #[test]
     fn idle_status_bar_hides_stop_and_toggle() {
         let view = idle_view();
-        let harness = themed_harness(|ui| {
+        let harness = Harness::new_ui(|ui| {
             render_status_bar(ui, &view, None, true);
         });
         assert!(harness.query_by_label("Stop").is_none());
@@ -463,7 +490,7 @@ mod tests {
     fn idle_start_click_emits_start() {
         let view = idle_view();
         let clicked = RefCell::new(None);
-        let mut harness = themed_harness(|ui| {
+        let mut harness = Harness::new_ui(|ui| {
             if let Some(command) = render_status_bar(ui, &view, None, true) {
                 *clicked.borrow_mut() = Some(command);
             }
@@ -477,7 +504,7 @@ mod tests {
     #[test]
     fn armed_status_bar_hides_start_and_toggle() {
         let view = watching_view();
-        let harness = themed_harness(|ui| {
+        let harness = Harness::new_ui(|ui| {
             render_status_bar(ui, &view, None, true);
         });
         assert!(harness.query_by_label("Start").is_none());
@@ -488,7 +515,7 @@ mod tests {
     fn armed_stop_click_emits_stop() {
         let view = watching_view();
         let clicked = RefCell::new(None);
-        let mut harness = themed_harness(|ui| {
+        let mut harness = Harness::new_ui(|ui| {
             if let Some(command) = render_status_bar(ui, &view, None, true) {
                 *clicked.borrow_mut() = Some(command);
             }
@@ -504,7 +531,7 @@ mod tests {
         let view = idle_view();
         let mut tab = Tab::Shop;
         let mut editor = EditorState::new(Filter::default(), Limits::default());
-        let harness = themed_harness(|ui| {
+        let harness = Harness::new_ui(|ui| {
             render_center(ui, &view, &mut tab, &mut editor, true);
         });
         assert!(harness.query_by_label("Filter").is_none());
@@ -516,7 +543,7 @@ mod tests {
         let view = idle_view();
         let mut tab = Tab::Shop;
         let mut editor = EditorState::new(Filter::default(), Limits::default());
-        let mut harness = themed_harness(|ui| {
+        let mut harness = Harness::new_ui(|ui| {
             render_center(ui, &view, &mut tab, &mut editor, true);
         });
         harness.get_by_label("Setup").click();
@@ -529,12 +556,34 @@ mod tests {
     }
 
     #[test]
+    fn empty_shop_tab_shows_the_quick_start() {
+        let view = idle_view();
+        let mut tab = Tab::Shop;
+        let mut editor = EditorState::new(Filter::default(), Limits::default());
+        let harness = Harness::new_ui(|ui| {
+            render_center(ui, &view, &mut tab, &mut editor, true);
+        });
+        harness.get_by_label("QUICK START");
+    }
+
+    #[test]
+    fn captured_shop_replaces_the_quick_start() {
+        let view = captured_view();
+        let mut tab = Tab::Shop;
+        let mut editor = EditorState::new(Filter::default(), Limits::default());
+        let harness = Harness::new_ui(|ui| {
+            render_center(ui, &view, &mut tab, &mut editor, true);
+        });
+        assert!(harness.query_by_label("QUICK START").is_none());
+    }
+
+    #[test]
     fn journal_lines_render_with_timestamps() {
         let lines = vec![LogLine {
             at_ms: 61_000,
             text: "refresh advised".to_owned(),
         }];
-        let harness = themed_harness(|ui| render_journal(ui, &lines));
+        let harness = Harness::new_ui(|ui| render_journal(ui, &lines));
         harness.get_by_label("[+1:01] refresh advised");
     }
 }

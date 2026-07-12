@@ -1,12 +1,10 @@
-//! Crystal-blue dark theme: THE palette, the embedded Inter fonts, and the
-//! status → color mapping. Widgets never hand-pick hex colors — they take
-//! them from here.
+//! Crystal-blue dark theme: THE palette, the visual style, and the status →
+//! color mapping. Widgets never hand-pick hex colors — they take them from
+//! here. Typography is egui's stock font: hierarchy comes from size and
+//! color only, with a single saturated element (the primary button) per
+//! screen.
 
-use std::sync::{Arc, LazyLock};
-
-use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle,
-};
+use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle};
 
 use crate::domain::control::{Status, StopReason};
 
@@ -16,8 +14,12 @@ const PAGE: Color32 = Color32::from_rgb(0x0d, 0x0d, 0x0d);
 const PANEL: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x19);
 /// Table stripes: one step above the panel, visible but quiet.
 const STRIPE: Color32 = Color32::from_rgb(0x22, 0x22, 0x21);
-/// Accent: selection, links, the active tab's underline.
+/// Accent: selection, links, the active tab's underline, the primary button.
 pub(super) const ACCENT: Color32 = Color32::from_rgb(0x39, 0x87, 0xe5);
+/// Accent under the pointer.
+const ACCENT_HOVER: Color32 = Color32::from_rgb(0x4f, 0x95, 0xea);
+/// Accent while pressed.
+const ACCENT_PRESSED: Color32 = Color32::from_rgb(0x2f, 0x74, 0xc9);
 /// Primary ink.
 pub(super) const INK: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
 /// Secondary ink (static labels, counters, inactive tabs).
@@ -36,47 +38,9 @@ const RED: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
 /// stays legible as body text on the panel.
 pub(super) const WANTED: Color32 = Color32::from_rgb(0x90, 0xee, 0x90);
 
-const INTER_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Inter-Regular.ttf");
-const INTER_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/Inter-SemiBold.ttf");
-
-/// The named family carrying Inter SemiBold — `RichText::strong` would
-/// fake-bold Regular. Static: `FontFamily::Name` holds an `Arc<str>`, so a
-/// clone per call is a refcount bump, not an allocation.
-static SEMIBOLD: LazyLock<FontFamily> = LazyLock::new(|| FontFamily::Name("inter-semibold".into()));
-
-pub(super) fn semibold() -> FontFamily {
-    SEMIBOLD.clone()
-}
-
-/// The one emphasis recipe: status label, primary button, tab labels,
-/// section headers.
-pub(super) fn semibold_text(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text.into()).family(semibold())
-}
-
-/// Installs the theme on the context: fonts, visuals, text styles. Called
-/// once per window, before the first frame.
+/// Installs the theme on the context: visuals and text styles. Called once
+/// per window, before the first frame.
 pub(super) fn apply(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert(
-        "inter".to_owned(),
-        Arc::new(FontData::from_static(INTER_REGULAR)),
-    );
-    fonts.font_data.insert(
-        "inter-semibold".to_owned(),
-        Arc::new(FontData::from_static(INTER_SEMIBOLD)),
-    );
-    let proportional = fonts
-        .families
-        .get_mut(&FontFamily::Proportional)
-        .expect("default proportional family");
-    proportional.insert(0, "inter".to_owned());
-    // Same fallback stack (emoji, symbols), SemiBold in front.
-    let mut semibold_stack = proportional.clone();
-    semibold_stack[0] = "inter-semibold".to_owned();
-    fonts.families.insert(semibold(), semibold_stack);
-    ctx.set_fonts(fonts);
-
     // The palette is dark by design: pin the theme so an OS in light mode
     // does not swap in egui's light visuals under it.
     ctx.set_theme(egui::Theme::Dark);
@@ -118,7 +82,10 @@ pub(super) fn apply(ctx: &egui::Context) {
                 TextStyle::Button,
                 FontId::new(14.0, FontFamily::Proportional),
             ),
-            (TextStyle::Heading, FontId::new(17.0, semibold())),
+            (
+                TextStyle::Heading,
+                FontId::new(17.0, FontFamily::Proportional),
+            ),
             (
                 TextStyle::Small,
                 FontId::new(11.5, FontFamily::Proportional),
@@ -129,9 +96,33 @@ pub(super) fn apply(ctx: &egui::Context) {
             ),
         ]
         .into();
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.item_spacing = egui::vec2(8.0, 10.0);
         style.spacing.button_padding = egui::vec2(14.0, 7.0);
     });
+}
+
+/// Section header: small grey capitals, the quiet divider of the layout.
+pub(super) fn section(text: &str) -> egui::RichText {
+    egui::RichText::new(text.to_uppercase())
+        .size(11.5)
+        .color(INK_FAINT)
+}
+
+/// The one saturated element on screen: accent fill, primary ink text.
+pub(super) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let widgets = &mut ui.style_mut().visuals.widgets;
+        widgets.inactive.weak_bg_fill = ACCENT;
+        widgets.hovered.weak_bg_fill = ACCENT_HOVER;
+        widgets.hovered.bg_stroke = Stroke::NONE;
+        widgets.active.weak_bg_fill = ACCENT_PRESSED;
+        widgets.active.bg_stroke = Stroke::NONE;
+        ui.add(
+            egui::Button::new(egui::RichText::new(text).size(15.0).color(INK))
+                .min_size(egui::vec2(88.0, 30.0)),
+        )
+    })
+    .inner
 }
 
 /// The status dot's color. One reading: green = working, amber = waiting on
@@ -199,5 +190,10 @@ mod tests {
         ] {
             assert_eq!(status_color(Status::Stopped(reason)), RED);
         }
+    }
+
+    #[test]
+    fn section_headers_render_as_capitals() {
+        assert_eq!(section("Quick start").text(), "QUICK START");
     }
 }
