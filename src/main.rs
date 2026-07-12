@@ -113,7 +113,7 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
         eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_inner_size([720.0, 680.0])
-                .with_min_inner_size([520.0, 420.0]),
+                .with_min_inner_size([520.0, 480.0]),
             ..Default::default()
         },
         Box::new(move |cc| Ok(Box::new(ui::ShopApp::new(cc, handles, error)))),

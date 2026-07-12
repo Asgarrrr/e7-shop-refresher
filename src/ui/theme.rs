@@ -2,7 +2,7 @@
 //! status → color mapping. Widgets never hand-pick hex colors — they take
 //! them from here.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle,
@@ -23,7 +23,7 @@ pub(super) const INK: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
 /// Secondary ink (static labels, counters, inactive tabs).
 pub(super) const INK_MUTED: Color32 = Color32::from_rgb(0xc3, 0xc2, 0xb7);
 /// Tertiary ink: hints, and the color of a state nobody needs to act on.
-pub(super) const INK_FAINT: Color32 = Color32::from_rgb(0x89, 0x87, 0x81);
+const INK_FAINT: Color32 = Color32::from_rgb(0x89, 0x87, 0x81);
 /// Hairline strokes and separators.
 const HAIRLINE: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2a);
 /// Watching: the loop is doing its job.
@@ -32,14 +32,26 @@ const GREEN: Color32 = Color32::from_rgb(0x0c, 0xa3, 0x0c);
 const AMBER: Color32 = Color32::from_rgb(0xfa, 0xb2, 0x19);
 /// Stops the player did not plan (machine faults).
 const RED: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
+/// Matched rows in the shop table: brighter than the status green so it
+/// stays legible as body text on the panel.
+pub(super) const WANTED: Color32 = Color32::from_rgb(0x90, 0xee, 0x90);
 
 const INTER_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Inter-Regular.ttf");
 const INTER_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/Inter-SemiBold.ttf");
 
-/// The named family carrying Inter SemiBold: headings and emphasis (status
-/// label, primary button) — `RichText::strong` would fake-bold Regular.
+/// The named family carrying Inter SemiBold — `RichText::strong` would
+/// fake-bold Regular. Static: `FontFamily::Name` holds an `Arc<str>`, so a
+/// clone per call is a refcount bump, not an allocation.
+static SEMIBOLD: LazyLock<FontFamily> = LazyLock::new(|| FontFamily::Name("inter-semibold".into()));
+
 pub(super) fn semibold() -> FontFamily {
-    FontFamily::Name("inter-semibold".into())
+    SEMIBOLD.clone()
+}
+
+/// The one emphasis recipe: status label, primary button, tab labels,
+/// section headers.
+pub(super) fn semibold_text(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text.into()).family(semibold())
 }
 
 /// Installs the theme on the context: fonts, visuals, text styles. Called
@@ -78,6 +90,8 @@ pub(super) fn apply(ctx: &egui::Context) {
     visuals.hyperlink_color = ACCENT;
     visuals.error_fg_color = RED;
     visuals.warn_fg_color = AMBER;
+    // `ui.weak` and hand-colored hints must be the same grey, not two.
+    visuals.weak_text_color = Some(INK_FAINT);
     visuals.window_corner_radius = CornerRadius::same(6);
     visuals.menu_corner_radius = CornerRadius::same(6);
     for widget in [
@@ -154,8 +168,12 @@ mod tests {
     }
 
     #[test]
-    fn status_color_watching_is_green_paused_is_amber() {
+    fn status_color_watching_is_green() {
         assert_eq!(status_color(Status::Watching), GREEN);
+    }
+
+    #[test]
+    fn status_color_paused_is_amber() {
         assert_eq!(status_color(Status::Paused), AMBER);
     }
 

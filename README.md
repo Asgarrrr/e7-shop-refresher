@@ -29,10 +29,11 @@ WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ Web
   from the traffic check the matched items off, and the loop resumes on its
   own once the last one is bought. A `[limits]` threshold reached → it stops
   the session. `[actuator] dry_run = true` journals the planned clicks
-  instead of sending them. The default build opens an **egui window**
-  (status, shop table, session journal, Start/Stop buttons, live
-  filter/limits editors — edits are session-only, `config.toml` is not
-  rewritten); there is no console beside the window — the journal carries
+  instead of sending them. The default build opens an **egui window**: a
+  status bar (state, counters, one contextual Start/Stop button), a tabbed
+  center (Shop table | Setup filter/limits editors — edits are
+  session-only, `config.toml` is not rewritten), and a resizable session
+  journal; there is no console beside the window — the journal carries
   every session line.
 
 The relay starts **idle** (nothing is captured or forwarded): press **Start**
@@ -91,8 +92,8 @@ a missing file falls back to the defaults.
 cargo run --release   # as administrator; opens the window (default features)
 ```
 
-Control from the window: Start / Stop / Toggle buttons, filter & limits
-editors. Close the window to quit.
+Control from the window: one contextual Start/Stop button in the status bar,
+filter & limits editors under the Setup tab. Close the window to quit.
 
 Console-only build (no window; `start`/`stop`/`[Enter]` on stdin, `Ctrl+C`
 quits):

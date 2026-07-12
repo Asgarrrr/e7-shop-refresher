@@ -132,11 +132,17 @@ impl eframe::App for ShopApp {
         let session_alive = outcome.is_none();
 
         let mut clicked = egui::Panel::top("status_bar")
-            .show(ui, |ui| render_status_bar(ui, &view, outcome.as_deref()))
+            .show(ui, |ui| {
+                render_status_bar(ui, &view, outcome.as_deref(), session_alive)
+            })
             .inner;
+        // The journal may grow but must never crush the center: whatever the
+        // window height or divider drag, the tab strip and a few rows stay.
+        let journal_max = (ui.available_rect_before_wrap().height() - 160.0).max(60.0);
         egui::Panel::bottom("journal")
             .resizable(true)
             .default_size(200.0)
+            .size_range(egui::Rangef::new(60.0, journal_max))
             .show(ui, |ui| render_journal(ui, &self.journal_cache));
         // The central panel always comes last: it takes whatever space the
         // chrome left over.
@@ -160,27 +166,21 @@ fn render_status_bar(
     ui: &mut egui::Ui,
     view: &ViewState,
     outcome: Option<&str>,
+    session_alive: bool,
 ) -> Option<Command> {
     let mut clicked = None;
     if let Some(outcome) = outcome {
         ui.colored_label(ui.visuals().error_fg_color, outcome);
         ui.separator();
     }
-    let session_alive = outcome.is_none();
 
     ui.add_space(4.0);
+    let color = theme::status_color(view.status_kind);
+    // Right-to-left rows, bounded by `horizontal` (a bare `with_layout`
+    // claims the panel's whole height): the edge element takes its width
+    // first, so at narrow widths the text truncates instead of running
+    // under it.
     ui.horizontal(|ui| {
-        let color = theme::status_color(view.status_kind);
-        let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-        ui.painter().circle_filled(dot.center(), 5.0, color);
-        ui.label(
-            egui::RichText::new(view.status)
-                .family(theme::semibold())
-                .size(15.0),
-        );
-        if let Some(reason) = view.stop_reason {
-            ui.label(egui::RichText::new(format!("({reason})")).color(theme::INK_FAINT));
-        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // One contextual button sending the explicit command, never
             // Toggle: the 4 Hz poll can show a label up to 250 ms stale, and
@@ -193,41 +193,55 @@ fn render_status_bar(
                 ("Start", Command::Start)
             };
             ui.add_enabled_ui(session_alive, |ui| {
-                let text = egui::RichText::new(label).family(theme::semibold());
-                if ui.button(text).clicked() {
+                if ui.button(theme::semibold_text(label)).clicked() {
                     clicked = Some(command);
+                }
+            });
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 5.0, color);
+                ui.add(
+                    egui::Label::new(
+                        theme::semibold_text(view.status)
+                            .size(15.0)
+                            .color(theme::INK),
+                    )
+                    .truncate(),
+                );
+                if let Some(reason) = view.stop_reason {
+                    // The reason shares the dot's severity color: a red halt
+                    // must not explain itself in the faintest ink.
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(format!("({reason})")).color(color))
+                            .truncate(),
+                    );
                 }
             });
         });
     });
     ui.horizontal(|ui| {
-        ui.label(format!(
-            "refreshes {}",
-            against(view.progress.refreshes, view.limits.max_refreshes)
-        ));
-        ui.label(format!(
-            "spent {}",
-            against(view.progress.spent, view.limits.max_spend)
-        ));
-        ui.label(format!(
-            "matches {}",
-            against(view.progress.matches_found, view.limits.max_matches)
-        ));
-        let balance = match view.crystal_balance {
-            Some(balance) => balance.to_string(),
-            None => "—".to_owned(),
-        };
-        ui.label(format!(
-            "crystals {balance} (refresh costs {})",
-            view.refresh_cost
-        ));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let capture = if view.capture_on {
+            ui.weak(if view.capture_on {
                 "capture on"
             } else {
                 "capture off"
-            };
-            ui.label(egui::RichText::new(capture).color(theme::INK_FAINT));
+            });
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let balance = match view.crystal_balance {
+                    Some(balance) => balance.to_string(),
+                    None => "—".to_owned(),
+                };
+                ui.add(
+                    egui::Label::new(format!(
+                        "refreshes {} · spent {} · matches {} · crystals {balance} (refresh costs {})",
+                        against(view.progress.refreshes, view.limits.max_refreshes),
+                        against(view.progress.spent, view.limits.max_spend),
+                        against(view.progress.matches_found, view.limits.max_matches),
+                        view.refresh_cost
+                    ))
+                    .truncate(),
+                );
+            });
         });
     });
     ui.add_space(4.0);
@@ -250,46 +264,51 @@ fn render_center(
     let tabs = ui.horizontal(|ui| {
         let visuals = &mut ui.style_mut().visuals;
         visuals.selection.bg_fill = egui::Color32::TRANSPARENT;
-        visuals.selection.stroke.color = theme::INK;
         visuals.widgets.hovered.weak_bg_fill = egui::Color32::TRANSPARENT;
         visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
         visuals.widgets.active.weak_bg_fill = egui::Color32::TRANSPARENT;
         visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
         visuals.widgets.inactive.fg_stroke.color = theme::INK_MUTED;
-        let label = |text: &str| egui::RichText::new(text).family(theme::semibold());
-        [
-            ui.selectable_value(tab, Tab::Shop, label("Shop")).rect,
-            ui.selectable_value(tab, Tab::Setup, label("Setup")).rect,
-        ]
+        let shop = ui
+            .selectable_value(tab, Tab::Shop, theme::semibold_text("Shop"))
+            .rect;
+        let setup = ui
+            .selectable_value(tab, Tab::Setup, theme::semibold_text("Setup"))
+            .rect;
+        if *tab == Tab::Shop { shop } else { setup }
     });
-    // The strip's baseline: one hairline across, the accent segment under the
-    // active tab painted over it.
+    // The accent underline shares the hairline's y and paints second, so the
+    // two read as one baseline with the active segment on top.
     let baseline = tabs.response.rect.bottom();
     ui.painter().hline(
         ui.max_rect().x_range(),
         baseline,
         ui.visuals().widgets.noninteractive.bg_stroke,
     );
-    let active = match tab {
-        Tab::Shop => tabs.inner[0],
-        Tab::Setup => tabs.inner[1],
-    };
     ui.painter().hline(
-        active.x_range(),
+        tabs.inner.x_range(),
         baseline,
         egui::Stroke::new(2.0, theme::ACCENT),
     );
     ui.add_space(6.0);
-    // Tab scroll: expanded editors must never overflow a clipped panel.
+    // Tab scroll: expanded editors must never overflow a clipped panel. One
+    // scroll state per tab — Setup's offset must not bleed into the table.
     egui::ScrollArea::vertical()
-        .id_salt("center")
+        .id_salt(match tab {
+            Tab::Shop => "tab-shop",
+            Tab::Setup => "tab-setup",
+        })
         .auto_shrink([false, false])
         .show(ui, |ui| match tab {
             Tab::Shop => render_shop_tab(ui, view),
             Tab::Setup => {
                 clicked = ui
                     .add_enabled_ui(session_alive, |ui| {
-                        editor::edit_filter(ui, editor).or_else(|| editor::edit_limits(ui, editor))
+                        // Both editors render every frame: or_else would skip
+                        // Limits on the frame Apply-filter is clicked.
+                        let filter = editor::edit_filter(ui, editor);
+                        let limits = editor::edit_limits(ui, editor);
+                        filter.or(limits)
                     })
                     .inner;
                 ui.weak("edits apply to this session only — config.toml is unchanged");
@@ -318,7 +337,7 @@ fn render_shop_tab(ui: &mut egui::Ui, view: &ViewState) {
                 let cell = |text: String| {
                     let mut text = egui::RichText::new(text);
                     if row.wanted {
-                        text = text.strong().color(egui::Color32::LIGHT_GREEN);
+                        text = text.strong().color(theme::WANTED);
                     }
                     if row.sold_out {
                         text = text.weak().strikethrough();
@@ -341,7 +360,7 @@ fn render_shop_tab(ui: &mut egui::Ui, view: &ViewState) {
 /// Bottom chrome: the journal, filling whatever height the panel was
 /// resized to.
 fn render_journal(ui: &mut egui::Ui, journal: &[LogLine]) {
-    ui.label(egui::RichText::new("Journal").family(theme::semibold()));
+    ui.label(theme::semibold_text("Journal"));
     // show_rows lays out only the visible slice; its uniform-row math
     // requires exactly one visual row per entry, so long lines extend into
     // a horizontal scroll instead of wrapping.
@@ -431,16 +450,24 @@ mod tests {
     }
 
     #[test]
-    fn idle_status_bar_offers_start_only() {
+    fn idle_status_bar_hides_stop_and_toggle() {
         let view = idle_view();
-        let clicked = RefCell::new(None);
-        let mut harness = themed_harness(|ui| {
-            if let Some(command) = render_status_bar(ui, &view, None) {
-                *clicked.borrow_mut() = Some(command);
-            }
+        let harness = themed_harness(|ui| {
+            render_status_bar(ui, &view, None, true);
         });
         assert!(harness.query_by_label("Stop").is_none());
         assert!(harness.query_by_label("Toggle").is_none());
+    }
+
+    #[test]
+    fn idle_start_click_emits_start() {
+        let view = idle_view();
+        let clicked = RefCell::new(None);
+        let mut harness = themed_harness(|ui| {
+            if let Some(command) = render_status_bar(ui, &view, None, true) {
+                *clicked.borrow_mut() = Some(command);
+            }
+        });
         harness.get_by_label("Start").click();
         harness.run();
         drop(harness);
@@ -448,16 +475,24 @@ mod tests {
     }
 
     #[test]
-    fn armed_status_bar_offers_stop_only() {
+    fn armed_status_bar_hides_start_and_toggle() {
         let view = watching_view();
-        let clicked = RefCell::new(None);
-        let mut harness = themed_harness(|ui| {
-            if let Some(command) = render_status_bar(ui, &view, None) {
-                *clicked.borrow_mut() = Some(command);
-            }
+        let harness = themed_harness(|ui| {
+            render_status_bar(ui, &view, None, true);
         });
         assert!(harness.query_by_label("Start").is_none());
         assert!(harness.query_by_label("Toggle").is_none());
+    }
+
+    #[test]
+    fn armed_stop_click_emits_stop() {
+        let view = watching_view();
+        let clicked = RefCell::new(None);
+        let mut harness = themed_harness(|ui| {
+            if let Some(command) = render_status_bar(ui, &view, None, true) {
+                *clicked.borrow_mut() = Some(command);
+            }
+        });
         harness.get_by_label("Stop").click();
         harness.run();
         drop(harness);
@@ -465,16 +500,25 @@ mod tests {
     }
 
     #[test]
-    fn setup_tab_reveals_the_editors_shop_hides_them() {
+    fn shop_tab_hides_the_editors() {
+        let view = idle_view();
+        let mut tab = Tab::Shop;
+        let mut editor = EditorState::new(Filter::default(), Limits::default());
+        let harness = themed_harness(|ui| {
+            render_center(ui, &view, &mut tab, &mut editor, true);
+        });
+        assert!(harness.query_by_label("Filter").is_none());
+        assert!(harness.query_by_label("Apply filter").is_none());
+    }
+
+    #[test]
+    fn setup_tab_reveals_the_editors() {
         let view = idle_view();
         let mut tab = Tab::Shop;
         let mut editor = EditorState::new(Filter::default(), Limits::default());
         let mut harness = themed_harness(|ui| {
             render_center(ui, &view, &mut tab, &mut editor, true);
         });
-        // Shop is the default tab: no editor controls in sight.
-        assert!(harness.query_by_label("Filter").is_none());
-        assert!(harness.query_by_label("Apply filter").is_none());
         harness.get_by_label("Setup").click();
         harness.run();
         harness.get_by_label("Filter").click();
@@ -482,5 +526,15 @@ mod tests {
         harness.get_by_label("Apply filter");
         drop(harness);
         assert_eq!(tab, Tab::Setup);
+    }
+
+    #[test]
+    fn journal_lines_render_with_timestamps() {
+        let lines = vec![LogLine {
+            at_ms: 61_000,
+            text: "refresh advised".to_owned(),
+        }];
+        let harness = themed_harness(|ui| render_journal(ui, &lines));
+        harness.get_by_label("[+1:01] refresh advised");
     }
 }
