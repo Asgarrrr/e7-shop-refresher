@@ -330,19 +330,9 @@ fn apply(
                 render_match(&mut lines, targets, controller);
                 submit_buys(&mut lines, controller, actuator, trigger, targets, now_ms);
             }
-            // Journal-only until the actuation wiring lands: the watchdog
-            // narrates its rungs even before it can click.
-            Action::Recover(recovery) => lines.push(
-                match recovery {
-                    Recovery::ConfirmRefresh => {
-                        ">> watchdog: no shop after refresh — re-clicking confirm"
-                    }
-                    Recovery::ConfirmBuy => ">> watchdog: no purchase echo — re-clicking confirm",
-                    Recovery::Refresh => ">> watchdog: re-issuing the refresh",
-                    Recovery::Buy { .. } => ">> watchdog: re-issuing buys",
-                }
-                .to_owned(),
-            ),
+            Action::Recover(recovery) => {
+                submit_recovery(&mut lines, controller, actuator, recovery, now_ms);
+            }
             Action::Halt(reason) => lines.push(format!(">> stopped: {}", describe(*reason))),
             Action::Refused(reason) => lines.push(format!(">> refused: {}", refusal(*reason))),
         }
@@ -384,6 +374,66 @@ fn submit_refresh(
     });
     if !submitted {
         lines.push(">> actuator queue full — refresh dropped".to_owned());
+    }
+}
+
+/// A watchdog retry: journal the rung, then queue its click job. Recovery
+/// only ever fires on recovery-enabled (live) sessions, but the mode gate
+/// stays — a job must never be queued without an input backend.
+fn submit_recovery(
+    lines: &mut Vec<String>,
+    controller: &Controller,
+    actuator: &ActuatorHandle,
+    recovery: &Recovery,
+    now_ms: u64,
+) {
+    match recovery {
+        Recovery::ConfirmRefresh => {
+            lines.push(">> watchdog: no shop after refresh — re-clicking confirm".to_owned());
+            submit_confirm_retry(lines, actuator, plan::CONFIRM_REFRESH, now_ms);
+        }
+        Recovery::ConfirmBuy => {
+            lines.push(">> watchdog: no purchase echo — re-clicking confirm".to_owned());
+            submit_confirm_retry(lines, actuator, plan::CONFIRM_BUY, now_ms);
+        }
+        Recovery::Refresh => {
+            lines.push(">> watchdog: re-issuing the refresh".to_owned());
+            if active_trigger(actuator, Some(Trigger::Recovery)).is_some()
+                && !actuator.submit(plan::refresh_job(
+                    Trigger::Recovery,
+                    actuator.epoch.current(),
+                    now_ms,
+                ))
+            {
+                lines.push(">> actuator queue full — refresh dropped".to_owned());
+            }
+        }
+        Recovery::Buy { targets } => {
+            lines.push(">> watchdog: re-issuing buys".to_owned());
+            submit_buys(
+                lines,
+                controller,
+                actuator,
+                Some(Trigger::Recovery),
+                targets,
+                now_ms,
+            );
+        }
+    }
+}
+
+fn submit_confirm_retry(
+    lines: &mut Vec<String>,
+    actuator: &ActuatorHandle,
+    zone: plan::Zone,
+    now_ms: u64,
+) {
+    if active_trigger(actuator, Some(Trigger::Recovery)).is_none() {
+        return;
+    }
+    let job = plan::confirm_retry_job(zone, actuator.epoch.current(), now_ms);
+    if !actuator.submit(job) {
+        lines.push(">> actuator queue full — confirm re-click dropped".to_owned());
     }
 }
 

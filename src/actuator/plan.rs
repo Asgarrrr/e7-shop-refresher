@@ -16,6 +16,9 @@ pub const MAX_ASPECT: f32 = 2.194;
 const WAIT_SHOP_OPENED_MS: u64 = 1_180;
 const WAIT_REFRESHED_MS: u64 = 780;
 const WAIT_PURCHASE_RESUMED_MS: u64 = 400;
+/// A watchdog retry fires into an idle game (the awaited animation never
+/// played): dispatch margin only.
+const WAIT_RECOVERY_MS: u64 = 400;
 const WAIT_CONFIRM_REFRESH_MODAL_MS: u64 = 270;
 const WAIT_BUY_MODAL_MS: u64 = 150;
 const WAIT_BETWEEN_BUYS_MS: u64 = 600;
@@ -154,6 +157,8 @@ pub enum Trigger {
     ShopOpened,
     Refreshed,
     PurchaseResumed,
+    /// A watchdog re-issue: the game sits idle, no animation to wait out.
+    Recovery,
 }
 
 impl Trigger {
@@ -162,6 +167,7 @@ impl Trigger {
             Trigger::ShopOpened => WAIT_SHOP_OPENED_MS,
             Trigger::Refreshed => WAIT_REFRESHED_MS,
             Trigger::PurchaseResumed => WAIT_PURCHASE_RESUMED_MS,
+            Trigger::Recovery => WAIT_RECOVERY_MS,
         }
     }
 }
@@ -255,6 +261,21 @@ fn scroll(jitter: &mut Jitter, notches: i32) -> Input {
     Input::Scroll {
         at: jitter.point_in(SCROLL_ZONE),
         notches,
+    }
+}
+
+/// One jittered click in the given confirm zone: the watchdog's free nudge
+/// after a confirm click that missed its modal. Safe on the shop screen —
+/// nothing clickable sits under either confirm zone when no modal is open
+/// (player-confirmed game fact).
+pub fn confirm_retry_job(zone: Zone, epoch: u64, seed: u64) -> Job {
+    let mut jitter = Jitter::new(seed);
+    Job {
+        epoch,
+        steps: vec![TimedStep {
+            wait_ms: WAIT_RECOVERY_MS,
+            input: click(&mut jitter, zone),
+        }],
     }
 }
 
@@ -506,6 +527,17 @@ mod tests {
         assert_eq!(Trigger::ShopOpened.pre_wait_ms(), 1_180);
         assert_eq!(Trigger::Refreshed.pre_wait_ms(), 780);
         assert_eq!(Trigger::PurchaseResumed.pre_wait_ms(), 400);
+        // Recovery fires into an idle game: dispatch margin only.
+        assert_eq!(Trigger::Recovery.pre_wait_ms(), 400);
+    }
+
+    #[test]
+    fn confirm_retry_job_single_click_in_zone() {
+        let job = confirm_retry_job(CONFIRM_BUY, 5, 42);
+        assert_eq!(job.epoch, 5);
+        assert_eq!(job.steps.len(), 1);
+        assert_eq!(job.steps[0].wait_ms, 400);
+        assert_within(click_at(&job.steps[0]), CONFIRM_BUY);
     }
 
     #[test]

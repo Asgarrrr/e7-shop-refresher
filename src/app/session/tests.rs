@@ -853,3 +853,207 @@ fn full_job_queue_journals_the_drop() {
             .any(|line| line.text.contains("queue full"))
     );
 }
+
+/// An armed controller with the recovery watchdog on, matching
+/// `ShopItem::default()`.
+fn armed_recovering() -> Mutex<Controller> {
+    let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
+    ctrl.enable_recovery();
+    ctrl.handle(Event::Start { now_ms: 0 });
+    Mutex::new(ctrl)
+}
+
+#[test]
+fn watchdog_confirm_retry_submits_one_click_at_current_epoch() {
+    let gate = WatchGate::new(true);
+    let journal = EventLog::default();
+    let (actuator, mut jobs) = recording(Mode::Live);
+    let controller = armed_recovering();
+    on_message(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        ServerMessage::Shop(dud_shop(10)),
+        1,
+    );
+    jobs.try_recv().expect("refresh job");
+    // The shop message bumped the epoch: the retry must carry the bumped
+    // value or the executor would drop it as stale.
+    dispatch(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        Event::Tick { now_ms: 10_001 },
+        10_001,
+    );
+    let retry = jobs.try_recv().expect("confirm retry job");
+    assert_eq!(retry.steps.len(), 1);
+    assert_eq!(retry.epoch, 1);
+    assert!(journal.entries().iter().any(|line| {
+        line.text
+            .contains("no shop after refresh — re-clicking confirm")
+    }));
+}
+
+#[test]
+fn watchdog_refresh_reissue_uses_recovery_pre_wait() {
+    let gate = WatchGate::new(true);
+    let journal = EventLog::default();
+    let (actuator, mut jobs) = recording(Mode::Live);
+    let controller = armed_recovering();
+    on_message(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        ServerMessage::Shop(dud_shop(10)),
+        1,
+    );
+    jobs.try_recv().expect("refresh job");
+    dispatch(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        Event::Tick { now_ms: 10_001 },
+        10_001,
+    );
+    jobs.try_recv().expect("confirm retry job");
+    dispatch(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        Event::Tick { now_ms: 20_001 },
+        20_001,
+    );
+    let reissue = jobs.try_recv().expect("re-issued refresh job");
+    // Full refresh sequence, but into an idle game: dispatch margin only.
+    assert_eq!(reissue.steps.len(), 2);
+    assert_eq!(reissue.steps[0].wait_ms, 400);
+    assert_eq!(reissue.epoch, 1);
+    assert!(
+        journal
+            .entries()
+            .iter()
+            .any(|line| line.text.contains("re-issuing the refresh"))
+    );
+}
+
+#[test]
+fn watchdog_buy_reissue_clicks_only_outstanding_rows() {
+    let gate = WatchGate::new(true);
+    let journal = EventLog::default();
+    let (actuator, mut jobs) = recording(Mode::Live);
+    let controller = armed_recovering();
+    // Two trackable matches: Paused with checklist [42, 43].
+    let snapshot = ShopSnapshot {
+        merchant: None,
+        slots: vec![
+            ShopItem {
+                id: 42,
+                ..ShopItem::default()
+            },
+            ShopItem {
+                id: 43,
+                ..ShopItem::default()
+            },
+        ],
+        refresh: None,
+    };
+    on_message(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        ServerMessage::Shop(snapshot),
+        1,
+    );
+    jobs.try_recv().expect("initial buy job");
+    // One echo lands: only id 43 (slot 2) stays outstanding.
+    on_message(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        ServerMessage::Purchase(PurchaseNotice {
+            item: 42,
+            gold: None,
+        }),
+        2,
+    );
+    dispatch(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        Event::Tick { now_ms: 12_001 },
+        12_001,
+    );
+    jobs.try_recv().expect("confirm retry job");
+    dispatch(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        Event::Tick { now_ms: 22_001 },
+        22_001,
+    );
+    let reissue = jobs.try_recv().expect("re-issued buy job");
+    // Scroll-to-top + one buy/confirm pair — the bought row is not re-clicked.
+    assert_eq!(reissue.steps.len(), 3);
+    // Only the lines after the re-issue marker: the initial buy job
+    // legitimately clicked both slots.
+    let entries = journal.entries();
+    let reissued_at = entries
+        .iter()
+        .position(|line| line.text.contains("re-issuing buys"))
+        .expect("re-issue line journaled");
+    let after = &entries[reissued_at..];
+    assert!(after.iter().any(|line| line.text.contains("buying slot 2")));
+    assert!(!after.iter().any(|line| line.text.contains("buying slot 1")));
+}
+
+#[test]
+fn unresponsive_halt_reaches_the_journal() {
+    let gate = WatchGate::new(true);
+    let journal = EventLog::default();
+    let (actuator, mut jobs) = recording(Mode::Live);
+    let controller = armed_recovering();
+    on_message(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        ServerMessage::Shop(dud_shop(10)),
+        1,
+    );
+    for now in [10_001, 20_001, 30_001] {
+        dispatch(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            Event::Tick { now_ms: now },
+            now,
+        );
+    }
+    assert_eq!(
+        controller.lock().unwrap().status(),
+        Status::Stopped(StopReason::Unresponsive)
+    );
+    assert!(!gate.is_enabled());
+    assert!(
+        journal
+            .entries()
+            .iter()
+            .any(|line| line.text.contains("no response from the game"))
+    );
+    // The whole ladder went out: refresh, confirm retry, re-issue.
+    assert!(jobs.try_recv().is_ok());
+    assert!(jobs.try_recv().is_ok());
+    assert!(jobs.try_recv().is_ok());
+    assert!(jobs.try_recv().is_err());
+}

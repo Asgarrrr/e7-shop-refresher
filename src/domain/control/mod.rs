@@ -276,6 +276,11 @@ impl Controller {
         self.recovery = true;
     }
 
+    /// Whether the recovery watchdog is armed (set once at wiring time).
+    pub fn recovery_enabled(&self) -> bool {
+        self.recovery
+    }
+
     pub fn status(&self) -> Status {
         self.status
     }

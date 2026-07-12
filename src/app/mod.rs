@@ -79,10 +79,14 @@ pub fn setup(config: Config) -> (Session, SessionHandles) {
     let gate = WatchGate::new(false);
     let journal = EventLog::default();
     let (command_tx, command_rx) = mpsc::channel::<Command>(16);
-    let controller = Arc::new(Mutex::new(Controller::new(
-        config.filter.clone(),
-        config.limits.clone(),
-    )));
+    let mut controller = Controller::new(config.filter.clone(), config.limits.clone());
+    if actuator_mode(&config) == Mode::Live {
+        // Only real clicking gets watchdog deadlines: Off is player-paced
+        // advice and DryRun never produces wire feedback — a deadline would
+        // self-halt both.
+        controller.enable_recovery();
+    }
+    let controller = Arc::new(Mutex::new(controller));
     let handles = SessionHandles {
         controller,
         commands: command_tx,
@@ -438,6 +442,29 @@ mod tests {
             .commands
             .try_send(Command::Toggle)
             .expect("channel open");
+    }
+
+    /// Without an input backend the mode is Off — advice only, so watchdog
+    /// deadlines would halt a session nobody clicks for.
+    #[cfg(not(all(windows, feature = "actuator")))]
+    #[test]
+    fn setup_enables_recovery_only_when_live() {
+        let (_session, handles) = setup(Config::default());
+        assert!(!handles.controller.lock().unwrap().recovery_enabled());
+    }
+
+    /// Live clicking arms the watchdog; a dry run produces no wire feedback
+    /// and must keep it dark.
+    #[cfg(all(windows, feature = "actuator"))]
+    #[test]
+    fn setup_enables_recovery_only_when_live() {
+        let (_session, handles) = setup(Config::default());
+        assert!(handles.controller.lock().unwrap().recovery_enabled());
+
+        let mut config = Config::default();
+        config.actuator.dry_run = true;
+        let (_session, handles) = setup(config);
+        assert!(!handles.controller.lock().unwrap().recovery_enabled());
     }
 
     async fn panicking_session() -> crate::Result<()> {
