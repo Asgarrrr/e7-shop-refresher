@@ -20,6 +20,41 @@ use dedup::{SlotIdentity, fingerprint};
 /// A refresh always costs 3 crystals (game fact); a wire-sent cost overrides.
 const REFRESH_COST_CRYSTALS: u32 = 3;
 
+// Watchdog deadlines. The worst honest first response observed is ≈ 4 s;
+// every accepted echo re-grants the full purchase window, so the value must
+// NOT scale with checklist length.
+const EXPECT_SNAPSHOT_MS: u64 = 10_000;
+const EXPECT_PURCHASE_MS: u64 = 10_000;
+
+/// The wire proof the watchdog waits on after an issued action, carrying the
+/// recovery-ladder rung already climbed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expectation {
+    /// A refresh went out: a new snapshot must arrive.
+    Snapshot { deadline_ms: u64, attempt: u8 },
+    /// Buys went out: purchase echoes must arrive.
+    Purchase { deadline_ms: u64, attempt: u8 },
+}
+
+/// A watchdog-issued retry. Deliberately distinct from bare
+/// `Refresh`/`Buy`: recovery reaches the caller from a tick, which carries
+/// no game-animation trigger — bare variants there would render as advice
+/// and submit nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recovery {
+    /// Blind confirm re-click after a missed refresh confirm — free and
+    /// safe: nothing clickable sits under the modal zone when it is closed
+    /// (player-confirmed game fact).
+    ConfirmRefresh,
+    /// Blind confirm re-click after a missed buy confirm.
+    ConfirmBuy,
+    /// Full refresh re-issue, counted and debited like any other refresh.
+    Refresh,
+    /// Full re-issue of the outstanding buys, rebuilt by identity from the
+    /// checklist — never re-filtered.
+    Buy { targets: Vec<BuyTarget> },
+}
+
 /// Stop limits, all optional; the loop halts at the first one reached.
 ///
 /// Deserialized from the config file's `[limits]` section; unknown keys are
@@ -47,6 +82,8 @@ pub enum StopReason {
     /// The click executor could not act safely: a machine fault, not the
     /// player's stop.
     ActuatorFailed,
+    /// The game answered nothing through the whole recovery ladder.
+    Unresponsive,
     OutOfFunds,
     MaxRefreshes,
     MaxSpend,
@@ -96,6 +133,14 @@ pub enum Event {
     FilterChanged(Filter),
     /// The player retuned the stop limits mid-session (from the GUI).
     LimitsChanged(Limits),
+    /// The uplink dropped: no proof can arrive, so the watchdog must not
+    /// escalate over a dead wire (the reconnect backoff alone outlasts the
+    /// whole ladder).
+    LinkDown,
+    /// The uplink is back; a pending expectation gets a fresh full deadline.
+    LinkUp {
+        now_ms: u64,
+    },
     /// Lets the duration limit expire outside snapshots (e.g. while `Paused`).
     Tick {
         now_ms: u64,
@@ -121,6 +166,8 @@ pub enum Action {
     Buy {
         targets: Vec<BuyTarget>,
     },
+    /// A watchdog retry to execute (recovery-enabled sessions only).
+    Recover(Recovery),
     Halt(StopReason),
     /// The event was rejected; nothing changed. Callers render the reason —
     /// enforcement and messaging come from the same decision.
@@ -190,6 +237,14 @@ pub struct Controller {
     /// The roll `bought` is scoped to; a snapshot with a different identity
     /// is fresh stock and empties the set.
     bought_fingerprint: Option<Vec<SlotIdentity>>,
+    /// Watchdog armed. Only ever true for live actuation: Off is
+    /// player-paced advice and DryRun never yields wire feedback — deadlines
+    /// would self-halt both.
+    recovery: bool,
+    /// The proof the watchdog currently waits on; `None` = quiet.
+    expectation: Option<Expectation>,
+    /// Deadlines only run while the uplink can deliver the proof.
+    link_up: bool,
 }
 
 impl Controller {
@@ -207,7 +262,18 @@ impl Controller {
             acted_fingerprint: None,
             bought: Vec::new(),
             bought_fingerprint: None,
+            recovery: false,
+            expectation: None,
+            link_up: true,
         }
+    }
+
+    /// Arms the recovery watchdog: every issued refresh/buy gets an
+    /// expectation deadline, escalating nudge → re-issue → honest halt.
+    /// Called once at wiring time, only when the actuator really clicks
+    /// (`Mode::Live`).
+    pub fn enable_recovery(&mut self) {
+        self.recovery = true;
     }
 
     pub fn status(&self) -> Status {
@@ -270,6 +336,11 @@ impl Controller {
                 self.limits = limits;
                 Vec::new()
             }
+            Event::LinkDown => {
+                self.link_up = false;
+                Vec::new()
+            }
+            Event::LinkUp { now_ms } => self.on_link_up(now_ms),
             Event::Tick { now_ms } => self.on_tick(now_ms),
         }
     }
@@ -292,6 +363,8 @@ impl Controller {
         self.checklist.clear();
         // A stale identity must not mute the new session's first snapshot.
         self.acted_fingerprint = None;
+        // Nor may a stale deadline fire into the new session.
+        self.expectation = None;
         // last_snapshot is kept: restarting the watch does not change the shop.
         self.status = Status::Watching;
         Vec::new()
@@ -350,6 +423,12 @@ impl Controller {
                 self.bought_fingerprint = self.acted_fingerprint.clone();
             }
         }
+        // Acting on this snapshot: whatever proof was awaited, this arrival
+        // is it — or supersedes it. Only this act point clears; duplicates
+        // and degraded arrivals returned above (a re-open is not a re-roll).
+        // Downstream re-arms: pause-entry → Purchase, emit_refresh →
+        // Snapshot.
+        self.expectation = None;
 
         let (targets, buyable) = self.plan_targets(snapshot);
         // Alignment by construction: the checklist is exactly the clickable
@@ -381,6 +460,14 @@ impl Controller {
         // resolves first (the items get bought) and the limit lands at the
         // next gate, which re-checks every stop reason.
         self.status = Status::Paused;
+        if self.recovery && !self.checklist.is_empty() {
+            // Only echo-clearable pauses get a deadline: an untrackable
+            // (empty-checklist) pause waits on the player, not the game.
+            self.expectation = Some(Expectation::Purchase {
+                deadline_ms: now_ms + EXPECT_PURCHASE_MS,
+                attempt: 0,
+            });
+        }
         vec![Action::Buy { targets }]
     }
 
@@ -446,6 +533,14 @@ impl Controller {
         };
         self.checklist.swap_remove(position);
         if !self.checklist.is_empty() {
+            if self.recovery {
+                // Proof of life: the game is delivering echoes, so the
+                // remaining buys restart the ladder with a full deadline.
+                self.expectation = Some(Expectation::Purchase {
+                    deadline_ms: now_ms + EXPECT_PURCHASE_MS,
+                    attempt: 0,
+                });
+            }
             return Vec::new();
         }
         self.status = Status::Watching;
@@ -455,21 +550,137 @@ impl Controller {
     /// A tick is a check-point: a limit tightened mid-session (or an elapsed
     /// timer) takes effect here, without waiting for the next snapshot.
     ///
-    /// While `Watching`, every stop reason applies — an already-exceeded
-    /// `max_refreshes`/`max_spend`/`max_matches` must not linger with the gate
-    /// on. While `Paused` the loop is waiting on a purchase, so only the
-    /// timeout applies; the other limits are re-checked when the buy or a new
-    /// shop resumes the hunt (`refresh_or_halt`), which avoids abandoning a
-    /// still-buyable pause on, say, an out-of-crystals estimate.
+    /// While `Watching` quietly (no expectation pending), every stop reason
+    /// applies — an already-exceeded `max_refreshes`/`max_spend`/
+    /// `max_matches` must not linger with the gate on. While a refresh is in
+    /// flight the count/spend gates move into the ladder's own
+    /// `refresh_or_halt`: the awaited roll is already paid for and may hold
+    /// a match, so only time may halt over it — mirroring `Paused`, where
+    /// only the timeout applies lest a still-buyable pause be abandoned on,
+    /// say, an out-of-crystals estimate. Time first, watchdog second.
     fn on_tick(&mut self, now_ms: u64) -> Vec<Action> {
         match self.status {
-            Status::Watching => match self.stop_reason(now_ms) {
+            Status::Watching if self.expectation.is_none() => match self.stop_reason(now_ms) {
                 Some(reason) => self.halt(reason),
                 None => Vec::new(),
             },
-            Status::Paused if self.duration_elapsed(now_ms) => self.halt(StopReason::Timeout),
+            Status::Watching | Status::Paused if self.duration_elapsed(now_ms) => {
+                self.halt(StopReason::Timeout)
+            }
+            Status::Watching | Status::Paused => self.watchdog(now_ms),
             _ => Vec::new(),
         }
+    }
+
+    /// The recovery ladder, run from ticks once a deadline lapses: miss #1 →
+    /// blind confirm re-click (free — nothing clickable sits under a closed
+    /// modal), miss #2 → full re-issue, miss #3 → honest halt. Suspended
+    /// while the link is down: no proof can arrive over a dead wire, and the
+    /// reconnect backoff alone outlasts the whole ladder.
+    fn watchdog(&mut self, now_ms: u64) -> Vec<Action> {
+        if !self.link_up {
+            return Vec::new();
+        }
+        match self.expectation {
+            Some(Expectation::Snapshot {
+                deadline_ms,
+                attempt,
+            }) if now_ms >= deadline_ms => match attempt {
+                0 => {
+                    self.expectation = Some(Expectation::Snapshot {
+                        deadline_ms: now_ms + EXPECT_SNAPSHOT_MS,
+                        attempt: 1,
+                    });
+                    vec![Action::Recover(Recovery::ConfirmRefresh)]
+                }
+                1 => {
+                    // Through the gate on purpose: the re-issue re-counts and
+                    // re-debits (`max_spend` is a ceiling promise, so
+                    // overcounting fails safe) and may halt honestly on a
+                    // limit instead of double-rolling.
+                    let actions: Vec<Action> = self
+                        .refresh_or_halt(now_ms)
+                        .into_iter()
+                        .map(|action| match action {
+                            Action::Refresh => Action::Recover(Recovery::Refresh),
+                            other => other,
+                        })
+                        .collect();
+                    // emit_refresh armed a fresh rung-0 expectation: the
+                    // ladder must not reset itself.
+                    if matches!(self.expectation, Some(Expectation::Snapshot { .. })) {
+                        self.expectation = Some(Expectation::Snapshot {
+                            deadline_ms: now_ms + EXPECT_SNAPSHOT_MS,
+                            attempt: 2,
+                        });
+                    }
+                    actions
+                }
+                _ => self.halt(StopReason::Unresponsive),
+            },
+            Some(Expectation::Purchase {
+                deadline_ms,
+                attempt,
+            }) if now_ms >= deadline_ms => match attempt {
+                0 => {
+                    self.expectation = Some(Expectation::Purchase {
+                        deadline_ms: now_ms + EXPECT_PURCHASE_MS,
+                        attempt: 1,
+                    });
+                    vec![Action::Recover(Recovery::ConfirmBuy)]
+                }
+                1 => {
+                    self.expectation = Some(Expectation::Purchase {
+                        deadline_ms: now_ms + EXPECT_PURCHASE_MS,
+                        attempt: 2,
+                    });
+                    vec![Action::Recover(Recovery::Buy {
+                        targets: self.recovery_buy_targets(),
+                    })]
+                }
+                _ => self.halt(StopReason::Unresponsive),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// The outstanding buys, rebuilt by identity from the checklist against
+    /// the stored snapshot — never re-filtered: a mid-pause filter swap must
+    /// not redraw what the pause is waiting on.
+    fn recovery_buy_targets(&self) -> Vec<BuyTarget> {
+        let Some(snapshot) = self.last_snapshot.as_ref() else {
+            return Vec::new();
+        };
+        snapshot
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let id = item.catalog_id()?;
+                self.checklist.contains(&id).then(|| BuyTarget {
+                    slot: item.effective_slot(index),
+                    id: Some(id),
+                })
+            })
+            .collect()
+    }
+
+    /// The outage may have swallowed the awaited proof mid-flight: re-grant
+    /// a full deadline. The rung already climbed is kept — a retry that
+    /// never got its answer must still escalate, not restart the ladder.
+    fn on_link_up(&mut self, now_ms: u64) -> Vec<Action> {
+        self.link_up = true;
+        if let Some(expectation) = &mut self.expectation {
+            match expectation {
+                Expectation::Snapshot { deadline_ms, .. } => {
+                    *deadline_ms = now_ms + EXPECT_SNAPSHOT_MS;
+                }
+                Expectation::Purchase { deadline_ms, .. } => {
+                    *deadline_ms = now_ms + EXPECT_PURCHASE_MS;
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// The gate in front of the single emission point: halt at the first
@@ -477,13 +688,14 @@ impl Controller {
     fn refresh_or_halt(&mut self, now_ms: u64) -> Vec<Action> {
         match self.stop_reason(now_ms) {
             Some(reason) => self.halt(reason),
-            None => vec![self.emit_refresh()],
+            None => vec![self.emit_refresh(now_ms)],
         }
     }
 
     /// Single emission point: every refresh, including the auto-resume one,
-    /// is counted and debited before it goes out.
-    fn emit_refresh(&mut self) -> Action {
+    /// is counted and debited before it goes out — and, with recovery on,
+    /// expected to produce a snapshot in time.
+    fn emit_refresh(&mut self, now_ms: u64) -> Action {
         self.progress.refreshes = self.progress.refreshes.saturating_add(1);
         let cost = self.refresh_cost();
         self.progress.spent = self.progress.spent.saturating_add(cost);
@@ -491,6 +703,12 @@ impl Controller {
             // Keeps the affordability estimate fresh across snapshots that
             // omit meta; a server-sent meta overwrites it with truth.
             meta.crystal_balance = meta.crystal_balance.saturating_sub(cost);
+        }
+        if self.recovery {
+            self.expectation = Some(Expectation::Snapshot {
+                deadline_ms: now_ms + EXPECT_SNAPSHOT_MS,
+                attempt: 0,
+            });
         }
         Action::Refresh
     }
@@ -508,6 +726,8 @@ impl Controller {
         // so a surviving checklist would keep painting yesterday's matches
         // as "wanted" in the view.
         self.checklist.clear();
+        // Every stop path (Unresponsive included) disarms the watchdog.
+        self.expectation = None;
         vec![Action::Halt(reason)]
     }
 

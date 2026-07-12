@@ -72,6 +72,10 @@ fn buy_with_gold(item: u32, gold: u32, now_ms: u64) -> Event {
     }
 }
 
+fn tick(now_ms: u64) -> Event {
+    Event::Tick { now_ms }
+}
+
 fn controller(limits: Limits) -> Controller {
     let filter = Filter {
         kinds: vec![Equipment],
@@ -83,6 +87,14 @@ fn controller(limits: Limits) -> Controller {
 /// A controller already started at t=0.
 fn started(limits: Limits) -> Controller {
     let mut ctrl = controller(limits);
+    assert!(ctrl.handle(Event::Start { now_ms: 0 }).is_empty());
+    ctrl
+}
+
+/// A controller started at t=0 with the recovery watchdog armed.
+fn recovering(limits: Limits) -> Controller {
+    let mut ctrl = controller(limits);
+    ctrl.enable_recovery();
     assert!(ctrl.handle(Event::Start { now_ms: 0 }).is_empty());
     ctrl
 }
@@ -1305,4 +1317,369 @@ fn buy_targets_align_with_checklist() {
         }]
     );
     assert_eq!(ctrl.checklist(), &[100]);
+}
+
+#[test]
+fn recovery_disabled_never_arms_the_watchdog() {
+    // Off is player-paced advice and DryRun never yields wire feedback:
+    // deadlines would self-halt both, so only live wiring arms them.
+    let mut ctrl = started(Limits::default());
+    assert_eq!(
+        ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
+        vec![Action::Refresh]
+    );
+    assert!(ctrl.handle(tick(1_000_000)).is_empty());
+    assert_eq!(ctrl.status(), Status::Watching);
+
+    // Same for a pending purchase.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    assert_eq!(ctrl.status(), Status::Paused);
+    assert!(ctrl.handle(tick(1_000_000)).is_empty());
+    assert_eq!(ctrl.status(), Status::Paused);
+}
+
+#[test]
+fn snapshot_watchdog_reclicks_confirm_then_reissues_then_halts() {
+    let mut ctrl = recovering(Limits::default());
+    assert_eq!(
+        ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
+        vec![Action::Refresh]
+    );
+    // Deadline not reached: quiet.
+    assert!(ctrl.handle(tick(10_000)).is_empty());
+    // Miss #1: free blind confirm re-click (safe on the shop screen).
+    assert_eq!(
+        ctrl.handle(tick(10_001)),
+        vec![Action::Recover(Recovery::ConfirmRefresh)]
+    );
+    // Miss #2: paid full re-issue, counted and debited like any refresh.
+    assert_eq!(
+        ctrl.handle(tick(20_001)),
+        vec![Action::Recover(Recovery::Refresh)]
+    );
+    assert_eq!(ctrl.progress().refreshes, 2);
+    assert_eq!(ctrl.progress().spent, 6);
+    // Miss #3: honest halt.
+    assert_eq!(
+        ctrl.handle(tick(30_001)),
+        vec![Action::Halt(StopReason::Unresponsive)]
+    );
+    assert_eq!(ctrl.status(), Status::Stopped(StopReason::Unresponsive));
+    assert_eq!(ctrl.expectation, None);
+}
+
+#[test]
+fn watchdog_reissue_respects_limits() {
+    // The paid rung goes through the same gate as any refresh: an exhausted
+    // limit halts honestly instead of double-rolling. The count gates moved
+    // into the ladder — the in-flight roll is already paid for, so a quiet
+    // tick must not discard it.
+    let mut ctrl = recovering(Limits {
+        max_refreshes: Some(1),
+        ..Limits::default()
+    });
+    assert_eq!(
+        ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
+        vec![Action::Refresh]
+    );
+    // The free rung still fires: it spends nothing.
+    assert_eq!(
+        ctrl.handle(tick(10_001)),
+        vec![Action::Recover(Recovery::ConfirmRefresh)]
+    );
+    // The paid rung would cross the ceiling: honest halt, no double-roll.
+    assert_eq!(
+        ctrl.handle(tick(20_001)),
+        vec![Action::Halt(StopReason::MaxRefreshes)]
+    );
+    assert_eq!(ctrl.progress().refreshes, 1);
+    assert!(ctrl.handle(tick(40_000)).is_empty());
+}
+
+#[test]
+fn new_snapshot_rearms_a_fresh_snapshot_deadline() {
+    let mut ctrl = recovering(Limits::default());
+    assert_eq!(
+        ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
+        vec![Action::Refresh]
+    );
+    // A genuinely new shop before the deadline: the awaited proof arrived,
+    // and the advised refresh arms a fresh full window.
+    let mut next = with_ids(dud_shop(None));
+    for item in &mut next.slots {
+        item.id += 100;
+    }
+    assert_eq!(ctrl.handle(snap(next, 9_000)), vec![Action::Refresh]);
+    // The original deadline passes silently...
+    assert!(ctrl.handle(tick(10_500)).is_empty());
+    // ...the fresh one fires.
+    assert_eq!(
+        ctrl.handle(tick(19_000)),
+        vec![Action::Recover(Recovery::ConfirmRefresh)]
+    );
+}
+
+#[test]
+fn duplicate_snapshot_keeps_the_snapshot_expectation() {
+    // A re-open re-delivers the same roll: not the awaited new shop, so
+    // the deadline keeps running.
+    let mut ctrl = recovering(Limits::default());
+    assert_eq!(
+        ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
+        vec![Action::Refresh]
+    );
+    assert!(
+        ctrl.handle(snap(with_ids(dud_shop(None)), 5_000))
+            .is_empty()
+    );
+    assert_eq!(
+        ctrl.handle(tick(10_001)),
+        vec![Action::Recover(Recovery::ConfirmRefresh)]
+    );
+}
+
+#[test]
+fn slotless_snapshot_keeps_the_snapshot_expectation() {
+    // A degraded slotless message is not shop content: the refresh's proof
+    // is still owed.
+    let mut ctrl = recovering(Limits::default());
+    assert_eq!(
+        ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
+        vec![Action::Refresh]
+    );
+    assert!(ctrl.handle(snap(empty_shop(), 5_000)).is_empty());
+    assert_eq!(
+        ctrl.handle(tick(10_001)),
+        vec![Action::Recover(Recovery::ConfirmRefresh)]
+    );
+}
+
+#[test]
+fn purchase_watchdog_ladder_reissues_outstanding_buys() {
+    let mut ctrl = recovering(Limits::default());
+    assert_eq!(
+        ctrl.handle(snap(with_ids(hit_shop(None)), 1)),
+        vec![Action::Buy {
+            targets: vec![target(3, Some(102))]
+        }]
+    );
+    // Miss #1: free blind confirm re-click.
+    assert_eq!(
+        ctrl.handle(tick(10_001)),
+        vec![Action::Recover(Recovery::ConfirmBuy)]
+    );
+    // Miss #2: the outstanding buys re-issued by identity.
+    assert_eq!(
+        ctrl.handle(tick(20_001)),
+        vec![Action::Recover(Recovery::Buy {
+            targets: vec![target(3, Some(102))]
+        })]
+    );
+    // Miss #3: honest halt.
+    assert_eq!(
+        ctrl.handle(tick(30_001)),
+        vec![Action::Halt(StopReason::Unresponsive)]
+    );
+    assert_eq!(ctrl.status(), Status::Stopped(StopReason::Unresponsive));
+}
+
+#[test]
+fn accepted_echo_resets_the_purchase_deadline_and_attempt() {
+    let mut ctrl = recovering(Limits::default());
+    let two_hits = with_ids(shop(
+        &[Equipment, Token, Equipment, Token, Token, Token],
+        None,
+    ));
+    ctrl.handle(snap(two_hits, 1)); // checklist [100, 102]
+    assert_eq!(
+        ctrl.handle(tick(10_001)),
+        vec![Action::Recover(Recovery::ConfirmBuy)]
+    );
+    // Proof of life: one echo lands — the ladder restarts at rung zero
+    // with a full window for the remaining buy.
+    assert!(ctrl.handle(buy(100, 12_000)).is_empty());
+    assert!(ctrl.handle(tick(21_000)).is_empty());
+    assert_eq!(
+        ctrl.handle(tick(22_000)),
+        vec![Action::Recover(Recovery::ConfirmBuy)]
+    );
+}
+
+#[test]
+fn pause_without_checklist_never_arms_the_watchdog() {
+    // An untrackable (id-0) match pauses for the player, not the game: no
+    // echo can ever arrive, so a deadline would always halt the session.
+    let mut ctrl = recovering(Limits::default());
+    ctrl.handle(snap(hit_shop(None), 1)); // fixture ids all 0
+    assert_eq!(ctrl.status(), Status::Paused);
+    assert!(ctrl.checklist().is_empty());
+    assert!(ctrl.handle(tick(1_000_000)).is_empty());
+    assert_eq!(ctrl.status(), Status::Paused);
+}
+
+#[test]
+fn dead_stock_batch_arms_snapshot_not_purchase() {
+    // Nothing in the batch is buyable: the hunt continues in the same
+    // batch, so the deadline watches for the next shop — not for echoes
+    // that cannot come.
+    let filter = Filter {
+        kinds: vec![Equipment],
+        include_sold_out: true,
+        ..Filter::default()
+    };
+    let mut ctrl = Controller::new(filter, Limits::default());
+    ctrl.enable_recovery();
+    ctrl.handle(Event::Start { now_ms: 0 });
+    let mut shop = with_ids(hit_shop(None));
+    shop.slots[2].limit = Some(PurchaseLimit {
+        remaining: 0,
+        total: 1,
+    });
+    let actions = ctrl.handle(snap(shop, 1));
+    assert_eq!(
+        actions,
+        vec![
+            Action::Buy {
+                targets: vec![target(3, None)]
+            },
+            Action::Refresh,
+        ]
+    );
+    assert_eq!(
+        ctrl.handle(tick(10_001)),
+        vec![Action::Recover(Recovery::ConfirmRefresh)]
+    );
+}
+
+#[test]
+fn buy_reissue_ignores_a_mid_pause_filter_swap() {
+    // The re-issue rebuilds targets from the checklist by identity: a new
+    // filter must not redraw (or drop) what the pause is waiting on.
+    let mut ctrl = recovering(Limits::default());
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1)); // checklist [102]
+    let token_filter = Filter {
+        kinds: vec![Token],
+        ..Filter::default()
+    };
+    assert!(ctrl.handle(Event::FilterChanged(token_filter)).is_empty());
+    ctrl.handle(tick(10_001)); // rung 1: confirm re-click
+    assert_eq!(
+        ctrl.handle(tick(20_001)),
+        vec![Action::Recover(Recovery::Buy {
+            targets: vec![target(3, Some(102))]
+        })]
+    );
+}
+
+#[test]
+fn halt_clears_the_expectation() {
+    let mut ctrl = recovering(Limits::default());
+    ctrl.handle(snap(with_ids(dud_shop(None)), 1));
+    ctrl.handle(Event::Stop);
+    assert_eq!(ctrl.expectation, None);
+    assert!(ctrl.handle(tick(10_001)).is_empty());
+}
+
+#[test]
+fn restart_carries_no_stale_expectation() {
+    let mut ctrl = recovering(Limits::default());
+    ctrl.handle(snap(with_ids(dud_shop(None)), 1));
+    ctrl.handle(Event::Stop);
+    ctrl.handle(Event::Start { now_ms: 2 });
+    // No refresh issued yet in this session: a leftover deadline firing
+    // here would recover a click nobody sent.
+    assert_eq!(ctrl.expectation, None);
+    assert!(ctrl.handle(tick(10_001)).is_empty());
+    assert_eq!(ctrl.status(), Status::Watching);
+}
+
+#[test]
+fn max_matches_resolution_halt_clears_the_expectation() {
+    // The pause resolves by buying, then the resume gate halts on the
+    // reached limit: the halt must also disarm the purchase deadline.
+    let mut ctrl = recovering(Limits {
+        max_matches: Some(1),
+        ..Limits::default()
+    });
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1)); // Purchase armed
+    assert_eq!(
+        ctrl.handle(buy(102, 2)),
+        vec![Action::Halt(StopReason::MaxMatches)]
+    );
+    assert_eq!(ctrl.expectation, None);
+    assert!(ctrl.handle(tick(20_000)).is_empty());
+}
+
+#[test]
+fn timeout_beats_the_watchdog_on_the_same_tick() {
+    // Both the session timer and the watchdog deadline lapse on the same
+    // tick: the honest label is the player's own limit, not the game's
+    // silence.
+    let mut ctrl = recovering(Limits {
+        max_duration_ms: Some(10_001),
+        ..Limits::default()
+    });
+    ctrl.handle(snap(with_ids(hit_shop(None)), 1)); // Paused, both at 10_001
+    assert_eq!(
+        ctrl.handle(tick(10_001)),
+        vec![Action::Halt(StopReason::Timeout)]
+    );
+
+    // Same while Watching on a refresh in flight.
+    let mut ctrl = recovering(Limits {
+        max_duration_ms: Some(10_001),
+        ..Limits::default()
+    });
+    ctrl.handle(snap(with_ids(dud_shop(None)), 1));
+    assert_eq!(
+        ctrl.handle(tick(10_001)),
+        vec![Action::Halt(StopReason::Timeout)]
+    );
+}
+
+#[test]
+fn link_down_suspends_the_watchdog() {
+    // The reconnect backoff caps above the whole ladder: left running, an
+    // outage would escalate into a paid double-roll and a halt blaming the
+    // game.
+    let mut ctrl = recovering(Limits::default());
+    ctrl.handle(snap(with_ids(dud_shop(None)), 1));
+    assert!(ctrl.handle(Event::LinkDown).is_empty());
+    assert!(ctrl.handle(tick(50_000)).is_empty());
+    assert_eq!(ctrl.status(), Status::Watching);
+}
+
+#[test]
+fn link_up_regrants_a_full_deadline() {
+    let mut ctrl = recovering(Limits::default());
+    ctrl.handle(snap(with_ids(dud_shop(None)), 1));
+    // One rung climbed before the outage.
+    assert_eq!(
+        ctrl.handle(tick(10_001)),
+        vec![Action::Recover(Recovery::ConfirmRefresh)]
+    );
+    ctrl.handle(Event::LinkDown);
+    assert!(ctrl.handle(tick(25_000)).is_empty());
+    // Back up: a full fresh window, but the climbed rung is kept — the
+    // retry never got its answer, so the next miss escalates.
+    assert!(ctrl.handle(Event::LinkUp { now_ms: 25_000 }).is_empty());
+    assert!(ctrl.handle(tick(34_999)).is_empty());
+    assert_eq!(
+        ctrl.handle(tick(35_000)),
+        vec![Action::Recover(Recovery::Refresh)]
+    );
+}
+
+#[test]
+fn purchase_echo_while_watching_leaves_snapshot_expectation_alone() {
+    // A stray echo (an unmatched manual buy) is not the proof a refresh
+    // waits on: only a snapshot may clear or re-arm it.
+    let mut ctrl = recovering(Limits::default());
+    ctrl.handle(snap(with_ids(dud_shop(None)), 1));
+    assert!(ctrl.handle(buy(999, 2)).is_empty());
+    assert_eq!(
+        ctrl.handle(tick(10_001)),
+        vec![Action::Recover(Recovery::ConfirmRefresh)]
+    );
 }

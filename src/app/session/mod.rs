@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::actuator::plan::{self, Trigger};
 use crate::actuator::{ActuatorHandle, Mode};
-use crate::domain::control::{Action, BuyTarget, Controller, Event, Status};
+use crate::domain::control::{Action, BuyTarget, Controller, Event, Recovery, Status};
 use crate::journal::EventLog;
 use crate::render::{describe, format_item, refusal, render_shop, status_label};
 use crate::uplink::UplinkEvent;
@@ -58,11 +58,18 @@ pub(super) async fn session_loop(
                 }
                 // An armed watch with a dead link looks exactly like a closed
                 // shop: without these lines the player cannot tell them apart.
-                Some(UplinkEvent::LinkDown(reason)) => journal.emit(
-                    &[format!(">> server link down: {reason} — retrying, no shop can arrive")],
-                ),
+                // The controller is told too: the watchdog must not escalate
+                // over a dead wire.
+                Some(UplinkEvent::LinkDown(reason)) => {
+                    journal.emit(
+                        &[format!(">> server link down: {reason} — retrying, no shop can arrive")],
+                    );
+                    dispatch(controller, gate, journal, actuator, Event::LinkDown, now_ms());
+                }
                 Some(UplinkEvent::LinkUp) => {
                     journal.emit(&[">> server link restored".to_owned()]);
+                    let now = now_ms();
+                    dispatch(controller, gate, journal, actuator, Event::LinkUp { now_ms: now }, now);
                 }
                 None => break, // uplink gone.
             },
@@ -323,6 +330,19 @@ fn apply(
                 render_match(&mut lines, targets, controller);
                 submit_buys(&mut lines, controller, actuator, trigger, targets, now_ms);
             }
+            // Journal-only until the actuation wiring lands: the watchdog
+            // narrates its rungs even before it can click.
+            Action::Recover(recovery) => lines.push(
+                match recovery {
+                    Recovery::ConfirmRefresh => {
+                        ">> watchdog: no shop after refresh — re-clicking confirm"
+                    }
+                    Recovery::ConfirmBuy => ">> watchdog: no purchase echo — re-clicking confirm",
+                    Recovery::Refresh => ">> watchdog: re-issuing the refresh",
+                    Recovery::Buy { .. } => ">> watchdog: re-issuing buys",
+                }
+                .to_owned(),
+            ),
             Action::Halt(reason) => lines.push(format!(">> stopped: {}", describe(*reason))),
             Action::Refused(reason) => lines.push(format!(">> refused: {}", refusal(*reason))),
         }
