@@ -111,10 +111,12 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
     let result = eframe::run_native(
         "Arkyve Refresh Shop",
         eframe::NativeOptions {
-            viewport: eframe::egui::ViewportBuilder::default().with_inner_size([640.0, 640.0]),
+            viewport: eframe::egui::ViewportBuilder::default()
+                .with_inner_size([720.0, 680.0])
+                .with_min_inner_size([520.0, 420.0]),
             ..Default::default()
         },
-        Box::new(move |_cc| Ok(Box::new(ui::ShopApp::new(handles, error)))),
+        Box::new(move |cc| Ok(Box::new(ui::ShopApp::new(cc, handles, error)))),
     );
     // Not a plain drop: tokio::io::stdin parks a blocking thread, and dropping
     // the runtime would hang window close until the player presses Enter.

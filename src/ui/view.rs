@@ -8,6 +8,9 @@ use crate::render::{describe, format_item, kind_label, merchant_label, status_la
 /// controller lock, rendered after the guard is dropped.
 pub struct ViewState {
     pub status: &'static str,
+    /// The raw status (with its `StopReason`), for the status color — the
+    /// label above stays the source of the wording.
+    pub status_kind: Status,
     pub stop_reason: Option<&'static str>,
     pub capture_on: bool,
     pub progress: Progress,
@@ -62,6 +65,7 @@ pub fn view_state(controller: &Controller, capture_on: bool) -> ViewState {
         .unwrap_or_default();
     ViewState {
         status: status_label(controller),
+        status_kind: controller.status(),
         stop_reason,
         capture_on,
         progress: controller.progress(),
@@ -77,7 +81,7 @@ pub fn view_state(controller: &Controller, capture_on: bool) -> ViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::control::Event;
+    use crate::domain::control::{Event, StopReason};
     use crate::domain::filter::Filter;
     use crate::domain::shop::{PurchaseLimit, RefreshMeta, ShopItem, ShopSnapshot};
 
@@ -97,6 +101,7 @@ mod tests {
     fn view_state_on_fresh_controller_is_idle_and_empty() {
         let view = view_state(&controller(), false);
         assert!(view.status.contains("idle"));
+        assert_eq!(view.status_kind, Status::Idle);
         assert_eq!(view.stop_reason, None);
         assert!(!view.capture_on);
         assert!(view.rows.is_empty());
@@ -249,6 +254,7 @@ mod tests {
         ctrl.handle(Event::Stop);
         let view = view_state(&ctrl, false);
         assert!(view.status.contains("stopped"));
+        assert_eq!(view.status_kind, Status::Stopped(StopReason::PlayerStopped));
         assert_eq!(view.stop_reason, Some("player stopped"));
     }
 
