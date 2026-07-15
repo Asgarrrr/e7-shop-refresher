@@ -283,61 +283,333 @@ fn stop_body(ui: &mut egui::Ui, editor: &mut EditorState) {
         });
 }
 
-/// Click timing: a random extra-wait range (min..max ms) per action, drawn
-/// fresh each time and added on top of the tuned baseline shown beside it.
-/// Folded by default (via `edit_setup`) — expert tuning, out of the way.
+/// Click timing: each click waits a fixed tuned delay, plus a random extra the
+/// player dials in on top so the loop never clicks like a metronome. One
+/// draggable bar per action on a shared time ruler — a solid segment for the
+/// fixed wait, a bright segment for the random extra — grouped by phase. Folded
+/// by default (via `edit_setup`).
 fn timing_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     let t = &mut editor.timings;
-    ui.weak("random extra delay (min..max ms) added on top of each tuned baseline");
+    ui.weak("Every click waits a fixed tuned delay, plus a random extra you add — drag a bar to give that click more human slack.");
+    ui.add_space(theme::SP_SM);
+    timing_legend(ui);
+    ui.add_space(theme::SP_SM);
+    routine_timeline(ui, t);
+    ui.add_space(theme::SP_SM);
+    timing_group(
+        ui,
+        "Open & refresh",
+        &mut [
+            ("shop opens", &mut t.shop_opened, plan::WAIT_SHOP_OPENED_MS),
+            ("paid refresh", &mut t.refreshed, plan::WAIT_REFRESHED_MS),
+            (
+                "confirm refresh",
+                &mut t.confirm_refresh_modal,
+                plan::WAIT_CONFIRM_REFRESH_MODAL_MS,
+            ),
+        ],
+    );
+    timing_group(
+        ui,
+        "Buy",
+        &mut [
+            ("confirm buy", &mut t.buy_modal, plan::WAIT_BUY_MODAL_MS),
+            (
+                "between buys",
+                &mut t.between_buys,
+                plan::WAIT_BETWEEN_BUYS_MS,
+            ),
+            (
+                "after a scroll",
+                &mut t.scroll_settle,
+                plan::WAIT_SCROLL_SETTLE_MS,
+            ),
+            (
+                "after a purchase",
+                &mut t.purchase_resumed,
+                plan::WAIT_PURCHASE_RESUMED_MS,
+            ),
+        ],
+    );
+    timing_group(
+        ui,
+        "Recovery",
+        &mut [("watchdog re-issue", &mut t.recovery, plan::WAIT_RECOVERY_MS)],
+    );
+}
+
+/// Names the two segments of every meter so the bars read at a glance: a muted
+/// swatch for the fixed tuned wait, a bright one for the random extra.
+fn timing_legend(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        legend_swatch(ui, theme::METER_BASE, "fixed tuned wait");
+        ui.add_space(theme::SP_XL);
+        legend_swatch(ui, theme::ACCENT, "random extra");
+    });
+}
+
+/// One legend entry: a small rounded colour chip followed by its label.
+fn legend_swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
+    let (chip, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(chip, egui::CornerRadius::same(3), color);
+    ui.weak(label);
+}
+
+/// The distinct waits a single find-and-buy pass strings together, in click
+/// order: the paid refresh, its confirm, the buy (the wait before its confirm),
+/// and the resume. Shop-open (once), scroll / between-buys (multi-item) and the
+/// watchdog (only on a miss) sit outside this steady loop, so the timeline stays
+/// an honest "typical pass".
+const ROUTINE: [(&str, u64); 4] = [
+    ("refresh", plan::WAIT_REFRESHED_MS),
+    ("confirm", plan::WAIT_CONFIRM_REFRESH_MODAL_MS),
+    ("buy", plan::WAIT_BUY_MODAL_MS),
+    ("resume", plan::WAIT_PURCHASE_RESUMED_MS),
+];
+
+/// A one-glance summary: the whole find-and-buy pass as a single stacked bar,
+/// each action a segment sized to its share of the total, with the summed wait
+/// on the right — so the player sees where the routine's time goes, not just the
+/// eight rows in isolation. Uses baselines only (the fixed skeleton); the range
+/// each row adds is tuned below.
+fn routine_timeline(ui: &mut egui::Ui, t: &Timings) {
+    // The per-pass extra each action can add, paired to ROUTINE by position, so
+    // the total reads as a range when the player has dialled in any slack.
+    let slack = [
+        t.refreshed,
+        t.confirm_refresh_modal,
+        t.buy_modal,
+        t.purchase_resumed,
+    ];
+    let base_total: u64 = ROUTINE.iter().map(|(_, b)| b).sum();
+    let hi_total: u64 = base_total + slack.iter().map(|r| r.max_ms.max(r.min_ms)).sum::<u64>();
+
+    ui.horizontal(|ui| {
+        ui.label(theme::section("one refresh + buy"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.weak(secs_range(base_total, hi_total));
+        });
+    });
     ui.add_space(theme::SP_XS);
-    delay_range(
-        ui,
-        "after shop opens",
-        &mut t.shop_opened,
-        plan::WAIT_SHOP_OPENED_MS,
+
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
+    let painter = ui.painter().clone();
+    painter.rect_filled(rect, egui::CornerRadius::same(4), theme::HAIRLINE);
+    // Each action is its own rounded pill sized by its *resolved* share (baseline
+    // + the slack dialled in), so dragging a bar below visibly rebalances this
+    // summary. A clear gap between pills makes the action boundaries unmistakable;
+    // inside a pill the fill uses the same two tones as the bars and the legend —
+    // muted `METER_BASE` for the fixed baseline, bright `ACCENT` for the random
+    // extra — so the colours mean the same thing everywhere, and the split reads
+    // as "within this action" rather than a new segment.
+    let scale = hi_total.max(1) as f32;
+    const GAP: f32 = 4.0;
+    let last = ROUTINE.len() - 1;
+    let mut x = rect.left();
+    for (i, (name, base)) in ROUTINE.iter().enumerate() {
+        let extra = slack[i].max_ms.max(slack[i].min_ms);
+        let seg_ms = base + extra;
+        let seg_w = rect.width() * (seg_ms as f32 / scale);
+        // Each pill ends a gap short of the next (the last reaches the edge).
+        let pill_end = if i == last {
+            rect.right()
+        } else {
+            x + seg_w - GAP
+        };
+        let split = x + (pill_end - x) * (*base as f32 / seg_ms.max(1) as f32);
+        let has_extra = extra > 0 && pill_end > split;
+        let round = egui::CornerRadius::same(5);
+        let square = egui::CornerRadius::ZERO;
+        // Muted fixed head of the pill: left corners always round; right corners
+        // round too only when there is no bright tail to close the pill.
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(split, rect.bottom())),
+            egui::CornerRadius {
+                ne: if has_extra { 0 } else { 5 },
+                se: if has_extra { 0 } else { 5 },
+                ..round
+            },
+            theme::METER_BASE,
+        );
+        if has_extra {
+            // Bright random tail closes the pill's right corners.
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(split, rect.top()),
+                    egui::pos2(pill_end, rect.bottom()),
+                ),
+                egui::CornerRadius {
+                    ne: 5,
+                    se: 5,
+                    ..square
+                },
+                theme::ACCENT,
+            );
+        }
+        // Name centred over the pill when it is wide enough to hold it.
+        if pill_end - x > 52.0 {
+            painter.text(
+                egui::pos2((x + pill_end) * 0.5, rect.center().y),
+                egui::Align2::CENTER_CENTER,
+                *name,
+                egui::FontId::new(11.0, egui::FontFamily::Proportional),
+                theme::INK,
+            );
+        }
+        x += seg_w;
+    }
+    ui.add_space(theme::SP_SM);
+}
+
+/// The meter height and the fixed time ruler the bars sit on. The ruler is
+/// constant (not fitted to the values) so a bar's length is a stable reading of
+/// its wait and every row compares on the same scale; it clears the longest
+/// baseline with room to drag real slack on top. The width is the row's — the
+/// bars fill to the content edge, aligned under a fixed label column.
+const METER_H: f32 = 22.0;
+const RULER_MS: f32 = 2_500.0;
+/// The label column: wide enough for the longest action name ("watchdog
+/// re-issue") so every bar starts at the same x. Painted in an exact-size box so
+/// a long label can never grow the column and shove its bar out of alignment.
+const LABEL_W: f32 = 150.0;
+/// The resolved-time column to the right of every bar: fixed so the values form
+/// an aligned column and never sit over the bar or its grip.
+const VALUE_W: f32 = 96.0;
+
+/// One phase of the timing tab: a small-caps header over its bars.
+fn timing_group(ui: &mut egui::Ui, title: &str, rows: &mut [(&str, &mut DelayRange, u64)]) {
+    ui.label(theme::section(title));
+    ui.add_space(theme::SP_XS);
+    for (label, value, baseline) in rows.iter_mut() {
+        timing_row(ui, label, value, *baseline);
+    }
+    ui.add_space(theme::SP_SM);
+}
+
+/// One action row: a fixed-width label column, the bar filling the middle, and a
+/// fixed-width resolved-time column on the right — so every bar aligns, and the
+/// values line up in their own column instead of floating over the bars.
+fn timing_row(ui: &mut egui::Ui, label: &str, value: &mut DelayRange, baseline: u64) {
+    ui.horizontal(|ui| {
+        // Exact-size box + painted label: a plain `ui.label` grows its cell to
+        // the text, so the longest name would push its bar right of the others.
+        // Allocating the column and painting into it pins every bar's start.
+        let (label_rect, _) =
+            ui.allocate_exact_size(egui::vec2(LABEL_W, METER_H), egui::Sense::hover());
+        ui.painter().with_clip_rect(label_rect).text(
+            egui::pos2(label_rect.left(), label_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+            theme::INK_MUTED,
+        );
+        let bar_w = (ui.available_width() - VALUE_W - theme::SP_SM).max(80.0);
+        timing_meter(ui, bar_w, baseline, value);
+        ui.allocate_ui_with_layout(
+            egui::vec2(VALUE_W, METER_H),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.monospace(resolved_band(baseline, value));
+            },
+        );
+    });
+}
+
+/// One action's bar: a draggable meter on the shared ruler. The tuned baseline
+/// is a muted fixed segment; dragging past it grows the bright random-extra
+/// segment (the `max` of the range, drawn fresh in `[min, max]` at runtime).
+/// Drag-to-set replaces the old min/max boxes — one gesture, and the bar is the
+/// control. The resolved wait is shown in the row's value column, not inside, so
+/// the grip never cuts through it.
+fn timing_meter(ui: &mut egui::Ui, width: f32, baseline: u64, value: &mut DelayRange) {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, METER_H), egui::Sense::click_and_drag());
+
+    // Drag or click sets the random extra: the pointer's x is the target total
+    // wait on the ruler, and the slack is whatever sits past the fixed baseline
+    // (never negative, never past the ruler's end).
+    if let Some(pos) = response.interact_pointer_pos() {
+        let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let target_ms = frac * RULER_MS;
+        let slack = (target_ms - baseline as f32).clamp(0.0, RULER_MS - baseline as f32);
+        value.max_ms = slack.round() as u64;
+        // Keep the invariant a config floor could otherwise break: min never
+        // exceeds the max the player just set.
+        value.min_ms = value.min_ms.min(value.max_ms);
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+
+    let painter = ui.painter().clone();
+    let radius = egui::CornerRadius::same(4);
+    painter.rect_filled(rect, radius, theme::HAIRLINE);
+    let total = baseline + value.max_ms.max(value.min_ms);
+    let base_w = rect.width() * (baseline as f32 / RULER_MS);
+    let total_w = rect.width() * (total as f32 / RULER_MS);
+    painter.rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(base_w, rect.height())),
+        radius,
+        theme::METER_BASE,
     );
-    delay_range(
-        ui,
-        "after paid refresh",
-        &mut t.refreshed,
-        plan::WAIT_REFRESHED_MS,
+    if total_w > base_w {
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left() + base_w, rect.top()),
+                egui::pos2(rect.left() + total_w, rect.bottom()),
+            ),
+            radius,
+            theme::ACCENT,
+        );
+    }
+    // Faint second-marks so the empty right of a bar reads as a time ruler you
+    // drag along, not dead space. Painted over the fills, subtle enough not to
+    // compete with them.
+    for mark_ms in [1_000.0_f32, 2_000.0] {
+        let x = rect.left() + rect.width() * (mark_ms / RULER_MS);
+        painter.vline(
+            x,
+            rect.y_range(),
+            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(18)),
+        );
+    }
+    // The grip sits at the draggable edge (the end of the slack, or the baseline
+    // when there is none) — a bright cap that reads as "grab here to add slack".
+    let grip_x = (rect.left() + total_w).clamp(rect.left() + 2.0, rect.right() - 2.0);
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(grip_x - 2.0, rect.top() + 2.0),
+            egui::pos2(grip_x + 2.0, rect.bottom() - 2.0),
+        ),
+        egui::CornerRadius::same(2),
+        theme::INK,
     );
-    delay_range(
-        ui,
-        "after a purchase",
-        &mut t.purchase_resumed,
-        plan::WAIT_PURCHASE_RESUMED_MS,
-    );
-    delay_range(
-        ui,
-        "watchdog re-issue",
-        &mut t.recovery,
-        plan::WAIT_RECOVERY_MS,
-    );
-    delay_range(
-        ui,
-        "refresh → confirm",
-        &mut t.confirm_refresh_modal,
-        plan::WAIT_CONFIRM_REFRESH_MODAL_MS,
-    );
-    delay_range(
-        ui,
-        "buy → confirm",
-        &mut t.buy_modal,
-        plan::WAIT_BUY_MODAL_MS,
-    );
-    delay_range(
-        ui,
-        "between buys",
-        &mut t.between_buys,
-        plan::WAIT_BETWEEN_BUYS_MS,
-    );
-    delay_range(
-        ui,
-        "after a scroll",
-        &mut t.scroll_settle,
-        plan::WAIT_SCROLL_SETTLE_MS,
-    );
+}
+
+/// The resolved wait the game will actually take: `baseline + min` to
+/// `baseline + max`, in seconds. A point range (no slack, or a reversed one)
+/// collapses to a single figure, matching the draw.
+fn resolved_band(baseline: u64, value: &DelayRange) -> String {
+    let lo = baseline + value.min_ms;
+    let hi = baseline + value.max_ms.max(value.min_ms);
+    secs_range(lo, hi)
+}
+
+/// `lo..hi` milliseconds as seconds; a zero-width range shows one figure. The
+/// one place the timing UI turns ms into the `x.xx s` / `x.xx–y.yy s` reading,
+/// shared by the per-action bars and the routine total.
+fn secs_range(lo_ms: u64, hi_ms: u64) -> String {
+    if lo_ms == hi_ms {
+        format!("{:.2} s", lo_ms as f64 / 1000.0)
+    } else {
+        format!(
+            "{:.2}–{:.2} s",
+            lo_ms as f64 / 1000.0,
+            hi_ms as f64 / 1000.0
+        )
+    }
 }
 
 /// The single commit: one primary Apply that sends every draft that moved and
@@ -384,32 +656,6 @@ fn commit_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
     ui.add_space(theme::SP_XS);
     ui.weak("edits apply to this session only — config.toml is unchanged");
     commands
-}
-
-/// One extra-wait row: min and max drags (0-floored) with the tuned baseline
-/// shown as a hint, so the player reads the range added on top of it. `max`
-/// is floored at `min` only when a drag actually moves, so a reversed
-/// config-seeded range is left untouched (never a phantom "dirty" on arrival).
-fn delay_range(ui: &mut egui::Ui, label: &str, value: &mut DelayRange, baseline: u64) {
-    ui.horizontal(|ui| {
-        let min = ui.add(
-            egui::DragValue::new(&mut value.min_ms)
-                .range(0..=u64::MAX)
-                .prefix("min ")
-                .suffix(" ms"),
-        );
-        let max = ui.add(
-            egui::DragValue::new(&mut value.max_ms)
-                .range(0..=u64::MAX)
-                .prefix("max ")
-                .suffix(" ms"),
-        );
-        if min.changed() || max.changed() {
-            value.max_ms = value.max_ms.max(value.min_ms);
-        }
-        ui.label(label);
-        ui.weak(format!("(+{baseline} base)"));
-    });
 }
 
 /// Row remove control: a `✕` on a 24px-square target. `small_button` gave an
@@ -624,18 +870,18 @@ mod tests {
     #[test]
     fn timing_section_folds_its_body_until_opened() {
         // Click timing arrives folded, so its rows are hidden; clicking the bar
-        // reveals them (a delay row's baseline hint is a body-only label). While
-        // folded, the bar's accessible name trails its summary peek.
+        // reveals them (a phase header is a body-only label). While folded, the
+        // bar's accessible name trails its summary peek.
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         let mut harness = Harness::new_ui(|ui| {
             edit_setup(ui, &mut editor);
         });
-        assert!(harness.query_by_label("(+780 base)").is_none());
+        assert!(harness.query_by_label("OPEN & REFRESH").is_none());
         harness
             .get_by_label("Click timing · no extra delay")
             .click();
         harness.run();
-        harness.get_by_label("(+780 base)");
+        harness.get_by_label("OPEN & REFRESH");
     }
 
     #[test]

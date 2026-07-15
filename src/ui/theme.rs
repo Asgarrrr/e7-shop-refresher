@@ -39,6 +39,10 @@ const RED: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
 /// Matched rows in the shop table: brighter than the status green so it
 /// stays legible as body text on the panel.
 pub(super) const WANTED: Color32 = Color32::from_rgb(0x90, 0xee, 0x90);
+/// The tuned-baseline fill of a timing meter: a muted steel blue that reads as
+/// "fixed by the tool", so the bright `ACCENT` slack painted past it stands out
+/// as the part the player controls.
+pub(super) const METER_BASE: Color32 = Color32::from_rgb(0x2c, 0x42, 0x60);
 
 /// Spacing scale (4px grid). Every gap the layout inserts comes from here, so
 /// the vertical rhythm reads as one system instead of a drift of hand-picked
