@@ -2,7 +2,7 @@
 //! shows, copied under a single short lock.
 
 use crate::domain::control::{Controller, Limits, Progress, Status};
-use crate::render::{format_item, kind_label, merchant_label, status_summary};
+use crate::render::{format_item, haul_tally, kind_label, status_summary};
 
 /// Plain per-frame copy of everything the window shows; built under the
 /// controller lock, rendered after the guard is dropped.
@@ -17,7 +17,6 @@ pub struct ViewState {
     pub status_kind: Status,
     pub progress: Progress,
     pub limits: Limits,
-    pub merchant: String,
     /// From the controller's enforced meta (debited per advised refresh,
     /// cleared on restart) — not the raw snapshot, which can be stale. The
     /// game calls these "skystones"; the code says "crystals".
@@ -30,6 +29,11 @@ pub struct ViewState {
     /// mid-session.
     pub has_snapshot: bool,
     pub rows: Vec<SlotRow>,
+    /// Confirmed buys this run, per headline token (label, count), in order —
+    /// shown even at zero once a run exists, so the player sees the target.
+    pub haul: [(&'static str, u32); 2],
+    /// Everything else bought this run, folded into one "+N other" bucket.
+    pub haul_others: u32,
 }
 
 /// One shop slot as the table shows it.
@@ -48,6 +52,7 @@ pub struct SlotRow {
 /// Pure extraction: the caller holds the controller lock only for this call.
 pub fn view_state(controller: &Controller) -> ViewState {
     let (status_word, status_hint) = status_summary(controller);
+    let (haul, haul_others) = haul_tally(controller.haul());
     let checklist = controller.checklist();
     let snapshot = controller.last_snapshot();
     let rows = snapshot
@@ -74,12 +79,12 @@ pub fn view_state(controller: &Controller) -> ViewState {
         status_kind: controller.status(),
         progress: controller.progress(),
         limits: controller.limits().clone(),
-        merchant: merchant_label(snapshot.and_then(|snapshot| snapshot.merchant.as_deref()))
-            .to_owned(),
         crystal_balance: controller.refresh_meta().map(|meta| meta.crystal_balance),
         gold_balance: controller.gold_balance(),
         has_snapshot: snapshot.is_some(),
         rows,
+        haul,
+        haul_others,
     }
 }
 
@@ -110,7 +115,6 @@ mod tests {
         assert_eq!(view.status_kind, Status::Idle);
         assert!(!view.has_snapshot);
         assert!(view.rows.is_empty());
-        assert_eq!(view.merchant, "Secret Shop");
         assert_eq!(view.crystal_balance, None);
         assert_eq!(view.gold_balance, None);
     }
@@ -197,7 +201,6 @@ mod tests {
             now_ms: 0,
         });
         let view = view_state(&ctrl);
-        assert_eq!(view.merchant, "Secret Shop");
         assert_eq!(view.crystal_balance, Some(95));
     }
 

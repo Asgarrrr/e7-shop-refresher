@@ -1,16 +1,64 @@
 //! Player-facing text for domain state: one wording shared by the console
 //! and the window.
 
+#[cfg(feature = "gui")]
+use crate::domain::control::Haul;
 use crate::domain::control::{Controller, RefusalReason, Status, StopReason};
 use crate::domain::shop::{ItemKind, ShopItem, ShopSnapshot};
 
+/// The hunt tokens worth naming in the haul readout — the covenant bookmark and
+/// mystic medal 90% of players chase. Wire name → display label, in headline
+/// order. Every other bought item is bucketed into "+N other". Only the window
+/// renders the haul (and the Setup tab's quick-add), so this display policy is
+/// gated with it.
+#[cfg(feature = "gui")]
+pub(crate) const HAUL_HEADLINERS: [(&str, &str); 2] = [
+    ("ticketrare_name", "Covenant"),
+    ("ticketspecial_name", "Mystic"),
+];
+
+/// The haul as the readout shows it: the headline tokens with their counts (in
+/// order, shown even at zero so the player sees what's hunted), and the count
+/// of everything else bought this run.
+#[cfg(feature = "gui")]
+pub(crate) fn haul_tally(haul: &Haul) -> ([(&'static str, u32); 2], u32) {
+    let named = HAUL_HEADLINERS.map(|(wire, label)| (label, haul.count(wire)));
+    let known = HAUL_HEADLINERS.map(|(wire, _)| wire);
+    (named, haul.others(&known))
+}
+
 pub(crate) fn kind_label(kind: ItemKind) -> &'static str {
     match kind {
-        ItemKind::Equipment => "equipment",
-        ItemKind::Hero => "hero",
-        ItemKind::Token => "token",
+        ItemKind::Equipment => "Equipment",
+        ItemKind::Hero => "Hero",
+        ItemKind::Token => "Token",
         ItemKind::Unknown => "?",
     }
+}
+
+/// Thousands-grouped decimal (`1234567` -> `1,234,567`); the stdlib has no
+/// locale-free grouping to lean on. Shared by the status-bar balances, the
+/// slot table's prices, and the console item line so every number reads the
+/// same.
+pub(crate) fn grouped(n: u32) -> String {
+    let digits = n.to_string();
+    let len = digits.len();
+    let mut out = String::with_capacity(len + (len - 1) / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (len - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A grouped balance/price, or an em-dash while the value is unknown. The one
+/// `Option<u32>` readout shared by the status-bar balance tiles and the slot
+/// table's price column, so an absent value reads the same in both.
+#[cfg(feature = "gui")]
+pub(crate) fn grouped_or_dash(value: Option<u32>) -> String {
+    value.map_or_else(|| "—".to_owned(), grouped)
 }
 
 /// The state word (title-cased for display) and an optional clause, split so
@@ -93,7 +141,7 @@ pub(crate) fn format_item(item: &ShopItem, index: usize) -> String {
         line.push_str(&format!(" · grade {grade}"));
     }
     if let Some(price) = item.price {
-        line.push_str(&format!(" · {price} gold"));
+        line.push_str(&format!(" · {} gold", grouped(price)));
     }
     if !item.substats.is_empty() {
         let stats: Vec<String> = item
@@ -124,10 +172,28 @@ mod tests {
 
     #[test]
     fn kind_label_names_each_kind() {
-        assert_eq!(kind_label(ItemKind::Equipment), "equipment");
-        assert_eq!(kind_label(ItemKind::Hero), "hero");
-        assert_eq!(kind_label(ItemKind::Token), "token");
+        assert_eq!(kind_label(ItemKind::Equipment), "Equipment");
+        assert_eq!(kind_label(ItemKind::Hero), "Hero");
+        assert_eq!(kind_label(ItemKind::Token), "Token");
         assert_eq!(kind_label(ItemKind::Unknown), "?");
+    }
+
+    #[test]
+    fn grouped_inserts_thousands_separators() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(88), "88");
+        assert_eq!(grouped(1_000), "1,000");
+        assert_eq!(grouped(1_234_567), "1,234,567");
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn haul_tally_names_the_headline_tokens_even_when_empty() {
+        // A fresh run: the two hunt tokens are still listed (at zero, so the
+        // player sees the target), and nothing sits in the bucket.
+        let (named, others) = haul_tally(&Haul::default());
+        assert_eq!(named, [("Covenant", 0), ("Mystic", 0)]);
+        assert_eq!(others, 0);
     }
 
     #[test]

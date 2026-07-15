@@ -12,8 +12,9 @@ use crate::domain::control::{Status, StopReason};
 const PAGE: Color32 = Color32::from_rgb(0x0d, 0x0d, 0x0d);
 /// Panel background.
 const PANEL: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x19);
-/// Table stripes: one step above the panel, visible but quiet.
-const STRIPE: Color32 = Color32::from_rgb(0x22, 0x22, 0x21);
+/// Row hover: one step above the panel, quiet enough to read as a highlight,
+/// not a fill. (Also egui's `faint_bg_color`.)
+pub(super) const STRIPE: Color32 = Color32::from_rgb(0x22, 0x22, 0x21);
 /// Accent: selection, links, the active tab's underline, the primary button.
 pub(super) const ACCENT: Color32 = Color32::from_rgb(0x39, 0x87, 0xe5);
 /// Accent under the pointer.
@@ -24,10 +25,11 @@ const ACCENT_PRESSED: Color32 = Color32::from_rgb(0x2f, 0x74, 0xc9);
 pub(super) const INK: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
 /// Secondary ink (static labels, counters, inactive tabs).
 pub(super) const INK_MUTED: Color32 = Color32::from_rgb(0xc3, 0xc2, 0xb7);
-/// Tertiary ink: hints, and the color of a state nobody needs to act on.
-const INK_FAINT: Color32 = Color32::from_rgb(0x89, 0x87, 0x81);
-/// Hairline strokes and separators.
-const HAIRLINE: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2a);
+/// Tertiary ink: hints, the journal caret, and the color of a state nobody
+/// needs to act on.
+pub(super) const INK_FAINT: Color32 = Color32::from_rgb(0x89, 0x87, 0x81);
+/// Hairline strokes and separators (panel dividers, the table's header rule).
+pub(super) const HAIRLINE: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2a);
 /// Watching: the loop is doing its job.
 const GREEN: Color32 = Color32::from_rgb(0x0c, 0xa3, 0x0c);
 /// Paused, and stops the player planned (limits).
@@ -37,6 +39,19 @@ const RED: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
 /// Matched rows in the shop table: brighter than the status green so it
 /// stays legible as body text on the panel.
 pub(super) const WANTED: Color32 = Color32::from_rgb(0x90, 0xee, 0x90);
+
+/// Spacing scale (4px grid). Every gap the layout inserts comes from here, so
+/// the vertical rhythm reads as one system instead of a drift of hand-picked
+/// numbers. Named by size, applied by role at the call site.
+pub(super) const SP_XS: f32 = 4.0;
+pub(super) const SP_SM: f32 = 8.0;
+pub(super) const SP_XL: f32 = 24.0;
+
+/// Horizontal inset for tab content: full-width rules and row-hover fills bleed
+/// to the window edges, but text sits this far in so it never touches them.
+/// Matches the chrome's 16px side margin, so the table text lines up under the
+/// status bar.
+pub(super) const EDGE: i8 = 16;
 
 /// Installs the theme on the context: visuals and text styles. Called once
 /// per window, before the first frame.
@@ -84,11 +99,11 @@ pub(super) fn apply(ctx: &egui::Context) {
             ),
             (
                 TextStyle::Heading,
-                FontId::new(17.0, FontFamily::Proportional),
+                FontId::new(16.0, FontFamily::Proportional),
             ),
             (
                 TextStyle::Small,
-                FontId::new(11.5, FontFamily::Proportional),
+                FontId::new(11.0, FontFamily::Proportional),
             ),
             (
                 TextStyle::Monospace,
@@ -96,8 +111,10 @@ pub(super) fn apply(ctx: &egui::Context) {
             ),
         ]
         .into();
-        style.spacing.item_spacing = egui::vec2(8.0, 10.0);
-        style.spacing.button_padding = egui::vec2(14.0, 7.0);
+        // On the 4px grid: an even 8px between items, roomy button padding
+        // that reads as a Linear-style pill.
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 8.0);
     });
 }
 
@@ -124,9 +141,118 @@ pub(super) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         widgets.hovered.weak_bg_fill = ACCENT_HOVER;
         widgets.hovered.bg_stroke = Stroke::NONE;
         widgets.active.weak_bg_fill = ACCENT_PRESSED;
-        ui.add(egui::Button::new(emphasis(text)).min_size(egui::vec2(88.0, 30.0)))
+        ui.add(egui::Button::new(emphasis(text)).min_size(egui::vec2(88.0, 32.0)))
     })
     .inner
+}
+
+/// A full-width collapsible section header in the journal bar's key: a painted
+/// disclosure caret (right = closed, down = open) beside the small-caps title,
+/// the whole bar lighting up on hover and bleeding to the window edges like the
+/// journal, the tab strip, and the shop rules. Text stays inset at the bar's
+/// left; the hover fill spans the clip rect. Painted, not nested widgets, so
+/// nothing steals hover over the bar. Returns true on click.
+///
+/// While collapsed, `summary` trails right-aligned in muted ink — the same
+/// "peek without expanding" the journal bar gives its latest line, so a folded
+/// section still shows what it holds. It rides in the accessible name too
+/// (`title · summary`), so assistive tooling and the tests read it.
+pub(super) fn collapsing_section(
+    ui: &mut egui::Ui,
+    title: &str,
+    summary: Option<&str>,
+    open: bool,
+) -> bool {
+    let (bar, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    // Bleed the fill + hit target to the clip rect (the full column past the
+    // content inset), the same full-width treatment the journal header takes.
+    // Grow the y-range by half the item spacing so consecutive collapsed bars
+    // tile at the seam: without it the fill is only 28px while egui hit-tests a
+    // wider area, so hovering the gap lights a bar the pointer isn't over. The
+    // label stays centred (the growth is symmetric).
+    let pad = ui.spacing().item_spacing.y * 0.5;
+    let full = egui::Rect::from_x_y_ranges(
+        ui.clip_rect().x_range(),
+        egui::Rangef::new(bar.top() - pad, bar.bottom() + pad),
+    );
+    let response = ui.interact(full, ui.id().with(("section", title)), egui::Sense::click());
+    let enabled = ui.is_enabled();
+    let peek = (!open).then_some(()).and(summary);
+    let name = match peek {
+        Some(summary) => format!("{title} · {summary}"),
+        None => title.to_owned(),
+    };
+    response
+        .widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &name));
+
+    // Unlike the journal's deliberately quiet bar, these are the Setup surface's
+    // primary structure: a heading-sized uppercase label in bright ink so they
+    // read as titles, not muted hints. The caret trails one step down so the
+    // word leads; hover lifts both to full ink over the fill.
+    let hovered = response.hovered();
+    let (title_color, caret_color) = if hovered {
+        (INK, INK)
+    } else {
+        (INK_MUTED, INK_FAINT)
+    };
+    if hovered {
+        ui.painter().rect_filled(full, CornerRadius::ZERO, STRIPE);
+    }
+    let painter = ui.painter().with_clip_rect(full);
+    caret(&painter, bar, open, caret_color);
+    let title_rect = painter.text(
+        egui::pos2(bar.left() + 22.0, bar.center().y),
+        egui::Align2::LEFT_CENTER,
+        title.to_uppercase(),
+        FontId::new(13.0, FontFamily::Proportional),
+        title_color,
+    );
+    // The collapsed peek: right-aligned at the content edge, clipped left of the
+    // title so a long summary never crosses it.
+    if let Some(summary) = peek {
+        let region = egui::Rect::from_min_max(
+            egui::pos2(title_rect.right() + SP_SM, bar.top()),
+            egui::pos2(bar.right() - SP_XS, bar.bottom()),
+        );
+        ui.painter().with_clip_rect(region).text(
+            egui::pos2(region.right(), bar.center().y),
+            egui::Align2::RIGHT_CENTER,
+            summary,
+            FontId::new(12.0, FontFamily::Proportional),
+            INK_FAINT,
+        );
+    }
+    // A full-bleed rule at the tiled seam (not the inner bar) anchors the title
+    // the way the shop table's header rule and the tab strip's baseline do — so
+    // the sections read as a divided accordion, and the hover fill stops exactly
+    // at the divider instead of spilling the pad below it into the next row.
+    // Drawn with the unclipped painter so the seam-edge line is not cut.
+    ui.painter()
+        .hline(full.x_range(), full.bottom(), Stroke::new(1.0, HAIRLINE));
+    response.clicked()
+}
+
+/// A small painted disclosure caret at the left of `row` (right = closed, down =
+/// open). Painted, not a `▸` glyph, so it never depends on the stock font
+/// carrying the symbol. Shared by the journal bar and the Setup sections.
+pub(super) fn caret(painter: &egui::Painter, row: egui::Rect, open: bool, color: Color32) {
+    let c = egui::pos2(row.left() + 6.0, row.center().y);
+    let r = 3.5;
+    let points = if open {
+        vec![
+            egui::pos2(c.x - r, c.y - r * 0.5),
+            egui::pos2(c.x + r, c.y - r * 0.5),
+            egui::pos2(c.x, c.y + r),
+        ]
+    } else {
+        vec![
+            egui::pos2(c.x - r * 0.5, c.y - r),
+            egui::pos2(c.x - r * 0.5, c.y + r),
+            egui::pos2(c.x + r, c.y),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
 }
 
 /// The status dot's color. One reading: green = working, amber = waiting on

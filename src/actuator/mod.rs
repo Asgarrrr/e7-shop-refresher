@@ -9,8 +9,8 @@ mod shield;
 #[cfg(all(windows, feature = "actuator"))]
 pub mod win;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -19,7 +19,7 @@ use crate::app::Command;
 use crate::journal::EventLog;
 use crate::watch::WatchGate;
 
-use plan::{Input, Job};
+use plan::{Input, Job, Timings};
 
 /// Generation counter of the shop state, bumped on every shop message. A job
 /// carries the epoch it was planned against and the executor refuses to act
@@ -48,23 +48,56 @@ pub enum Mode {
     Live,
 }
 
-/// The session's grip on the executor: submit jobs, bump the epoch.
+/// The session's grip on the executor: submit jobs, bump the epoch, read and
+/// retune the player's extra waits.
 #[derive(Clone)]
 pub struct ActuatorHandle {
     pub mode: Mode,
     pub epoch: SnapshotEpoch,
     jobs: mpsc::Sender<Job>,
+    /// Shared with [`setup`]'s live-edit path: the session thread swaps this
+    /// on a `SetTimings` command and reads it when building each job. Jobs
+    /// bake the resolved waits at submit time, so the executor never touches
+    /// it.
+    timings: Arc<Mutex<Timings>>,
 }
 
 impl ActuatorHandle {
-    pub fn new(mode: Mode, epoch: SnapshotEpoch, jobs: mpsc::Sender<Job>) -> Self {
-        Self { mode, epoch, jobs }
+    pub fn new(
+        mode: Mode,
+        epoch: SnapshotEpoch,
+        jobs: mpsc::Sender<Job>,
+        timings: Arc<Mutex<Timings>>,
+    ) -> Self {
+        Self {
+            mode,
+            epoch,
+            jobs,
+            timings,
+        }
     }
 
     /// Queues a job for the executor; `false` when the queue is full — the
     /// caller journals the drop, a lost click must not be silent.
     pub fn submit(&self, job: Job) -> bool {
         self.jobs.try_send(job).is_ok()
+    }
+
+    /// The extra waits to bake into the next job, copied out from under the
+    /// lock (never held across a plan build).
+    pub fn timings(&self) -> Timings {
+        *self
+            .timings
+            .lock()
+            .expect("actuator timings mutex poisoned")
+    }
+
+    /// Swaps in the player's retuned waits; the next queued job uses them.
+    pub fn set_timings(&self, timings: Timings) {
+        *self
+            .timings
+            .lock()
+            .expect("actuator timings mutex poisoned") = timings;
     }
 }
 
@@ -332,7 +365,12 @@ mod tests {
     async fn executor_skips_stale_epoch_jobs() {
         let mut rig = rig();
         let (surface, events) = FakeSurface::new(design_rect());
-        let job = plan::refresh_job(Trigger::Refreshed, rig.epoch.current(), 1);
+        let job = plan::refresh_job(
+            Trigger::Refreshed,
+            Timings::default(),
+            rig.epoch.current(),
+            1,
+        );
         rig.epoch.bump(); // a newer shop arrived before the job started
         rig.job_tx.send(job).await.unwrap();
         drop(rig.job_tx);
@@ -362,7 +400,12 @@ mod tests {
         rig.gate.set(false);
         let (surface, events) = FakeSurface::new(design_rect());
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -392,7 +435,12 @@ mod tests {
         let gate = rig.gate.clone();
         surface.on_input = Box::new(move || gate.set(false));
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -425,7 +473,12 @@ mod tests {
         let epoch = rig.epoch.clone();
         surface.on_input = Box::new(move || epoch.bump());
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -453,7 +506,12 @@ mod tests {
         let (surface, events) =
             FakeSurface::new(Err(SurfaceError::Fatal("game window not found".to_owned())));
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -488,7 +546,12 @@ mod tests {
             SurfaceError::Fatal("could not raise the input shield".to_owned()),
         ));
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -524,7 +587,13 @@ mod tests {
         ));
         let releases = surface.releases.clone();
         rig.job_tx
-            .send(plan::buy_job(Trigger::ShopOpened, 0, &[0, 4], 42))
+            .send(plan::buy_job(
+                Trigger::ShopOpened,
+                Timings::default(),
+                0,
+                &[0, 4],
+                42,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -567,7 +636,13 @@ mod tests {
         ));
         let releases = surface.releases.clone();
         rig.job_tx
-            .send(plan::buy_job(Trigger::ShopOpened, 0, &[0, 4], 42))
+            .send(plan::buy_job(
+                Trigger::ShopOpened,
+                Timings::default(),
+                0,
+                &[0, 4],
+                42,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -606,11 +681,21 @@ mod tests {
         ));
         let releases = surface.releases.clone();
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
             .await
             .unwrap();
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 2))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                2,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -644,7 +729,12 @@ mod tests {
         }));
         let releases = surface.releases.clone();
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -678,11 +768,21 @@ mod tests {
         let gate = rig.gate.clone();
         surface.on_input = Box::new(move || gate.set(false));
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
             .await
             .unwrap();
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 2))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                2,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -709,7 +809,12 @@ mod tests {
             height: 800,
         }));
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -739,7 +844,12 @@ mod tests {
         let mut rig = rig();
         let (surface, events) = FakeSurface::new(design_rect());
         rig.job_tx
-            .send(plan::refresh_job(Trigger::Refreshed, 0, 1))
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
             .await
             .unwrap();
         drop(rig.job_tx);
@@ -776,7 +886,7 @@ mod tests {
             height: 1080,
         };
         let (surface, events) = FakeSurface::new(Ok(rect));
-        let job = plan::buy_job(Trigger::ShopOpened, 0, &[1], 42);
+        let job = plan::buy_job(Trigger::ShopOpened, Timings::default(), 0, &[1], 42);
         let expected: Vec<Recorded> = job
             .steps
             .iter()

@@ -4,6 +4,8 @@
 //!
 //! Coordinates are in the game's 1280×720 design space, origin top-left.
 
+use serde::Deserialize;
+
 const DESIGN_W: f32 = 1280.0;
 const DESIGN_H: f32 = 720.0;
 
@@ -13,17 +15,19 @@ pub const MAX_ASPECT: f32 = 2.194;
 
 // Block-animation waits (dispatch margin included): the game ignores input
 // while the matching animation runs, so every step waits before it acts.
-const WAIT_SHOP_OPENED_MS: u64 = 1_180;
-const WAIT_REFRESHED_MS: u64 = 780;
-const WAIT_PURCHASE_RESUMED_MS: u64 = 400;
+// Public because the Setup editor shows each as the baseline its extra-delay
+// range adds onto — one source of truth, no hand-copied hints.
+pub const WAIT_SHOP_OPENED_MS: u64 = 1_180;
+pub const WAIT_REFRESHED_MS: u64 = 780;
+pub const WAIT_PURCHASE_RESUMED_MS: u64 = 400;
 /// A watchdog retry fires into an idle game (the awaited animation never
 /// played): dispatch margin only.
-const WAIT_RECOVERY_MS: u64 = 400;
-const WAIT_CONFIRM_REFRESH_MODAL_MS: u64 = 270;
-const WAIT_BUY_MODAL_MS: u64 = 150;
-const WAIT_BETWEEN_BUYS_MS: u64 = 600;
+pub const WAIT_RECOVERY_MS: u64 = 400;
+pub const WAIT_CONFIRM_REFRESH_MODAL_MS: u64 = 270;
+pub const WAIT_BUY_MODAL_MS: u64 = 150;
+pub const WAIT_BETWEEN_BUYS_MS: u64 = 600;
 /// A wheel scroll blocks nothing: only input-dispatch time before the click.
-const WAIT_SCROLL_SETTLE_MS: u64 = 100;
+pub const WAIT_SCROLL_SETTLE_MS: u64 = 100;
 
 /// Wheel notches for one scroll-to-extreme — generous on purpose: the list
 /// clamps, so overshooting is free and the resulting position deterministic.
@@ -172,6 +176,96 @@ impl Trigger {
     }
 }
 
+/// An inclusive extra-wait range, in milliseconds. Each resolved wait draws a
+/// uniform value in `[min_ms, max_ms]` and adds it to a tuned baseline, so the
+/// loop's pauses vary like a human's instead of being byte-identical every
+/// time. The default (`0..=0`) reproduces the calibrated timing exactly; the
+/// baseline is the floor, so a range only ever slows the loop down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DelayRange {
+    pub min_ms: u64,
+    pub max_ms: u64,
+}
+
+impl DelayRange {
+    /// A uniform draw in `[min_ms, max_ms]`; a reversed range is read as a
+    /// point at `min_ms` (an obvious misconfiguration never widens the draw).
+    fn draw(&self, jitter: &mut Jitter) -> u64 {
+        let span = self.max_ms.saturating_sub(self.min_ms);
+        if span == 0 {
+            return self.min_ms;
+        }
+        // The modulus is `span + 1` (inclusive range). A full-u64 span
+        // (`min_ms = 0, max_ms = u64::MAX`) overflows that add — but there the
+        // whole domain is in range, so the raw sample is already a valid draw.
+        // Without this guard a `max_ms = u64::MAX` config would panic (`% 0`).
+        match span.checked_add(1) {
+            Some(modulus) => self.min_ms.saturating_add(jitter.next() % modulus),
+            None => self.min_ms.saturating_add(jitter.next()),
+        }
+    }
+}
+
+/// Player-set extra-wait ranges, added on top of every tuned baseline above.
+/// All-default (`0..=0`) reproduces the calibrated timing exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Timings {
+    /// Before the first click once the shop opens.
+    pub shop_opened: DelayRange,
+    /// Before the first click after a paid refresh.
+    pub refreshed: DelayRange,
+    /// Before the first click when resuming after a purchase.
+    pub purchase_resumed: DelayRange,
+    /// Before a watchdog re-issue (the game sits idle).
+    pub recovery: DelayRange,
+    /// Between the Refresh click and its confirm click.
+    pub confirm_refresh_modal: DelayRange,
+    /// Between a Buy click and its confirm click.
+    pub buy_modal: DelayRange,
+    /// Between two consecutive buys.
+    pub between_buys: DelayRange,
+    /// After a wheel scroll before the next click.
+    pub scroll_settle: DelayRange,
+}
+
+impl Timings {
+    /// The pre-wait for a trigger: its tuned baseline plus a fresh draw from
+    /// the matching range.
+    fn pre_wait_ms(&self, trigger: Trigger, jitter: &mut Jitter) -> u64 {
+        let range = match trigger {
+            Trigger::ShopOpened => self.shop_opened,
+            Trigger::Refreshed => self.refreshed,
+            Trigger::PurchaseResumed => self.purchase_resumed,
+            Trigger::Recovery => self.recovery,
+        };
+        trigger.pre_wait_ms().saturating_add(range.draw(jitter))
+    }
+
+    fn confirm_refresh_modal_ms(&self, jitter: &mut Jitter) -> u64 {
+        WAIT_CONFIRM_REFRESH_MODAL_MS.saturating_add(self.confirm_refresh_modal.draw(jitter))
+    }
+
+    fn buy_modal_ms(&self, jitter: &mut Jitter) -> u64 {
+        WAIT_BUY_MODAL_MS.saturating_add(self.buy_modal.draw(jitter))
+    }
+
+    fn between_buys_ms(&self, jitter: &mut Jitter) -> u64 {
+        WAIT_BETWEEN_BUYS_MS.saturating_add(self.between_buys.draw(jitter))
+    }
+
+    fn scroll_settle_ms(&self, jitter: &mut Jitter) -> u64 {
+        WAIT_SCROLL_SETTLE_MS.saturating_add(self.scroll_settle.draw(jitter))
+    }
+}
+
+/// Separates the wait-jitter stream from the click-position stream: both seed
+/// from the same `now_ms`, but a shared sequence would make click coordinates
+/// depend on the timing config. XORing the seed keeps positions byte-stable
+/// whatever the ranges.
+const DELAY_SEED_SALT: u64 = 0xD31A_7000_D31A_7000;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Input {
     /// Press at `at`, hold `press_ms`, release.
@@ -268,27 +362,29 @@ fn scroll(jitter: &mut Jitter, notches: i32) -> Input {
 /// after a confirm click that missed its modal. Safe on the shop screen —
 /// nothing clickable sits under either confirm zone when no modal is open
 /// (player-confirmed game fact).
-pub fn confirm_retry_job(zone: Zone, epoch: u64, seed: u64) -> Job {
+pub fn confirm_retry_job(zone: Zone, timings: Timings, epoch: u64, seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
+    let mut delay = Jitter::new(seed ^ DELAY_SEED_SALT);
     Job {
         epoch,
         steps: vec![TimedStep {
-            wait_ms: WAIT_RECOVERY_MS,
+            wait_ms: timings.pre_wait_ms(Trigger::Recovery, &mut delay),
             input: click(&mut jitter, zone),
         }],
     }
 }
 
 /// Refresh = click Refresh, wait out the confirm modal, click its yes.
-pub fn refresh_job(trigger: Trigger, epoch: u64, seed: u64) -> Job {
+pub fn refresh_job(trigger: Trigger, timings: Timings, epoch: u64, seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
+    let mut delay = Jitter::new(seed ^ DELAY_SEED_SALT);
     let steps = vec![
         TimedStep {
-            wait_ms: trigger.pre_wait_ms(),
+            wait_ms: timings.pre_wait_ms(trigger, &mut delay),
             input: click(&mut jitter, REFRESH),
         },
         TimedStep {
-            wait_ms: WAIT_CONFIRM_REFRESH_MODAL_MS,
+            wait_ms: timings.confirm_refresh_modal_ms(&mut delay),
             input: click(&mut jitter, CONFIRM_REFRESH),
         },
     ];
@@ -300,8 +396,9 @@ pub fn refresh_job(trigger: Trigger, epoch: u64, seed: u64) -> Job {
 /// clamp makes it a no-op when already there), buy the top-group rows, one
 /// scroll to the bottom, buy the bottom-group rows. Each buy is click +
 /// confirm.
-pub fn buy_job(trigger: Trigger, epoch: u64, rows: &[u8], seed: u64) -> Job {
+pub fn buy_job(trigger: Trigger, timings: Timings, epoch: u64, rows: &[u8], seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
+    let mut delay = Jitter::new(seed ^ DELAY_SEED_SALT);
     let mut rows: Vec<u8> = rows.iter().copied().filter(|&row| row <= 5).collect();
     rows.sort_unstable();
     rows.dedup();
@@ -312,10 +409,12 @@ pub fn buy_job(trigger: Trigger, epoch: u64, rows: &[u8], seed: u64) -> Job {
         };
     }
     let mut steps = vec![TimedStep {
-        wait_ms: trigger.pre_wait_ms(),
+        wait_ms: timings.pre_wait_ms(trigger, &mut delay),
         input: scroll(&mut jitter, SCROLL_TO_EXTREME_NOTCHES),
     }];
-    let mut wait_ms = WAIT_SCROLL_SETTLE_MS;
+    // Each buy draws its own settle/between-buys wait, so the pacing varies
+    // step to step; the pre-scroll before the bottom group draws afresh too.
+    let mut wait_ms = timings.scroll_settle_ms(&mut delay);
     let mut at_bottom = false;
     for row in rows {
         if row > 3 && !at_bottom {
@@ -324,17 +423,17 @@ pub fn buy_job(trigger: Trigger, epoch: u64, rows: &[u8], seed: u64) -> Job {
                 input: scroll(&mut jitter, -SCROLL_TO_EXTREME_NOTCHES),
             });
             at_bottom = true;
-            wait_ms = WAIT_SCROLL_SETTLE_MS;
+            wait_ms = timings.scroll_settle_ms(&mut delay);
         }
         steps.push(TimedStep {
             wait_ms,
             input: click(&mut jitter, buy_zone(row, at_bottom)),
         });
         steps.push(TimedStep {
-            wait_ms: WAIT_BUY_MODAL_MS,
+            wait_ms: timings.buy_modal_ms(&mut delay),
             input: click(&mut jitter, CONFIRM_BUY),
         });
-        wait_ms = WAIT_BETWEEN_BUYS_MS;
+        wait_ms = timings.between_buys_ms(&mut delay);
     }
     Job { epoch, steps }
 }
@@ -533,7 +632,7 @@ mod tests {
 
     #[test]
     fn confirm_retry_job_single_click_in_zone() {
-        let job = confirm_retry_job(CONFIRM_BUY, 5, 42);
+        let job = confirm_retry_job(CONFIRM_BUY, Timings::default(), 5, 42);
         assert_eq!(job.epoch, 5);
         assert_eq!(job.steps.len(), 1);
         assert_eq!(job.steps[0].wait_ms, 400);
@@ -542,7 +641,7 @@ mod tests {
 
     #[test]
     fn refresh_job_clicks_refresh_then_confirm() {
-        let job = refresh_job(Trigger::Refreshed, 3, 42);
+        let job = refresh_job(Trigger::Refreshed, Timings::default(), 3, 42);
         assert_eq!(job.epoch, 3);
         assert_eq!(job.steps.len(), 2);
         assert_eq!(job.steps[0].wait_ms, 780);
@@ -554,7 +653,13 @@ mod tests {
     #[test]
     fn buy_job_orders_top_group_then_one_scroll_then_bottom_group() {
         // Unsorted with a duplicate and an out-of-range row.
-        let job = buy_job(Trigger::ShopOpened, 9, &[5, 0, 4, 0, 6], 42);
+        let job = buy_job(
+            Trigger::ShopOpened,
+            Timings::default(),
+            9,
+            &[5, 0, 4, 0, 6],
+            42,
+        );
         assert_eq!(job.epoch, 9);
         assert_eq!(job.steps.len(), 8);
         // Scroll to the top first, whatever the current position.
@@ -581,7 +686,7 @@ mod tests {
 
     #[test]
     fn buy_job_scrolls_top_then_bottom_for_a_bottom_only_row() {
-        let job = buy_job(Trigger::PurchaseResumed, 1, &[4], 42);
+        let job = buy_job(Trigger::PurchaseResumed, Timings::default(), 1, &[4], 42);
         assert_eq!(job.steps.len(), 4);
         assert_eq!(job.steps[0].wait_ms, 400);
         assert!(scroll_notches(&job.steps[0]) > 0);
@@ -594,8 +699,116 @@ mod tests {
     #[test]
     fn buy_job_drops_out_of_range_rows_entirely() {
         // A clamped fallback slot must never become a click.
-        let job = buy_job(Trigger::ShopOpened, 7, &[6, u8::MAX], 42);
+        let job = buy_job(
+            Trigger::ShopOpened,
+            Timings::default(),
+            7,
+            &[6, u8::MAX],
+            42,
+        );
         assert_eq!(job.epoch, 7);
         assert!(job.steps.is_empty());
+    }
+
+    fn range(min_ms: u64, max_ms: u64) -> DelayRange {
+        DelayRange { min_ms, max_ms }
+    }
+
+    #[test]
+    fn extra_ranges_add_a_bounded_draw_on_top_of_the_baselines() {
+        // Every draw lands on the step it names, within [baseline+min,
+        // baseline+max], and no click position moves (the delay stream is
+        // salted apart from the position stream).
+        let timings = Timings {
+            refreshed: range(200, 800),
+            confirm_refresh_modal: range(50, 150),
+            ..Timings::default()
+        };
+        let job = refresh_job(Trigger::Refreshed, timings, 3, 42);
+        assert!((780 + 200..=780 + 800).contains(&job.steps[0].wait_ms));
+        assert!((270 + 50..=270 + 150).contains(&job.steps[1].wait_ms));
+        let baseline = refresh_job(Trigger::Refreshed, Timings::default(), 3, 42);
+        assert_eq!(click_at(&job.steps[0]), click_at(&baseline.steps[0]));
+        assert_eq!(click_at(&job.steps[1]), click_at(&baseline.steps[1]));
+    }
+
+    #[test]
+    fn a_point_range_resolves_to_the_baseline_plus_that_point() {
+        // min == max is a fixed extra: no randomness, an exact wait.
+        let timings = Timings {
+            refreshed: range(500, 500),
+            ..Timings::default()
+        };
+        let job = refresh_job(Trigger::Refreshed, timings, 3, 42);
+        assert_eq!(job.steps[0].wait_ms, 780 + 500);
+    }
+
+    #[test]
+    fn draws_are_deterministic_per_seed_and_vary_across_seeds() {
+        let timings = Timings {
+            refreshed: range(0, 1_000),
+            ..Timings::default()
+        };
+        let a = refresh_job(Trigger::Refreshed, timings, 3, 42);
+        let b = refresh_job(Trigger::Refreshed, timings, 3, 42);
+        assert_eq!(a.steps[0].wait_ms, b.steps[0].wait_ms); // same seed
+        // A different seed almost surely lands on a different draw over a wide
+        // range; scan a few so the test never flakes on one unlucky collision.
+        let differs = (100..110).any(|seed| {
+            refresh_job(Trigger::Refreshed, timings, 3, seed).steps[0].wait_ms != a.steps[0].wait_ms
+        });
+        assert!(differs, "a wide range should vary across seeds");
+    }
+
+    #[test]
+    fn extra_buy_ranges_land_on_scroll_confirm_and_between_buys() {
+        let timings = Timings {
+            shop_opened: range(200, 200),
+            scroll_settle: range(50, 50),
+            buy_modal: range(30, 30),
+            between_buys: range(400, 400),
+            ..Timings::default()
+        };
+        // Point ranges keep the assertions exact while still exercising the
+        // draw path on every buy step.
+        let job = buy_job(Trigger::ShopOpened, timings, 9, &[0, 1], 42);
+        assert_eq!(job.steps[0].wait_ms, 1_180 + 200); // pre-wait on the scroll
+        assert_eq!(job.steps[1].wait_ms, 100 + 50); // scroll settle before buy 0
+        assert_eq!(job.steps[2].wait_ms, 150 + 30); // confirm buy 0
+        assert_eq!(job.steps[3].wait_ms, 600 + 400); // between buys, before buy 1
+        assert_eq!(job.steps[4].wait_ms, 150 + 30); // confirm buy 1
+    }
+
+    #[test]
+    fn confirm_retry_job_folds_in_the_recovery_range() {
+        let timings = Timings {
+            recovery: range(250, 250),
+            ..Timings::default()
+        };
+        let job = confirm_retry_job(CONFIRM_REFRESH, timings, 5, 42);
+        assert_eq!(job.steps[0].wait_ms, 400 + 250);
+    }
+
+    #[test]
+    fn reversed_range_reads_as_its_min_point() {
+        let timings = Timings {
+            refreshed: range(600, 100),
+            ..Timings::default()
+        };
+        let job = refresh_job(Trigger::Refreshed, timings, 3, 42);
+        assert_eq!(job.steps[0].wait_ms, 780 + 600);
+    }
+
+    #[test]
+    fn full_u64_range_draws_without_panicking() {
+        // A `max_ms = u64::MAX, min_ms = 0` range makes the modulus `span + 1`
+        // overflow: the draw must fall back to the raw sample, never `% 0`.
+        let timings = Timings {
+            refreshed: range(0, u64::MAX),
+            ..Timings::default()
+        };
+        // No panic, and the baseline still saturates the result.
+        let job = refresh_job(Trigger::Refreshed, timings, 3, 42);
+        assert!(job.steps[0].wait_ms >= 780);
     }
 }

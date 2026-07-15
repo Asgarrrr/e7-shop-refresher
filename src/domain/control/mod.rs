@@ -11,6 +11,8 @@ mod dedup;
 mod tests;
 mod watchdog;
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 use crate::domain::filter::Filter;
@@ -186,6 +188,46 @@ pub struct Progress {
     pub matches_found: u32,
 }
 
+/// Confirmed purchases this run, tallied by the bought item's wire name so a
+/// view can group them into headline tokens (Covenant, Mystic, …) and a
+/// generic bucket. Buys that carry no name in their roll land in `untitled`.
+/// Reset on `Start`, like `Progress`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Haul {
+    named: BTreeMap<String, u32>,
+    untitled: u32,
+}
+
+impl Haul {
+    /// How many bought under this exact wire name.
+    pub fn count(&self, name: &str) -> u32 {
+        self.named.get(name).copied().unwrap_or(0)
+    }
+
+    /// Everything not one of `known`: named-but-unlisted buys plus the
+    /// unresolved/nameless ones. The view passes its headline names here.
+    pub fn others(&self, known: &[&str]) -> u32 {
+        let bucketed = self
+            .named
+            .iter()
+            .filter(|(name, _)| !known.contains(&name.as_str()))
+            .map(|(_, count)| *count)
+            .fold(0u32, u32::saturating_add);
+        bucketed.saturating_add(self.untitled)
+    }
+
+    /// Record one confirmed buy, keyed by the item's name when it resolved.
+    fn record(&mut self, name: Option<String>) {
+        match name {
+            Some(name) => {
+                let count = self.named.entry(name).or_insert(0);
+                *count = count.saturating_add(1);
+            }
+            None => self.untitled = self.untitled.saturating_add(1),
+        }
+    }
+}
+
 /// Invariant: refreshes are reactive — one is only requested in reaction to
 /// a no-match snapshot or the purchase clearing the last checklist entry;
 /// duplicate snapshots and snapshots received while unarmed
@@ -197,6 +239,8 @@ pub struct Controller {
     status: Status,
     started_at: Option<u64>,
     progress: Progress,
+    /// Confirmed buys this run, grouped by item name for the haul readout.
+    haul: Haul,
     /// Last balance/cost seen this session, locally debited per refresh so
     /// the affordability estimate survives snapshots that omit meta; a
     /// server-sent meta overwrites the estimate. Forgotten on `Start`.
@@ -241,6 +285,7 @@ impl Controller {
             status: Status::Idle,
             started_at: None,
             progress: Progress::default(),
+            haul: Haul::default(),
             refresh_meta: None,
             gold_balance: None,
             last_snapshot: None,
@@ -277,6 +322,10 @@ impl Controller {
 
     pub fn progress(&self) -> Progress {
         self.progress
+    }
+
+    pub fn haul(&self) -> &Haul {
+        &self.haul
     }
 
     /// The active stop limits.
@@ -354,6 +403,7 @@ impl Controller {
             return vec![Action::Refused(RefusalReason::UnrestrictedFilter)];
         }
         self.progress = Progress::default();
+        self.haul = Haul::default(); // last run's haul is not this run's
         self.started_at = Some(now_ms);
         self.refresh_meta = None; // a stale balance must not stop the new session
         self.gold_balance = None; // nor a stale purse veto its buys
@@ -512,8 +562,23 @@ impl Controller {
         }
         // Like gold, a buy is truth whatever the status: the slot is spent
         // for the rest of the roll. The id-0 sentinel never names an item.
+        // The `bought` guard also dedups a replayed echo, so a buy is counted
+        // at most once per roll (a genuine re-buy in a fresh roll clears
+        // `bought` and counts again — two items obtained).
         if item != 0 && !self.bought.contains(&item) {
             self.bought.push(item);
+            // `bought` takes every buy as roll truth (dedup, re-open guard);
+            // the haul is narrower — the *run's* take. Record only while a
+            // run is live (a manual buy after a stop is the player's, not the
+            // loop's) and only when the id still sits in the current roll: a
+            // stale echo whose roll rotated out before it landed resolves to
+            // no slot, and bucketing it would double-count the buy as a
+            // phantom Other.
+            if !matches!(self.status, Status::Stopped(_))
+                && let Some(slot) = self.last_snapshot.as_ref().and_then(|s| s.slot_by_id(item))
+            {
+                self.haul.record(slot.name.clone());
+            }
         }
         if self.status != Status::Paused {
             return Vec::new();

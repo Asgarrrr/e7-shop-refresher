@@ -66,3 +66,24 @@ names = ["ticketrare_name", "ticketspecial_name"]
 # focus and mouse) — the fallback if a game update stops honoring posted
 # clicks.
 # backend = "message"
+
+# [actuator.timings]
+# Random extra delay added on top of each tuned click baseline. Each wait
+# draws a fresh uniform value in [min_ms, max_ms] and adds it to the baseline,
+# so the loop's pauses vary like a human's instead of being identical every
+# time. The baselines are calibrated to the game's blocking animations and are
+# the floor: a range only ever slows the loop down, never clicks earlier.
+# Every range defaults to { min_ms = 0, max_ms = 0 } (the fixed calibrated
+# timing, no randomness). min == max is a fixed extra. The same knobs live in
+# the window's Setup tab (Click timings), applied live without editing this
+# file. Baselines, in ms: shop_opened 1180, refreshed 780, purchase_resumed
+# 400, recovery 400, confirm_refresh_modal 270, buy_modal 150, between_buys
+# 600, scroll_settle 100.
+# refreshed = { min_ms = 200, max_ms = 800 }         # after a paid refresh
+# between_buys = { min_ms = 150, max_ms = 500 }       # between two buys
+# shop_opened = { min_ms = 0, max_ms = 0 }
+# purchase_resumed = { min_ms = 0, max_ms = 0 }
+# recovery = { min_ms = 0, max_ms = 0 }
+# confirm_refresh_modal = { min_ms = 0, max_ms = 0 }
+# buy_modal = { min_ms = 0, max_ms = 0 }
+# scroll_settle = { min_ms = 0, max_ms = 0 }

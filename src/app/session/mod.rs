@@ -172,6 +172,12 @@ fn handle_command(
             }
             return lines;
         }
+        // Timings are not domain state: swap the actuator's shared waits and
+        // acknowledge. The next queued job bakes them in.
+        Command::SetTimings(timings) => {
+            actuator.set_timings(timings);
+            return vec![">> click timings updated — applies to the next queued clicks".to_owned()];
+        }
     };
     let before = ctrl.status();
     let actions = ctrl.handle(event);
@@ -383,7 +389,13 @@ fn queue_refresh(
     trigger: Trigger,
     now_ms: u64,
 ) {
-    if !actuator.submit(plan::refresh_job(trigger, actuator.epoch.current(), now_ms)) {
+    let job = plan::refresh_job(
+        trigger,
+        actuator.timings(),
+        actuator.epoch.current(),
+        now_ms,
+    );
+    if !actuator.submit(job) {
         lines.push(">> actuator queue full — refresh dropped".to_owned());
     }
 }
@@ -436,7 +448,7 @@ fn submit_confirm_retry(
     if active_trigger(actuator, Some(Trigger::Recovery)).is_none() {
         return;
     }
-    let job = plan::confirm_retry_job(zone, actuator.epoch.current(), now_ms);
+    let job = plan::confirm_retry_job(zone, actuator.timings(), actuator.epoch.current(), now_ms);
     if !actuator.submit(job) {
         lines.push(">> actuator queue full — confirm re-click dropped".to_owned());
     }
@@ -482,7 +494,13 @@ fn submit_buys(
             format!(">> → buy slot {} planned (dry-run)", row + 1)
         });
     }
-    let job = plan::buy_job(trigger, actuator.epoch.current(), &rows, now_ms);
+    let job = plan::buy_job(
+        trigger,
+        actuator.timings(),
+        actuator.epoch.current(),
+        &rows,
+        now_ms,
+    );
     if !actuator.submit(job) {
         lines.push(">> actuator queue full — buys dropped".to_owned());
     }

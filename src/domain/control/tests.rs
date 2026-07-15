@@ -1683,3 +1683,99 @@ fn purchase_echo_while_watching_leaves_snapshot_expectation_alone() {
         vec![Action::Recover(Recovery::ConfirmRefresh)]
     );
 }
+
+/// A shop whose slots carry both ids and names, so a purchase echo (id only)
+/// resolves back to the item's wire name for the haul tally.
+fn named_shop() -> ShopSnapshot {
+    let named = |id: u32, name: Option<&str>| ShopItem {
+        id,
+        name: name.map(str::to_owned),
+        ..ShopItem::default()
+    };
+    ShopSnapshot {
+        merchant: None,
+        slots: vec![
+            named(100, Some("ticketrare_name")),
+            named(101, Some("ticketspecial_name")),
+            named(102, Some("Wondrous Potion Vial")),
+            named(103, None),
+        ],
+        refresh: None,
+    }
+}
+
+#[test]
+fn haul_tallies_bought_items_by_resolved_name() {
+    let mut ctrl = controller(Limits::default());
+    ctrl.handle(snap(named_shop(), 0));
+    ctrl.handle(buy(100, 1)); // covenant
+    ctrl.handle(buy(101, 2)); // mystic
+    ctrl.handle(buy(102, 3)); // named, but not a headliner
+    ctrl.handle(buy(103, 4)); // nameless
+    let haul = ctrl.haul();
+    assert_eq!(haul.count("ticketrare_name"), 1);
+    assert_eq!(haul.count("ticketspecial_name"), 1);
+    // The unlisted named buy and the nameless one both fall in the bucket.
+    assert_eq!(haul.others(&["ticketrare_name", "ticketspecial_name"]), 2);
+}
+
+#[test]
+fn haul_counts_a_repeated_echo_once_per_roll() {
+    // A replayed echo of the same buy in the same roll must not double-count.
+    let mut ctrl = controller(Limits::default());
+    ctrl.handle(snap(named_shop(), 0));
+    ctrl.handle(buy(100, 1));
+    ctrl.handle(buy(100, 2));
+    assert_eq!(ctrl.haul().count("ticketrare_name"), 1);
+}
+
+#[test]
+fn haul_resets_on_start() {
+    let mut ctrl = controller(Limits::default());
+    ctrl.handle(snap(named_shop(), 0));
+    ctrl.handle(buy(100, 1));
+    assert_eq!(ctrl.haul().count("ticketrare_name"), 1);
+    // A new run starts a fresh haul; last run's take is not this run's.
+    assert!(ctrl.handle(Event::Start { now_ms: 2 }).is_empty());
+    assert_eq!(ctrl.haul().count("ticketrare_name"), 0);
+}
+
+#[test]
+fn haul_ignores_a_buy_after_the_run_stops() {
+    // A manual buy once the run has stopped is the player's own, not the
+    // loop's — it must not inflate the stopped run's haul.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(named_shop(), 0));
+    ctrl.handle(buy(100, 1));
+    assert_eq!(ctrl.haul().count("ticketrare_name"), 1);
+    ctrl.handle(Event::Stop);
+    ctrl.handle(buy(101, 2));
+    assert_eq!(ctrl.haul().count("ticketspecial_name"), 0);
+}
+
+#[test]
+fn haul_drops_a_stale_echo_after_the_roll_rotates() {
+    // A buy's echo replayed after a fresh roll has rotated the stock out finds
+    // no slot for its id — dropping it, not bucketing it as a phantom Other.
+    let mut ctrl = started(Limits::default());
+    ctrl.handle(snap(named_shop(), 0));
+    ctrl.handle(buy(100, 1));
+    assert_eq!(ctrl.haul().count("ticketrare_name"), 1);
+    // A new roll (fresh ids) rotates the stock; `bought` clears.
+    let roll_b = ShopSnapshot {
+        merchant: None,
+        slots: vec![ShopItem {
+            id: 200,
+            ..ShopItem::default()
+        }],
+        refresh: None,
+    };
+    ctrl.handle(snap(roll_b, 2));
+    ctrl.handle(buy(100, 3));
+    assert_eq!(ctrl.haul().count("ticketrare_name"), 1);
+    assert_eq!(
+        ctrl.haul()
+            .others(&["ticketrare_name", "ticketspecial_name"]),
+        0
+    );
+}

@@ -18,6 +18,16 @@ pub struct ShopSnapshot {
     pub refresh: Option<RefreshMeta>,
 }
 
+impl ShopSnapshot {
+    /// The slot bearing this catalog id, if any. Ids are unique within a
+    /// snapshot (the shop never lists an item twice), so at most one matches.
+    /// The single home for a find-by-id, keyed through `catalog_id` so the `0`
+    /// sentinel is never a match.
+    pub fn slot_by_id(&self, id: u32) -> Option<&ShopItem> {
+        self.slots.iter().find(|item| item.catalog_id() == Some(id))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct RefreshMeta {
     /// Crystal balance after the debit.

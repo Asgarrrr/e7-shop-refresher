@@ -1,20 +1,32 @@
+use std::sync::Arc;
+
 use super::*;
 use crate::actuator::SnapshotEpoch;
 use crate::domain::control::{Limits, StopReason};
 use crate::domain::filter::Filter;
 use crate::domain::shop::{ItemKind, PurchaseLimit, ShopItem, ShopSnapshot};
 
+/// A fresh shared-timings cell at the calibrated baselines (all extras 0).
+fn timings() -> Arc<Mutex<plan::Timings>> {
+    Arc::new(Mutex::new(plan::Timings::default()))
+}
+
 /// Off-mode actuator: decisions keep the advice wording, nothing is
 /// ever submitted.
 fn off() -> ActuatorHandle {
-    ActuatorHandle::new(Mode::Off, SnapshotEpoch::default(), mpsc::channel(8).0)
+    ActuatorHandle::new(
+        Mode::Off,
+        SnapshotEpoch::default(),
+        mpsc::channel(8).0,
+        timings(),
+    )
 }
 
 /// An actuator whose submitted jobs the test inspects.
 fn recording(mode: Mode) -> (ActuatorHandle, mpsc::Receiver<plan::Job>) {
     let (jobs, rx) = mpsc::channel(8);
     (
-        ActuatorHandle::new(mode, SnapshotEpoch::default(), jobs),
+        ActuatorHandle::new(mode, SnapshotEpoch::default(), jobs, timings()),
         rx,
     )
 }
@@ -297,6 +309,29 @@ fn set_limits_updates_controller() {
     );
     assert!(lines.iter().any(|line| line.contains("limits updated")));
     assert_eq!(controller.lock().unwrap().limits(), &limits);
+}
+
+#[test]
+fn set_timings_swaps_the_actuator_waits() {
+    let gate = WatchGate::new(false);
+    let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
+    let actuator = off();
+    let timings = plan::Timings {
+        refreshed: plan::DelayRange {
+            min_ms: 200,
+            max_ms: 800,
+        },
+        ..plan::Timings::default()
+    };
+    let lines = handle_command(
+        &controller,
+        &gate,
+        &actuator,
+        Command::SetTimings(timings),
+        0,
+    );
+    assert!(lines.iter().any(|line| line.contains("timings updated")));
+    assert_eq!(actuator.timings(), timings);
 }
 
 #[test]
@@ -834,9 +869,14 @@ fn full_job_queue_journals_the_drop() {
     let journal = EventLog::default();
     let (job_tx, _job_rx) = mpsc::channel(1);
     job_tx
-        .try_send(plan::refresh_job(Trigger::Refreshed, 0, 0))
+        .try_send(plan::refresh_job(
+            Trigger::Refreshed,
+            plan::Timings::default(),
+            0,
+            0,
+        ))
         .expect("fills the queue");
-    let actuator = ActuatorHandle::new(Mode::Live, SnapshotEpoch::default(), job_tx);
+    let actuator = ActuatorHandle::new(Mode::Live, SnapshotEpoch::default(), job_tx, timings());
     let controller = armed();
     on_message(
         &controller,

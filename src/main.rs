@@ -93,6 +93,9 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
 
     use arkyve_refresh_shop::ui;
 
+    // Capture the startup timings before setup consumes the config: they seed
+    // the window's timing editor (no controller home for them).
+    let seed_timings = config.actuator.timings;
     let (session, handles) = app::setup(config);
     let error = ui::SessionErrorSlot::default();
     let failed = Arc::new(AtomicBool::new(false));
@@ -112,11 +115,11 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
         arkyve_refresh_shop::APP_NAME,
         eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
-                .with_inner_size([720.0, 680.0])
-                .with_min_inner_size([520.0, 480.0]),
+                .with_inner_size([500.0, 560.0])
+                .with_min_inner_size([440.0, 460.0]),
             ..Default::default()
         },
-        Box::new(move |cc| Ok(Box::new(ui::ShopApp::new(cc, handles, error)))),
+        Box::new(move |cc| Ok(Box::new(ui::ShopApp::new(cc, handles, error, seed_timings)))),
     );
     // Not a plain drop: tokio::io::stdin parks a blocking thread, and dropping
     // the runtime would hang window close until the player presses Enter.

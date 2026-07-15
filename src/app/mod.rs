@@ -46,6 +46,8 @@ pub enum Command {
     SetFilter(Filter),
     /// Live limits retune; checked before the next refresh.
     SetLimits(Limits),
+    /// Live click-timing retune; applies to the next queued job.
+    SetTimings(plan::Timings),
     /// Actuator-side halt; the executor is its only producer.
     ActuatorFailed,
 }
@@ -94,7 +96,13 @@ pub fn setup(config: Config) -> (Session, SessionHandles) {
         journal,
     };
     let (job_tx, job_rx) = mpsc::channel::<plan::Job>(8);
-    let actuator = ActuatorHandle::new(actuator_mode(&config), SnapshotEpoch::default(), job_tx);
+    let timings = Arc::new(Mutex::new(config.actuator.timings));
+    let actuator = ActuatorHandle::new(
+        actuator_mode(&config),
+        SnapshotEpoch::default(),
+        job_tx,
+        timings,
+    );
     let session = Session {
         config,
         handles: handles.clone(),

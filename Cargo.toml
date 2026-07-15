@@ -71,6 +71,13 @@ egui_kittest = { version = "0.35", default-features = false }
 # Paused-clock tests (`start_paused`) for the uplink send timeout.
 tokio = { version = "1", features = ["test-util"] }
 
+# Dashboard preview with injected mock data — lets the egui UI be seen on a
+# machine with no capture backend (mac dev). Reuses the real `ShopApp`; needs
+# eframe, hence the `gui` feature.
+[[example]]
+name = "ui_preview"
+required-features = ["gui"]
+
 [profile.release]
 lto = "thin"
 strip = true

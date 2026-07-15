@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::actuator::plan::Timings;
 use crate::domain::control::Limits;
 use crate::domain::filter::Filter;
 use crate::domain::shop::ItemKind;
@@ -70,6 +71,10 @@ pub struct ActuatorConfig {
 
     /// How clicks reach the game window.
     pub backend: ActuatorBackend,
+
+    /// Per-action random extra-wait ranges, added on top of the tuned click
+    /// baselines; the all-`0..=0` default keeps the calibrated timing.
+    pub timings: Timings,
 }
 
 /// Input backend of the Windows build.
@@ -329,6 +334,33 @@ mod tests {
         let config: Config = toml::from_str("[actuator]").expect("config should parse");
         assert_eq!(config.actuator.backend, ActuatorBackend::Message);
         assert_eq!(Config::default().actuator.backend, ActuatorBackend::Message);
+    }
+
+    #[test]
+    fn actuator_timings_parse_and_default_to_zero() {
+        let config: Config = toml::from_str(
+            r#"
+            [actuator.timings]
+            refreshed = { min_ms = 200, max_ms = 800 }
+            between_buys = { min_ms = 100, max_ms = 500 }
+            "#,
+        )
+        .expect("config should parse");
+        assert_eq!(config.actuator.timings.refreshed.min_ms, 200);
+        assert_eq!(config.actuator.timings.refreshed.max_ms, 800);
+        assert_eq!(config.actuator.timings.between_buys.max_ms, 500);
+        // Unset ranges stay at the calibrated baseline (0..=0 extra).
+        assert_eq!(config.actuator.timings.shop_opened.max_ms, 0);
+        assert_eq!(Config::default().actuator.timings.refreshed.max_ms, 0);
+    }
+
+    #[test]
+    fn misspelled_timings_key_is_rejected() {
+        // A silently ignored typo would leave the loop at the baseline while
+        // the player thinks they slowed it down.
+        assert!(toml::from_str::<Config>("[actuator.timings]\nrefesh = { min_ms = 500 }").is_err());
+        // A typo inside a range is caught too (deny_unknown_fields on the range).
+        assert!(toml::from_str::<Config>("[actuator.timings.refreshed]\nminms = 500").is_err());
     }
 
     #[test]
