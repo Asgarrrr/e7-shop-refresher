@@ -260,6 +260,73 @@ impl Timings {
     }
 }
 
+/// One-touch humanization level: a named `Timings` the Setup UI offers before
+/// the per-action fine-tuning. Each preset only dials the *random extra* every
+/// action can add on top of its tuned baseline (the `max_ms`); `min_ms` stays a
+/// config-only floor, so a preset never rewrites the calibrated minimum. Higher
+/// levels add more random slack so the loop clicks less like a metronome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingPreset {
+    /// Tuned minimums only, no random extra — `Timings::default()`.
+    Instant,
+    /// Modest random slack on the actions a watcher would notice.
+    Human,
+    /// Roughly double the slack: slowest and least regular.
+    Cautious,
+}
+
+impl TimingPreset {
+    /// The three presets in display order (fastest to most cautious).
+    pub const ALL: [TimingPreset; 3] = [
+        TimingPreset::Instant,
+        TimingPreset::Human,
+        TimingPreset::Cautious,
+    ];
+
+    /// The player-facing name of the level.
+    pub fn label(self) -> &'static str {
+        match self {
+            TimingPreset::Instant => "Instant",
+            TimingPreset::Human => "Human",
+            TimingPreset::Cautious => "Cautious",
+        }
+    }
+
+    /// The `Timings` this level resolves to. Only `max_ms` is set (the random
+    /// ceiling); `min_ms` stays 0 so the floor remains a config-only concern.
+    pub fn timings(self) -> Timings {
+        // Per-action random ceilings (ms) for Human; Cautious doubles them. The
+        // watchdog stays tight at every level — recovery is not humanization.
+        let human = match self {
+            TimingPreset::Instant => return Timings::default(),
+            TimingPreset::Human => 1,
+            TimingPreset::Cautious => 2,
+        };
+        let x = |base: u64| DelayRange {
+            min_ms: 0,
+            max_ms: base * human,
+        };
+        Timings {
+            shop_opened: x(500),
+            refreshed: x(350),
+            purchase_resumed: x(250),
+            recovery: DelayRange::default(),
+            confirm_refresh_modal: x(150),
+            buy_modal: x(100),
+            between_buys: x(400),
+            scroll_settle: x(100),
+        }
+    }
+
+    /// The preset `timings` exactly matches, or `None` when the player has
+    /// fine-tuned away from every level ("Custom").
+    pub fn from_timings(timings: &Timings) -> Option<TimingPreset> {
+        TimingPreset::ALL
+            .into_iter()
+            .find(|preset| preset.timings() == *timings)
+    }
+}
+
 /// Separates the wait-jitter stream from the click-position stream: both seed
 /// from the same `now_ms`, but a shared sequence would make click coordinates
 /// depend on the timing config. XORing the seed keeps positions byte-stable
@@ -448,6 +515,46 @@ mod tests {
             top,
             width,
             height,
+        }
+    }
+
+    #[test]
+    fn instant_preset_is_the_default_timings() {
+        assert_eq!(TimingPreset::Instant.timings(), Timings::default());
+    }
+
+    #[test]
+    fn from_timings_round_trips_every_preset() {
+        for preset in TimingPreset::ALL {
+            assert_eq!(TimingPreset::from_timings(&preset.timings()), Some(preset));
+        }
+    }
+
+    #[test]
+    fn a_fine_tuned_timings_matches_no_preset() {
+        let mut custom = TimingPreset::Human.timings();
+        custom.refreshed.max_ms += 5;
+        assert_eq!(TimingPreset::from_timings(&custom), None);
+    }
+
+    #[test]
+    fn presets_only_dial_the_random_ceiling() {
+        // A preset must never write a floor: `min_ms` stays 0 on every action so
+        // the config-only minimum is left untouched.
+        for preset in TimingPreset::ALL {
+            let t = preset.timings();
+            for range in [
+                t.shop_opened,
+                t.refreshed,
+                t.purchase_resumed,
+                t.recovery,
+                t.confirm_refresh_modal,
+                t.buy_modal,
+                t.between_buys,
+                t.scroll_settle,
+            ] {
+                assert_eq!(range.min_ms, 0);
+            }
         }
     }
 

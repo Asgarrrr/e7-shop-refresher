@@ -7,7 +7,7 @@
 use eframe::egui;
 
 use super::theme;
-use crate::actuator::plan::{self, DelayRange, Timings};
+use crate::actuator::plan::{self, DelayRange, TimingPreset, Timings};
 use crate::app::Command;
 use crate::domain::control::Limits;
 use crate::domain::filter::{Filter, SubstatReq};
@@ -36,6 +36,9 @@ pub struct EditorState {
     hunt_open: bool,
     stop_open: bool,
     timing_open: bool,
+    /// Within the Click timing section: whether the Custom mode segment is
+    /// selected, revealing the per-action bars inline under the presets.
+    fine_tune_open: bool,
 }
 
 impl EditorState {
@@ -53,6 +56,7 @@ impl EditorState {
             hunt_open: true,
             stop_open: true,
             timing_open: false,
+            fine_tune_open: false,
         }
     }
 }
@@ -167,14 +171,13 @@ fn stop_summary(limits: &Limits) -> String {
     }
 }
 
-/// The Click timing bar is always folded on arrival, so its peek carries the
-/// most weight: whether the player tuned any extra delay on top of the tuned
-/// baselines, or left them at zero.
+/// The Click timing bar is always folded on arrival, so its peek names the
+/// humanization level in force — the same word the mode control shows — or
+/// "Custom" once the player fine-tuned away from every preset.
 fn timing_summary(timings: &Timings) -> &'static str {
-    if *timings == Timings::default() {
-        "no extra delay"
-    } else {
-        "custom extra delay"
+    match TimingPreset::from_timings(timings) {
+        Some(preset) => preset.label(),
+        None => "Custom",
     }
 }
 
@@ -289,12 +292,111 @@ fn stop_body(ui: &mut egui::Ui, editor: &mut EditorState) {
 /// fixed wait, a bright segment for the random extra — grouped by phase. Folded
 /// by default (via `edit_setup`).
 fn timing_body(ui: &mut egui::Ui, editor: &mut EditorState) {
-    let t = &mut editor.timings;
-    ui.weak("Every click waits a fixed tuned delay, plus a random extra you add — drag a bar to give that click more human slack.");
+    ui.label("How human should the clicks look?");
     ui.add_space(theme::SP_SM);
+    // `active` is the lit segment: `Some(preset)` for a preset, `None` for Custom
+    // (bars shown). It carries the detected preset out of `preset_row` so the
+    // hint reuses that one lookup instead of scanning the timings again.
+    let active = preset_row(ui, editor);
+    ui.add_space(theme::SP_SM);
+    // The per-pass estimate is folded into the hint sentence, not a separate
+    // right-aligned stat row — a lone number floating in the empty space below a
+    // preset read as a misplaced KPI. In Custom the range tracks the bars live.
+    ui.weak(format!(
+        "{} About {} per pass.",
+        mode_hint(active),
+        pass_estimate(&editor.timings)
+    ));
+
+    // The eight bars live inline under the mode control, revealed by the Custom
+    // segment — no second collapse nested in the Click timing section.
+    if active.is_none() {
+        ui.add_space(theme::SP_SM);
+        fine_tune_body(ui, &mut editor.timings);
+    }
+}
+
+/// The humanization mode as one segmented control: the three presets plus a
+/// Custom segment that reveals the per-action bars. The active segment is the
+/// preset the timings match, or Custom when the player is fine-tuning (bars
+/// open) or the timings match no preset. Clicking a preset overwrites every
+/// action's random extra and hides the bars; clicking Custom reveals them
+/// without touching the timings. Returns the lit segment: `Some(preset)` for a
+/// preset, `None` for Custom (bars shown).
+fn preset_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Option<TimingPreset> {
+    let detected = TimingPreset::from_timings(&editor.timings);
+    // Custom wins whenever the bars are open or the mix matches no preset — so a
+    // config-seeded custom timing lands on Custom with its bars ready.
+    let custom = editor.fine_tune_open || detected.is_none();
+    // A unified segmented track: a raised rounded strip split into snug
+    // segments, so the three presets read as clickable parts of one control, not
+    // bare labels beside a button. The active segment fills with the bright
+    // `ACCENT` (egui's selection fill) so the chosen mode reads unmistakably;
+    // unselected labels mute until hovered.
+    egui::Frame::new()
+        .fill(theme::STRIPE)
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(3)
+        .show(ui, |ui| {
+            let visuals = &mut ui.style_mut().visuals;
+            visuals.widgets.inactive.fg_stroke.color = theme::INK_MUTED;
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.horizontal(|ui| {
+                for preset in TimingPreset::ALL {
+                    let selected = !custom && detected == Some(preset);
+                    if ui.selectable_label(selected, preset.label()).clicked() {
+                        editor.timings = preset.timings();
+                        editor.fine_tune_open = false;
+                    }
+                }
+                if ui.selectable_label(custom, "Custom").clicked() {
+                    editor.fine_tune_open = true;
+                }
+            });
+        });
+    // Reflect the pre-click state (as `custom` above): `None` when Custom is lit.
+    if custom { None } else { detected }
+}
+
+/// The one-line hint under the mode control, worded for the lit segment (from
+/// `preset_row`) — so the copy describes the current choice instead of listing
+/// them all. `None` is Custom (bars shown).
+fn mode_hint(active: Option<TimingPreset>) -> &'static str {
+    match active {
+        None => "Custom exposes each click's random delay — drag a bar to tune it yourself.",
+        Some(TimingPreset::Instant) => {
+            "Instant runs the tuned minimums — fastest, but every click fires on the same beat."
+        }
+        Some(TimingPreset::Human) => {
+            "Human adds a little random delay to each click, so the loop never ticks like a metronome."
+        }
+        Some(TimingPreset::Cautious) => {
+            "Cautious adds the most random delay — slowest, and the hardest to read as a bot."
+        }
+    }
+}
+
+/// The steady find-and-buy pass as a single honest reading — the summed baseline
+/// to baseline-plus-slack, in seconds — so the player sees the loop's per-pass
+/// cost without decoding eight bars. Folded into the mode hint sentence by
+/// `timing_body` rather than shown as its own stat row.
+fn pass_estimate(t: &Timings) -> String {
+    let slack = [
+        t.refreshed,
+        t.confirm_refresh_modal,
+        t.buy_modal,
+        t.purchase_resumed,
+    ];
+    let base_total: u64 = ROUTINE.iter().sum();
+    let hi_total: u64 = base_total + slack.iter().map(|r| r.max_ms.max(r.min_ms)).sum::<u64>();
+    secs_range(base_total, hi_total)
+}
+
+/// The per-action bars, revealed inline when the Custom mode segment is active.
+/// The legend rides here (not up top) so its two-tone key sits next to the bars
+/// it explains, and the presets carry the common case above.
+fn fine_tune_body(ui: &mut egui::Ui, t: &mut Timings) {
     timing_legend(ui);
-    ui.add_space(theme::SP_SM);
-    routine_timeline(ui, t);
     ui.add_space(theme::SP_SM);
     timing_group(
         ui,
@@ -356,112 +458,18 @@ fn legend_swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
     ui.weak(label);
 }
 
-/// The distinct waits a single find-and-buy pass strings together, in click
-/// order: the paid refresh, its confirm, the buy (the wait before its confirm),
-/// and the resume. Shop-open (once), scroll / between-buys (multi-item) and the
-/// watchdog (only on a miss) sit outside this steady loop, so the timeline stays
-/// an honest "typical pass".
-const ROUTINE: [(&str, u64); 4] = [
-    ("refresh", plan::WAIT_REFRESHED_MS),
-    ("confirm", plan::WAIT_CONFIRM_REFRESH_MODAL_MS),
-    ("buy", plan::WAIT_BUY_MODAL_MS),
-    ("resume", plan::WAIT_PURCHASE_RESUMED_MS),
+/// The tuned baselines a single steady find-and-buy pass strings together, in
+/// click order: the paid refresh, its confirm, the buy (the wait before its
+/// confirm), and the resume. Shop-open (once), scroll / between-buys
+/// (multi-item) and the watchdog (only on a miss) sit outside this steady loop,
+/// so the summary stays an honest "typical pass". `pass_estimate` adds each
+/// action's dialled-in slack on top for the high end.
+const ROUTINE: [u64; 4] = [
+    plan::WAIT_REFRESHED_MS,
+    plan::WAIT_CONFIRM_REFRESH_MODAL_MS,
+    plan::WAIT_BUY_MODAL_MS,
+    plan::WAIT_PURCHASE_RESUMED_MS,
 ];
-
-/// A one-glance summary: the whole find-and-buy pass as a single stacked bar,
-/// each action a segment sized to its share of the total, with the summed wait
-/// on the right — so the player sees where the routine's time goes, not just the
-/// eight rows in isolation. Uses baselines only (the fixed skeleton); the range
-/// each row adds is tuned below.
-fn routine_timeline(ui: &mut egui::Ui, t: &Timings) {
-    // The per-pass extra each action can add, paired to ROUTINE by position, so
-    // the total reads as a range when the player has dialled in any slack.
-    let slack = [
-        t.refreshed,
-        t.confirm_refresh_modal,
-        t.buy_modal,
-        t.purchase_resumed,
-    ];
-    let base_total: u64 = ROUTINE.iter().map(|(_, b)| b).sum();
-    let hi_total: u64 = base_total + slack.iter().map(|r| r.max_ms.max(r.min_ms)).sum::<u64>();
-
-    ui.horizontal(|ui| {
-        ui.label(theme::section("one refresh + buy"));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.weak(secs_range(base_total, hi_total));
-        });
-    });
-    ui.add_space(theme::SP_XS);
-
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
-    let painter = ui.painter().clone();
-    painter.rect_filled(rect, egui::CornerRadius::same(4), theme::HAIRLINE);
-    // Each action is its own rounded pill sized by its *resolved* share (baseline
-    // + the slack dialled in), so dragging a bar below visibly rebalances this
-    // summary. A clear gap between pills makes the action boundaries unmistakable;
-    // inside a pill the fill uses the same two tones as the bars and the legend —
-    // muted `METER_BASE` for the fixed baseline, bright `ACCENT` for the random
-    // extra — so the colours mean the same thing everywhere, and the split reads
-    // as "within this action" rather than a new segment.
-    let scale = hi_total.max(1) as f32;
-    const GAP: f32 = 4.0;
-    let last = ROUTINE.len() - 1;
-    let mut x = rect.left();
-    for (i, (name, base)) in ROUTINE.iter().enumerate() {
-        let extra = slack[i].max_ms.max(slack[i].min_ms);
-        let seg_ms = base + extra;
-        let seg_w = rect.width() * (seg_ms as f32 / scale);
-        // Each pill ends a gap short of the next (the last reaches the edge).
-        let pill_end = if i == last {
-            rect.right()
-        } else {
-            x + seg_w - GAP
-        };
-        let split = x + (pill_end - x) * (*base as f32 / seg_ms.max(1) as f32);
-        let has_extra = extra > 0 && pill_end > split;
-        let round = egui::CornerRadius::same(5);
-        let square = egui::CornerRadius::ZERO;
-        // Muted fixed head of the pill: left corners always round; right corners
-        // round too only when there is no bright tail to close the pill.
-        painter.rect_filled(
-            egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(split, rect.bottom())),
-            egui::CornerRadius {
-                ne: if has_extra { 0 } else { 5 },
-                se: if has_extra { 0 } else { 5 },
-                ..round
-            },
-            theme::METER_BASE,
-        );
-        if has_extra {
-            // Bright random tail closes the pill's right corners.
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(split, rect.top()),
-                    egui::pos2(pill_end, rect.bottom()),
-                ),
-                egui::CornerRadius {
-                    ne: 5,
-                    se: 5,
-                    ..square
-                },
-                theme::ACCENT,
-            );
-        }
-        // Name centred over the pill when it is wide enough to hold it.
-        if pill_end - x > 52.0 {
-            painter.text(
-                egui::pos2((x + pill_end) * 0.5, rect.center().y),
-                egui::Align2::CENTER_CENTER,
-                *name,
-                egui::FontId::new(11.0, egui::FontFamily::Proportional),
-                theme::INK,
-            );
-        }
-        x += seg_w;
-    }
-    ui.add_space(theme::SP_SM);
-}
 
 /// The meter height and the fixed time ruler the bars sit on. The ruler is
 /// constant (not fitted to the values) so a bar's length is a stable reading of
@@ -868,20 +876,59 @@ mod tests {
     }
 
     #[test]
-    fn timing_section_folds_its_body_until_opened() {
-        // Click timing arrives folded, so its rows are hidden; clicking the bar
-        // reveals them (a phase header is a body-only label). While folded, the
-        // bar's accessible name trails its summary peek.
+    fn open_timing_shows_the_mode_control_not_the_bars() {
+        // Opening Click timing on a preset shows the segmented mode control; the
+        // eight bars stay hidden until the Custom segment is chosen.
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
+        editor.timing_open = true;
         let mut harness = Harness::new_ui(|ui| {
             edit_setup(ui, &mut editor);
         });
+        harness.run();
+        harness.get_by_label("Instant");
+        harness.get_by_label("Custom");
         assert!(harness.query_by_label("OPEN & REFRESH").is_none());
-        harness
-            .get_by_label("Click timing · no extra delay")
-            .click();
+    }
+
+    #[test]
+    fn the_custom_segment_reveals_and_hides_the_bars() {
+        // Clicking Custom reveals the bars inline; clicking a preset overwrites
+        // the timings and folds them away again — no nested disclosure.
+        let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
+        editor.timing_open = true;
+        let mut harness = Harness::new_ui(|ui| {
+            edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Custom").click();
         harness.run();
         harness.get_by_label("OPEN & REFRESH");
+        harness.get_by_label("Human").click();
+        harness.run();
+        assert!(harness.query_by_label("OPEN & REFRESH").is_none());
+    }
+
+    #[test]
+    fn mode_hint_varies_with_the_active_mode() {
+        // Each mode gets its own line; Custom wins over the detected preset so
+        // the hint tracks the segment lit in the control.
+        assert!(mode_hint(Some(TimingPreset::Instant)).starts_with("Instant"));
+        assert!(mode_hint(Some(TimingPreset::Human)).starts_with("Human"));
+        assert!(mode_hint(Some(TimingPreset::Cautious)).starts_with("Cautious"));
+        assert!(mode_hint(None).starts_with("Custom"));
+    }
+
+    #[test]
+    fn clicking_a_preset_writes_its_timings() {
+        // The preset control overwrites the timing draft; Apply then commits it.
+        let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
+        editor.timing_open = true;
+        let mut harness = Harness::new_ui(|ui| {
+            edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Cautious").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.timings, TimingPreset::Cautious.timings());
     }
 
     #[test]
@@ -902,7 +949,7 @@ mod tests {
         harness.run();
         let hunt = harness.get_by_label("Hunt · Covenant").rect();
         let stop = harness.get_by_label("Stop · no limits").rect();
-        let click = harness.get_by_label("Click timing · no extra delay").rect();
+        let click = harness.get_by_label("Click timing · Instant").rect();
         assert_eq!(hunt.max.y, stop.min.y, "Hunt and Stop must tile");
         assert_eq!(stop.max.y, click.min.y, "Stop and Click timing must tile");
     }
