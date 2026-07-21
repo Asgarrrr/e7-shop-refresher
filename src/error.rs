@@ -12,6 +12,9 @@ pub enum Error {
     #[error("configuration parse: {0}")]
     ConfigParse(#[from] toml::de::Error),
 
+    #[error("config write: {0}")]
+    ConfigWrite(String),
+
     #[error("network capture: {0}")]
     Capture(String),
 

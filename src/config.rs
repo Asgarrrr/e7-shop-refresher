@@ -1,5 +1,7 @@
 //! Relay configuration, loaded from a TOML file (defaults otherwise).
 
+pub mod persist;
+
 use std::path::Path;
 use std::time::Duration;
 
