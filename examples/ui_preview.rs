@@ -184,7 +184,8 @@ fn main() -> eframe::Result {
                 handles,
                 error,
                 Default::default(),
-                "config.toml",
+                // scratch path: the design-mock preview must never overwrite the real config.toml on Apply
+                "ui_preview_scratch.toml",
             )))
         }),
     )
