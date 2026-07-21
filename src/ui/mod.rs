@@ -22,6 +22,7 @@ use eframe::egui;
 
 use crate::actuator::plan::Timings;
 use crate::app::{Command, SessionHandles};
+use crate::config;
 use crate::journal::LogLine;
 
 use editor::EditorState;
@@ -81,6 +82,7 @@ enum Tab {
 /// The eframe application: a thin shell around the session handles.
 pub struct ShopApp {
     handles: SessionHandles,
+    config_path: &'static str,
     error: SessionErrorSlot,
     editor: EditorState,
     tab: Tab,
@@ -99,6 +101,7 @@ impl ShopApp {
         handles: SessionHandles,
         error: SessionErrorSlot,
         timings: Timings,
+        config_path: &'static str,
     ) -> Self {
         theme::apply(&cc.egui_ctx);
         // Seed the drafts from the controller itself — the single source of
@@ -113,6 +116,7 @@ impl ShopApp {
         let journal_generation = handles.journal.generation();
         Self {
             handles,
+            config_path,
             error,
             editor,
             tab: Tab::Shop,
@@ -204,6 +208,17 @@ impl eframe::App for ShopApp {
                 render_tab_content(ui, &view, self.tab, &mut self.editor, session_alive)
             })
             .inner;
+        // Persist the Setup edits before dispatch. Best-effort: the live apply
+        // below is unaffected by a write failure — a read-only or unwritable
+        // config.toml only costs the on-disk copy, journaled and moved past.
+        let sections = persisted_sections(&applied);
+        if !sections.is_empty()
+            && let Err(err) = config::persist::save(self.config_path, &sections)
+        {
+            self.handles
+                .journal
+                .push(&[format!("config.toml not saved: {err}")]);
+        }
         // The status bar sends at most one command; Setup's single Apply may
         // send several (one per changed draft). A full channel only happens
         // with a dead session loop, where the banner already explains the
@@ -248,6 +263,20 @@ fn render_tabs(ui: &mut egui::Ui, tab: &mut Tab) {
     // The underline is a 2px stroke centred on the baseline: reserve its lower
     // half so the zero-margin panel doesn't clip it.
     ui.add_space(theme::SP_XS);
+}
+
+/// The persistable sections for a batch of Apply commands — only the three
+/// `Set*` producers; Start/Stop and friends are skipped.
+fn persisted_sections(commands: &[Command]) -> Vec<config::persist::Section> {
+    commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::SetFilter(filter) => Some(config::persist::Section::Filter(filter.clone())),
+            Command::SetLimits(limits) => Some(config::persist::Section::Limits(limits.clone())),
+            Command::SetTimings(timings) => Some(config::persist::Section::Timings(*timings)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The active tab's content in its own scroll area. Returns the commands the
@@ -334,6 +363,22 @@ mod tests {
             now_ms: 0,
         });
         view_state(&controller)
+    }
+
+    #[test]
+    fn only_setup_commands_become_persisted_sections() {
+        use crate::app::Command;
+        let commands = vec![
+            Command::Start,
+            Command::SetLimits(crate::domain::control::Limits::default()),
+        ];
+        let sections = persisted_sections(&commands);
+        // Start is not persisted; the limits edit is.
+        assert_eq!(sections.len(), 1);
+        assert!(matches!(
+            sections[0],
+            crate::config::persist::Section::Limits(_)
+        ));
     }
 
     #[test]

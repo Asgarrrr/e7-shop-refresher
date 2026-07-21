@@ -119,7 +119,15 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
                 .with_min_inner_size([440.0, 460.0]),
             ..Default::default()
         },
-        Box::new(move |cc| Ok(Box::new(ui::ShopApp::new(cc, handles, error, seed_timings)))),
+        Box::new(move |cc| {
+            Ok(Box::new(ui::ShopApp::new(
+                cc,
+                handles,
+                error,
+                seed_timings,
+                CONFIG_PATH,
+            )))
+        }),
     );
     // Not a plain drop: tokio::io::stdin parks a blocking thread, and dropping
     // the runtime would hang window close until the player presses Enter.

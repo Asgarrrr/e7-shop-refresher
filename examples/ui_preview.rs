@@ -184,6 +184,7 @@ fn main() -> eframe::Result {
                 handles,
                 error,
                 Default::default(),
+                "config.toml",
             )))
         }),
     )
