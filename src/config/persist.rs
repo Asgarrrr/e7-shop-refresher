@@ -33,7 +33,11 @@ pub fn save(path: impl AsRef<Path>, edits: &[Section]) -> Result<()> {
         Err(err) => return Err(err.into()),
     };
     let updated = write_sections(&text, edits)?;
-    std::fs::write(path, updated)?;
+    // Atomic replace: write a sibling temp then rename, so a mid-write failure
+    // never truncates the hand-authored config.
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, updated)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -137,6 +141,23 @@ buffer_size = 65535
         assert!(out.contains("# what we hunt"), "above-header comment kept");
         assert!(out.contains("ticketrare_name"));
         assert!(!out.contains("old_name"), "old section value replaced");
+    }
+
+    #[test]
+    fn inner_section_comment_is_dropped_on_replace() {
+        let text = "\
+# what we hunt
+[filter]
+# example: min_substats = 3
+names = [\"old_name\"]
+";
+        let out = write_sections(text, &[Section::Filter(hunt_filter())]).expect("write");
+        assert!(out.contains("# what we hunt"), "above-header comment kept");
+        assert!(
+            !out.contains("min_substats = 3"),
+            "inner example comment dropped"
+        );
+        assert!(out.contains("ticketrare_name"));
     }
 
     #[test]
