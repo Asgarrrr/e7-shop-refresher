@@ -34,10 +34,13 @@ pub fn save(path: impl AsRef<Path>, edits: &[Section]) -> Result<()> {
     };
     let updated = write_sections(&text, edits)?;
     // Atomic replace: write a sibling temp then rename, so a mid-write failure
-    // never truncates the hand-authored config.
+    // never truncates the hand-authored config. On any failure, remove the temp
+    // so a read-only or locked target doesn't accrete a stale `config.toml.tmp`.
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, updated)?;
-    std::fs::rename(&tmp, path)?;
+    if let Err(err) = std::fs::write(&tmp, updated).and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
     Ok(())
 }
 
