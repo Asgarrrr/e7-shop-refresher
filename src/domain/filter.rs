@@ -2,7 +2,7 @@
 //! worth stopping the refresh loop to buy. Kept on the client so they can be
 //! tuned live from the UI.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::shop::{ItemKind, ShopItem};
 
@@ -16,7 +16,7 @@ use crate::domain::shop::{ItemKind, ShopItem};
 /// Deserialized from the config file's `[filter]` section. Unlike the wire
 /// models, unknown keys are rejected: a typo here silently loosens the
 /// criteria the refresh loop spends crystals against.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Filter {
     /// Kept item kinds (any-of); empty keeps all, including `Unknown`.
@@ -41,7 +41,7 @@ pub struct Filter {
 ///
 /// `name` is deliberately required (no container default): a nameless
 /// requirement would silently match nothing.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubstatReq {
     pub name: String,
@@ -417,6 +417,23 @@ mod tests {
             substat("speed", Some(3.0)),
         ];
         assert!(filter.matches(&item));
+    }
+
+    #[test]
+    fn filter_round_trips_through_toml() {
+        let filter = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            min_substats: Some(3),
+            max_price: Some(300_000),
+            required_substats: vec![SubstatReq {
+                name: "speed".to_owned(),
+                min: Some(8.0),
+            }],
+            ..Filter::default()
+        };
+        let text = toml::to_string(&filter).expect("serialize");
+        let back: Filter = toml::from_str(&text).expect("deserialize");
+        assert_eq!(filter, back);
     }
 
     #[test]

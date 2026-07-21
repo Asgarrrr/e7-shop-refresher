@@ -2,7 +2,7 @@
 //! display and filter. Only this shape crosses the link; how the server
 //! produces it is not the client's concern.
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShopSnapshot {
@@ -128,7 +128,7 @@ impl ShopItem {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemKind {
     Equipment,

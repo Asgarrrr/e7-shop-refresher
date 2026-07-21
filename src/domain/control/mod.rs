@@ -13,7 +13,7 @@ mod watchdog;
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::filter::Filter;
 use crate::domain::shop::{RefreshMeta, ShopSnapshot};
@@ -47,7 +47,7 @@ pub enum Recovery {
 ///
 /// Deserialized from the config file's `[limits]` section; unknown keys are
 /// rejected because a misspelled limit is a limit that never triggers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_refreshes: Option<u32>,

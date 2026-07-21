@@ -4,7 +4,7 @@
 //!
 //! Coordinates are in the game's 1280×720 design space, origin top-left.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const DESIGN_W: f32 = 1280.0;
 const DESIGN_H: f32 = 720.0;
@@ -181,7 +181,7 @@ impl Trigger {
 /// loop's pauses vary like a human's instead of being byte-identical every
 /// time. The default (`0..=0`) reproduces the calibrated timing exactly; the
 /// baseline is the floor, so a range only ever slows the loop down.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DelayRange {
     pub min_ms: u64,
@@ -209,7 +209,7 @@ impl DelayRange {
 
 /// Player-set extra-wait ranges, added on top of every tuned baseline above.
 /// All-default (`0..=0`) reproduces the calibrated timing exactly.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Timings {
     /// Before the first click once the shop opens.
