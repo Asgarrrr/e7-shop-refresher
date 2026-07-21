@@ -74,11 +74,16 @@ fn set_table(parent: &mut Table, key: &str, mut new: Table) {
     parent.insert(key, Item::Table(new));
 }
 
-/// Replace `parent[outer][inner]`, creating `outer` as an implicit table if it
-/// is absent (so a fresh file grows only `[actuator.timings]`, no bare
-/// `[actuator]` header, and an existing `[actuator]` keeps its other keys).
+/// Replace `parent[outer][inner]`, ensuring `outer` is a header table first.
+/// Absent → a fresh implicit table (so a new file grows only
+/// `[actuator.timings]`, no bare `[actuator]` header). Authored inline
+/// (`actuator = { .. }`) → promoted to a header table in place so its other
+/// keys (dry_run/backend) survive the splice. Already a header table → left as
+/// is, its keys preserved.
 fn set_nested_table(parent: &mut Table, outer: &str, inner: &str, new: Table) {
-    if parent.get(outer).and_then(Item::as_table).is_none() {
+    if let Some(inline) = parent.get(outer).and_then(Item::as_inline_table).cloned() {
+        parent.insert(outer, Item::Table(inline.into_table()));
+    } else if parent.get(outer).and_then(Item::as_table).is_none() {
         let mut created = Table::new();
         created.set_implicit(true);
         parent.insert(outer, Item::Table(created));
@@ -220,6 +225,28 @@ backend = \"input\"
         assert!(out.contains("backend = \"input\""), "backend kept");
         assert!(out.contains("[actuator.timings]"));
         assert!(out.contains("{ min_ms = 100, max_ms = 500 }"));
+    }
+
+    #[test]
+    fn inline_actuator_keeps_its_mode_keys() {
+        let text = "actuator = { dry_run = true, backend = \"input\" }\n";
+        let mut timings = Timings::default();
+        timings.buy_modal = crate::actuator::plan::DelayRange {
+            min_ms: 50,
+            max_ms: 250,
+        };
+        let out = write_sections(text, &[Section::Timings(timings)]).expect("write");
+        // Promoted to a header table; mode keys survive; timings spliced in.
+        assert!(out.contains("dry_run = true"), "dry_run kept");
+        assert!(out.contains("backend = \"input\""), "backend kept");
+        assert!(out.contains("[actuator.timings]"));
+        // The whole thing still loads and the mode is intact.
+        let config: crate::config::Config = toml::from_str(&out).expect("reload");
+        assert!(config.actuator.dry_run);
+        assert_eq!(
+            config.actuator.backend,
+            crate::config::ActuatorBackend::Input
+        );
     }
 
     #[test]
