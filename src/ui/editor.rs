@@ -17,8 +17,10 @@ use crate::render::kind_label;
 /// Draft criteria owned by the window until Apply pushes them to the session;
 /// seeded from the controller's live criteria (and the startup timings) at
 /// startup. Each draft carries the last-applied copy beside it so Apply lights
-/// up only on a real change and sends nothing that has not moved. Edits are
-/// session-only — config.toml is never rewritten.
+/// up only on a real change and sends nothing that has not moved. Drafts are
+/// still session-seeded from the controller, but Apply now both retunes the
+/// live session AND writes the changed sections back to config.toml (via
+/// `config::persist`, format-preserving, best-effort).
 pub struct EditorState {
     filter: Filter,
     limits: Limits,
@@ -661,8 +663,6 @@ fn commit_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
             }
         });
     });
-    ui.add_space(theme::SP_XS);
-    ui.weak("edits apply to this session only — config.toml is unchanged");
     commands
 }
 
