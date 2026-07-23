@@ -1,5 +1,20 @@
-# Static linking: WinDivert's user-mode code is compiled into the exe (from the
-# C sources vendored by windivert-sys, via MSVC). No WinDivert.dll to ship — only
-# the WinDivert64.sys driver remains, embedded in the exe and extracted at runtime.
+# WinDivert linking. We link DYNAMICALLY against the official WinDivert release
+# binaries vendored under `vendor/windivert/` (WinDivert.lib at build time; the
+# exe loads WinDivert.dll at runtime, which in turn loads WinDivert{64,32}.sys).
+#
+# We deliberately do NOT use `WINDIVERT_STATIC`: statically linking the C that
+# `windivert-sys` compiles from source produces a RELEASE binary that overflows
+# the stack at startup (before the window opens). The self-compiled object is
+# built with flags that corrupt the release build's stack-guard probing, so
+# every function with a frame larger than a page faults on the guard page.
+# Debug builds are unaffected, which is why it only bit the shipped .exe. The
+# official prebuilt DLL is a correct build and works.
+#
+# `relative = true` resolves the path against this file's directory (repo root),
+# so the build is reproducible on any machine that has the repo.
+#
+# DISTRIBUTION: ship `WinDivert.dll` and `WinDivert64.sys` next to the .exe.
+# The crate's `build.rs` stages both into `target/<profile>/` on every build, so
+# `cargo run` works and the profile dir is ready to ship as-is.
 [env]
-WINDIVERT_STATIC = "1"
+WINDIVERT_PATH = { value = "vendor/windivert", relative = true }
