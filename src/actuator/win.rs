@@ -62,18 +62,18 @@ impl Surface for WinSurface {
     }
 
     fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError> {
-        move_cursor(at);
+        move_cursor(at)?;
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
-        send_mouse(0, MOUSEEVENTF_LEFTDOWN);
+        send_mouse(0, MOUSEEVENTF_LEFTDOWN)?;
         std::thread::sleep(Duration::from_millis(press_ms));
-        send_mouse(0, MOUSEEVENTF_LEFTUP);
+        send_mouse(0, MOUSEEVENTF_LEFTUP)?;
         Ok(())
     }
 
     fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError> {
-        move_cursor(at);
+        move_cursor(at)?;
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
-        send_mouse(notches.saturating_mul(WHEEL_DELTA), MOUSEEVENTF_WHEEL);
+        send_mouse(notches.saturating_mul(WHEEL_DELTA), MOUSEEVENTF_WHEEL)?;
         Ok(())
     }
 }
@@ -137,7 +137,7 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
 
 /// Absolute cursor move, normalized to the virtual desktop so multi-monitor
 /// setups resolve the same physical pixel.
-fn move_cursor(at: (i32, i32)) {
+fn move_cursor(at: (i32, i32)) -> Result<(), SurfaceError> {
     let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
     let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
     let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
@@ -151,10 +151,10 @@ fn move_cursor(at: (i32, i32)) {
         dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         time: 0,
         dwExtraInfo: 0,
-    });
+    })
 }
 
-fn send_mouse(data: i32, flags: u32) {
+fn send_mouse(data: i32, flags: u32) -> Result<(), SurfaceError> {
     send_input(MOUSEINPUT {
         dx: 0,
         dy: 0,
@@ -162,15 +162,43 @@ fn send_mouse(data: i32, flags: u32) {
         dwFlags: flags,
         time: 0,
         dwExtraInfo: 0,
-    });
+    })
 }
 
-fn send_input(mi: MOUSEINPUT) {
+fn send_input(mi: MOUSEINPUT) -> Result<(), SurfaceError> {
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 { mi },
     };
-    unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    let inserted = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    sendinput_result(inserted)
+}
+
+/// `SendInput` returns the number of events inserted; we always send 1, so
+/// anything else means the input was blocked (UIPI, foreground lock, full
+/// queue). Recoverable: the watchdog re-issues against a fresh acquire.
+fn sendinput_result(inserted: u32) -> Result<(), SurfaceError> {
+    if inserted == 1 {
+        Ok(())
+    } else {
+        Err(SurfaceError::Recoverable(format!(
+            "SendInput injected {inserted}/1 events — input blocked ({})",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+/// `PostMessageW` returns a BOOL; false means the post failed (window gone,
+/// queue full). Recoverable for the same reason.
+fn postmessage_result(ok: bool) -> Result<(), SurfaceError> {
+    if ok {
+        Ok(())
+    } else {
+        Err(SurfaceError::Recoverable(format!(
+            "PostMessageW failed — window gone or queue full ({})",
+            std::io::Error::last_os_error()
+        )))
+    }
 }
 
 /// `PostMessageW` backend (the default): posts synthetic mouse messages to
@@ -240,11 +268,11 @@ impl Surface for MessageSurface {
         let target = self.target.expect("acquire() before click");
         target.engage()?;
         let lparam = pack_point(target.to_client(at));
-        post(target.hwnd, WM_MOUSEMOVE, 0, lparam);
+        post(target.hwnd, WM_MOUSEMOVE, 0, lparam)?;
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
-        post(target.hwnd, WM_LBUTTONDOWN, MK_LBUTTON as usize, lparam);
+        post(target.hwnd, WM_LBUTTONDOWN, MK_LBUTTON as usize, lparam)?;
         std::thread::sleep(Duration::from_millis(press_ms));
-        post(target.hwnd, WM_LBUTTONUP, 0, lparam);
+        post(target.hwnd, WM_LBUTTONUP, 0, lparam)?;
         Ok(())
     }
 
@@ -256,7 +284,7 @@ impl Surface for MessageSurface {
             WM_MOUSEMOVE,
             0,
             pack_point(target.to_client(at)),
-        );
+        )?;
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
         // WM_MOUSEWHEEL takes screen coordinates; the delta rides wParam's
         // high word.
@@ -266,7 +294,7 @@ impl Surface for MessageSurface {
             WM_MOUSEWHEEL,
             ((delta as u32) << 16) as usize,
             pack_point(at),
-        );
+        )?;
         Ok(())
     }
 
@@ -280,6 +308,38 @@ fn pack_point((x, y): (i32, i32)) -> isize {
     (((y & 0xFFFF) << 16) | (x & 0xFFFF)) as isize
 }
 
-fn post(hwnd: isize, msg: u32, wparam: usize, lparam: isize) {
-    unsafe { PostMessageW(hwnd as HWND, msg, wparam, lparam) };
+fn post(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> Result<(), SurfaceError> {
+    let ok = unsafe { PostMessageW(hwnd as HWND, msg, wparam, lparam) } != 0;
+    postmessage_result(ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sendinput_one_event_is_ok() {
+        assert!(sendinput_result(1).is_ok());
+    }
+
+    #[test]
+    fn sendinput_zero_events_is_recoverable() {
+        assert!(matches!(
+            sendinput_result(0),
+            Err(SurfaceError::Recoverable(_))
+        ));
+    }
+
+    #[test]
+    fn postmessage_true_is_ok() {
+        assert!(postmessage_result(true).is_ok());
+    }
+
+    #[test]
+    fn postmessage_false_is_recoverable() {
+        assert!(matches!(
+            postmessage_result(false),
+            Err(SurfaceError::Recoverable(_))
+        ));
+    }
 }
