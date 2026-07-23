@@ -33,6 +33,7 @@ names = ["ticketrare_name", "ticketspecial_name"]
 # sets = ["set_speed", "set_counter"]   # any-of, exact internal set ids
 # min_substats = 3                      # minimum substat count
 # max_price = 300000                    # inclusive gold cap; unknown price fails it
+# min_grade = 4                         # inclusive gear-grade floor (2, 3, or 4); unknown grade fails it
 # include_sold_out = false              # keep sold-out items (default drops them)
 
 # Substats that must all be present; `min` is an inclusive threshold,

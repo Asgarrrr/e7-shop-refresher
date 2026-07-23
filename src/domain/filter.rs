@@ -32,6 +32,8 @@ pub struct Filter {
     pub required_substats: Vec<SubstatReq>,
     /// Inclusive gold cap; an unknown price fails it.
     pub max_price: Option<u32>,
+    /// Inclusive minimum gear grade (2, 3, or 4); an unknown grade fails it.
+    pub min_grade: Option<u8>,
     /// Keep sold-out items (default drops them).
     pub include_sold_out: bool,
 }
@@ -75,6 +77,11 @@ impl Filter {
         {
             return false;
         }
+        if let Some(min) = self.min_grade
+            && item.grade.is_none_or(|grade| grade < min)
+        {
+            return false;
+        }
         if !self.sets.is_empty() && !item.set.as_ref().is_some_and(|set| self.sets.contains(set)) {
             return false;
         }
@@ -94,6 +101,7 @@ impl Filter {
             && self.min_substats.is_none_or(|min| min == 0)
             && self.required_substats.is_empty()
             && self.max_price.is_none()
+            && self.min_grade.is_none_or(|min| min <= 2)
     }
 }
 
@@ -359,6 +367,58 @@ mod tests {
     }
 
     #[test]
+    fn min_grade_accepts_equal_and_above() {
+        let filter = Filter {
+            min_grade: Some(3),
+            ..Filter::default()
+        };
+        assert!(filter.matches(&equip())); // grade 3, equal to floor
+        let mut item = equip();
+        item.grade = Some(4);
+        assert!(filter.matches(&item)); // grade 4, above floor
+    }
+
+    #[test]
+    fn min_grade_rejects_below() {
+        let filter = Filter {
+            min_grade: Some(4),
+            ..Filter::default()
+        };
+        assert!(!filter.matches(&equip())); // grade 3, below floor
+    }
+
+    #[test]
+    fn min_grade_unknown_fails() {
+        let filter = Filter {
+            min_grade: Some(3),
+            ..Filter::default()
+        };
+        let mut item = equip();
+        item.grade = None;
+        assert!(!filter.matches(&item)); // fail-closed: unknown grade fails
+    }
+
+    #[test]
+    fn min_grade_is_a_real_constraint() {
+        let real = Filter {
+            min_grade: Some(4),
+            ..Filter::default()
+        };
+        assert!(!real.is_unrestricted());
+        // All gear is grade >= 2, so a floor of 2 (or 0) constrains nothing.
+        let noop = Filter {
+            min_grade: Some(2),
+            ..Filter::default()
+        };
+        assert!(noop.is_unrestricted());
+        let zero = Filter {
+            min_grade: Some(0),
+            ..Filter::default()
+        };
+        assert!(zero.is_unrestricted());
+    }
+
+    #[test]
     fn substat_req_presence_only_min_none() {
         let filter = Filter {
             required_substats: vec![SubstatReq {
@@ -425,6 +485,7 @@ mod tests {
             names: vec!["ticketrare_name".to_owned()],
             min_substats: Some(3),
             max_price: Some(300_000),
+            min_grade: Some(4),
             required_substats: vec![SubstatReq {
                 name: "speed".to_owned(),
                 min: Some(8.0),
