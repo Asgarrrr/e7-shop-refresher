@@ -279,8 +279,9 @@ fn persisted_sections(commands: &[Command]) -> Vec<config::persist::Section> {
         .collect()
 }
 
-/// The active tab's content in its own scroll area. Returns the commands the
-/// player committed (Setup's single Apply lives here, and may send several).
+/// The active tab's content. Returns the commands the player committed (Setup's
+/// single Apply lives here, and may send several). One scroll state per tab —
+/// Setup's offset must not bleed into the table.
 fn render_tab_content(
     ui: &mut egui::Ui,
     view: &ViewState,
@@ -288,24 +289,46 @@ fn render_tab_content(
     editor: &mut EditorState,
     session_alive: bool,
 ) -> Vec<Command> {
+    match tab {
+        // The shop table bleeds its hover fill to the edges itself, so it takes
+        // no inset and commits nothing.
+        Tab::Shop => {
+            egui::ScrollArea::vertical()
+                .id_salt("tab-shop")
+                .auto_shrink([false, false])
+                .show(ui, |ui| shop::render_shop_tab(ui, view));
+            Vec::new()
+        }
+        Tab::Setup => render_setup_tab(ui, editor, session_alive),
+    }
+}
+
+/// The Setup tab, split into a pinned commit bar over a scrolling body: the bar
+/// is a bottom sub-panel (shown first so it reserves its strip), the sections
+/// scroll in whatever height is left. This keeps Apply reachable at any scroll
+/// offset instead of trailing the last section off-screen. Its `side_top_panel`
+/// frame draws the hairline that separates it from the body.
+fn render_setup_tab(
+    ui: &mut egui::Ui,
+    editor: &mut EditorState,
+    session_alive: bool,
+) -> Vec<Command> {
     let mut clicked = Vec::new();
-    // Tab scroll: an expanded editor must never overflow a clipped panel. One
-    // scroll state per tab — Setup's offset must not bleed into the table.
+    egui::Panel::bottom("setup_commit")
+        .frame(
+            egui::Frame::side_top_panel(ui.style())
+                .inner_margin(egui::Margin::symmetric(theme::EDGE, 8)),
+        )
+        .show(ui, |ui| {
+            clicked = editor::commit_row(ui, editor, session_alive);
+        });
     egui::ScrollArea::vertical()
-        .id_salt(match tab {
-            Tab::Shop => "tab-shop",
-            Tab::Setup => "tab-setup",
-        })
+        .id_salt("tab-setup")
         .auto_shrink([false, false])
-        .show(ui, |ui| match tab {
-            // The shop table bleeds its hover fill to the edges itself; the
-            // editors are plain widgets, so they take the shared inset.
-            Tab::Shop => shop::render_shop_tab(ui, view),
-            Tab::Setup => content_inset(ui, |ui| {
-                clicked = ui
-                    .add_enabled_ui(session_alive, |ui| editor::edit_setup(ui, editor))
-                    .inner;
-            }),
+        .show(ui, |ui| {
+            content_inset(ui, |ui| {
+                ui.add_enabled_ui(session_alive, |ui| editor::edit_sections(ui, editor));
+            });
         });
     clicked
 }

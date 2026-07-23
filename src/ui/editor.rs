@@ -63,10 +63,22 @@ impl EditorState {
     }
 }
 
-/// The whole Setup surface: three journal-style collapsible sections over one
-/// Apply. Returns the commands the player committed — one per draft that
-/// changed, empty until Apply fires (or while it stays disabled).
-pub fn edit_setup(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
+/// The whole Setup surface in one pass: the three sections over the Apply
+/// footer, stacked in a single `ui`. The live window mounts them in separate
+/// panels ([`edit_sections`] in the scroll, [`commit_row`] pinned to the
+/// bottom) so Apply never scrolls out of reach; this combined entry lets the
+/// test harness drive both at once. Session is assumed alive — the pinned path
+/// passes the real flag.
+#[cfg(test)]
+fn edit_setup(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
+    edit_sections(ui, editor);
+    ui.add_space(theme::SP_XL);
+    commit_row(ui, editor, true)
+}
+
+/// The three journal-style collapsible sections (Hunt / Stop / Click timing) —
+/// the scrolling body of the Setup tab, without the commit bar.
+pub(super) fn edit_sections(ui: &mut egui::Ui, editor: &mut EditorState) {
     // The section bar trails a peek of what it holds while folded, keeping the
     // intent visible without the controls. The summary is built only when the
     // section is folded (the bar drops it once open), so an expanded Setup tab
@@ -92,8 +104,6 @@ pub fn edit_setup(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
         timing_body(ui, editor);
         ui.add_space(theme::SP_SM);
     }
-    ui.add_space(theme::SP_XL);
-    commit_row(ui, editor)
 }
 
 /// One collapsible section bar (journal key) plus the breathing room its open
@@ -627,8 +637,16 @@ fn secs_range(lo_ms: u64, hi_ms: u64) -> String {
 /// filter is the change, until it is restricted enough to arm (an unrestricted
 /// filter the loop would refuse never reaches the session). Timing/limit-only
 /// edits apply even while the filter sits unrestricted, since the domain only
-/// gates arming on the filter.
-fn commit_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
+/// gates arming on the filter. Left of the button, a peek names the sections
+/// with unsaved edits (or, when the block is on, why Apply is dark) so the
+/// pinned bar reads as a pending-changes summary, not a lone button. Disabled
+/// wholesale once the session is dead — the click would vanish into a closed
+/// channel.
+pub(super) fn commit_row(
+    ui: &mut egui::Ui,
+    editor: &mut EditorState,
+    session_alive: bool,
+) -> Vec<Command> {
     let dirty_filter = editor.filter != editor.applied_filter;
     let dirty_limits = editor.limits != editor.applied_limits;
     let dirty_timings = editor.timings != editor.applied_timings;
@@ -639,12 +657,18 @@ fn commit_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
 
     let mut commands = Vec::new();
     ui.horizontal(|ui| {
+        // The blocking reason wins the peek slot: it explains the dark button.
+        // Otherwise, name the dirty sections so Apply's target is legible.
         if blocked {
             ui.weak("add at least one hunt criterion before Apply");
+        } else if let Some(summary) = dirty_summary(dirty_filter, dirty_limits, dirty_timings) {
+            ui.weak(summary);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let clicked = ui
-                .add_enabled_ui(dirty && !blocked, |ui| theme::primary_button(ui, "Apply"))
+                .add_enabled_ui(session_alive && dirty && !blocked, |ui| {
+                    theme::primary_button(ui, "Apply")
+                })
                 .inner
                 .clicked();
             if clicked {
@@ -664,6 +688,24 @@ fn commit_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
         });
     });
     commands
+}
+
+/// The pending-edit peek for the commit bar: the section labels with unsaved
+/// drafts, e.g. `Hunt, Stop edited`. `None` when nothing moved (Apply is dark
+/// and the bar stays bare). Labels mirror the section titles so the peek points
+/// straight at the collapsible that changed.
+fn dirty_summary(filter: bool, limits: bool, timings: bool) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    if filter {
+        parts.push("Hunt");
+    }
+    if limits {
+        parts.push("Stop");
+    }
+    if timings {
+        parts.push("Click timing");
+    }
+    (!parts.is_empty()).then(|| format!("{} edited", parts.join(", ")))
 }
 
 /// Row remove control: a `✕` on a 24px-square target. `small_button` gave an
@@ -849,6 +891,32 @@ mod tests {
         editor.filter.names.clear();
         assert!(editor.filter.is_unrestricted());
         assert!(run_setup(&mut editor).is_empty());
+    }
+
+    #[test]
+    fn dirty_summary_joins_the_changed_section_labels() {
+        assert_eq!(dirty_summary(false, false, false), None);
+        assert_eq!(
+            dirty_summary(true, false, false).as_deref(),
+            Some("Hunt edited")
+        );
+        assert_eq!(
+            dirty_summary(true, true, true).as_deref(),
+            Some("Hunt, Stop, Click timing edited")
+        );
+    }
+
+    #[test]
+    fn commit_bar_names_the_dirty_section() {
+        // A changed limit lights the Stop peek beside Apply, so the pinned bar
+        // reads as a pending-changes summary rather than a lone button.
+        let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
+        editor.limits.max_refreshes = Some(5);
+        let mut harness = Harness::new_ui(|ui| {
+            edit_setup(ui, &mut editor);
+        });
+        harness.run();
+        harness.get_by_label("Stop edited");
     }
 
     #[test]
