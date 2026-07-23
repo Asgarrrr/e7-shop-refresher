@@ -15,6 +15,7 @@ mod statusbar;
 mod theme;
 mod view;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -82,7 +83,7 @@ enum Tab {
 /// The eframe application: a thin shell around the session handles.
 pub struct ShopApp {
     handles: SessionHandles,
-    config_path: &'static str,
+    config_path: PathBuf,
     error: SessionErrorSlot,
     editor: EditorState,
     tab: Tab,
@@ -101,7 +102,7 @@ impl ShopApp {
         handles: SessionHandles,
         error: SessionErrorSlot,
         timings: Timings,
-        config_path: &'static str,
+        config_path: PathBuf,
     ) -> Self {
         theme::apply(&cc.egui_ctx);
         // Seed the drafts from the controller itself — the single source of
@@ -213,7 +214,7 @@ impl eframe::App for ShopApp {
         // config.toml only costs the on-disk copy, journaled and moved past.
         let sections = persisted_sections(&applied);
         if !sections.is_empty()
-            && let Err(err) = config::persist::save(self.config_path, &sections)
+            && let Err(err) = config::persist::save(&self.config_path, &sections)
         {
             self.handles
                 .journal

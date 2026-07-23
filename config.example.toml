@@ -4,9 +4,9 @@
 # Epic Seven game server TCP port.
 game_port = 3333
 
-# Analysis server. ws:// for a local dev server; the hosted server is wss://
-# (TLS): server_url = "wss://ingest.arkyve.dev/refresh-shop".
-server_url = "ws://127.0.0.1:3001/refresh-shop"
+# Analysis server. Defaults to the hosted server over wss:// (TLS). For a
+# local dev server use ws://: server_url = "ws://127.0.0.1:3001/refresh-shop".
+server_url = "wss://ingest.arkyve.dev/refresh-shop"
 
 [forward]
 # Server -> client responses: carry the shop contents (forward these).

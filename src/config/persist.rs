@@ -33,6 +33,12 @@ pub fn save(path: impl AsRef<Path>, edits: &[Section]) -> Result<()> {
         Err(err) => return Err(err.into()),
     };
     let updated = write_sections(&text, edits)?;
+    // The config lives in a per-user app-data subdir that may not exist yet on
+    // first run (nothing created it before this first Apply); make it so the
+    // sibling-temp write below has a directory to land in.
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
     // Atomic replace: write a sibling temp then rename, so a mid-write failure
     // never truncates the hand-authored config. On any failure, remove the temp
     // so a read-only or locked target doesn't accrete a stale `config.toml.tmp`.

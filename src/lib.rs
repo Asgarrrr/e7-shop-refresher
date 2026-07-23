@@ -33,3 +33,8 @@ pub use error::{Error, Result};
 /// The one place the product name lives: window titles and the welcome
 /// screen must never disagree.
 pub const APP_NAME: &str = "Arkyve Refresh Shop";
+
+/// Filesystem-safe app folder name, shared by the per-user data locations:
+/// the config under `%APPDATA%` (roaming) and the extracted runtime binaries
+/// under `%LOCALAPPDATA%` (local). One constant so the two never diverge.
+pub const APP_DIR: &str = "arkyve-refresh-shop";

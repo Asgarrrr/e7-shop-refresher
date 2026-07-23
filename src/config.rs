@@ -107,7 +107,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             game_port: DEFAULT_GAME_PORT,
-            server_url: "ws://127.0.0.1:3001/refresh-shop".to_owned(),
+            server_url: "wss://ingest.arkyve.dev/refresh-shop".to_owned(),
             forward: ForwardConfig::default(),
             reconnect: ReconnectConfig::default(),
             capture: CaptureConfig::default(),

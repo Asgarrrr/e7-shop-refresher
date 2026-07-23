@@ -5,13 +5,45 @@
 // and stdin become inert sinks there (the console build keeps them).
 #![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use tracing_subscriber::EnvFilter;
 
 use arkyve_refresh_shop::{Config, app, crash};
 
-const CONFIG_PATH: &str = "config.toml";
+/// Location of the config file. The app owns this file (the GUI's Setup/Apply
+/// writes it); the player isn't expected to hand-edit it, so it lives out of
+/// the way in per-user roaming app-data on Windows —
+/// `%APPDATA%\arkyve-refresh-shop\config.toml` — rather than beside the exe.
+/// If `APPDATA` is somehow unset, or on non-Windows dev machines (mac), it
+/// falls back to a `config.toml` in the working directory.
+fn config_path() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return PathBuf::from(appdata)
+            .join(arkyve_refresh_shop::APP_DIR)
+            .join("config.toml");
+    }
+    PathBuf::from("config.toml")
+}
+
+/// On first run no config file exists yet. Write the bundled example (compiled
+/// into the exe) to the resolved path so the player finds a real, commented
+/// file at the standard location — and a valid one: the example carries the
+/// default hunt `[filter]`, which the relay requires to start. Best-effort:
+/// any failure is ignored and `Config::load` falls back to the in-memory
+/// defaults, exactly as before.
+fn seed_config_if_missing(path: &std::path::Path) {
+    if path.exists() {
+        return;
+    }
+    const EXAMPLE: &str = include_str!("../config.example.toml");
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, EXAMPLE);
+}
 
 fn main() -> ExitCode {
     // Before anything can panic: capture panics to a file. In the windowed
@@ -35,11 +67,14 @@ fn main() -> ExitCode {
         .with_target(false)
         .init();
 
-    let config = match Config::load(CONFIG_PATH) {
+    let config_path = config_path();
+    seed_config_if_missing(&config_path);
+    let config = match Config::load(&config_path) {
         Ok(config) => config,
         Err(err) => {
             return fatal(format!(
-                "Invalid configuration: {err}\n\nFix config.toml and restart."
+                "Invalid configuration: {err}\n\nFix {} and restart.",
+                config_path.display()
             ));
         }
     };
@@ -53,7 +88,7 @@ fn main() -> ExitCode {
         Ok(runtime) => runtime,
         Err(err) => return fatal(format!("Failed to start the async runtime: {err}")),
     };
-    run_mode(runtime, config)
+    run_mode(runtime, config, config_path)
 }
 
 /// Every fatal error before the main window opens lands here: stderr always,
@@ -69,7 +104,7 @@ fn fatal(message: String) -> ExitCode {
 
 /// Console-only build: the session blocks the main thread, as before.
 #[cfg(not(feature = "gui"))]
-fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
+fn run_mode(runtime: tokio::runtime::Runtime, config: Config, _config_path: PathBuf) -> ExitCode {
     let outcome = runtime.block_on(app::run(config));
     // Not a plain drop: tokio::io::stdin parks an uncancelable blocking read,
     // and dropping the runtime would hang exit until the player presses Enter.
@@ -87,7 +122,7 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
 /// main thread; the session's outcome lands in the window banner instead of
 /// killing the window.
 #[cfg(feature = "gui")]
-fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
+fn run_mode(runtime: tokio::runtime::Runtime, config: Config, config_path: PathBuf) -> ExitCode {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -125,7 +160,7 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config) -> ExitCode {
                 handles,
                 error,
                 seed_timings,
-                CONFIG_PATH,
+                config_path.clone(),
             )))
         }),
     );
