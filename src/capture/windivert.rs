@@ -146,8 +146,12 @@ fn preload_dll(path: &Path, expected: &[u8]) -> Result<()> {
 
     // Verify the on-disk bytes are our embedded copy right before loading, so a
     // file swapped in after the earlier extraction check is not loaded. This
-    // shrinks (does not fully close) the check-to-load TOCTOU window.
-    if !file_has_content(path, expected) {
+    // shrinks (does not fully close) the check-to-load TOCTOU window. Refuse only
+    // on a *successful* read that mismatches: if the file is momentarily
+    // unreadable (e.g. an antivirus lock), fall through to LoadLibraryW — which
+    // maps via an image section and tolerates that — rather than fail a genuine
+    // DLL. A readable-but-foreign file is still refused.
+    if matches!(std::fs::read(path), Ok(bytes) if bytes != expected) {
         return Err(Error::Capture(format!(
             "{} does not match the embedded WinDivert.dll — refusing to load it",
             path.display()
@@ -197,8 +201,10 @@ fn ensure_file_present(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
                 Ok(())
             } else {
                 Err(Error::Capture(format!(
-                    "{} exists with unexpected content and could not be replaced ({err}) — \
-                     refusing to load a runtime file that does not match the embedded copy",
+                    "{} is locked with content that does not match this build ({err}) — \
+                     close any other running instance of the app and retry (an in-place \
+                     upgrade cannot replace a locked runtime file); refusing to load a \
+                     runtime file that does not match the embedded copy",
                     target.display()
                 )))
             }
