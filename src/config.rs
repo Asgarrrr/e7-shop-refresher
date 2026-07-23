@@ -147,14 +147,22 @@ impl Default for CaptureConfig {
 }
 
 /// True when the `ws://` authority is loopback, where cleartext never leaves
-/// the machine. Accepts `host` or `host:port`, IPv6 in brackets.
+/// the machine. Accepts `host` or `host:port`, IPv6 in brackets. The scheme is
+/// matched case-insensitively, and any `user:pass@` userinfo is dropped: the
+/// real host is what follows the last `@` (what `http::Uri`, and thus the
+/// WebSocket client, actually connects to), so `ws://127.0.0.1@evil.com` is
+/// correctly seen as `evil.com` and rejected rather than passing as loopback.
 fn is_loopback_ws_host(url: &str) -> bool {
-    let after = match url.strip_prefix("ws://") {
-        Some(rest) => rest,
-        None => return false,
+    let after = match url.get(..5) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("ws://") => &url[5..],
+        _ => return false,
     };
     // Authority ends at the first path/query separator.
     let authority = after.split(['/', '?']).next().unwrap_or("");
+    // Drop any userinfo: the host is what follows the last '@'. Honoring this is
+    // what stops a userinfo-embedded loopback from leaking traffic in cleartext
+    // to a remote host the WebSocket client would actually dial.
+    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
     // Strip the port: an IPv6 literal is bracketed, so split off a trailing
     // ":port" only when it is not inside brackets.
     let host = if let Some(closing) = authority.strip_prefix('[') {
@@ -211,9 +219,11 @@ impl Config {
         // session tokens: require TLS (`wss://`) unless the host is loopback,
         // where cleartext (`ws://`) never leaves the machine.
         let url = self.server_url.trim();
-        if url.starts_with("wss://") {
+        // URL schemes are case-insensitive, so match `WSS://` too.
+        let lower = url.to_ascii_lowercase();
+        if lower.starts_with("wss://") {
             // TLS: fine.
-        } else if url.starts_with("ws://") {
+        } else if lower.starts_with("ws://") {
             if !is_loopback_ws_host(url) {
                 return Err(crate::Error::Config(
                     "server_url uses ws:// to a non-loopback host — captured traffic \
@@ -502,5 +512,34 @@ mod tests {
     fn empty_still_rejected() {
         let err = config_with_url("").validate().unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
+    }
+
+    #[test]
+    fn ws_userinfo_loopback_is_rejected() {
+        // The loopback text sits in the userinfo; the real host (evil.com) is
+        // remote, so this must be refused — not accepted as loopback.
+        let err = config_with_url("ws://127.0.0.1:3001@evil.com/refresh-shop")
+            .validate()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::Config(_)));
+        // Even a bare userinfo form must be caught.
+        let err = config_with_url("ws://localhost@evil.com/x")
+            .validate()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::Config(_)));
+    }
+
+    #[test]
+    fn scheme_match_is_case_insensitive() {
+        // URL schemes are case-insensitive; an uppercase scheme must not be
+        // rejected when the WebSocket client would accept it.
+        assert!(config_with_url("WSS://ingest.arkyve.dev/refresh-shop")
+            .validate()
+            .is_ok());
+        assert!(config_with_url("WS://127.0.0.1:3001/x").validate().is_ok());
+        // A userinfo bypass must still be caught regardless of scheme case.
+        assert!(config_with_url("WS://127.0.0.1@evil.com/x")
+            .validate()
+            .is_err());
     }
 }
