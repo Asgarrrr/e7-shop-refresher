@@ -76,9 +76,11 @@ runs cleanly from the Desktop:
 
 ## Requirements
 
-- **End user**: Windows x64 + administrator rights at launch (WinDivert loads a
-  kernel driver — UAC prompt on first run). Just the exe; it self-extracts its
-  runtime to `%LOCALAPPDATA%` on first run.
+- **End user**: Windows x64. Just the exe — double-click it. It carries a UAC
+  manifest (`requireAdministrator`), so Windows shows the consent prompt on
+  launch automatically (WinDivert loads a kernel driver, which needs admin); no
+  "Run as administrator" needed. It self-extracts its runtime to `%LOCALAPPDATA%`
+  on first run.
 - **Build machine**: Rust >= 1.85 and the MSVC toolchain (`link.exe`). No C
   compiler needed — the DLL is prebuilt.
 
@@ -95,6 +97,11 @@ the native backend:
 ```sh
 cargo test --no-default-features
 ```
+
+> **Dev note:** the default (WinDivert) build embeds a `requireAdministrator`
+> manifest, so `cargo run` from a non-elevated shell fails with "requires
+> elevation". Run it from an **elevated terminal**, launch the built exe
+> directly (it prompts UAC), or use `--no-default-features` for pipeline work.
 
 ## Configuration
 

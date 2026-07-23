@@ -30,5 +30,14 @@ fn main() {
         println!("cargo:rustc-link-arg-bins=/DELAYLOAD:WinDivert.dll");
         // The delay-load stubs call `__delayLoadHelper2`, which lives here.
         println!("cargo:rustc-link-arg-bins=delayimp.lib");
+
+        // Require elevation at launch. WinDivert installs and loads a kernel
+        // driver, which needs administrator rights; without this the player
+        // must right-click > "Run as administrator" or the first capture fails.
+        // The linker bakes a UAC manifest into the exe so Windows shows the
+        // consent prompt automatically on every launch. `/MANIFEST:EMBED` puts
+        // it inside the exe (the default only emits an external `.manifest`).
+        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg-bins=/MANIFESTUAC:level='requireAdministrator'");
     }
 }
