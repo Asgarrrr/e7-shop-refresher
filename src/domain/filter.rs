@@ -101,7 +101,9 @@ impl Filter {
             && self.min_substats.is_none_or(|min| min == 0)
             && self.required_substats.is_empty()
             && self.max_price.is_none()
-            && self.min_grade.is_none_or(|min| min <= 2)
+            // Any grade floor constrains: `matches` is fail-closed, so it drops
+            // every gradeless item (tokens, heroes) even at `min_grade = 2`.
+            && self.min_grade.is_none()
     }
 }
 
@@ -405,17 +407,20 @@ mod tests {
             ..Filter::default()
         };
         assert!(!real.is_unrestricted());
-        // All gear is grade >= 2, so a floor of 2 (or 0) constrains nothing.
-        let noop = Filter {
+        // Any grade floor is a real constraint: matches() fail-closes on a
+        // gradeless item, so even `min_grade = 2` drops every token/hero (grade
+        // None) and keeps only grade-2+ gear. It must arm the loop, not read as
+        // "matches everything".
+        let floor_two = Filter {
             min_grade: Some(2),
             ..Filter::default()
         };
-        assert!(noop.is_unrestricted());
-        let zero = Filter {
+        assert!(!floor_two.is_unrestricted());
+        let floor_zero = Filter {
             min_grade: Some(0),
             ..Filter::default()
         };
-        assert!(zero.is_unrestricted());
+        assert!(!floor_zero.is_unrestricted());
     }
 
     #[test]
