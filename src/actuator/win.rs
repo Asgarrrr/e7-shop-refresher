@@ -66,7 +66,13 @@ impl Surface for WinSurface {
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
         send_mouse(0, MOUSEEVENTF_LEFTDOWN)?;
         std::thread::sleep(Duration::from_millis(press_ms));
-        send_mouse(0, MOUSEEVENTF_LEFTUP)?;
+        // The button is down: always release it, and if the release is refused,
+        // retry once best-effort — a failed click must never leave the left
+        // button stuck down (the watchdog may halt rather than re-click).
+        if let Err(err) = send_mouse(0, MOUSEEVENTF_LEFTUP) {
+            let _ = send_mouse(0, MOUSEEVENTF_LEFTUP);
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -272,7 +278,12 @@ impl Surface for MessageSurface {
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
         post(target.hwnd, WM_LBUTTONDOWN, MK_LBUTTON as usize, lparam)?;
         std::thread::sleep(Duration::from_millis(press_ms));
-        post(target.hwnd, WM_LBUTTONUP, 0, lparam)?;
+        // Button is down: always post the release, retrying once on failure so a
+        // refused click never leaves the game seeing a held left button.
+        if let Err(err) = post(target.hwnd, WM_LBUTTONUP, 0, lparam) {
+            let _ = post(target.hwnd, WM_LBUTTONUP, 0, lparam);
+            return Err(err);
+        }
         Ok(())
     }
 
