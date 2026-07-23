@@ -146,6 +146,40 @@ impl Default for CaptureConfig {
     }
 }
 
+/// True when the `ws://` authority is loopback, where cleartext never leaves
+/// the machine. Accepts `host` or `host:port`, IPv6 in brackets.
+fn is_loopback_ws_host(url: &str) -> bool {
+    let after = match url.strip_prefix("ws://") {
+        Some(rest) => rest,
+        None => return false,
+    };
+    // Authority ends at the first path/query separator.
+    let authority = after.split(['/', '?']).next().unwrap_or("");
+    // Strip the port: an IPv6 literal is bracketed, so split off a trailing
+    // ":port" only when it is not inside brackets.
+    let host = if let Some(closing) = authority.strip_prefix('[') {
+        // "[::1]:3001" -> "[::1]"
+        closing
+            .split_once(']')
+            .map(|(h, _)| {
+                let mut s = String::from("[");
+                s.push_str(h);
+                s.push(']');
+                s
+            })
+            .unwrap_or_else(|| authority.to_owned())
+    } else {
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h.to_owned())
+            .unwrap_or_else(|| authority.to_owned())
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "[::1]" | "::1"
+    )
+}
+
 impl Config {
     /// Loads the configuration from `path`. A missing file yields the defaults.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
@@ -172,6 +206,26 @@ impl Config {
         }
         if self.server_url.trim().is_empty() {
             return Err(crate::Error::Config("server_url is empty".into()));
+        }
+        // `server_url` receives the reassembled game stream, which can carry
+        // session tokens: require TLS (`wss://`) unless the host is loopback,
+        // where cleartext (`ws://`) never leaves the machine.
+        let url = self.server_url.trim();
+        if url.starts_with("wss://") {
+            // TLS: fine.
+        } else if url.starts_with("ws://") {
+            if !is_loopback_ws_host(url) {
+                return Err(crate::Error::Config(
+                    "server_url uses ws:// to a non-loopback host — captured traffic \
+                     would be sent in cleartext; use wss:// (or ws:// only for \
+                     127.0.0.1/localhost)"
+                        .into(),
+                ));
+            }
+        } else {
+            return Err(crate::Error::Config(
+                "server_url must be a ws:// or wss:// URL".into(),
+            ));
         }
         // `ItemKind` is wire-tolerant (`serde(other)` -> Unknown), which in a
         // config file would let a typo silently match nothing: reject it here.
@@ -388,5 +442,65 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
+    }
+
+    /// Builds a default `Config` (which forwards `server_to_client`, so
+    /// `validate` reaches the scheme check) with `server_url` overwritten.
+    fn config_with_url(server_url: &str) -> Config {
+        Config {
+            server_url: server_url.to_owned(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn wss_is_accepted() {
+        assert!(config_with_url("wss://ingest.arkyve.dev/refresh-shop")
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn ws_loopback_ipv4_accepted() {
+        assert!(config_with_url("ws://127.0.0.1:3001/refresh-shop")
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn ws_localhost_accepted() {
+        assert!(config_with_url("ws://localhost:3001/x").validate().is_ok());
+    }
+
+    #[test]
+    fn ws_ipv6_loopback_accepted() {
+        assert!(config_with_url("ws://[::1]:3001/x").validate().is_ok());
+    }
+
+    #[test]
+    fn ws_remote_host_rejected() {
+        let err = config_with_url("ws://ingest.arkyve.dev/x")
+            .validate()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::Config(_)));
+    }
+
+    #[test]
+    fn ws_example_com_rejected() {
+        // Done-criteria spot check: a non-loopback ws:// host is refused.
+        let err = config_with_url("ws://example.com/x").validate().unwrap_err();
+        assert!(matches!(err, crate::Error::Config(_)));
+    }
+
+    #[test]
+    fn non_ws_scheme_rejected() {
+        let err = config_with_url("http://example.com").validate().unwrap_err();
+        assert!(matches!(err, crate::Error::Config(_)));
+    }
+
+    #[test]
+    fn empty_still_rejected() {
+        let err = config_with_url("").validate().unwrap_err();
+        assert!(matches!(err, crate::Error::Config(_)));
     }
 }
