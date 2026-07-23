@@ -15,14 +15,15 @@ use crate::error::{Error, Result};
 
 /// Signed kernel driver, embedded in the executable and extracted at runtime.
 ///
-/// Statically linked, WinDivert loads the driver from the exe's directory
-/// (`GetModuleFileName(NULL)`), so we ship a single exe that drops the `.sys`
-/// itself on first run.
+/// WinDivert loads the driver from the module directory
+/// (`GetModuleFileName`) — the exe's folder, where `WinDivert.dll` also sits —
+/// so the exe drops the `.sys` there itself on first run. Distribution is thus
+/// exe + `WinDivert.dll`; the `.sys` rides inside the exe.
 ///
-/// This `.sys` (WinDivert 2.2.2) must stay aligned with the user-mode sources
-/// compiled by `windivert-sys`. WinDivert only requires a matching *major*
-/// version (>= 2), so a minor drift is tolerated, but a major bump would force
-/// replacing this file.
+/// This `.sys` (WinDivert 2.2.2) must stay aligned with `WinDivert.dll` and the
+/// user-mode bindings in `windivert-sys` (both under `vendor/windivert/`).
+/// WinDivert only requires a matching *major* version (>= 2), so a minor drift
+/// is tolerated, but a major bump would force replacing all three together.
 const DRIVER_SYS: &[u8] = include_bytes!("../../vendor/windivert/WinDivert64.sys");
 const DRIVER_FILE: &str = "WinDivert64.sys";
 

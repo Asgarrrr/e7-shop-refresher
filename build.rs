@@ -1,12 +1,17 @@
 //! Stages the vendored WinDivert runtime files next to the built executable.
 //!
-//! WinDivert is linked dynamically (see `.cargo/config.toml`): the exe loads
-//! `WinDivert.dll` at runtime, which in turn loads `WinDivert64.sys`, and both
-//! are found beside the executable. `windivert-sys`'s own build script only
-//! stages them into its `OUT_DIR`, which is not on the exe's DLL search path —
-//! so `cargo run` and a copied-out release build would fail to load the driver.
-//! This copies them into `target/<profile>/` so both just work, and the profile
-//! dir is ready to ship as-is (exe + WinDivert.dll + WinDivert64.sys).
+//! WinDivert is linked dynamically (see `.cargo/config.toml`): the exe imports
+//! `WinDivert.dll` at load time, so the DLL must sit beside the executable —
+//! `windivert-sys`'s own build script only stages it into its `OUT_DIR`, which
+//! is not on the exe's DLL search path, so `cargo run` and a copied-out release
+//! build would fail to load it. This copies `WinDivert.dll` into
+//! `target/<profile>/` so both just work.
+//!
+//! The `WinDivert64.sys` driver is NOT copied here: it is embedded in the exe
+//! (`include_bytes!`) and self-extracted next to the exe on first run (see
+//! `src/capture/windivert.rs`). WinDivert.dll is LGPL, so its license is staged
+//! alongside to keep the profile dir ready to ship (exe + WinDivert.dll +
+//! WinDivert-LICENSE.txt).
 
 use std::path::PathBuf;
 use std::{env, fs};
@@ -24,10 +29,13 @@ fn main() {
         return;
     };
 
-    for name in ["WinDivert.dll", "WinDivert64.sys"] {
-        let src = vendor.join(name);
+    for (src_name, dst_name) in [
+        ("WinDivert.dll", "WinDivert.dll"),
+        ("LICENSE", "WinDivert-LICENSE.txt"),
+    ] {
+        let src = vendor.join(src_name);
         if src.exists() {
-            let _ = fs::copy(&src, profile_dir.join(name));
+            let _ = fs::copy(&src, profile_dir.join(dst_name));
         }
     }
 }

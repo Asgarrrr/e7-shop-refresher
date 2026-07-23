@@ -40,23 +40,34 @@ The relay starts **idle** (nothing is captured or forwarded): press **Start**
 in the window (or type `start` in the console) when opening the shop to arm
 the session, **Stop** when done.
 
-## Distribution — a single executable
+## Distribution — exe + WinDivert.dll
 
-WinDivert's user-mode code is **statically linked** into the exe, and the
-`WinDivert64.sys` driver is **embedded** (`include_bytes!`) then extracted next
-to the exe on first launch. You ship **one `.exe`** (e.g. a GitHub release): no
-DLL or side files to bundle.
+WinDivert's user-mode library is the **official prebuilt `WinDivert.dll`**
+(vendored under `vendor/windivert/`), linked **dynamically**. The
+`WinDivert64.sys` driver is **embedded** in the exe (`include_bytes!`) and
+extracted next to it on first launch. You ship **`arkyve-refresh-shop.exe` +
+`WinDivert.dll`** (plus `WinDivert-LICENSE.txt`); the `.sys` rides inside the
+exe. `cargo build` stages the DLL and license into `target/<profile>/` (via
+`build.rs`), so that directory is ready to zip and ship as-is.
 
 > The `.sys` is a kernel driver: Windows loads it from a file on disk (never from
-> memory). The exe drops it itself — invisible to the user, and the already
+> memory). The exe drops it beside itself — invisible to the user, and the already
 > required admin rights are enough to write it.
+
+> **Why not static?** `WINDIVERT_STATIC` compiles WinDivert's C from source and
+> links it into the exe; that object corrupts the **release** build's stack-guard
+> probing and the exe overflows its stack at startup (debug is unaffected). The
+> official prebuilt DLL is a correct build, so we link against it instead.
+
+> **License:** WinDivert is LGPL. We link it dynamically and ship
+> `WinDivert-LICENSE.txt` beside the exe — keep it in any redistributed bundle.
 
 ## Requirements
 
 - **End user**: Windows x64 + administrator rights at launch (WinDivert loads a
-  kernel driver — UAC prompt on first run). Nothing else.
-- **Build machine**: Rust >= 1.85 and the MSVC Build Tools (`cl.exe`) — static
-  linking compiles WinDivert from its C sources.
+  kernel driver — UAC prompt on first run). `WinDivert.dll` beside the exe.
+- **Build machine**: Rust >= 1.85 and the MSVC toolchain (`link.exe`). No C
+  compiler needed — the DLL is prebuilt.
 
 ## Build
 
@@ -64,8 +75,9 @@ DLL or side files to bundle.
 cargo build --release
 ```
 
-Static linking is enabled via `WINDIVERT_STATIC` in `.cargo/config.toml`. To
-build/test the pipeline without the native backend (no MSVC required):
+WinDivert is linked dynamically against `vendor/windivert/` (set by
+`WINDIVERT_PATH` in `.cargo/config.toml`). To build/test the pipeline without
+the native backend:
 
 ```sh
 cargo test --no-default-features
