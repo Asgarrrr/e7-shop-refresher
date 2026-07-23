@@ -13,8 +13,14 @@
 # `relative = true` resolves the path against this file's directory (repo root),
 # so the build is reproducible on any machine that has the repo.
 #
-# DISTRIBUTION: ship `WinDivert.dll` and `WinDivert64.sys` next to the .exe.
-# The crate's `build.rs` stages both into `target/<profile>/` on every build, so
-# `cargo run` works and the profile dir is ready to ship as-is.
+# DISTRIBUTION: ship the .exe alone. Both `WinDivert.dll` and `WinDivert64.sys`
+# are embedded in it (`include_bytes!`) and self-extracted at first run into
+# `%LOCALAPPDATA%\arkyve-refresh-shop\` (nothing lands beside the exe). The DLL
+# is delay-loaded (see `build.rs`) so its import resolves after that extraction
+# rather than at process load; it is then preloaded by full path from there.
+#
+# The vendored `WinDivert.lib` was regenerated from `WinDivert.def` (via
+# `lib.exe /DEF`) into a proper MSVC short-import library — the official release
+# ships a "long" import lib that `/DELAYLOAD` silently ignores (LNK4199).
 [env]
 WINDIVERT_PATH = { value = "vendor/windivert", relative = true }

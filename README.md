@@ -40,32 +40,45 @@ The relay starts **idle** (nothing is captured or forwarded): press **Start**
 in the window (or type `start` in the console) when opening the shop to arm
 the session, **Stop** when done.
 
-## Distribution — exe + WinDivert.dll
+## Distribution — a single exe
 
-WinDivert's user-mode library is the **official prebuilt `WinDivert.dll`**
-(vendored under `vendor/windivert/`), linked **dynamically**. The
-`WinDivert64.sys` driver is **embedded** in the exe (`include_bytes!`) and
-extracted next to it on first launch. You ship **`arkyve-refresh-shop.exe` +
-`WinDivert.dll`** (plus `WinDivert-LICENSE.txt`); the `.sys` rides inside the
-exe. `cargo build` stages the DLL and license into `target/<profile>/` (via
-`build.rs`), so that directory is ready to zip and ship as-is.
+You ship **`arkyve-refresh-shop.exe` alone**. Both WinDivert runtime files ride
+inside it (`include_bytes!`) and are self-extracted on first launch into
+`%LOCALAPPDATA%\arkyve-refresh-shop\` — **nothing lands beside the exe**, so it
+runs cleanly from the Desktop:
 
-> The `.sys` is a kernel driver: Windows loads it from a file on disk (never from
-> memory). The exe drops it beside itself — invisible to the user, and the already
-> required admin rights are enough to write it.
+- **`WinDivert.dll`** (the official prebuilt library, vendored under
+  `vendor/windivert/`) is **delay-loaded**: its import binds on the first
+  WinDivert call, *after* the exe has extracted it and `LoadLibrary`'d it by full
+  path from the app-data dir. Without delay-load the Windows loader would demand
+  the DLL at process start — before any extraction could run — and abort with
+  "WinDivert.dll not found".
+- **`WinDivert64.sys`** (the signed kernel driver) is loaded by the DLL from that
+  same directory. Windows loads a driver only from a file on disk, never from
+  memory, so *some* file is unavoidable — but it stays in the hidden app-data
+  dir, not in the user's face.
+
+> **Delay-load needs a proper import lib.** The official release ships a "long"
+> `WinDivert.lib` that `/DELAYLOAD` silently ignores (`LNK4199`). We regenerated
+> it as an MSVC **short-import** lib from `vendor/windivert/WinDivert.def`
+> (`lib.exe /DEF`). If you ever re-vendor it, run `cargo clean -p windivert-sys`
+> — that crate copies the lib into its `OUT_DIR` and won't notice an in-place
+> change.
 
 > **Why not static?** `WINDIVERT_STATIC` compiles WinDivert's C from source and
 > links it into the exe; that object corrupts the **release** build's stack-guard
 > probing and the exe overflows its stack at startup (debug is unaffected). The
 > official prebuilt DLL is a correct build, so we link against it instead.
 
-> **License:** WinDivert is LGPL. We link it dynamically and ship
-> `WinDivert-LICENSE.txt` beside the exe — keep it in any redistributed bundle.
+> **License:** WinDivert is LGPL. The DLL is extracted (re-materialized as a file
+> the user can replace with their own build) and its license is `vendor/windivert/LICENSE`
+> — keep the license available in any redistribution.
 
 ## Requirements
 
 - **End user**: Windows x64 + administrator rights at launch (WinDivert loads a
-  kernel driver — UAC prompt on first run). `WinDivert.dll` beside the exe.
+  kernel driver — UAC prompt on first run). Just the exe; it self-extracts its
+  runtime to `%LOCALAPPDATA%` on first run.
 - **Build machine**: Rust >= 1.85 and the MSVC toolchain (`link.exe`). No C
   compiler needed — the DLL is prebuilt.
 
@@ -85,13 +98,21 @@ cargo test --no-default-features
 
 ## Configuration
 
-Copy `config.example.toml` to `config.toml` and adjust. Every key has a default;
-a missing file falls back to the defaults.
+The app reads and writes its config at a per-user location, not beside the exe:
+
+- **Windows:** `%APPDATA%\arkyve-refresh-shop\config.toml`
+- **Other (dev):** `config.toml` in the working directory
+
+The GUI owns this file — the Setup tab's Apply writes the edited sections back
+to it — so it normally isn't hand-edited. On first run the bundled
+`config.example.toml` (compiled into the exe) is written to that path, so a
+real, commented, valid file is always there to inspect or edit; later runs
+leave it untouched. Delete it to regenerate the example on the next launch.
 
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `game_port` | `3333` | Game server TCP port |
-| `server_url` | `ws://127.0.0.1:3001/refresh-shop` | Analysis server |
+| `server_url` | `wss://ingest.arkyve.dev/refresh-shop` | Analysis server |
 | `forward.server_to_client` | `true` | Forward responses (shop contents) |
 | `forward.client_to_server` | `false` | Forward requests (context) |
 | `[filter]` | matches everything | Item interest criteria (kinds, sets, substats, price) |

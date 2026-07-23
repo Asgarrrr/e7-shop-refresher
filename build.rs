@@ -1,41 +1,34 @@
-//! Stages the vendored WinDivert runtime files next to the built executable.
+//! Delay-loads WinDivert.dll so the exe can ship as a single file.
 //!
-//! WinDivert is linked dynamically (see `.cargo/config.toml`): the exe imports
-//! `WinDivert.dll` at load time, so the DLL must sit beside the executable —
-//! `windivert-sys`'s own build script only stages it into its `OUT_DIR`, which
-//! is not on the exe's DLL search path, so `cargo run` and a copied-out release
-//! build would fail to load it. This copies `WinDivert.dll` into
-//! `target/<profile>/` so both just work.
+//! `WinDivert.dll` and `WinDivert64.sys` are both embedded in the exe
+//! (`include_bytes!` in `src/capture/windivert.rs`) and self-extracted on first
+//! run into `%LOCALAPPDATA%\arkyve-refresh-shop\`. That only works if the DLL is
+//! NOT resolved at process load (the loader runs before any of our code, so the
+//! file isn't on disk yet): we delay-load it, so the import binds on the first
+//! WinDivert call — after the extraction. The extraction dir is not on the DLL
+//! search path, so `ensure_runtime_present` also `LoadLibrary`s the DLL by full
+//! path before that first call; the delay-load thunk then binds to the already
+//! mapped module. This script emits the linker flags that arrange the delay.
 //!
-//! The `WinDivert64.sys` driver is NOT copied here: it is embedded in the exe
-//! (`include_bytes!`) and self-extracted next to the exe on first run (see
-//! `src/capture/windivert.rs`). WinDivert.dll is LGPL, so its license is staged
-//! alongside to keep the profile dir ready to ship (exe + WinDivert.dll +
-//! WinDivert-LICENSE.txt).
-
-use std::path::PathBuf;
-use std::{env, fs};
+//! WinDivert.dll is LGPL. Embedding it keeps the shipped artifact a single exe;
+//! the exe writes the DLL back out on first run (alongside its license), so a
+//! user can replace it with their own build — the relink freedom the LGPL
+//! requires.
 
 fn main() {
-    println!("cargo:rerun-if-changed=vendor/windivert");
+    println!("cargo:rerun-if-changed=build.rs");
 
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let vendor = manifest.join("vendor").join("windivert");
-
-    // OUT_DIR = target/<profile>/build/<pkg>-<hash>/out; three levels up is the
-    // profile dir (target/<profile>), where the executable lands.
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let Some(profile_dir) = out_dir.ancestors().nth(3) else {
-        return;
-    };
-
-    for (src_name, dst_name) in [
-        ("WinDivert.dll", "WinDivert.dll"),
-        ("LICENSE", "WinDivert-LICENSE.txt"),
-    ] {
-        let src = vendor.join(src_name);
-        if src.exists() {
-            let _ = fs::copy(&src, profile_dir.join(dst_name));
-        }
+    // Delay-loading is an MSVC linker feature (`/DELAYLOAD` + `delayimp.lib`),
+    // and WinDivert is only linked when its backend feature is on.
+    let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    let windivert = std::env::var_os("CARGO_FEATURE_WINDIVERT_BACKEND").is_some();
+    if msvc && windivert {
+        // Resolve WinDivert.dll on first use, not at load, so the embedded copy
+        // can be extracted and preloaded first (see `ensure_runtime_present`).
+        // `-bins` scopes this to the executable (tests and examples don't link
+        // WinDivert).
+        println!("cargo:rustc-link-arg-bins=/DELAYLOAD:WinDivert.dll");
+        // The delay-load stubs call `__delayLoadHelper2`, which lives here.
+        println!("cargo:rustc-link-arg-bins=delayimp.lib");
     }
 }

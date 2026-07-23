@@ -10,8 +10,10 @@ publish = false
 [features]
 default = ["windivert-backend", "gui", "actuator"]
 # Native Windows capture backend (WinDivert). Disable to build/test the pipeline
-# (reassembly, uplink, models) without the WinDivert SDK.
-windivert-backend = ["dep:windivert"]
+# (reassembly, uplink, models) without the WinDivert SDK. Pulls windows-sys for
+# `LoadLibraryW` (the delay-loaded WinDivert.dll is preloaded by full path from
+# its extracted app-data location).
+windivert-backend = ["dep:windivert", "dep:windows-sys"]
 # egui window over the session (dashboard + player commands). Disable for the
 # console-only build.
 gui = ["dep:eframe"]

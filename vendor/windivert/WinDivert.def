@@ -1,0 +1,39 @@
+; Import definitions for WinDivert.dll (x64), used to regenerate a clean MSVC
+; short-import WinDivert.lib. The library shipped in the official WinDivert
+; release is a "long" import library that link.exe cannot delay-load; a lib
+; built from this .def with lib.exe /DEF produces proper short-import records so
+; /DELAYLOAD:WinDivert.dll takes effect (the exe self-extracts the DLL before
+; the first call — see build.rs and src/capture/windivert.rs). Exports mirror
+; `dumpbin /exports WinDivert.dll`.
+LIBRARY WinDivert.dll
+EXPORTS
+    WinDivertClose
+    WinDivertGetParam
+    WinDivertHelperCalcChecksums
+    WinDivertHelperCompileFilter
+    WinDivertHelperDecrementTTL
+    WinDivertHelperEvalFilter
+    WinDivertHelperFormatFilter
+    WinDivertHelperFormatIPv4Address
+    WinDivertHelperFormatIPv6Address
+    WinDivertHelperHashPacket
+    WinDivertHelperHtonIPv6Address
+    WinDivertHelperHtonIpv6Address
+    WinDivertHelperHtonl
+    WinDivertHelperHtonll
+    WinDivertHelperHtons
+    WinDivertHelperNtohIPv6Address
+    WinDivertHelperNtohIpv6Address
+    WinDivertHelperNtohl
+    WinDivertHelperNtohll
+    WinDivertHelperNtohs
+    WinDivertHelperParseIPv4Address
+    WinDivertHelperParseIPv6Address
+    WinDivertHelperParsePacket
+    WinDivertOpen
+    WinDivertRecv
+    WinDivertRecvEx
+    WinDivertSend
+    WinDivertSendEx
+    WinDivertSetParam
+    WinDivertShutdown
