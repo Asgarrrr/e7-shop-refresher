@@ -413,8 +413,20 @@ fn queue_refresh(
         actuator.epoch.current(),
         now_ms,
     );
+    submit_or_report(lines, actuator, job, "refresh dropped");
+}
+
+/// Submits a job, journaling the drop if the actuator queue is full — a lost
+/// click must never be silent. `dropped` names what was lost, e.g. "refresh
+/// dropped".
+fn submit_or_report(
+    lines: &mut Vec<String>,
+    actuator: &ActuatorHandle,
+    job: plan::Job,
+    dropped: &str,
+) {
     if !actuator.submit(job) {
-        lines.push(">> actuator queue full — refresh dropped".to_owned());
+        lines.push(format!(">> actuator queue full — {dropped}"));
     }
 }
 
@@ -467,9 +479,7 @@ fn submit_confirm_retry(
         return;
     }
     let job = plan::confirm_retry_job(zone, actuator.timings(), actuator.epoch.current(), now_ms);
-    if !actuator.submit(job) {
-        lines.push(">> actuator queue full — confirm re-click dropped".to_owned());
-    }
+    submit_or_report(lines, actuator, job, "confirm re-click dropped");
 }
 
 /// A buy decision: one job clicking every trackable target. Only `id: Some`
@@ -519,9 +529,7 @@ fn submit_buys(
         &rows,
         now_ms,
     );
-    if !actuator.submit(job) {
-        lines.push(">> actuator queue full — buys dropped".to_owned());
-    }
+    submit_or_report(lines, actuator, job, "buys dropped");
 }
 
 /// Details of the matched targets, straight from the snapshot that raised
