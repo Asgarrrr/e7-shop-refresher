@@ -118,6 +118,14 @@ fn ensure_runtime_present() -> Result<()> {
     let dir = runtime_dir()?;
     fs::create_dir_all(&dir)
         .map_err(|err| Error::Capture(format!("runtime dir {}: {err}", dir.display())))?;
+    // Best-effort defense-in-depth: restrict the directory to admins/SYSTEM so a
+    // non-elevated same-user process can't win the extract-then-load race by
+    // planting a file here first. A failure only logs — the byte re-verifies
+    // above and in `preload_dll`/`refuse_if_foreign` remain the real guard.
+    if let Err(err) = harden_runtime_dir(&dir) {
+        warn!(dir = %dir.display(), error = %err,
+            "could not restrict runtime dir permissions — relying on byte re-verify");
+    }
     ensure_file_present(&dir, DLL_FILE, RUNTIME_DLL)?;
     ensure_file_present(&dir, DRIVER_FILE, DRIVER_SYS)?;
     // Best-effort: the LGPL text traveling with the DLL is a distribution
@@ -125,6 +133,108 @@ fn ensure_runtime_present() -> Result<()> {
     // block capture.
     let _ = ensure_file_present(&dir, LICENSE_FILE, LICENSE_TEXT);
     preload_dll(&dir.join(DLL_FILE), RUNTIME_DLL)?;
+    Ok(())
+}
+
+/// Restricts `dir`'s DACL to Administrators and SYSTEM only, dropping inherited
+/// ACEs, so a non-elevated process running as the same user can no longer write
+/// into the runtime directory this elevated process loads from. This process
+/// itself runs elevated (an Administrators member), so its own access is
+/// unaffected; it is defense-in-depth on top of `refuse_if_foreign`'s byte
+/// re-verify, not a replacement for it — callers must treat failure as
+/// non-fatal.
+#[cfg(all(windows, feature = "windivert-backend"))]
+fn harden_runtime_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSID, SECURITY_MAX_SID_SIZE, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: `system_sid`/`admins_sid` are stack buffers sized to
+    // `SECURITY_MAX_SID_SIZE`, the documented upper bound for any SID,
+    // written by `CreateWellKnownSid` and checked for success before use.
+    // `BuildTrusteeWithSidW` stores a pointer into those still-live buffers
+    // inside each `EXPLICIT_ACCESS_W::Trustee`, and both buffers outlive the
+    // `SetEntriesInAclW` call that reads them. `SetEntriesInAclW` allocates
+    // `new_dacl` via `LocalAlloc` on success (checked via its `WIN32_ERROR`
+    // return); it is always freed with `LocalFree` after
+    // `SetNamedSecurityInfoW` has consumed it, on both the success and error
+    // paths. `wide` is a valid null-terminated UTF-16 path kept alive for the
+    // whole call.
+    unsafe {
+        let mut system_sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut system_sid_len = system_sid.len() as u32;
+        if CreateWellKnownSid(
+            WinLocalSystemSid,
+            ptr::null_mut(),
+            system_sid.as_mut_ptr() as PSID,
+            &mut system_sid_len,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut admins_sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut admins_sid_len = admins_sid.len() as u32;
+        if CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            ptr::null_mut(),
+            admins_sid.as_mut_ptr() as PSID,
+            &mut admins_sid_len,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut entries = [EXPLICIT_ACCESS_W::default(); 2];
+        for entry in &mut entries {
+            entry.grfAccessPermissions = FILE_ALL_ACCESS;
+            entry.grfAccessMode = GRANT_ACCESS;
+            entry.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+            entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            entry.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+        }
+        BuildTrusteeWithSidW(&mut entries[0].Trustee, system_sid.as_mut_ptr() as PSID);
+        BuildTrusteeWithSidW(&mut entries[1].Trustee, admins_sid.as_mut_ptr() as PSID);
+
+        let mut new_dacl: *mut ACL = ptr::null_mut();
+        let status = SetEntriesInAclW(2, entries.as_ptr(), ptr::null(), &mut new_dacl);
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+
+        let result = SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_dacl,
+            ptr::null(),
+        );
+        LocalFree(new_dacl as _);
+
+        if result != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(result as i32));
+        }
+    }
+
     Ok(())
 }
 
