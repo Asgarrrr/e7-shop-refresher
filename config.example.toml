@@ -4,8 +4,9 @@
 # Epic Seven game server TCP port.
 game_port = 3333
 
-# Analysis server. Defaults to the hosted server over wss:// (TLS). For a
-# local dev server use ws://: server_url = "ws://127.0.0.1:3001/refresh-shop".
+# Analysis server. Defaults to the hosted server over wss:// (TLS). A plain
+# ws:// URL is accepted only for loopback (127.0.0.1 / localhost) — a
+# non-loopback ws:// is refused because it would forward traffic in cleartext.
 server_url = "wss://ingest.arkyve.dev/refresh-shop"
 
 [forward]
