@@ -81,7 +81,7 @@ runs cleanly from the Desktop:
   launch automatically (WinDivert loads a kernel driver, which needs admin); no
   "Run as administrator" needed. It self-extracts its runtime to `%LOCALAPPDATA%`
   on first run.
-- **Build machine**: Rust >= 1.85 and the MSVC toolchain (`link.exe`). No C
+- **Build machine**: Rust >= 1.88 and the MSVC toolchain (`link.exe`). No C
   compiler needed — the DLL is prebuilt.
 
 ## Build
