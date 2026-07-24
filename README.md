@@ -31,8 +31,8 @@ WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ Web
   the session. `[actuator] dry_run = true` journals the planned clicks
   instead of sending them. The default build opens an **egui window**: a
   status bar (state, counters, one contextual Start/Stop button), a tabbed
-  center (Shop table | Setup filter/limits editors — edits are
-  session-only, `config.toml` is not rewritten), and a resizable session
+  center (Shop table | Setup filter/limits editors — Apply is applied live
+  and written back to `config.toml`), and a resizable session
   journal; there is no console beside the window — the journal carries
   every session line.
 

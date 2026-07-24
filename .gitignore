@@ -22,5 +22,5 @@ Thumbs.db
 # Instructions agent — local, jamais publié
 /CLAUDE.md
 
-# Runtime panic log (written next to the exe)
+# Runtime panic log (crash.log; app-data first, temp-dir fallback)
 crash.log
