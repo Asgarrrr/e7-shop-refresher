@@ -162,7 +162,10 @@ fn is_loopback_ws_host(url: &str) -> bool {
     // Drop any userinfo: the host is what follows the last '@'. Honoring this is
     // what stops a userinfo-embedded loopback from leaking traffic in cleartext
     // to a remote host the WebSocket client would actually dial.
-    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
     // Strip the port: an IPv6 literal is bracketed, so split off a trailing
     // ":port" only when it is not inside brackets.
     let host = if let Some(closing) = authority.strip_prefix('[') {
@@ -465,16 +468,20 @@ mod tests {
 
     #[test]
     fn wss_is_accepted() {
-        assert!(config_with_url("wss://ingest.arkyve.dev/refresh-shop")
-            .validate()
-            .is_ok());
+        assert!(
+            config_with_url("wss://ingest.arkyve.dev/refresh-shop")
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
     fn ws_loopback_ipv4_accepted() {
-        assert!(config_with_url("ws://127.0.0.1:3001/refresh-shop")
-            .validate()
-            .is_ok());
+        assert!(
+            config_with_url("ws://127.0.0.1:3001/refresh-shop")
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -498,13 +505,17 @@ mod tests {
     #[test]
     fn ws_example_com_rejected() {
         // Done-criteria spot check: a non-loopback ws:// host is refused.
-        let err = config_with_url("ws://example.com/x").validate().unwrap_err();
+        let err = config_with_url("ws://example.com/x")
+            .validate()
+            .unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
     }
 
     #[test]
     fn non_ws_scheme_rejected() {
-        let err = config_with_url("http://example.com").validate().unwrap_err();
+        let err = config_with_url("http://example.com")
+            .validate()
+            .unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
     }
 
@@ -533,13 +544,17 @@ mod tests {
     fn scheme_match_is_case_insensitive() {
         // URL schemes are case-insensitive; an uppercase scheme must not be
         // rejected when the WebSocket client would accept it.
-        assert!(config_with_url("WSS://ingest.arkyve.dev/refresh-shop")
-            .validate()
-            .is_ok());
+        assert!(
+            config_with_url("WSS://ingest.arkyve.dev/refresh-shop")
+                .validate()
+                .is_ok()
+        );
         assert!(config_with_url("WS://127.0.0.1:3001/x").validate().is_ok());
         // A userinfo bypass must still be caught regardless of scheme case.
-        assert!(config_with_url("WS://127.0.0.1@evil.com/x")
-            .validate()
-            .is_err());
+        assert!(
+            config_with_url("WS://127.0.0.1@evil.com/x")
+                .validate()
+                .is_err()
+        );
     }
 }
