@@ -116,7 +116,7 @@ fn ensure_runtime_present() -> Result<()> {
     // obligation, not a runtime dependency, so a failure to write it must not
     // block capture.
     let _ = ensure_file_present(&dir, LICENSE_FILE, LICENSE_TEXT);
-    preload_dll(&dir.join(DLL_FILE))?;
+    preload_dll(&dir.join(DLL_FILE), RUNTIME_DLL)?;
     Ok(())
 }
 
@@ -139,10 +139,24 @@ fn runtime_dir() -> Result<PathBuf> {
 /// already mapped (matched by base name) instead of searching for it — the
 /// runtime dir is not on the DLL search path. The handle is intentionally
 /// leaked: the DLL must stay resident for the whole session.
-fn preload_dll(path: &Path) -> Result<()> {
+fn preload_dll(path: &Path, expected: &[u8]) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+
+    // Verify the on-disk bytes are our embedded copy right before loading, so a
+    // file swapped in after the earlier extraction check is not loaded. This
+    // shrinks (does not fully close) the check-to-load TOCTOU window. Refuse only
+    // on a *successful* read that mismatches: if the file is momentarily
+    // unreadable (e.g. an antivirus lock), fall through to LoadLibraryW — which
+    // maps via an image section and tolerates that — rather than fail a genuine
+    // DLL. A readable-but-foreign file is still refused.
+    if matches!(std::fs::read(path), Ok(bytes) if bytes != expected) {
+        return Err(Error::Capture(format!(
+            "{} does not match the embedded WinDivert.dll — refusing to load it",
+            path.display()
+        )));
+    }
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     // SAFETY: `wide` is a valid null-terminated UTF-16 path for the call's
@@ -175,14 +189,25 @@ fn ensure_file_present(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     // and concurrent first launches stay safe.
     match atomic_replace(dir, name, &target, bytes) {
         Ok(()) => Ok(()),
-        // Replacement failed but the file is already present: most likely locked
-        // because loaded by a running instance (the DLL mapped, or the driver
-        // service up). Either way the loaded copy will be reused — continue
-        // rather than abort startup.
+        // Replacement failed but the file is already present. Reuse ONLY our own
+        // identical copy (a second running instance holds the real DLL locked so
+        // the rename fails). A file that exists but does NOT match the embedded
+        // bytes is foreign — refuse it rather than load attacker-controlled code
+        // into this elevated process.
         Err(err) if target.exists() => {
-            warn!(error = %err, path = %target.display(),
-                "runtime file present but not replaceable (already loaded?) — reusing it");
-            Ok(())
+            if file_has_content(&target, bytes) {
+                warn!(error = %err, path = %target.display(),
+                    "runtime file locked but identical to the embedded copy — reusing it");
+                Ok(())
+            } else {
+                Err(Error::Capture(format!(
+                    "{} is locked with content that does not match this build ({err}) — \
+                     close any other running instance of the app and retry (an in-place \
+                     upgrade cannot replace a locked runtime file); refusing to load a \
+                     runtime file that does not match the embedded copy",
+                    target.display()
+                )))
+            }
         }
         Err(err) => Err(Error::Capture(format!(
             "extracting {}: {err} — the app-data directory must be writable",
@@ -207,4 +232,32 @@ fn atomic_replace(dir: &Path, name: &str, target: &Path, bytes: &[u8]) -> std::i
         return Err(err);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("arkyve_{tag}_{}.bin", std::process::id()))
+    }
+
+    #[test]
+    fn file_has_content_matches_only_exact_bytes() {
+        let p = temp_path("fhc");
+        std::fs::write(&p, b"embedded").unwrap();
+        assert!(file_has_content(&p, b"embedded"));
+        assert!(!file_has_content(&p, b"planted!!"));
+        assert!(!file_has_content(&p.with_extension("missing"), b"x"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn preload_refuses_a_mismatched_file() {
+        // The verify guard rejects before LoadLibraryW is ever reached.
+        let p = temp_path("preload");
+        std::fs::write(&p, b"not the real dll").unwrap();
+        assert!(preload_dll(&p, b"the embedded bytes").is_err());
+        let _ = std::fs::remove_file(&p);
+    }
 }

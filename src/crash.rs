@@ -3,8 +3,8 @@
 //! In the windowed build stdout/stderr are inert, and a panic on a worker task
 //! or the capture thread is swallowed by the runtime — it would otherwise
 //! surface only as a bare "session ended". The hook appends each panic (thread,
-//! location, message, backtrace) to `crash.log`, preferring the exe's directory
-//! and falling back to the temp dir when that isn't writable.
+//! location, message, backtrace) to `crash.log`, preferring the per-user
+//! app-data dir and falling back to the temp dir when that isn't writable.
 
 use std::path::PathBuf;
 
@@ -63,16 +63,21 @@ fn crash_entry(
     )
 }
 
-/// Candidate log paths, most-preferred first: next to the exe, then the temp
-/// dir (in case the exe lives somewhere read-only, e.g. Program Files).
+/// Candidate log paths, most-preferred first: the per-user app-data dir, then
+/// the temp dir as a guaranteed-writable fallback.
 fn crash_log_paths() -> Vec<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    crash_log_paths_from(local, std::env::temp_dir())
+}
+
+/// Pure ordering: per-user app-data first (kept out of the user's face and off
+/// shared dirs), the temp dir as a guaranteed-writable fallback.
+fn crash_log_paths_from(local_appdata: Option<PathBuf>, temp: PathBuf) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        paths.push(dir.join("crash.log"));
+    if let Some(local) = local_appdata {
+        paths.push(local.join(crate::APP_DIR).join("crash.log"));
     }
-    paths.push(std::env::temp_dir().join("arkyve-crash.log"));
+    paths.push(temp.join("arkyve-crash.log"));
     paths
 }
 
@@ -88,6 +93,12 @@ fn write_first_writable(paths: &[PathBuf], entry: &str) {
 
 fn append(path: &std::path::Path, entry: &str) -> std::io::Result<()> {
     use std::io::Write;
+    // Best-effort: create the app-data parent so the preferred path is usable
+    // even before capture has created the folder. Ignore the result — the panic
+    // hook must never itself panic, and the open below reports real failures.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -116,11 +127,33 @@ mod tests {
     }
 
     #[test]
+    fn prefers_local_appdata_over_temp() {
+        let paths = crash_log_paths_from(
+            Some(PathBuf::from("C:/Users/x/AppData/Local")),
+            PathBuf::from("C:/Temp"),
+        );
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("arkyve-refresh-shop/crash.log"));
+        assert!(paths[1].ends_with("arkyve-crash.log"));
+    }
+
+    #[test]
+    fn falls_back_to_temp_without_appdata() {
+        let paths = crash_log_paths_from(None, PathBuf::from("/tmp"));
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("arkyve-crash.log"));
+    }
+
+    #[test]
     fn write_first_writable_falls_back_past_an_unwritable_path() {
         // First candidate is under a path that cannot exist as a directory
-        // (a file component in the middle), so the open fails and the fallback
-        // temp file is used instead.
-        let bad = std::env::temp_dir().join("arkyve_nope.log/inner/crash.log");
+        // (a real file sits in the middle), so `append`'s best-effort
+        // `create_dir_all` fails, the open fails, and the fallback temp file is
+        // used instead. The middle component is materialized as a file below so
+        // the premise holds now that `append` creates parents.
+        let blocker = std::env::temp_dir().join(format!("arkyve_nope_{}.log", std::process::id()));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let bad = blocker.join("inner/crash.log");
         let good =
             std::env::temp_dir().join(format!("arkyve_crash_test_{}.log", std::process::id()));
         let _ = std::fs::remove_file(&good);
@@ -132,5 +165,6 @@ mod tests {
         assert!(body.contains("entry-one"));
         assert!(body.contains("entry-two"));
         let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&blocker);
     }
 }
