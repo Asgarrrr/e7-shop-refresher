@@ -247,7 +247,13 @@ fn abort(journal: &EventLog, reason: &str) {
 /// label, never the player's.
 fn fail(journal: &EventLog, commands: &mpsc::Sender<Command>, reason: &str) {
     journal.emit(&[format!(">> actuator: {reason} — stopping the loop")]);
-    let _ = commands.try_send(Command::ActuatorFailed);
+    if commands.try_send(Command::ActuatorFailed).is_err() {
+        journal.emit(&[
+            ">> actuator: could not signal the halt (command queue full) — \
+             stop the session manually"
+                .to_owned(),
+        ]);
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +261,35 @@ mod tests {
     use super::*;
     use plan::{ClientRect, Trigger};
     use std::sync::Mutex;
+
+    #[test]
+    fn fail_signals_the_halt_when_the_queue_has_room() {
+        let journal = EventLog::default();
+        let (tx, mut rx) = mpsc::channel::<Command>(1);
+        fail(&journal, &tx, "window gone");
+        assert_eq!(rx.try_recv().ok(), Some(Command::ActuatorFailed));
+        assert!(
+            !journal
+                .entries()
+                .iter()
+                .any(|l| l.text.contains("could not signal"))
+        );
+    }
+
+    #[test]
+    fn fail_journals_a_dropped_halt_when_the_queue_is_full() {
+        let journal = EventLog::default();
+        let (tx, _rx) = mpsc::channel::<Command>(1);
+        tx.try_send(Command::Start).unwrap();
+        fail(&journal, &tx, "window gone");
+        let entries = journal.entries();
+        assert!(entries.iter().any(|l| l.text.contains("window gone")));
+        assert!(
+            entries
+                .iter()
+                .any(|l| l.text.contains("could not signal the halt"))
+        );
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Recorded {
