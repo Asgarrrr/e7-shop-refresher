@@ -162,3 +162,58 @@ fn render_quick_start(ui: &mut egui::Ui) {
         ui.add_space(theme::SP_XS);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    use crate::domain::control::{Controller, Event, Limits};
+    use crate::domain::filter::Filter;
+    use crate::domain::shop::{ShopItem, ShopSnapshot};
+
+    use super::super::view::{ViewState, view_state};
+    use super::*;
+
+    fn idle_view() -> ViewState {
+        view_state(&Controller::new(Filter::default(), Limits::default()))
+    }
+
+    fn captured_view(slots: Vec<ShopItem>) -> ViewState {
+        let mut ctrl = Controller::new(Filter::default(), Limits::default());
+        ctrl.handle(Event::Snapshot {
+            snapshot: ShopSnapshot {
+                merchant: None,
+                slots,
+                refresh: None,
+            },
+            now_ms: 0,
+        });
+        view_state(&ctrl)
+    }
+
+    #[test]
+    fn quick_start_shows_before_any_capture() {
+        let view = idle_view();
+        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view));
+        harness.get_by_label("QUICK START");
+    }
+
+    #[test]
+    fn table_replaces_quick_start_once_a_shop_is_captured() {
+        let view = captured_view(vec![ShopItem {
+            slot: 3,
+            ..ShopItem::default()
+        }]);
+        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view));
+        assert!(harness.query_by_label("QUICK START").is_none());
+        harness.get_by_label("SLOT");
+    }
+
+    #[test]
+    fn slotless_snapshot_shows_the_reopen_hint_not_quick_start() {
+        let view = captured_view(vec![]);
+        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view));
+        assert!(harness.query_by_label("QUICK START").is_none());
+        harness.get_by_label("the last shop message carried no slots — re-open the shop in game");
+    }
+}
