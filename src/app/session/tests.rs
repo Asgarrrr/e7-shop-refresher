@@ -92,13 +92,15 @@ async fn a_worker_panic_is_reported_when_the_uplink_channel_closes() {
     let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
     let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
     let (error_tx, error_rx) = mpsc::channel::<String>(1);
-    // The supervisor's fatal is already queued, and (same instant) the uplink
-    // task's message sender dropped — the exact panic race.
-    error_tx
-        .send("uplink task panicked".to_owned())
-        .await
-        .unwrap();
+    // The uplink task's message sender drops, so the loop takes the
+    // uplink-closed break. Its supervisor delivers the panic report a beat
+    // LATER — during the grace window, not before — so only the post-loop
+    // grace-drain can surface it. Without that drain the loop returns None.
     drop(message_tx);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let _ = error_tx.send("uplink task panicked".to_owned()).await;
+    });
 
     let failure = session_loop(
         &controller,
