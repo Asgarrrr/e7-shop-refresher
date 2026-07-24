@@ -59,6 +59,14 @@ impl WinDivertSource {
     /// rights (driver load).
     pub fn open(filter: &str, game_port: u16, buffer_size: usize) -> Result<Self> {
         ensure_runtime_present()?;
+        // The DLL loads WinDivert64.sys from the runtime dir during the call below.
+        // Re-verify the driver bytes here, mirroring preload_dll's DLL guard, so a
+        // .sys swapped in after extraction is not loaded into this elevated process.
+        refuse_if_foreign(
+            &runtime_dir()?.join(DRIVER_FILE),
+            DRIVER_SYS,
+            "WinDivert64.sys",
+        )?;
 
         let flags = WinDivertFlags::new().set_sniff().set_recv_only();
         let handle = WinDivert::network(filter, 0, flags)
@@ -135,6 +143,21 @@ fn runtime_dir() -> Result<PathBuf> {
         .ok_or_else(|| Error::Capture("executable directory not found".to_owned()))
 }
 
+/// Refuses a runtime file that is readable but is NOT our embedded copy — the
+/// just-before-load guard that shrinks the check-to-load TOCTOU window. A
+/// momentarily-unreadable file (e.g. an antivirus lock) falls through: the
+/// loader maps it via an image section and tolerates that, so a genuine file
+/// must not be failed on a transient read error.
+fn refuse_if_foreign(path: &Path, expected: &[u8], label: &str) -> Result<()> {
+    if matches!(std::fs::read(path), Ok(bytes) if bytes != expected) {
+        return Err(Error::Capture(format!(
+            "{} does not match the embedded {label} — refusing to load it",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Loads `WinDivert.dll` by absolute path so the delay-load thunk finds it
 /// already mapped (matched by base name) instead of searching for it — the
 /// runtime dir is not on the DLL search path. The handle is intentionally
@@ -146,17 +169,8 @@ fn preload_dll(path: &Path, expected: &[u8]) -> Result<()> {
 
     // Verify the on-disk bytes are our embedded copy right before loading, so a
     // file swapped in after the earlier extraction check is not loaded. This
-    // shrinks (does not fully close) the check-to-load TOCTOU window. Refuse only
-    // on a *successful* read that mismatches: if the file is momentarily
-    // unreadable (e.g. an antivirus lock), fall through to LoadLibraryW — which
-    // maps via an image section and tolerates that — rather than fail a genuine
-    // DLL. A readable-but-foreign file is still refused.
-    if matches!(std::fs::read(path), Ok(bytes) if bytes != expected) {
-        return Err(Error::Capture(format!(
-            "{} does not match the embedded WinDivert.dll — refusing to load it",
-            path.display()
-        )));
-    }
+    // shrinks (does not fully close) the check-to-load TOCTOU window.
+    refuse_if_foreign(path, expected, "WinDivert.dll")?;
 
     let wide: Vec<u16> = path
         .as_os_str()
@@ -262,6 +276,16 @@ mod tests {
         let p = temp_path("preload");
         std::fs::write(&p, b"not the real dll").unwrap();
         assert!(preload_dll(&p, b"the embedded bytes").is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn refuse_if_foreign_rejects_a_mismatch_and_accepts_a_match() {
+        let p = temp_path("refuse");
+        std::fs::write(&p, b"embedded").unwrap();
+        assert!(refuse_if_foreign(&p, b"embedded", "test").is_ok());
+        assert!(refuse_if_foreign(&p, b"planted!!", "test").is_err());
+        assert!(refuse_if_foreign(&p.with_extension("missing"), b"x", "test").is_ok());
         let _ = std::fs::remove_file(&p);
     }
 }
