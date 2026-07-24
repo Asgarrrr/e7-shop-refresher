@@ -158,7 +158,11 @@ fn preload_dll(path: &Path, expected: &[u8]) -> Result<()> {
         )));
     }
 
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     // SAFETY: `wide` is a valid null-terminated UTF-16 path for the call's
     // duration; LoadLibraryW only reads it and returns a handle (null on error).
     let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
