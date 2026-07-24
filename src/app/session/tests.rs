@@ -80,6 +80,40 @@ async fn session_loop_exit_stops_controller_and_gate() {
     assert!(!gate.is_enabled());
 }
 
+#[tokio::test]
+async fn a_worker_panic_is_reported_when_the_uplink_channel_closes() {
+    let gate = WatchGate::new(false);
+    let journal = EventLog::default();
+    let controller = Mutex::new(Controller::new(
+        Filter::matching_default_items(),
+        Limits::default(),
+    ));
+
+    let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
+    let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
+    let (error_tx, error_rx) = mpsc::channel::<String>(1);
+    // The supervisor's fatal is already queued, and (same instant) the uplink
+    // task's message sender dropped — the exact panic race.
+    error_tx
+        .send("uplink task panicked".to_owned())
+        .await
+        .unwrap();
+    drop(message_tx);
+
+    let failure = session_loop(
+        &controller,
+        &gate,
+        &journal,
+        &off(),
+        command_rx,
+        message_rx,
+        error_rx,
+    )
+    .await;
+
+    assert_eq!(failure, Some("uplink task panicked".to_owned()));
+}
+
 #[test]
 fn stop_while_idle_reports_no_effect() {
     let gate = WatchGate::new(false);
