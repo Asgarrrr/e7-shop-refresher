@@ -46,6 +46,7 @@ pub(super) async fn session_loop(
     let mut fatal_open = true;
     let mut fatal_failure = None;
     let mut player_exit = false;
+    let mut uplink_closed = false;
     loop {
         tokio::select! {
             command = commands.recv(), if commands_open => match command {
@@ -71,7 +72,10 @@ pub(super) async fn session_loop(
                     let now = now_ms();
                     dispatch(controller, gate, journal, actuator, Event::LinkUp { now_ms: now }, now);
                 }
-                None => break, // uplink gone.
+                None => {
+                    uplink_closed = true;
+                    break; // uplink channel closed.
+                }
             },
             error = fatal_errors.recv(), if fatal_open => match error {
                 Some(error) => {
@@ -94,6 +98,20 @@ pub(super) async fn session_loop(
                 break;
             }
         }
+    }
+    // A worker panic can close the uplink's message channel — the panicking
+    // task drops its sender as it unwinds — a scheduling hop *before* its
+    // supervisor delivers the fatal on `fatal_errors`. If the loop ended that
+    // way with no fatal captured yet, wait briefly for the racing report so a
+    // crash is not misreported as a clean "session ended".
+    if uplink_closed
+        && fatal_failure.is_none()
+        && fatal_open
+        && let Ok(Some(error)) =
+            tokio::time::timeout(Duration::from_millis(150), fatal_errors.recv()).await
+    {
+        journal.emit(&[format!(">> session aborted — {error}")]);
+        fatal_failure = Some(error);
     }
     // The window (GUI build) outlives the loop: leave an honest state behind
     // — controller stopped, gate (and thus capture) off, a journal line
