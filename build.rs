@@ -38,7 +38,7 @@
 //! existed.
 
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-changed=build.rs");
 
     let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if !msvc {
@@ -65,8 +65,8 @@ fn main() {
     // Unconditional on purpose — no feature gate. Every build of this exe is
     // the same exe as far as Windows is concerned, and a lane that produced an
     // unmanifested binary would be making a different declaration about it.
-    println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+    println!("cargo::rustc-link-arg-bins=/MANIFEST:EMBED");
     println!(
-        "cargo:rustc-link-arg-bins=/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
+        "cargo::rustc-link-arg-bins=/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
     );
 }

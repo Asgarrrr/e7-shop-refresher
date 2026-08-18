@@ -123,3 +123,30 @@ buffering. Predecessors arriving after the deadline or budgets remain outside
 the recovery guarantee. If authoritative decoder evidence later proves
 arbitrary-boundary synchronization, this decision can be revisited and the
 one-shot latency removed.
+
+## Editorial note on the `plan-008` citation, 2026-08-18
+
+Added below the record rather than inside it, because the body above is frozen
+as written and rewriting a cited authority out of an evidence document would
+falsify the thing it is evidence of.
+
+"Selected limits and behavior" defers twice to an authority a reader of this
+repository cannot obtain: *"whose plan-008 incarnation reset remains
+authoritative"*, and — resting on the same source — the claim that this is *"why
+the post-resync window is global rather than continuously maintained per
+half-stream"*. There is no plan 008 in the tree: `plans/` is gitignored and
+untracked, and plans 001–014 were deleted on 2026-08-17.
+
+The invariant itself is unchanged and now lives in the code, which is what a
+later reader should consult instead:
+
+- **The incarnation reset** is `Reassembler::syn_starts_new_incarnation`
+  (`src/stream.rs`). A SYN re-anchors the sequence space, which is why it is
+  never held behind the anchor deadline: buffering it would make the burst's own
+  ordering meaningless. Any older burst is committed first, then the SYN is
+  classified immediately.
+- **The global window** follows from that, with no external authority needed: a
+  flow that appears while watching arrives with its own captured SYN and anchors
+  on it, so the one-shot post-`Resync` window only has to cover the flows already
+  in progress at the off-to-on transition — once, globally — rather than being
+  maintained per half-stream forever.

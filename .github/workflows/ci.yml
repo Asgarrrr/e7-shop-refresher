@@ -10,6 +10,15 @@ on:
 jobs:
   verify:
     runs-on: windows-latest
+    # `dtolnay/rust-toolchain` activates its toolchain with `rustup default` and
+    # nothing else, and rustup ranks `rustup default` *below* a repo-root
+    # `rust-toolchain.toml`. Without this variable the pinned `channel =
+    # "1.92.0"` won every cargo invocation and the `stable` arm was a second
+    # MSRV arm — nothing was ever built on current stable. `RUSTUP_TOOLCHAIN`
+    # outranks the toolchain file, so the matrix means what it says.
+    # `rust-toolchain.toml` stays as it is: it pins *local* builds to the MSRV.
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
     strategy:
       fail-fast: false
       matrix:
@@ -27,6 +36,13 @@ jobs:
         run: cargo fmt --all --check
       - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
       - run: cargo clippy --locked --no-default-features --features gui,actuator --all-targets -- -D warnings
+      # `gui` and `actuator` on their own. Nobody ships either, so these are not
+      # product configurations — they are the cfg shapes a future
+      # `cfg(feature = "gui")` block nested inside an `all(windows, feature =
+      # "actuator")` region would break while every shipped combination stayed
+      # green. Both compile clean today; these two lanes keep it that way.
+      - run: cargo clippy --locked --no-default-features --features gui --all-targets -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features actuator --all-targets -- -D warnings
       # Both arms of build_source must survive: no backend (above) and the
       # backend alone. There is no third arm and no `--all-features` lane — with
       # WinDivert removed, `--all-features` is the default feature set.
@@ -37,6 +53,14 @@ jobs:
       # product build has.
       - name: Check shipped default features
         run: cargo clippy --locked --all-targets -- -D warnings
+      # rustdoc was the one lane nothing gated, and it was not clean: the
+      # doc-comments here are the design record and they navigate by intra-doc
+      # links, two of which had rotted into plain text unnoticed. Levels live in
+      # `Cargo.toml`'s `[lints.rustdoc]` rather than in `RUSTDOCFLAGS`, so this
+      # step, `just doc` and an editor cannot disagree — and a rustdoc lint added
+      # by a future stable release only warns instead of turning this arm red.
+      - name: Check the documentation cross-references
+        run: cargo doc --locked --no-deps --document-private-items
       - name: Build shipped release (default features)
         if: matrix.toolchain == 'stable'
         run: cargo build --locked --release
@@ -68,6 +92,10 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_DENY_VERSION: "0.20.2"
+      # Same reason as `verify` above, in the other direction: this job wants the
+      # MSRV and got it only because `rust-toolchain.toml` happens to agree with
+      # the pinned action. Say it out loud so the agreement is not accidental.
+      RUSTUP_TOOLCHAIN: "1.92.0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92.0

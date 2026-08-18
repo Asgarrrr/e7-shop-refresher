@@ -9,7 +9,8 @@ the next day, which is why this is a rewrite and not an amendment.
 ## Decision
 
 The relay captures game traffic through **Npcap**, opened read-only on **every
-adapter**, one handle and one kernel-side BPF filter (`tcp and port 3333`) each.
+adapter**, one handle and one kernel-side BPF filter (`tcp and src port 3333`)
+each — `src port`, not `port`, so the client → server half is never copied.
 Each capture thread strips its own adapter's link header, so what reaches the
 pipeline is an IP packet — the same shape the previous backend delivered, from a
 process with no special privilege.

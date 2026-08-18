@@ -26,6 +26,73 @@ gui = ["dep:eframe"]
 # Windows; elsewhere the executor is replaced by a job-draining stub.
 actuator = []
 
+# The lint policy, in the one place `rust-analyzer`, a plain `cargo build` and a
+# reader of this manifest all see it. Until now it existed only as the four
+# `cargo clippy … -- -D warnings` invocations in `.github/workflows/ci.yml` and
+# the `justfile`, which no editor can read. Every entry below measures **zero
+# sites** on all four feature lanes and on both matrix toolchains, so nothing
+# here is a migration.
+#
+# A `[lints]` table applies to *every* target, the test harness included. That is
+# why `clippy::unwrap_used` (257 sites, all of them in tests, where `unwrap` in a
+# fixture is the correct spelling) and `clippy::panic` (19, likewise) are **not**
+# here — they belong in a `#![cfg_attr(not(test), warn(…))]` at the crate root.
+# The five below measure zero in the test harness as well, so the table is the
+# right home for them.
+#
+# Deliberately *not* enabled, each measured and argued in `docs/tech-debt/25-lint.md`:
+# whole-group `pedantic` (161 sites) and `nursery` (121) — nearly all of them are
+# this crate doing something deliberate with the reason written at the site;
+# `clippy::cargo` (29 unactionable `multiple_crate_versions` out of the eframe
+# tree, already covered better by `cargo deny`'s `[bans]`); `missing_docs` (141,
+# on a `publish = false` binary); `expect_used` (13 shipped sites where the
+# message *is* the invariant); `indexing_slicing` (3, all provably in bounds).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [] } # 0 — every cfg string matches a declared feature
+trivial_casts = "warn"                               # 0
+
+[lints.clippy]
+# Whole groups. `priority = -1` so an individually named lint can override one.
+correctness = { level = "deny", priority = -1 } # 0
+suspicious = { level = "deny", priority = -1 }  # 0
+style = { level = "warn", priority = -1 }       # 0
+complexity = { level = "warn", priority = -1 }  # 0
+perf = { level = "warn", priority = -1 }        # 0
+# This is an FFI-heavy crate — `windows-sys` plus a runtime-loaded `wpcap.dll` —
+# and every `unsafe` block in it already carries a real `// SAFETY:`. New unsafe
+# arrives with every Win32 call added, so turn the convention into a check.
+undocumented_unsafe_blocks = "warn" # 0
+# Zero in the test harness too, unlike `unwrap_used`/`panic` above.
+todo = "warn"           # 0
+unimplemented = "warn"  # 0
+dbg_macro = "warn"      # 0
+mem_forget = "warn"     # 0
+exit = "warn"           # 0
+
+# rustdoc was the one lane nothing gated, and it was not clean. `just doc` and
+# the CI step both run `--document-private-items`, which is the right mode for a
+# `publish = false` binary: the cross-reference network these docs navigate by is
+# mostly between internal items, so that is the only way it gets checked at all.
+#
+# The levels are here rather than in a `RUSTDOCFLAGS="-D warnings"` on the
+# command line so that `just doc`, the CI step and an editor cannot disagree, and
+# so that a rustdoc lint added by a future stable release only *warns* instead of
+# turning the `stable` matrix arm red. Every one below is warn-by-default and
+# measures zero sites today.
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+redundant_explicit_links = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_html_tags = "deny"
+invalid_rust_codeblocks = "deny"
+bare_urls = "deny"
+# Measured, and contrary to what the lint's name suggests: rustdoc reports a
+# public doc linking to a private item *even under* `--document-private-items`,
+# where the target is rendered and the link works. The lint exists for published
+# crates, whose private items are absent from the output. Five such links are
+# deliberate here.
+private_intra_doc_links = "allow"
+
 [dependencies]
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -110,9 +177,48 @@ required-features = ["gui"]
 opt-level = 2
 
 [profile.release]
+# Thin, not fat, and the reason is recorded rather than assumed: nothing in this
+# crate has ever been profiled or benchmarked (no `benches/`, no criterion, and
+# the one end-to-end capture test is `#[ignore]`d because it needs a real
+# adapter), so "fat is faster here" would be exactly the unmeasured claim the
+# rest of this manifest avoids. Thin already gives cross-crate inlining across
+# the lib → bin/example boundary, which is the only inlining that matters in a
+# single-crate binary with `codegen-units = 1`. Revisit with a measurement — see
+# `[profile.profiling]` below for the build that can produce one — not with a
+# preference.
 lto = "thin"
 # Not `strip = true`: that drops the symbol table too, and `crash.rs`'s
 # `Backtrace::force_capture()` — the product's only post-mortem channel —
 # then records bare addresses. Debug info goes, symbol names stay.
 strip = "debuginfo"
 codegen-units = 1
+# Integer overflow was the one class of fault that bypassed every diagnostic this
+# product has: `crash.rs`'s panic hook, the per-worker `catch_unwind` in
+# `SessionWorkers::spawn`, the fatal channel into the session loop and the
+# symbolised backtrace above all trigger on a panic, and a wrap is not one. The
+# arithmetic here runs on values the crate does not control — TCP payload
+# lengths, sequence deltas, wire prices and gold balances, `GetSystemMetrics`
+# results, config millisecond counts — so a wrap is a wrong click or a stalled
+# pipeline that a player reports as "it stopped working" over a log file showing
+# nothing at all. Now it is a `crash.log` entry instead.
+#
+# The prerequisite, audited before enabling this: a panic raised from a `Drop`
+# *during an unwind* aborts the process with no banner and no `crash.log` (see
+# `stream.rs`'s `PipelineBudget::release`). All four production `Drop` impls were
+# read — `PayloadLease` (saturating arithmetic only), `capture::pcap::Handle`
+# (one FFI close), `capture::pcap::PcapSource` (an atomic store and joins),
+# `actuator::win::MessageSurface` (`cleanup` → `shield::hide`, one FFI call) —
+# and none of them performs checkable arithmetic. The cost is a few percent on
+# integer-heavy loops, and this pipeline is I/O-bound end to end. Note the dev
+# and test profiles have had overflow checks on all along, dependencies
+# included, so the whole suite already runs under them.
+overflow-checks = true
+
+# Symbols and line numbers for a profiler, without disturbing what ships:
+# `release` must keep `strip = "debuginfo"` because `crash.rs` depends on it, so
+# a profiling build has to be a separate, purely additive profile. Nothing that
+# ships uses this one.
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"

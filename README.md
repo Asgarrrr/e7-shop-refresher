@@ -19,8 +19,10 @@ Npcap tap ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket
   tool is never a proxy and never owns the game's socket — nothing can be
   injected, dropped or rewritten, by this code or by any later addition to it,
   because a capture handle physically cannot send. The kernel-side filter is
-  fixed (`tcp and port 3333`, built from `game_port`), so no other traffic on
-  the machine is even copied.
+  fixed (`tcp and src port 3333`, built from `game_port`), so no other traffic
+  on the machine is even copied — and the `src` is the point: only what the game
+  *server* sends is copied at all, the client → server half never leaves the
+  driver.
 - **Reassembly**: captured segments (possibly out of order or retransmitted) are
   recomposed into an ordered byte stream, per connection.
 - **Forwarding**: the raw server → client stream is sent as-is to the analysis
@@ -237,9 +239,16 @@ system temp directory.
 
 Reading it yourself:
 
-- `arkyve-refresh-shop starting` missing → the app never got to run; check that
-  no antivirus quarantined the exe, and that the UAC prompt at launch was
-  approved rather than dismissed.
+- `arkyve-refresh-shop starting` missing → either the app never got to run —
+  check that no antivirus quarantined the exe, and that the UAC prompt at launch
+  was approved rather than dismissed — or it ran fine and could not create the
+  log file at all. The second case looks identical from here, because there is no
+  file to look in: if `%LOCALAPPDATA%\arkyve-refresh-shop\logs` is not writable
+  (a leftover admins-only ACL from an old build, antivirus, a roaming-profile
+  policy, a full disk) logging falls back to a console this build does not have.
+  A panic report does have a second candidate — `arkyve-crash.log` in the system
+  temp directory — so one of those with no session log beside it means the app
+  definitely ran.
 - `wpcap.dll loaded` missing → Npcap is not installed, or its driver is not
   running. The error that follows says which, and names https://npcap.com. If it
   says Npcap enumerated no capture device at all on a machine that clearly has
@@ -267,4 +276,6 @@ Reading it yourself:
   `session aborted` just before.
 
 Raise or narrow the verbosity with `RUST_LOG`, e.g. `RUST_LOG=journal=info`
-for the player-facing lines only, or `RUST_LOG=arkyve_refresh_shop=trace`.
+for the player-facing lines only, or `RUST_LOG=arkyve_refresh_shop=debug` for the
+capture internals. `debug` is as detailed as it gets: nothing in the app logs at
+`trace`, so asking for that level changes nothing.
