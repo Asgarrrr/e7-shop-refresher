@@ -22,6 +22,11 @@ use crate::error::{Error, Result};
 
 /// One GUI-editable section to persist. Built per Apply from the commands that
 /// actually changed, so a limits-only edit never rewrites `[filter]`.
+///
+/// `Debug` because [`save`] is best-effort and its failure is journaled: without
+/// it the line cannot name which section was being written. Every payload here
+/// already carries all three derives.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Section {
     Filter(Filter),
     Limits(Limits),
@@ -42,6 +47,12 @@ pub enum Section {
 /// - [`Error::ConfigSerialize`] — a section could not be rendered back to TOML.
 ///   Unreachable for the three concrete section types today, and kept typed so
 ///   it stays distinguishable from the parse failure above.
+/// - [`Error::Config`] — a [`Section::Timings`] range is reversed or over the
+///   ceiling. Nothing can produce one today (the editor clamps, and every preset
+///   is covered by a test), and that is exactly why it is checked here: refusing
+///   the Apply costs one journal line, whereas writing it costs the player their
+///   *next launch* — `Config::load` refuses the same value, fatally, with
+///   hand-editing the only way out.
 /// - [`Error::ConfigWrite`] — creating the parent directory, writing the
 ///   sibling temp file, or renaming it over the target failed. The path is in
 ///   the message: this is the read-only / OneDrive-locked `config.toml` case,
@@ -344,6 +355,10 @@ fn write_sections(text: &str, edits: &[Section]) -> Result<String> {
             Section::Filter(filter) => set_table(root, "filter", section_table(filter)?),
             Section::Limits(limits) => set_table(root, "limits", section_table(limits)?),
             Section::Timings(timings) => {
+                // The write boundary the loader's `validate` never sees: the
+                // Setup tab hands `Timings` straight to this module, with no
+                // `Config` in the path. One check, called from both.
+                super::validate_timings(timings)?;
                 let mut table = section_table(timings)?;
                 inline_ranges(&mut table);
                 set_nested_table(root, "actuator", "timings", table);
@@ -574,6 +589,84 @@ backend = \"input\"
         // The omission still round-trips: `#[serde(default)]` restores them.
         let config: crate::config::Config = toml::from_str(&out).expect("reload");
         assert_eq!(config.actuator.timings, timings);
+    }
+
+    #[test]
+    fn inert_filter_keys_are_not_written() {
+        // The `Timings` twin, at the layer that actually writes the file. Four
+        // of `Filter`'s five never-`None` fields are inert when empty, and
+        // whole-section replacement meant the first Apply after typing one item
+        // name wrote `kinds = []`, `sets = []`, `required_substats = []` and
+        // `include_sold_out = false` into a file this module exists to leave as
+        // the player wrote it.
+        let out = write_sections("", &[Section::Filter(hunt_filter())]).expect("write");
+        assert!(out.contains("names = [\"ticketrare_name\"]"));
+        for inert in ["kinds", "sets", "required_substats", "include_sold_out"] {
+            assert!(!out.contains(inert), "{inert} is inert and must be omitted");
+        }
+        // The omission still round-trips: `#[serde(default)]` restores them.
+        let config: crate::config::Config = toml::from_str(&out).expect("reload");
+        assert_eq!(config.filter, hunt_filter());
+    }
+
+    #[test]
+    fn a_persisted_substat_requirement_reloads() {
+        // Nothing covered persisting a filter that carries one, and it is the
+        // one `Filter` field that is not a scalar or a string list.
+        //
+        // Note the shape: `toml_edit` renders it as the inline
+        // `required_substats = [{ name = "speed", min = 8.0 }]`, not the
+        // `[[filter.required_substats]]` array-of-tables `config.example.toml`
+        // documents. Both are the same document to any TOML parser, so this is a
+        // house-style divergence and not a defect — recorded here rather than
+        // "fixed", because `inline_ranges` shows the crate does care, and
+        // matching the example is a separate, cosmetic change.
+        let filter = Filter {
+            required_substats: vec![crate::domain::filter::SubstatReq {
+                name: "speed".to_owned(),
+                min: Some(8.0),
+            }],
+            ..Filter::default()
+        };
+        let out = write_sections("", &[Section::Filter(filter.clone())]).expect("write");
+        assert!(out.contains("required_substats"), "{out}");
+        let config: crate::config::Config = toml::from_str(&out).expect("reload");
+        assert_eq!(config.filter, filter);
+    }
+
+    #[test]
+    fn a_timing_range_the_loader_would_refuse_is_never_written() {
+        // The second write boundary. `Config::validate` guards the loader, but
+        // the Setup tab reaches this module with no `Config` in the path, so an
+        // unclamped `Timings` used to land on disk and take out the *next*
+        // launch — an error window with hand-editing the only way out. Nothing
+        // can produce one today; the point is that it cannot become possible
+        // without this failing.
+        let reversed = Timings {
+            refreshed: crate::actuator::plan::DelayRange {
+                min_ms: 800,
+                max_ms: 200,
+            },
+            ..Timings::default()
+        };
+        let err = write_sections("", &[Section::Timings(reversed)])
+            .expect_err("a reversed range must not be written");
+        assert!(matches!(err, Error::Config(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("actuator.timings.refreshed"),
+            "the message must name the key: {err}"
+        );
+
+        let oversized = Timings {
+            shop_opened: crate::actuator::plan::DelayRange {
+                min_ms: 0,
+                max_ms: 600_000,
+            },
+            ..Timings::default()
+        };
+        let err = write_sections("", &[Section::Timings(oversized)])
+            .expect_err("a ten-minute extra wait must not be written");
+        assert!(matches!(err, Error::Config(_)), "got {err:?}");
     }
 
     #[test]

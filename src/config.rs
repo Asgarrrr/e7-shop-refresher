@@ -2,6 +2,7 @@
 
 pub mod persist;
 
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -38,13 +39,20 @@ pub(crate) const RECONNECT_FLOOR: Duration = Duration::from_millis(100);
 /// validated at all.
 const MAX_TIMING_MS: u64 = 60_000;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// TCP port of the game server, remote side.
     pub game_port: u16,
 
     /// Analysis server URL (`ws://` or `wss://`).
+    ///
+    /// Checked by [`ServerUrl::parse`] on the load path, which is the only path
+    /// that checks it. It is still a `String` because the two consumers outside
+    /// this module take one; making the field a [`ServerUrl`] is what would stop
+    /// a `Config` built any other way — a struct literal, a mutated
+    /// `Config::default()`, a future GUI field — from reaching the uplink
+    /// unchecked.
     pub server_url: String,
 
     /// Vestigial; see [`ForwardConfig`].
@@ -66,6 +74,44 @@ pub struct Config {
     /// Click-emulation behavior (acted on by the Windows build; the section
     /// always parses).
     pub actuator: ActuatorConfig,
+}
+
+/// Hand-written so `server_url` cannot reach the log through this type.
+///
+/// A `wss://` URL may carry a `user:pass@` credential, and `Config` is exactly
+/// the kind of value that ends up in a startup line or an `#[instrument]`
+/// argument list. Nothing formats a `Config` today; the whole point is that the
+/// next thing to do so is safe by default, because the promise in `README.md`
+/// ("the log never contains the server URL's credentials") is currently kept by
+/// remembering to call a helper.
+///
+/// Destructured rather than read field-by-field off `self`: adding a field to
+/// `Config` is then a compile error here until it is listed, which is the one
+/// real hazard of a hand-written `Debug`. Becomes a plain derive again once the
+/// field is a [`ServerUrl`], whose own `Debug` redacts.
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            game_port,
+            server_url,
+            forward,
+            reconnect,
+            capture,
+            filter,
+            limits,
+            actuator,
+        } = self;
+        f.debug_struct("Config")
+            .field("game_port", game_port)
+            .field("server_url", &redacted_authority(server_url))
+            .field("forward", forward)
+            .field("reconnect", reconnect)
+            .field("capture", capture)
+            .field("filter", filter)
+            .field("limits", limits)
+            .field("actuator", actuator)
+            .finish()
+    }
 }
 
 /// Vestigial. Both keys are parsed and both are ignored.
@@ -109,6 +155,9 @@ pub struct ForwardConfig {
     pub client_to_server: Option<bool>,
 }
 
+/// Exponential-backoff policy for the server link: where it starts and where it
+/// stops doubling. Both are floored and ordered by the accessors, not here —
+/// see [`Config::reconnect_initial`] and [`Config::reconnect_max`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReconnectConfig {
@@ -252,49 +301,221 @@ impl ForwardConfig {
     }
 }
 
-/// True when the `ws://` authority is loopback, where cleartext never leaves
-/// the machine. Accepts `host` or `host:port`, IPv6 in brackets. The scheme is
-/// matched case-insensitively, and any `user:pass@` userinfo is dropped: the
-/// real host is what follows the last `@` (what `http::Uri`, and thus the
-/// WebSocket client, actually connects to), so `ws://127.0.0.1@evil.com` is
-/// correctly seen as `evil.com` and rejected rather than passing as loopback.
-fn is_loopback_ws_host(url: &str) -> bool {
-    let after = match url.get(..5) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("ws://") => &url[5..],
-        _ => return false,
-    };
-    // Authority ends at the first path/query separator.
-    let authority = after.split(['/', '?']).next().unwrap_or("");
-    // Drop any userinfo: the host is what follows the last '@'. Honoring this is
-    // what stops a userinfo-embedded loopback from leaking traffic in cleartext
-    // to a remote host the WebSocket client would actually dial.
-    let authority = authority
+/// The authority of `rest` (everything after a `scheme://`), with any
+/// `user:pass@` userinfo dropped: `host` or `host:port`, IPv6 in brackets.
+///
+/// The real host is what follows the *last* `@` — what `http::Uri`, and thus the
+/// WebSocket client, actually connects to — so `127.0.0.1@evil.com` is correctly
+/// seen as `evil.com`. That one line does double duty, which is why it lives in
+/// exactly one place now: it is what stops a userinfo-embedded loopback from
+/// leaking traffic in cleartext to a remote host, *and* what keeps a credential
+/// out of the redacted form written to the log.
+fn authority_of(rest: &str) -> &str {
+    // The authority ends at the first path/query/fragment separator.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority
         .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(authority);
-    // Strip the port: an IPv6 literal is bracketed, so split off a trailing
-    // ":port" only when it is not inside brackets.
-    let host = if let Some(closing) = authority.strip_prefix('[') {
+        .map_or(authority, |(_, host)| host)
+}
+
+/// `scheme://host[:port]` — userinfo, path, query and fragment all gone. The
+/// only form of a server URL that may be written to a log or a journal line.
+///
+/// Deliberately lenient rather than fallible: it is also what `Config`'s `Debug`
+/// prints for a `server_url` that has *not* been through [`ServerUrl::parse`],
+/// so it has to reduce garbage instead of refusing it (`"garbage"` becomes
+/// `"://garbage"`, which is unmistakably not a URL and still carries no secret).
+fn redacted_authority(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    format!("{scheme}://{}", authority_of(rest))
+}
+
+/// Strip a trailing `:port` from an authority. An IPv6 literal is bracketed, so
+/// a trailing `:port` is only a port when it sits outside the brackets.
+fn host_of(authority: &str) -> &str {
+    if authority.starts_with('[') {
         // "[::1]:3001" -> "[::1]"
-        closing
+        authority
             .split_once(']')
-            .map(|(h, _)| {
-                let mut s = String::from("[");
-                s.push_str(h);
-                s.push(']');
-                s
-            })
-            .unwrap_or_else(|| authority.to_owned())
+            .map_or(authority, |(head, _)| &authority[..head.len() + 1])
     } else {
         authority
             .rsplit_once(':')
-            .map(|(h, _)| h.to_owned())
-            .unwrap_or_else(|| authority.to_owned())
-    };
-    matches!(
-        host.to_ascii_lowercase().as_str(),
-        "127.0.0.1" | "localhost" | "[::1]" | "::1"
-    )
+            .map_or(authority, |(host, _)| host)
+    }
+}
+
+/// True for the hosts where cleartext never leaves the machine.
+fn is_loopback_host(host: &str) -> bool {
+    ["127.0.0.1", "localhost", "[::1]", "::1"]
+        .iter()
+        .any(|loopback| host.eq_ignore_ascii_case(loopback))
+}
+
+/// A `server_url` that has been proven safe to dial, carrying the proof.
+///
+/// The rule is a security property, not a spelling convention: `server_url`
+/// receives the reassembled game stream, which can carry session tokens, so it
+/// must be `wss://` — or `ws://` to a loopback host, where cleartext never
+/// leaves the machine. [`ServerUrl::parse`] is the single place that rule and
+/// the authority split it needs are written, and a `ServerUrl` that exists is
+/// the evidence that they passed.
+///
+/// It also carries the redacted `scheme://host[:port]` form, because the same
+/// split that defeats `ws://127.0.0.1@evil.com` is the one that keeps a
+/// `user:pass@` credential out of the log the player is asked to send us. Those
+/// two were written twice — here and in `app::redacted_server_url` — and only
+/// this copy had the userinfo tests, so the next parsing subtlety had to be
+/// found twice.
+///
+/// `Debug` and `Display` print the redacted form **only**, so no `?url`, `%url`
+/// or `#[instrument]` argument list can put a credential in the log. The dial
+/// string — what the WebSocket client is actually given — comes out through
+/// [`ServerUrl::as_str`] and nowhere else.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ServerUrl {
+    dial: String,
+    redacted: String,
+}
+
+impl ServerUrl {
+    /// Parses `raw`, enforcing the cleartext rule. Surrounding whitespace is
+    /// trimmed: a hand-edited `server_url = " wss://… "` dials the same server.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] — `raw` is empty, carries a scheme other than `ws://`
+    /// or `wss://`, or is `ws://` to anywhere but loopback (which would forward
+    /// the captured game stream, session tokens included, in cleartext).
+    ///
+    /// [`Error::Config`]: crate::Error::Config
+    pub fn parse(raw: &str) -> Result<Self> {
+        let dial = raw.trim();
+        if dial.is_empty() {
+            return Err(crate::Error::Config("server_url is empty".into()));
+        }
+        // URL schemes are case-insensitive, so match `WSS://` too.
+        let (rest, tls) = if let Some(rest) = strip_scheme(dial, "wss://") {
+            (rest, true)
+        } else if let Some(rest) = strip_scheme(dial, "ws://") {
+            (rest, false)
+        } else {
+            return Err(crate::Error::Config(
+                "server_url must be a ws:// or wss:// URL".into(),
+            ));
+        };
+        if !tls && !is_loopback_host(host_of(authority_of(rest))) {
+            return Err(crate::Error::Config(
+                "server_url uses ws:// to a non-loopback host — captured traffic \
+                 would be sent in cleartext; use wss:// (or ws:// only for \
+                 127.0.0.1/localhost)"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            redacted: redacted_authority(dial),
+            dial: dial.to_owned(),
+        })
+    }
+
+    /// The dial string: what the WebSocket client connects to, userinfo and
+    /// query intact. Never log this — see [`ServerUrl::redacted`].
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.dial
+    }
+
+    /// `scheme://host[:port]`, the only form safe to write to the log file the
+    /// player is asked to send us. Also what `Debug`/`Display` print.
+    #[must_use]
+    pub fn redacted(&self) -> &str {
+        &self.redacted
+    }
+}
+
+/// Case-insensitive scheme prefix strip. `get` rather than a slice index because
+/// `raw` is arbitrary player text and may not have a char boundary there.
+fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
+    url.get(..scheme.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        .map(|prefix| &url[prefix.len()..])
+}
+
+impl fmt::Debug for ServerUrl {
+    /// The redacted form, deliberately — see the type's documentation.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ServerUrl").field(&self.redacted).finish()
+    }
+}
+
+impl fmt::Display for ServerUrl {
+    /// The redacted form, deliberately — see the type's documentation.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.redacted)
+    }
+}
+
+/// The serde hook: `#[serde(try_from = "String")]` on a `ServerUrl` field parses
+/// through [`ServerUrl::parse`], so the cleartext rule stops depending on
+/// `Config::load` being the only constructor.
+impl TryFrom<String> for ServerUrl {
+    type Error = crate::Error;
+
+    fn try_from(raw: String) -> Result<Self> {
+        Self::parse(&raw)
+    }
+}
+
+/// Reject an `[actuator.timings]` table the refresh loop cannot honour.
+///
+/// Separate from [`Config::validate`], and `pub(crate)`, because there are
+/// **two** write boundaries and only one of them has a `Config`: the loader, and
+/// [`persist::save`], which serializes whatever `Timings` the Setup tab hands it
+/// with no `Config` anywhere in the path. Enforced at the loader alone, the GUI
+/// was one missing clamp away from writing a file the *next* launch refuses —
+/// the exact shape of the `kinds = ["unknown"]` checkbox that shipped, whose
+/// only cure was hand-editing the file the app owns.
+///
+/// Better still would be for `DelayRange` to carry the invariant itself, where no
+/// producer at all could bypass it. That is a bigger move than it looks: the type
+/// lives in [`crate::actuator::plan`] and [`MAX_TIMING_MS`] lives here, so it
+/// inverts the current dependency direction — and the reversed-range message
+/// below, which names the key *and* says what the value would be read as, has to
+/// survive the move.
+///
+/// # Errors
+///
+/// [`Error::Config`] — a range is reversed (`min_ms > max_ms`), or its `max_ms`
+/// exceeds the [`MAX_TIMING_MS`] ceiling. The message names the key.
+///
+/// [`Error::Config`]: crate::Error::Config
+pub(crate) fn validate_timings(timings: &Timings) -> Result<()> {
+    // `[actuator.timings]` reaches both the refresh loop and the Setup meter
+    // unchecked otherwise. Two shapes have to be refused:
+    //
+    // - a reversed range. With this TOML's inline form
+    //   (`{ min_ms = 800, max_ms = 200 }`) swapping the two is an ordinary
+    //   typo, and `DelayRange::draw` reads it as a fixed 800 ms delay — the
+    //   player configures variability and silently gets none, while the
+    //   Setup tab shows "Custom" with no clue why.
+    // - an unbounded `max_ms`. It is what freezes the loop for ten minutes
+    //   between two clicks, and what overflows the editor's `baseline + max`
+    //   sums near `u64::MAX`.
+    for (name, range) in timings.named_ranges() {
+        if range.min_ms > range.max_ms {
+            return Err(crate::Error::Config(format!(
+                "actuator.timings.{name} is reversed: min_ms = {} is above max_ms = {} — swap them (it would be read as a fixed {} ms delay, not a range)",
+                range.min_ms, range.max_ms, range.min_ms
+            )));
+        }
+        if range.max_ms > MAX_TIMING_MS {
+            return Err(crate::Error::Config(format!(
+                "actuator.timings.{name} max_ms = {} exceeds the {MAX_TIMING_MS} ms ceiling — that would stall the refresh loop between two clicks",
+                range.max_ms
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl Config {
@@ -317,6 +538,8 @@ impl Config {
     ///     captured game stream, session tokens included, in cleartext);
     ///   - an unrecognized value in `[filter] kinds`, which the wire-tolerant
     ///     `ItemKind` would otherwise fold into `Unknown` and match nothing;
+    ///   - a non-finite `[[filter.required_substats]] min` (`nan`/`inf` are
+    ///     legal TOML floats), which no substat value can ever satisfy;
     ///   - an `[actuator.timings]` range that is reversed (`min_ms > max_ms`)
     ///     or whose `max_ms` exceeds the 60 000 ms ceiling.
     ///
@@ -345,37 +568,40 @@ impl Config {
         if self.game_port == 0 {
             return Err(crate::Error::Config("game_port cannot be 0".into()));
         }
-        if self.server_url.trim().is_empty() {
-            return Err(crate::Error::Config("server_url is empty".into()));
-        }
         // `server_url` receives the reassembled game stream, which can carry
         // session tokens: require TLS (`wss://`) unless the host is loopback,
-        // where cleartext (`ws://`) never leaves the machine.
-        let url = self.server_url.trim();
-        // URL schemes are case-insensitive, so match `WSS://` too.
-        let lower = url.to_ascii_lowercase();
-        if lower.starts_with("wss://") {
-            // TLS: fine.
-        } else if lower.starts_with("ws://") {
-            if !is_loopback_ws_host(url) {
-                return Err(crate::Error::Config(
-                    "server_url uses ws:// to a non-loopback host — captured traffic \
-                     would be sent in cleartext; use wss:// (or ws:// only for \
-                     127.0.0.1/localhost)"
-                        .into(),
-                ));
-            }
-        } else {
-            return Err(crate::Error::Config(
-                "server_url must be a ws:// or wss:// URL".into(),
-            ));
-        }
+        // where cleartext (`ws://`) never leaves the machine. Parsed rather than
+        // spot-checked, so that the rule and the authority split it needs have
+        // one implementation — `ServerUrl` — instead of one here and one in the
+        // log redactor.
+        //
+        // The parsed value is dropped because the field is still a `String`;
+        // storing it is what would extend the proof to a `Config` that did not
+        // come from disk. See the field.
+        ServerUrl::parse(&self.server_url)?;
         // `ItemKind` is wire-tolerant (`serde(other)` -> Unknown), which in a
         // config file would let a typo silently match nothing: reject it here.
         if self.filter.kinds.contains(&ItemKind::Unknown) {
             return Err(crate::Error::Config(
                 "unrecognized kind in [filter] kinds (expected: equipment, hero, token)".into(),
             ));
+        }
+        // The same failure mode as `kinds`, by a different route, and TOML 1.0
+        // supplies the literal: `min = nan` parses. Nothing can then satisfy
+        // `value >= min`, so the filter matches nothing while `is_unrestricted`
+        // reports it restricted and the loop arms and burns crystals — and
+        // `Filter`'s derived `PartialEq` (the Setup tab's dirty check) recurses
+        // into this `Option<f64>`, so `NaN != NaN` leaves Apply lit forever,
+        // rewriting `config.toml` on every click. `+inf` gives the first half
+        // without the second.
+        for req in &self.filter.required_substats {
+            if req.min.is_some_and(|min| !min.is_finite()) {
+                return Err(crate::Error::Config(format!(
+                    "filter.required_substats \"{}\" has a non-finite min — no substat value can \
+                     ever satisfy it, so the filter would match nothing",
+                    req.name
+                )));
+            }
         }
         // `capture.filter` used to be checked here for naming `game_port`,
         // because a filter on another port delivered traffic nothing could
@@ -394,33 +620,10 @@ impl Config {
         // Refusing any `[forward]` value would only lock out a player whose
         // file predates the change, which is every player's file.
         //
-        // `[actuator.timings]` reaches both the refresh loop and the Setup
-        // meter unchecked otherwise. Two shapes have to be refused here, at the
-        // root, rather than absorbed downstream:
-        //
-        // - a reversed range. With this TOML's inline form
-        //   (`{ min_ms = 800, max_ms = 200 }`) swapping the two is an ordinary
-        //   typo, and `DelayRange::draw` reads it as a fixed 800 ms delay — the
-        //   player configures variability and silently gets none, while the
-        //   Setup tab shows "Custom" with no clue why.
-        // - an unbounded `max_ms`. It is what freezes the loop for ten minutes
-        //   between two clicks, and what overflows the editor's `baseline + max`
-        //   sums near `u64::MAX`.
-        for (name, range) in self.actuator.timings.named_ranges() {
-            if range.min_ms > range.max_ms {
-                return Err(crate::Error::Config(format!(
-                    "actuator.timings.{name} is reversed: min_ms = {} is above max_ms = {} — swap them (it would be read as a fixed {} ms delay, not a range)",
-                    range.min_ms, range.max_ms, range.min_ms
-                )));
-            }
-            if range.max_ms > MAX_TIMING_MS {
-                return Err(crate::Error::Config(format!(
-                    "actuator.timings.{name} max_ms = {} exceeds the {MAX_TIMING_MS} ms ceiling — that would stall the refresh loop between two clicks",
-                    range.max_ms
-                )));
-            }
-        }
-        Ok(())
+        // The timing ranges are checked by the free `validate_timings`, which
+        // `persist::save` calls too — the disk is written from the GUI without a
+        // `Config` in the path, so the loader cannot be the only boundary.
+        validate_timings(&self.actuator.timings)
     }
 
     pub fn reconnect_initial(&self) -> Duration {
@@ -946,7 +1149,11 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
-        // Even a bare userinfo form must be caught.
+    }
+
+    #[test]
+    fn ws_bare_userinfo_loopback_is_rejected() {
+        // The same bypass without a port in the userinfo.
         let err = config_with_url("ws://localhost@evil.com/x")
             .validate()
             .unwrap_err();
@@ -1255,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn scheme_match_is_case_insensitive() {
+    fn an_uppercase_wss_scheme_is_accepted() {
         // URL schemes are case-insensitive; an uppercase scheme must not be
         // rejected when the WebSocket client would accept it.
         assert!(
@@ -1263,12 +1470,123 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn an_uppercase_ws_scheme_to_loopback_is_accepted() {
         assert!(config_with_url("WS://127.0.0.1:3001/x").validate().is_ok());
-        // A userinfo bypass must still be caught regardless of scheme case.
+    }
+
+    #[test]
+    fn an_uppercase_ws_userinfo_bypass_is_still_rejected() {
+        // The case-insensitive match must not become a way around the host check.
         assert!(
             config_with_url("WS://127.0.0.1@evil.com/x")
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_non_finite_substat_threshold_is_rejected() {
+        // `nan` and `inf` are TOML 1.0 float literals, so this is a legal parse.
+        // Accepted, it is the worst kind of silent failure: `value >= min` is
+        // false for every value so the filter matches nothing, while
+        // `is_unrestricted()` counts the requirement as a real criterion, so the
+        // loop arms and refreshes forever debiting crystals. `nan` adds a second
+        // symptom — `Filter`'s derived `PartialEq` recurses into the
+        // `Option<f64>`, so the Setup tab's dirty check never clears and every
+        // Apply rewrites `config.toml`.
+        for literal in ["nan", "inf", "-inf", "-nan"] {
+            let text = format!("[[filter.required_substats]]\nname = \"speed\"\nmin = {literal}\n");
+            let error = parse_and_validate(&text)
+                .expect_err("a threshold no value can satisfy must be refused");
+            assert!(matches!(error, crate::Error::Config(_)), "{literal}");
+            let message = error.to_string();
+            assert!(
+                message.contains("speed"),
+                "must name the requirement: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finite_substat_threshold_including_zero_and_negative_is_accepted() {
+        // Only *non-finite* is refused. A zero or negative floor is meaningful
+        // (some substats are stored as deltas) and must stay reachable.
+        let config = parse_and_validate(
+            "[[filter.required_substats]]\nname = \"speed\"\nmin = 0.0\n\n\
+             [[filter.required_substats]]\nname = \"cri\"\nmin = -1.5\n\n\
+             [[filter.required_substats]]\nname = \"atk\"\n",
+        )
+        .expect("finite thresholds are legal");
+        assert_eq!(config.filter.required_substats.len(), 3);
+        assert_eq!(config.filter.required_substats[2].min, None);
+    }
+
+    #[test]
+    fn a_parsed_server_url_keeps_the_dial_string_and_redacts_the_credential() {
+        // The two halves the crate used to write twice: what gets dialed, and
+        // what is safe to log. One parse now produces both.
+        let url = ServerUrl::parse("wss://token:secret@ingest.arkyve.dev:8443/path?key=abc")
+            .expect("wss is accepted whatever the authority carries");
+        assert_eq!(
+            url.as_str(),
+            "wss://token:secret@ingest.arkyve.dev:8443/path?key=abc"
+        );
+        assert_eq!(url.redacted(), "wss://ingest.arkyve.dev:8443");
+    }
+
+    #[test]
+    fn a_server_urls_debug_and_display_cannot_leak_the_credential() {
+        // The reason `Debug` is hand-written: the log file is what the player is
+        // asked to email us, and `README.md` promises it carries no credential.
+        let url = ServerUrl::parse("wss://token:secret@ingest.arkyve.dev/x").expect("accepted");
+        for rendered in [format!("{url:?}"), format!("{url}")] {
+            assert!(!rendered.contains("secret"), "{rendered}");
+            assert!(rendered.contains("ingest.arkyve.dev"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn a_configs_debug_redacts_the_server_url_it_has_not_parsed() {
+        // `Config` is exactly the kind of value that ends up in a startup line.
+        // The field is still a bare `String`, so the redaction has to work on
+        // whatever is in it — including a value that never went through
+        // `validate` at all.
+        let rendered = format!(
+            "{:?}",
+            config_with_url("wss://token:secret@host:8443/p?k=v")
+        );
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert!(rendered.contains("wss://host:8443"), "{rendered}");
+    }
+
+    #[test]
+    fn a_query_or_fragment_never_reaches_the_redacted_form() {
+        // A fragment used to be authority text to the loopback check and not to
+        // the log redactor; one parser now handles both.
+        let url = ServerUrl::parse("ws://127.0.0.1:9000/?key=abc#frag").expect("loopback");
+        assert_eq!(url.redacted(), "ws://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn a_surrounding_whitespace_server_url_is_accepted_and_dials_trimmed() {
+        // A hand-edited `server_url = " wss://… "` names the same server; the
+        // trim has to happen before the scheme match *and* before the dial
+        // string is kept, or the client gets a URL with a leading space.
+        let url = ServerUrl::parse("  wss://ingest.arkyve.dev/x  ").expect("accepted");
+        assert_eq!(url.as_str(), "wss://ingest.arkyve.dev/x");
+    }
+
+    #[test]
+    fn the_serde_hook_parses_through_the_same_rule() {
+        // `#[serde(try_from = "String")]` on a `ServerUrl` field is what makes
+        // the cleartext rule stop depending on `Config::load` being the only
+        // constructor; the conversion must be the same parse, not a second one.
+        assert!(ServerUrl::try_from("wss://ingest.arkyve.dev/x".to_owned()).is_ok());
+        let error = ServerUrl::try_from("ws://evil.com/x".to_owned())
+            .expect_err("a non-loopback ws:// must not become a ServerUrl");
+        assert!(matches!(error, crate::Error::Config(_)));
     }
 }
