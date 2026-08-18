@@ -189,13 +189,13 @@ mod tests {
         let entry = crash_entry(
             42,
             "capture",
-            "src/capture/pcap.rs:60",
+            "src/capture/pcap/sys.rs:60",
             "recv failed",
             "<backtrace>",
         );
         assert!(entry.contains("epoch 42s"));
         assert!(entry.contains("thread: capture"));
-        assert!(entry.contains("location: src/capture/pcap.rs:60"));
+        assert!(entry.contains("location: src/capture/pcap/sys.rs:60"));
         assert!(entry.contains("message: recv failed"));
         assert!(entry.contains("<backtrace>"));
     }

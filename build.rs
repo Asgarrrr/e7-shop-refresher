@@ -6,7 +6,7 @@
 //! in full.
 //!
 //! The capture backend needs no privilege at all. It is Npcap
-//! (`src/capture/pcap.rs`): it taps every adapter through `wpcap.dll` from an
+//! (`src/capture/pcap/`): it taps every adapter through `wpcap.dll` from an
 //! ordinary process, and the whole pipeline — capture, reassembly, uplink,
 //! decoded snapshot, refresh job — was measured working end to end from an
 //! unelevated run. Nothing below is for it. We ship no driver and embed

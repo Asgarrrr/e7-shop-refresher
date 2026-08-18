@@ -99,20 +99,20 @@ format_push_string = "warn"  # 0
 # logical AND" because backticking English would have been the wrong fix.
 doc_markdown = "warn"        # 0
 # Zero in the test harness too, unlike `unwrap_used`/`panic` above.
-# The one panic macro the ratchet used to miss. `unwrap_used` and `panic` live in
-# a crate-root `cfg_attr(not(test), …)` because the test harness needs them, but
-# `unreachable!` measures **0** here on all six lanes for `--lib --bins` *and*
-# for `--all-targets` — there is not one token of it left under `src/`,
-# `examples/`, `tests/` or `build.rs` — so it belongs in the table with no gate.
-# It got in once: a per-packet `Resync::from_u8` fallback, three doors from
-# `stream.rs`'s reporters, which argue at length that this pipeline must
-# saturate-and-log rather than abort a player's session.
-unreachable = "warn"    # 0
 todo = "warn"           # 0
 unimplemented = "warn"  # 0
 dbg_macro = "warn"      # 0
 mem_forget = "warn"     # 0
 exit = "warn"           # 0
+# The one panic macro the ratchet used to miss, and the only one that got in:
+# a per-packet `Resync::from_u8` fallback, three doors from `stream/budget.rs`'s
+# reporters, which argue at length that this pipeline must saturate-and-log
+# rather than abort a player's session. `unwrap_used` and `panic` need the
+# crate-root `cfg_attr(not(test), …)` because fixtures use them, but
+# `unreachable!` measures **0** on all six lanes for `--lib --bins` *and* for
+# `--all-targets` — not one token of it is left under `src/`, `examples/`,
+# `tests/` or `build.rs` — so it belongs here, ungated.
+unreachable = "warn"    # 0
 
 # rustdoc was the one lane nothing gated, and it was not clean. `just doc` and
 # the CI step both run `--document-private-items`, which is the right mode for a
@@ -256,7 +256,7 @@ codegen-units = 1
 #
 # The prerequisite, audited before enabling this: a panic raised from a `Drop`
 # *during an unwind* aborts the process with no banner and no `crash.log` (see
-# `stream.rs`'s `PipelineBudget::release`). All four production `Drop` impls were
+# `stream/budget.rs`'s `PipelineBudget::release`). All four production `Drop` impls were
 # read — `PayloadLease` (saturating arithmetic only), `capture::pcap::Handle`
 # (one FFI close), `capture::pcap::PcapSource` (an atomic store and joins),
 # `actuator::win::MessageSurface` (`cleanup` → `shield::hide`, one FFI call) —

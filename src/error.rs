@@ -103,7 +103,7 @@ pub enum Error {
 
 // There is deliberately no context-free `Io(#[from] std::io::Error)` variant above.
 // It had exactly one reachable producer — a blanket `?` on
-// `std::thread::Builder::spawn` in `app::spawn_capture_with_budget` — and that
+// `std::thread::Builder::spawn` in `app::workers::spawn_capture_with_budget` — and that
 // site now says what it was doing (`Error::Capture("starting the capture thread:
 // …")`), because "i/o: The system cannot find the file specified." is a message no
 // player can act on. A `#[from] std::io::Error` is what makes that outcome the

@@ -141,7 +141,7 @@ The invariant itself is unchanged and now lives in the code, which is what a
 later reader should consult instead:
 
 - **The incarnation reset** is `Reassembler::syn_starts_new_incarnation`
-  (`src/stream.rs`). A SYN re-anchors the sequence space, which is why it is
+  (`src/stream/reassembly.rs`). A SYN re-anchors the sequence space, which is why it is
   never held behind the anchor deadline: buffering it would make the burst's own
   ordering meaningless. Any older burst is committed first, then the SYN is
   classified immediately.
