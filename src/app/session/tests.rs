@@ -6,6 +6,13 @@ use crate::domain::control::{Limits, StopReason};
 use crate::domain::filter::Filter;
 use crate::domain::shop::{ItemKind, PurchaseLimit, ShopItem, ShopSnapshot};
 
+/// A shutdown signal nobody ever raises: the loop must exit through its own
+/// paths. The sender is dropped straight away, which the loop reads as "no
+/// stop can ever arrive" (the branch disables itself), never as a stop.
+fn never_shutdown() -> watch::Receiver<bool> {
+    watch::channel(false).1
+}
+
 /// A fresh shared-timings cell at the calibrated baselines (all extras 0).
 fn timings() -> Arc<Mutex<plan::Timings>> {
     Arc::new(Mutex::new(plan::Timings::default()))
@@ -68,6 +75,7 @@ async fn session_loop_exit_stops_controller_and_gate() {
         command_rx,
         message_rx,
         error_rx,
+        never_shutdown(),
     )
     .await;
 
@@ -110,6 +118,7 @@ async fn a_worker_panic_is_reported_when_the_uplink_channel_closes() {
         command_rx,
         message_rx,
         error_rx,
+        never_shutdown(),
     )
     .await;
 
@@ -129,23 +138,118 @@ fn stop_while_idle_reports_no_effect() {
     assert_eq!(controller.lock().unwrap().status(), Status::Idle);
 }
 
-#[test]
-fn actuator_failure_command_halts_with_the_clicker_label() {
+#[tokio::test]
+async fn actuator_failure_latch_halts_with_the_clicker_label() {
     let gate = WatchGate::new(false);
+    let journal = EventLog::default();
     let controller = Mutex::new(Controller::new(
         Filter::matching_default_items(),
         Limits::default(),
     ));
-    handle_command(&controller, &gate, &off(), Command::Start, 0);
+    on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
     assert!(gate.is_enabled());
-    let lines = handle_command(&controller, &gate, &off(), Command::ActuatorFailed, 1);
-    assert!(lines.iter().any(|line| line.contains("clicker failed")));
-    assert!(!lines.iter().any(|line| line.contains("player stopped")));
+
+    let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
+    let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
+    let (_error_tx, error_rx) = mpsc::channel::<String>(1);
+    gate.request_halt(crate::watch::HaltSource::ActuatorFailed);
+    drop(message_tx);
+    session_loop(
+        &controller,
+        &gate,
+        &journal,
+        &off(),
+        command_rx,
+        message_rx,
+        error_rx,
+        never_shutdown(),
+    )
+    .await;
+
+    let lines = journal.entries();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text.contains("clicker failed"))
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.text.contains("player stopped"))
+    );
     assert_eq!(
         controller.lock().unwrap().status(),
         Status::Stopped(StopReason::ActuatorFailed)
     );
     assert!(!gate.is_enabled());
+}
+
+#[tokio::test]
+async fn saturated_command_queue_cannot_drop_an_actuator_halt() {
+    let gate = WatchGate::new(false);
+    let journal = EventLog::default();
+    let controller = Mutex::new(Controller::new(
+        Filter::matching_default_items(),
+        Limits::default(),
+    ));
+    on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
+    assert!(gate.is_enabled());
+
+    let (command_tx, command_rx) = mpsc::channel::<Command>(1);
+    command_tx
+        .try_send(Command::SetTimings(plan::Timings::default()))
+        .expect("fill the bounded command queue");
+    let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
+    let (_error_tx, error_rx) = mpsc::channel::<String>(1);
+    gate.request_halt(crate::watch::HaltSource::ActuatorFailed);
+    assert!(!gate.is_enabled(), "the safety cutoff is synchronous");
+    drop(message_tx);
+
+    session_loop(
+        &controller,
+        &gate,
+        &journal,
+        &off(),
+        command_rx,
+        message_rx,
+        error_rx,
+        never_shutdown(),
+    )
+    .await;
+
+    assert_eq!(
+        controller.lock().unwrap().status(),
+        Status::Stopped(StopReason::ActuatorFailed)
+    );
+    assert!(!gate.is_enabled());
+    assert!(
+        journal
+            .entries()
+            .iter()
+            .any(|line| { line.text.contains("clicker failed") })
+    );
+    drop(command_tx);
+}
+
+#[test]
+fn queued_start_cannot_rearm_before_pending_halt_is_applied() {
+    let gate = WatchGate::new(false);
+    let controller = Mutex::new(Controller::new(
+        Filter::matching_default_items(),
+        Limits::default(),
+    ));
+    let (command_tx, mut command_rx) = mpsc::channel::<Command>(1);
+    command_tx.try_send(Command::Start).unwrap();
+    gate.request_halt(crate::watch::HaltSource::ActuatorFailed);
+
+    let queued = command_rx.try_recv().expect("queued Start");
+    handle_command(&controller, &gate, &off(), queued, 0);
+
+    assert_eq!(controller.lock().unwrap().status(), Status::Watching);
+    assert!(
+        !gate.is_enabled(),
+        "set(true) must not bypass a pending safety halt"
+    );
 }
 
 #[tokio::test]
@@ -174,6 +278,7 @@ async fn uplink_outage_and_recovery_reach_the_journal() {
         command_rx,
         message_rx,
         error_rx,
+        never_shutdown(),
     )
     .await;
 
@@ -219,6 +324,7 @@ async fn fatal_failure_reaches_journal_gate_and_caller() {
         command_rx,
         message_rx,
         fatal_rx,
+        never_shutdown(),
     )
     .await;
 
@@ -250,6 +356,7 @@ async fn session_loop_exit_leaves_never_armed_controller_idle() {
         command_rx,
         message_rx,
         error_rx,
+        never_shutdown(),
     )
     .await;
 
@@ -261,6 +368,87 @@ async fn session_loop_exit_leaves_never_armed_controller_idle() {
             .iter()
             .all(|line| !line.text.contains("stopped"))
     );
+}
+
+/// Closing the window must unwind the pipeline: without this branch the loop
+/// keeps running on a detached task and the process dies with a live capture
+/// session still open in the driver.
+#[tokio::test]
+async fn shutdown_signal_ends_the_loop_and_stops_the_watch() {
+    let gate = WatchGate::new(false);
+    let journal = EventLog::default();
+    let controller = Mutex::new(Controller::new(
+        Filter::matching_default_items(),
+        Limits::default(),
+    ));
+    on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
+    assert!(gate.is_enabled());
+
+    // Every other source stays open: only the shutdown signal can end this.
+    let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
+    let (_message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
+    let (_error_tx, error_rx) = mpsc::channel::<String>(1);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let signal = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        shutdown_tx.send_replace(true);
+        shutdown_tx
+    });
+
+    let failure = session_loop(
+        &controller,
+        &gate,
+        &journal,
+        &off(),
+        command_rx,
+        message_rx,
+        error_rx,
+        shutdown_rx,
+    )
+    .await;
+
+    let _sender = signal.await.unwrap();
+    // A requested shutdown is a clean end, not a failure — and the player's
+    // own stop, so the controller must not report "session ended".
+    assert_eq!(failure, None);
+    assert!(!gate.is_enabled());
+    assert_eq!(
+        controller.lock().unwrap().status(),
+        Status::Stopped(StopReason::PlayerStopped)
+    );
+}
+
+/// A signal already raised before the loop starts must still be honoured:
+/// `changed()` alone would never fire for it.
+#[tokio::test]
+async fn a_shutdown_requested_before_the_loop_starts_is_honoured() {
+    let gate = WatchGate::new(false);
+    let journal = EventLog::default();
+    let controller = Mutex::new(Controller::new(
+        Filter::matching_default_items(),
+        Limits::default(),
+    ));
+
+    let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
+    let (_message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
+    let (_error_tx, error_rx) = mpsc::channel::<String>(1);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    shutdown_tx.send_replace(true);
+
+    let failure = session_loop(
+        &controller,
+        &gate,
+        &journal,
+        &off(),
+        command_rx,
+        message_rx,
+        error_rx,
+        shutdown_rx,
+    )
+    .await;
+
+    assert_eq!(failure, None);
+    assert!(!gate.is_enabled());
 }
 
 #[test]

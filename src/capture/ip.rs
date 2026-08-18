@@ -1,4 +1,4 @@
-//! Decodes a raw IP packet (WinDivert network layer) into a [`Segment`].
+//! Decodes a captured IP packet into a [`Segment`].
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -12,7 +12,6 @@ use super::{Direction, FlowKey, Segment};
 /// malformed. Direction is inferred from which side owns `game_port`.
 pub fn parse_segment(bytes: &[u8], game_port: u16) -> Option<Segment> {
     let sliced = SlicedPacket::from_ip(bytes).ok()?;
-
     let (src_ip, dst_ip) = match sliced.net? {
         NetSlice::Ipv4(ip) => {
             let header = ip.header();

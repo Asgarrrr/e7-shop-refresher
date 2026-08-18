@@ -2,17 +2,21 @@
 name = "arkyve-refresh-shop"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.92"
 description = "Local relay that captures Epic Seven Secret Shop traffic, forwards it to the analysis server, and drives the refresh loop by clicking the game window."
 license = "MIT"
 publish = false
 
 [features]
 default = ["windivert-backend", "gui", "actuator"]
-# Native Windows capture backend (WinDivert). Disable to build/test the pipeline
-# (reassembly, uplink, models) without the WinDivert SDK. Pulls windows-sys for
+# Native Windows capture backend (WinDivert), the shipped default. Delivers
+# IP-layer copies of the game's TCP packets, so it is indifferent to the link
+# layer underneath — the reason it works on WiFi where a NIC-level tap hands
+# out 802.11 frames. Links *dynamically* against the vendored prebuilt
+# `WinDivert.lib`/`WinDivert.dll` (`WINDIVERT_PATH` in `.cargo/config.toml`);
+# never `WINDIVERT_STATIC`, see that file for why. Pulls windows-sys for
 # `LoadLibraryW` (the delay-loaded WinDivert.dll is preloaded by full path from
-# its extracted app-data location).
+# its extracted app-data location) and for the runtime-dir DACL hardening.
 windivert-backend = ["dep:windivert", "dep:windows-sys"]
 # egui window over the session (dashboard + player commands). Disable for the
 # console-only build.
@@ -47,6 +51,9 @@ toml_edit = { version = "0.25", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# The windowed build has no console: stdout is an inert sink, so every log
+# would be lost. Logs go to a daily-rotated file under %LOCALAPPDATA%.
+tracing-appender = "0.2"
 # glow renderer only: targets are Windows (player) and macOS (dev); the
 # default wgpu/x11/wayland stacks would only slow the build down.
 eframe = { version = "0.35", optional = true, default-features = false, features = [
@@ -55,6 +62,9 @@ eframe = { version = "0.35", optional = true, default-features = false, features
 ] }
 
 [target.'cfg(windows)'.dependencies]
+# Default features only: `static`/`vendored` are deliberately OFF. See
+# `.cargo/config.toml` — `WINDIVERT_STATIC` compiles the vendor C in-tree and
+# the resulting object breaks the release build's stack-guard probing.
 windivert = { version = "0.7.0-beta.4", optional = true }
 windows-sys = { version = "0.61", optional = true, features = [
     "Win32_Foundation",
@@ -73,7 +83,7 @@ windows-sys = { version = "0.61", optional = true, features = [
 # Headless widget-interaction tests for the ui module (no renderer needed).
 # Dev-deps cannot be feature-gated: the console-only test lane builds egui
 # once too; the kittest tests themselves are behind the `gui` feature.
-egui_kittest = { version = "0.35", default-features = false }
+egui_kittest = { version = "0.35", default-features = false, features = ["wgpu", "snapshot"] }
 # Paused-clock tests (`start_paused`) for the uplink send timeout.
 tokio = { version = "1", features = ["test-util"] }
 
@@ -84,6 +94,16 @@ tokio = { version = "1", features = ["test-util"] }
 name = "ui_preview"
 required-features = ["gui"]
 
+# Dependencies are compiled once and reused by every dev and test build; at
+# opt-level 0 an egui/glow UI is visibly sluggish (see `examples/ui_preview`)
+# and the kittest lane crawls. Our own crate stays unoptimized and debuggable.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
-strip = true
+# Not `strip = true`: that drops the symbol table too, and `crash.rs`'s
+# `Backtrace::force_capture()` — the product's only post-mortem channel —
+# then records bare addresses. Debug info goes, symbol names stay.
+strip = "debuginfo"
+codegen-units = 1

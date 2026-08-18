@@ -32,8 +32,10 @@ pub(super) const INK_FAINT: Color32 = Color32::from_rgb(0x89, 0x87, 0x81);
 pub(super) const HAIRLINE: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2a);
 /// Watching: the loop is doing its job.
 const GREEN: Color32 = Color32::from_rgb(0x0c, 0xa3, 0x0c);
-/// Paused, and stops the player planned (limits).
-const AMBER: Color32 = Color32::from_rgb(0xfa, 0xb2, 0x19);
+/// Paused, and stops the player planned (limits). Also the rail the Setup tab's
+/// Stop section paints beside an armed limit, so arming a rail previews the
+/// color the status dot turns when that very limit trips (see `status_color`).
+pub(super) const AMBER: Color32 = Color32::from_rgb(0xfa, 0xb2, 0x19);
 /// Stops the player did not plan (machine faults).
 const RED: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
 /// Matched rows in the shop table: brighter than the status green so it
@@ -150,6 +152,32 @@ pub(super) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     .inner
 }
 
+/// A bare (label-less) checkbox whose checked box fills the accent, so an "on"
+/// toggle carries the same blue as the primary button, the selection, and the
+/// tab underline — the app's single active color — instead of the default grey
+/// box. The box is squared to a 2px radius: the global 6px radius rounds the
+/// ~16px checkbox icon into a circle that reads as a radio button. The caller
+/// owns the row's label (the Stop limits set the unit in their own column).
+pub(super) fn accent_checkbox(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    ui.scope(|ui| {
+        let visuals = &mut ui.style_mut().visuals;
+        for state in [
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+        ] {
+            state.corner_radius = CornerRadius::same(2);
+        }
+        if *on {
+            visuals.widgets.inactive.bg_fill = ACCENT;
+            visuals.widgets.hovered.bg_fill = ACCENT_HOVER;
+            visuals.widgets.active.bg_fill = ACCENT_PRESSED;
+        }
+        ui.checkbox(on, "")
+    })
+    .inner
+}
+
 /// A full-width collapsible section header in the journal bar's key: a painted
 /// disclosure caret (right = closed, down = open) beside the small-caps title,
 /// the whole bar lighting up on hover and bleeding to the window edges like the
@@ -183,12 +211,18 @@ pub(super) fn collapsing_section(
     let response = ui.interact(full, ui.id().with(("section", title)), egui::Sense::click());
     let enabled = ui.is_enabled();
     let peek = (!open).then_some(()).and(summary);
-    let name = match peek {
-        Some(summary) => format!("{title} · {summary}"),
-        None => title.to_owned(),
-    };
-    response
-        .widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &name));
+    // The name is built *inside* the closure, which is the whole point of
+    // `widget_info` taking one: egui only calls it when AccessKit is live, a
+    // test harness is reading, or the widget was just clicked/focused. Building
+    // the string outside would pay the `format!` on every frame of every
+    // section bar for nothing. Only `Copy` inputs are captured.
+    response.widget_info(|| {
+        let name = match peek {
+            Some(summary) => format!("{title} · {summary}"),
+            None => title.to_owned(),
+        };
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &name)
+    });
 
     // Unlike the journal's deliberately quiet bar, these are the Setup surface's
     // primary structure: a heading-sized uppercase label in bright ink so they

@@ -65,36 +65,42 @@ fn shop_table(ui: &mut egui::Ui, rows: &[SlotRow]) {
                 theme::STRIPE,
             );
         }
-        // Matched-and-unbought rows read as body text in the wanted green;
-        // sold-out rows mute and strike through — both signals survive the
-        // hover fill because the text paints on top of it.
-        let style = |text: String| {
-            let mut text = egui::RichText::new(text);
-            if row.wanted {
-                text = text.strong().color(theme::WANTED);
-            }
-            if row.sold_out {
-                text = text.weak().strikethrough();
-            }
-            text
-        };
         let [c_slot, c_kind, c_name, c_price] = column_rects(rect.shrink2(edge));
-        cell(ui, c_slot, false, style(row.slot.to_string()));
-        cell(ui, c_kind, false, style(row.kind.to_owned()));
+        cell(ui, c_slot, false, styled(row, row.slot.to_string()));
+        cell(ui, c_kind, false, styled(row, row.kind));
         cell(
             ui,
             c_name,
             false,
-            style(row.name.clone().unwrap_or_else(|| "—".to_owned())),
+            styled(row, row.name.as_deref().unwrap_or("—")),
         );
-        cell(
-            ui,
-            c_price,
-            true,
-            style(crate::render::grouped_or_dash(row.price)),
-        );
+        let price = crate::render::grouped_or_dash(row.price);
+        cell(ui, c_price, true, styled(row, price));
         response.on_hover_text(&row.detail);
     }
+}
+
+/// One cell's text in its row's ink: matched-and-unbought rows read as body text
+/// in the wanted green, sold-out rows mute and strike through — both signals
+/// survive the hover fill because the text paints on top of it.
+///
+/// Takes `impl Into<String>` exactly like `RichText::new`, so each caller pays
+/// one copy at most: a freshly formatted value (`slot`, `price`) moves straight
+/// in, and a borrow (`kind`'s `&'static str`, the row's own name) is copied once
+/// by `RichText` instead of being pre-allocated into a `String` first. A free
+/// function rather than a closure: a closure cannot be generic over its
+/// argument, which is what forced the old `String`-only signature — and with it
+/// a `to_owned` on a `&'static str` and a `clone` of a name the frame never
+/// mutates.
+fn styled(row: &SlotRow, text: impl Into<String>) -> egui::RichText {
+    let mut text = egui::RichText::new(text);
+    if row.wanted {
+        text = text.strong().color(theme::WANTED);
+    }
+    if row.sold_out {
+        text = text.weak().strikethrough();
+    }
+    text
 }
 
 /// Column geometry shared by the header and every data row so the two always

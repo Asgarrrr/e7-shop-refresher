@@ -15,9 +15,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::app::Command;
 use crate::journal::EventLog;
-use crate::watch::WatchGate;
+use crate::watch::{HaltSource, WatchGate};
 
 use plan::{Input, Job, Timings};
 
@@ -33,6 +32,7 @@ impl SnapshotEpoch {
         self.0.fetch_add(1, Ordering::AcqRel);
     }
 
+    #[must_use]
     pub fn current(&self) -> u64 {
         self.0.load(Ordering::Acquire)
     }
@@ -79,12 +79,14 @@ impl ActuatorHandle {
 
     /// Queues a job for the executor; `false` when the queue is full — the
     /// caller journals the drop, a lost click must not be silent.
+    #[must_use = "a full queue means a lost click — journal the drop"]
     pub fn submit(&self, job: Job) -> bool {
         self.jobs.try_send(job).is_ok()
     }
 
     /// The extra waits to bake into the next job, copied out from under the
     /// lock (never held across a plan build).
+    #[must_use]
     pub fn timings(&self) -> Timings {
         *self
             .timings
@@ -117,14 +119,98 @@ pub enum SurfaceError {
 
 /// The input backend the executor drives: real input on Windows, a recorder
 /// in tests.
+///
+/// Every method may park its thread for the length of an input (Win32
+/// syscalls plus the deliberate settle and hold beats), so the executor only
+/// ever calls them through `blocking`.
 pub trait Surface {
     /// Locates the game window, returning its client area — whether it is
     /// brought to the foreground is backend-specific.
     fn acquire(&mut self) -> Result<plan::ClientRect, SurfaceError>;
+    /// One left click at a screen point, held `press_ms`.
+    ///
+    /// Preconditioned on a successful [`acquire`](Surface::acquire) since the
+    /// last [`release`](Surface::release): the point is meaningless without
+    /// the client rect that produced it. Implementations must answer a
+    /// violation with [`SurfaceError::Fatal`], never a panic — the executor
+    /// runs inside a supervised task, so a panic ends the whole session while
+    /// `Fatal` stops the loop with a reason the player can read.
     fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError>;
+    /// Wheel notches at a screen point. Same precondition and same
+    /// fail-closed rule as [`click`](Surface::click).
     fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError>;
     /// Job over, completed or aborted: undo whatever the inputs set up.
+    /// Implementations must make this idempotent and non-panicking because
+    /// it runs from a destructor.
     fn release(&mut self) {}
+}
+
+/// Runs one blocking [`Surface`] call without starving the runtime.
+///
+/// Every surface method parks its thread: the Win32 backends sleep through
+/// the cursor-settle, button-hold, focus-settle and shield-drain beats, wait
+/// on the shield thread's setup handshake, and call `SetForegroundWindow` /
+/// `SendInput` / `FindWindowW` synchronously — 120-170 ms for a single click,
+/// and a multi-slot buy is a dozen of them back to back. Left plain on a
+/// runtime worker that stalls the reassembly task long enough for the capture
+/// channels to overflow, and the stream re-anchors in the middle of a
+/// purchase — precisely when the `purchase` echo is due. It also outlasts
+/// shutdown's grace deadline, because `JoinHandle::abort` cannot interrupt a
+/// thread sitting in `std::thread::sleep`.
+///
+/// `block_in_place` hands the worker's other tasks to a sibling thread for the
+/// duration. It panics anywhere but the multi-thread runtime, hence the
+/// flavor probe: the executor's own tests drive it on the current-thread
+/// runtime with the clock paused (`start_paused` and `multi_thread` are
+/// mutually exclusive), and the guard tests call it with no runtime at all.
+fn blocking<T>(call: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(call),
+        _ => call(),
+    }
+}
+
+/// Owns cleanup for one successfully acquired job.
+struct SurfaceJobGuard<'a, S: Surface> {
+    surface: Option<&'a mut S>,
+}
+
+impl<'a, S: Surface> SurfaceJobGuard<'a, S> {
+    fn new(surface: &'a mut S) -> Self {
+        Self {
+            surface: Some(surface),
+        }
+    }
+
+    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError> {
+        let surface = self
+            .surface
+            .as_deref_mut()
+            .expect("active surface job guard");
+        blocking(|| surface.click(at, press_ms))
+    }
+
+    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError> {
+        let surface = self
+            .surface
+            .as_deref_mut()
+            .expect("active surface job guard");
+        blocking(|| surface.scroll(at, notches))
+    }
+
+    fn release_once(&mut self) {
+        if let Some(surface) = self.surface.take() {
+            // Cleanup posts and hides too: blocking all the same, and this
+            // also runs from `Drop` on the runtime worker.
+            blocking(|| surface.release());
+        }
+    }
+}
+
+impl<S: Surface> Drop for SurfaceJobGuard<'_, S> {
+    fn drop(&mut self) {
+        self.release_once();
+    }
 }
 
 /// Replays queued jobs step by step. Before every act it re-checks the gate
@@ -137,7 +223,6 @@ pub async fn run_executor(
     gate: WatchGate,
     epoch: SnapshotEpoch,
     journal: EventLog,
-    commands: mpsc::Sender<Command>,
     dry_run: bool,
 ) {
     while let Some(job) = jobs.recv().await {
@@ -147,7 +232,9 @@ pub async fn run_executor(
             journal.emit(&[format!(">> actuator: {reason} — dropped planned clicks")]);
             continue;
         }
-        let rect = match surface.acquire() {
+        // `acquire` finds the window, may steal the foreground and sleeps out
+        // the focus settle: blocking like every other surface call.
+        let rect = match blocking(|| surface.acquire()) {
             Ok(rect) => rect,
             Err(SurfaceError::Recoverable(reason)) => {
                 // Nothing engaged, nothing landed: drop the job and let the
@@ -156,10 +243,11 @@ pub async fn run_executor(
                 continue;
             }
             Err(SurfaceError::Fatal(reason)) => {
-                fail(&journal, &commands, &reason);
-                continue;
+                fail(&journal, &gate, &reason);
+                return;
             }
         };
+        let mut surface = SurfaceJobGuard::new(&mut surface);
         // A minimized window acquires with an empty client area: same fault
         // as minimized mid-job, same recoverable abort.
         if rect.width <= 0 || rect.height <= 0 {
@@ -167,7 +255,6 @@ pub async fn run_executor(
                 &journal,
                 &format!("degenerate client area {}×{}", rect.width, rect.height),
             );
-            surface.release();
             continue;
         }
         for step in &job.steps {
@@ -179,8 +266,8 @@ pub async fn run_executor(
             let at = match plan::to_screen(rect, step.input.at()) {
                 Ok(at) => at,
                 Err(reason) => {
-                    fail(&journal, &commands, &reason);
-                    break;
+                    fail(&journal, &gate, &reason);
+                    return;
                 }
             };
             let delivered = match step.input {
@@ -215,18 +302,20 @@ pub async fn run_executor(
                         // self-heals instead of halting the loop.
                         abort(&journal, &reason);
                     }
-                    SurfaceError::Fatal(reason) => fail(&journal, &commands, &reason),
+                    SurfaceError::Fatal(reason) => {
+                        fail(&journal, &gate, &reason);
+                        return;
+                    }
                 }
                 break;
             }
         }
-        // Completion, abort and failure all land here: never stay engaged.
-        surface.release();
     }
 }
 
 /// Why a job (or its remainder) must not act: a newer shop invalidated the
 /// planned coordinates, or the watch is off. `None` means clear to act.
+#[must_use]
 fn drop_reason(job: &Job, epoch: &SnapshotEpoch, gate: &WatchGate) -> Option<&'static str> {
     if job.epoch != epoch.current() {
         Some("the shop changed")
@@ -245,15 +334,9 @@ fn abort(journal: &EventLog, reason: &str) {
 
 /// An actuator that cannot act safely stops the whole loop — with its own
 /// label, never the player's.
-fn fail(journal: &EventLog, commands: &mpsc::Sender<Command>, reason: &str) {
+fn fail(journal: &EventLog, gate: &WatchGate, reason: &str) {
     journal.emit(&[format!(">> actuator: {reason} — stopping the loop")]);
-    if commands.try_send(Command::ActuatorFailed).is_err() {
-        journal.emit(&[
-            ">> actuator: could not signal the halt (command queue full) — \
-             stop the session manually"
-                .to_owned(),
-        ]);
-    }
+    gate.request_halt(HaltSource::ActuatorFailed);
 }
 
 #[cfg(test)]
@@ -262,33 +345,38 @@ mod tests {
     use plan::{ClientRect, Trigger};
     use std::sync::Mutex;
 
-    #[test]
-    fn fail_signals_the_halt_when_the_queue_has_room() {
+    #[tokio::test]
+    async fn fail_disables_the_gate_and_latches_the_actuator_cause() {
         let journal = EventLog::default();
-        let (tx, mut rx) = mpsc::channel::<Command>(1);
-        fail(&journal, &tx, "window gone");
-        assert_eq!(rx.try_recv().ok(), Some(Command::ActuatorFailed));
+        let gate = WatchGate::new(true);
+        fail(&journal, &gate, "window gone");
+        assert!(!gate.is_enabled());
+        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
         assert!(
-            !journal
+            journal
                 .entries()
                 .iter()
-                .any(|l| l.text.contains("could not signal"))
+                .any(|l| l.text.contains("window gone"))
         );
     }
 
+    /// The whole point of the flavor probe: `block_in_place` panics off the
+    /// multi-thread runtime, and both other contexts are real — the executor
+    /// tests below run current-thread (paused clock), the guard tests run
+    /// with no runtime at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_offloads_on_the_multi_thread_runtime() {
+        assert_eq!(blocking(|| 7), 7);
+    }
+
+    #[tokio::test]
+    async fn blocking_runs_inline_on_the_current_thread_runtime() {
+        assert_eq!(blocking(|| 7), 7);
+    }
+
     #[test]
-    fn fail_journals_a_dropped_halt_when_the_queue_is_full() {
-        let journal = EventLog::default();
-        let (tx, _rx) = mpsc::channel::<Command>(1);
-        tx.try_send(Command::Start).unwrap();
-        fail(&journal, &tx, "window gone");
-        let entries = journal.entries();
-        assert!(entries.iter().any(|l| l.text.contains("window gone")));
-        assert!(
-            entries
-                .iter()
-                .any(|l| l.text.contains("could not signal the halt"))
-        );
+    fn blocking_runs_inline_without_a_runtime() {
+        assert_eq!(blocking(|| 7), 7);
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,6 +451,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn surface_job_guard_releases_once_on_scope_exit() {
+        let (mut surface, _) = FakeSurface::new(design_rect());
+        let releases = surface.releases.clone();
+
+        {
+            let _guard = SurfaceJobGuard::new(&mut surface);
+        }
+
+        assert_eq!(*releases.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn surface_job_guard_explicit_release_is_idempotent_with_drop() {
+        let (mut surface, _) = FakeSurface::new(design_rect());
+        let releases = surface.releases.clone();
+
+        {
+            let mut guard = SurfaceJobGuard::new(&mut surface);
+            guard.release_once();
+            guard.release_once();
+        }
+
+        assert_eq!(*releases.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn surface_job_guard_releases_once_during_unwind() {
+        let (mut surface, _) = FakeSurface::new(design_rect());
+        let releases = surface.releases.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = SurfaceJobGuard::new(&mut surface);
+            panic!("test unwind");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(*releases.lock().unwrap(), 1);
+    }
+
     fn design_rect() -> Result<ClientRect, SurfaceError> {
         Ok(ClientRect {
             left: 0,
@@ -378,27 +506,22 @@ mod tests {
         gate: WatchGate,
         epoch: SnapshotEpoch,
         journal: EventLog,
-        command_tx: mpsc::Sender<Command>,
-        command_rx: mpsc::Receiver<Command>,
     }
 
     fn rig() -> Rig {
         let (job_tx, job_rx) = mpsc::channel(8);
-        let (command_tx, command_rx) = mpsc::channel(4);
         Rig {
             job_tx,
             job_rx,
             gate: WatchGate::new(true),
             epoch: SnapshotEpoch::default(),
             journal: EventLog::default(),
-            command_tx,
-            command_rx,
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn executor_skips_stale_epoch_jobs() {
-        let mut rig = rig();
+        let rig = rig();
         let (surface, events) = FakeSurface::new(design_rect());
         let job = plan::refresh_job(
             Trigger::Refreshed,
@@ -410,18 +533,8 @@ mod tests {
         rig.job_tx.send(job).await.unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
-        )
-        .await;
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         assert!(events.lock().unwrap().is_empty());
-        assert!(rig.command_rx.try_recv().is_err());
         // Dropped, but never silently: the submit side promised a click.
         assert!(journal.entries().iter().any(|line| {
             line.text
@@ -431,7 +544,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_skips_jobs_while_gate_off() {
-        let mut rig = rig();
+        let rig = rig();
         rig.gate.set(false);
         let (surface, events) = FakeSurface::new(design_rect());
         rig.job_tx
@@ -445,18 +558,8 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
-        )
-        .await;
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         assert!(events.lock().unwrap().is_empty());
-        assert!(rig.command_rx.try_recv().is_err());
         assert!(journal.entries().iter().any(|line| {
             line.text
                 .contains("the watch is off — dropped planned clicks")
@@ -467,6 +570,7 @@ mod tests {
     async fn executor_aborts_mid_job_when_gate_turns_off() {
         let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
+        let releases = surface.releases.clone();
         let gate = rig.gate.clone();
         surface.on_input = Box::new(move || gate.set(false));
         rig.job_tx
@@ -480,19 +584,11 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
-        )
-        .await;
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         // Two steps planned, only the first landed — and the abort is
         // journaled.
         assert_eq!(events.lock().unwrap().len(), 1);
+        assert_eq!(*releases.lock().unwrap(), 1);
         assert!(
             journal
                 .entries()
@@ -505,6 +601,7 @@ mod tests {
     async fn executor_aborts_mid_job_on_epoch_bump() {
         let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
+        let releases = surface.releases.clone();
         let epoch = rig.epoch.clone();
         surface.on_input = Box::new(move || epoch.bump());
         rig.job_tx
@@ -518,17 +615,9 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
-        )
-        .await;
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         assert_eq!(events.lock().unwrap().len(), 1);
+        assert_eq!(*releases.lock().unwrap(), 1);
         assert!(journal.entries().iter().any(|line| {
             line.text
                 .contains("the shop changed — aborted remaining clicks")
@@ -537,9 +626,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_stops_the_loop_when_acquire_fails() {
-        let mut rig = rig();
+        let rig = rig();
         let (surface, events) =
             FakeSurface::new(Err(SurfaceError::Fatal("game window not found".to_owned())));
+        let releases = surface.releases.clone();
         rig.job_tx
             .send(plan::refresh_job(
                 Trigger::Refreshed,
@@ -549,20 +639,18 @@ mod tests {
             ))
             .await
             .unwrap();
-        drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
+        let gate = rig.gate.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
         )
-        .await;
+        .await
+        .expect("fatal acquire must return with the producer still alive");
         assert!(events.lock().unwrap().is_empty());
-        assert_eq!(rig.command_rx.try_recv(), Ok(Command::ActuatorFailed));
+        assert!(!gate.is_enabled());
+        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(*releases.lock().unwrap(), 0, "acquire engaged nothing");
         assert!(journal.entries().iter().any(|line| {
             line.text
                 .contains("actuator: game window not found — stopping the loop")
@@ -574,12 +662,13 @@ mod tests {
         // A fatal input failure (e.g. the shield refused to raise) halts
         // with the actuator's own label — never a blind click or a silent
         // skip.
-        let mut rig = rig();
+        let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         surface.deny_after = Some((
             0,
             SurfaceError::Fatal("could not raise the input shield".to_owned()),
         ));
+        let releases = surface.releases.clone();
         rig.job_tx
             .send(plan::refresh_job(
                 Trigger::Refreshed,
@@ -589,20 +678,18 @@ mod tests {
             ))
             .await
             .unwrap();
-        drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
+        let gate = rig.gate.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
         )
-        .await;
+        .await
+        .expect("fatal input must return with the producer still alive");
         assert!(events.lock().unwrap().is_empty());
-        assert_eq!(rig.command_rx.try_recv(), Ok(Command::ActuatorFailed));
+        assert!(!gate.is_enabled());
+        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(*releases.lock().unwrap(), 1);
         assert!(journal.entries().iter().any(|line| {
             line.text
                 .contains("could not raise the input shield — stopping the loop")
@@ -614,7 +701,7 @@ mod tests {
         // Three inputs land, the fourth fails fatally: landed inputs stay
         // recorded, exactly one halt goes out, the surface is still
         // released.
-        let mut rig = rig();
+        let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         surface.deny_after = Some((
             3,
@@ -631,24 +718,26 @@ mod tests {
             ))
             .await
             .unwrap();
-        drop(rig.job_tx);
+        rig.job_tx
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
+            .await
+            .unwrap();
         let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
+        let gate = rig.gate.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
         )
-        .await;
+        .await
+        .expect("fatal mid-job input must return with queued work and a live producer");
         assert_eq!(events.lock().unwrap().len(), 3);
-        assert_eq!(rig.command_rx.try_recv(), Ok(Command::ActuatorFailed));
-        assert!(
-            rig.command_rx.try_recv().is_err(),
-            "one halt, not one per step"
-        );
+        assert!(!gate.is_enabled());
+        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
         assert_eq!(*releases.lock().unwrap(), 1);
         assert!(
             journal
@@ -663,13 +752,14 @@ mod tests {
         // The window moved mid-job: landed inputs stay, the remainder is
         // aborted without stopping the loop — the watchdog's retry
         // re-acquires a fresh rect.
-        let mut rig = rig();
+        let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         surface.deny_after = Some((
             3,
             SurfaceError::Recoverable("the game window moved or resized mid-job".to_owned()),
         ));
         let releases = surface.releases.clone();
+        let gate = rig.gate.clone();
         rig.job_tx
             .send(plan::buy_job(
                 Trigger::ShopOpened,
@@ -682,21 +772,9 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
-        )
-        .await;
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         assert_eq!(events.lock().unwrap().len(), 3);
-        assert!(
-            rig.command_rx.try_recv().is_err(),
-            "no halt for a recoverable abort"
-        );
+        assert!(gate.is_enabled(), "no halt for a recoverable abort");
         assert_eq!(*releases.lock().unwrap(), 1);
         assert!(journal.entries().iter().any(|line| {
             line.text
@@ -708,7 +786,7 @@ mod tests {
     async fn executor_serves_the_next_job_after_a_recoverable_abort() {
         // A recoverable abort ends one job, not the loop: the next job runs
         // against a freshly acquired rect.
-        let mut rig = rig();
+        let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         surface.deny_after = Some((
             1,
@@ -734,19 +812,11 @@ mod tests {
             .await
             .unwrap();
         drop(rig.job_tx);
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
-        )
-        .await;
+        let gate = rig.gate.clone();
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         // First job: one landed click, then the abort. Second job: both.
         assert_eq!(events.lock().unwrap().len(), 3);
-        assert!(rig.command_rx.try_recv().is_err());
+        assert!(gate.is_enabled());
         assert_eq!(*releases.lock().unwrap(), 2);
     }
 
@@ -755,7 +825,7 @@ mod tests {
         // A minimized window acquires with an empty client area: same fault
         // as minimized mid-job, same recoverable abort — the loop halts only
         // if the watchdog's retries stay broken.
-        let mut rig = rig();
+        let rig = rig();
         let (surface, events) = FakeSurface::new(Ok(ClientRect {
             left: 0,
             top: 0,
@@ -774,18 +844,10 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
-        )
-        .await;
+        let gate = rig.gate.clone();
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         assert!(events.lock().unwrap().is_empty());
-        assert!(rig.command_rx.try_recv().is_err());
+        assert!(gate.is_enabled());
         assert_eq!(*releases.lock().unwrap(), 1);
         assert!(journal.entries().iter().any(|line| {
             line.text
@@ -821,28 +883,20 @@ mod tests {
             .await
             .unwrap();
         drop(rig.job_tx);
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
-        )
-        .await;
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         assert_eq!(*releases.lock().unwrap(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn executor_stops_the_loop_on_a_narrow_window() {
-        let mut rig = rig();
+        let rig = rig();
         let (surface, events) = FakeSurface::new(Ok(ClientRect {
             left: 0,
             top: 0,
             width: 1280,
             height: 800,
         }));
+        let releases = surface.releases.clone();
         rig.job_tx
             .send(plan::refresh_job(
                 Trigger::Refreshed,
@@ -852,20 +906,18 @@ mod tests {
             ))
             .await
             .unwrap();
-        drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
+        let gate = rig.gate.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
         )
-        .await;
+        .await
+        .expect("fatal coordinate conversion must return with the producer alive");
         assert!(events.lock().unwrap().is_empty());
-        assert_eq!(rig.command_rx.try_recv(), Ok(Command::ActuatorFailed));
+        assert!(!gate.is_enabled());
+        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(*releases.lock().unwrap(), 1);
         assert!(
             journal
                 .entries()
@@ -876,8 +928,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_dry_run_journals_without_input() {
-        let mut rig = rig();
+        let rig = rig();
         let (surface, events) = FakeSurface::new(design_rect());
+        let releases = surface.releases.clone();
         rig.job_tx
             .send(plan::refresh_job(
                 Trigger::Refreshed,
@@ -889,17 +942,9 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            true,
-        )
-        .await;
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, true).await;
         assert!(events.lock().unwrap().is_empty());
+        assert_eq!(*releases.lock().unwrap(), 1);
         let lines = journal.entries();
         assert_eq!(
             lines
@@ -908,7 +953,6 @@ mod tests {
                 .count(),
             2
         );
-        assert!(rig.command_rx.try_recv().is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -921,6 +965,7 @@ mod tests {
             height: 1080,
         };
         let (surface, events) = FakeSurface::new(Ok(rect));
+        let releases = surface.releases.clone();
         let job = plan::buy_job(Trigger::ShopOpened, Timings::default(), 0, &[1], 42);
         let expected: Vec<Recorded> = job
             .steps
@@ -935,16 +980,8 @@ mod tests {
             .collect();
         rig.job_tx.send(job).await.unwrap();
         drop(rig.job_tx);
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rig.command_tx,
-            false,
-        )
-        .await;
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         assert_eq!(*events.lock().unwrap(), expected);
+        assert_eq!(*releases.lock().unwrap(), 1);
     }
 }

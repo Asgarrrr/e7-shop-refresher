@@ -1,20 +1,106 @@
 name: CI
-# The native windivert-backend build needs admin and a kernel driver, so it is a
-# documented manual step (see README), not run in CI.
+# Compiling the capture backend is safe in CI — the vendored WinDivert
+# binaries are in the repo and only linked against. Elevation and the kernel
+# driver are needed to *launch* a capture session, which CI never does.
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
 jobs:
   verify:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.92.0", stable]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --no-default-features -- -D warnings
-      - run: cargo clippy --no-default-features --features gui,actuator -- -D warnings
-      - run: cargo test --no-default-features
-      - run: cargo test --no-default-features --features gui,actuator
+        with:
+          shared-key: ${{ matrix.toolchain }}
+      - if: matrix.toolchain == '1.92.0'
+        run: cargo fmt --all --check
+      - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features gui,actuator --all-targets -- -D warnings
+      # Both combinations build_source must survive: no backend (above) and the
+      # WinDivert backend alone.
+      - name: Check passive WinDivert backend
+        run: cargo clippy --locked --no-default-features --features windivert-backend --all-targets -- -D warnings
+      # The combination actually shipped (windivert-backend + gui + actuator).
+      # Checking the pieces separately misses a cfg interaction that only the
+      # product build has.
+      - name: Check shipped default features
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build shipped release (default features)
+        if: matrix.toolchain == 'stable'
+        run: cargo build --locked --release
+      # The release exe must not merely link: the WinDivert import has to be a
+      # *delay* import. A plain static import means the loader demands the DLL
+      # before the exe can extract it, and every launch dies with
+      # "WinDivert.dll not found" — invisible to any compile-only check.
+      - name: Assert WinDivert.dll is delay-loaded, not statically imported
+        if: matrix.toolchain == 'stable'
+        shell: pwsh
+        run: |
+          $exe = "target\release\arkyve-refresh-shop.exe"
+          $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe `
+            "${env:ProgramFiles}\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio" `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          $out = & $dumpbin.FullName /dependents $exe
+          $text = $out -join "`n"
+          $delay = $text -split "delay load dependencies"
+          if ($delay.Count -lt 2) { throw "no delay load section: WinDivert.dll is a static import" }
+          if ($delay[0] -match "WinDivert\.dll") { throw "WinDivert.dll is a static import" }
+          if ($delay[1] -notmatch "WinDivert\.dll") { throw "WinDivert.dll is not delay-loaded" }
+          "WinDivert.dll is delay-loaded"
+      - run: cargo test --locked --no-default-features
+      - run: cargo test --locked --no-default-features --features gui,actuator
+      - name: Test passive WinDivert backend (non-elevated tests)
+        run: cargo test --locked --no-default-features --features windivert-backend
+      - name: Test shipped default features (non-elevated tests)
+        run: cargo test --locked
+
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+
+      - name: Cache cargo-deny binary
+        id: cargo-deny-cache
+        uses: actions/cache@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_DENY_VERSION }}
+
+      - name: Cache registry indexes and RustSec database
+        uses: actions/cache@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/advisory-dbs
+          key: dependency-data-${{ runner.os }}-v1-${{ hashFiles('Cargo.lock', 'deny.toml') }}
+          restore-keys: |
+            dependency-data-${{ runner.os }}-v1-
+
+      - name: Install pinned cargo-deny
+        if: steps.cargo-deny-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+
+      - name: Verify cargo-deny version
+        run: test "$(cargo deny --version)" = "cargo-deny $CARGO_DENY_VERSION"
+
+      - name: Check RustSec advisories and yanked crates
+        run: cargo deny --all-features --locked check advisories
+
+      - name: Check dependency licenses, bans, and sources
+        run: cargo deny --all-features --locked check bans licenses sources

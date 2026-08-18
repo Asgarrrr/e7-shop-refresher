@@ -16,6 +16,28 @@ use crate::error::Result;
 /// TCP port of the Epic Seven game server (`msg://`).
 pub const DEFAULT_GAME_PORT: u16 = 3333;
 
+/// Smallest effective delay between server connection attempts.
+pub(crate) const RECONNECT_FLOOR: Duration = Duration::from_millis(100);
+
+/// Ceiling on a single `[actuator.timings]` extra wait, in milliseconds.
+///
+/// One minute. The click baselines this adds onto are calibrated to the game's
+/// blocking animations and span 100 ms (`scroll_settle`) to 1180 ms
+/// (`shop_opened`), and the Setup tab's own meter tops out at 2500 ms total —
+/// so 60 000 ms is roughly fifty times the slowest baseline and twenty-four
+/// times anything the GUI can produce. Every legitimate "pause like a slow,
+/// distracted human" setting stays reachable, plus a wide margin for
+/// experimenting past what the UI offers.
+///
+/// What it makes unreachable is the two ways an unbounded value hurt:
+/// a `max_ms` in the tens of minutes silently freezes the refresh loop between
+/// two clicks with nothing to distinguish it from a hang, and a value near
+/// `u64::MAX` overflows the plain `baseline + extra` sums the timing editor
+/// does while painting a range (panic in debug, silent wrap in release). Every
+/// other knob in this file is validated aggressively; this one was not
+/// validated at all.
+const MAX_TIMING_MS: u64 = 60_000;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -97,9 +119,11 @@ pub enum ActuatorBackend {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
-    /// Receive buffer size for one WinDivert packet (bytes).
+    /// Receive buffer size for one WinDivert packet (bytes). Raised to the
+    /// driver's own maximum when set lower.
     pub buffer_size: usize,
-    /// Explicit WinDivert filter; otherwise derived from `game_port` + `forward`.
+    /// Explicit WinDivert filter; otherwise derived from `game_port` +
+    /// `forward`.
     pub filter: Option<String>,
 }
 
@@ -193,6 +217,35 @@ fn is_loopback_ws_host(url: &str) -> bool {
 
 impl Config {
     /// Loads the configuration from `path`. A missing file yields the defaults.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ConfigRead`] — the file exists but could not be read (locked
+    ///   by an antivirus, permission denied, a directory in its place). A
+    ///   *missing* file is deliberately not an error: it yields
+    ///   `Config::default()`, which is how a fresh machine starts.
+    /// - [`Error::ConfigParse`] — not valid TOML, or it does not match this
+    ///   struct: unknown or misspelled key (every section is
+    ///   `deny_unknown_fields`, so a typo is refused rather than silently
+    ///   ignored), wrong type, or an integer out of range.
+    /// - [`Error::Config`] — it parsed but breaks an invariant:
+    ///   - `game_port = 0`;
+    ///   - `[forward]` with both directions off — nothing would be captured at
+    ///     all;
+    ///   - an empty `server_url`, a scheme other than `ws://` / `wss://`, or a
+    ///     `ws://` URL pointing anywhere but loopback (it would forward the
+    ///     captured game stream, session tokens included, in cleartext);
+    ///   - an unrecognized value in `[filter] kinds`, which the wire-tolerant
+    ///     `ItemKind` would otherwise fold into `Unknown` and match nothing;
+    ///   - a `capture.filter` that never mentions `game_port`: the direction of
+    ///     a segment is inferred from that port, so such a filter would deliver
+    ///     packets nothing can classify — zero segments and no error;
+    ///   - an `[actuator.timings]` range that is reversed (`min_ms > max_ms`)
+    ///     or whose `max_ms` exceeds the 60 000 ms ceiling.
+    ///
+    /// [`Error::Config`]: crate::Error::Config
+    /// [`Error::ConfigParse`]: crate::Error::ConfigParse
+    /// [`Error::ConfigRead`]: crate::Error::ConfigRead
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         match std::fs::read_to_string(path) {
@@ -202,7 +255,12 @@ impl Config {
                 Ok(config)
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err.into()),
+            // Name the file: it lives out of the way under %APPDATA%, so a bare
+            // "Access is denied. (os error 5)" leaves nothing to act on.
+            Err(source) => Err(crate::Error::ConfigRead {
+                path: path.to_path_buf(),
+                source,
+            }),
         }
     }
 
@@ -258,12 +316,41 @@ impl Config {
                 self.game_port
             )));
         }
+        // `[actuator.timings]` reaches both the refresh loop and the Setup
+        // meter unchecked otherwise. Two shapes have to be refused here, at the
+        // root, rather than absorbed downstream:
+        //
+        // - a reversed range. With this TOML's inline form
+        //   (`{ min_ms = 800, max_ms = 200 }`) swapping the two is an ordinary
+        //   typo, and `DelayRange::draw` reads it as a fixed 800 ms delay — the
+        //   player configures variability and silently gets none, while the
+        //   Setup tab shows "Custom" with no clue why.
+        // - an unbounded `max_ms`. It is what freezes the loop for ten minutes
+        //   between two clicks, and what overflows the editor's `baseline + max`
+        //   sums near `u64::MAX`.
+        for (name, range) in self.actuator.timings.named_ranges() {
+            if range.min_ms > range.max_ms {
+                return Err(crate::Error::Config(format!(
+                    "actuator.timings.{name} is reversed: min_ms = {} is above max_ms = {} — swap them (it would be read as a fixed {} ms delay, not a range)",
+                    range.min_ms, range.max_ms, range.min_ms
+                )));
+            }
+            if range.max_ms > MAX_TIMING_MS {
+                return Err(crate::Error::Config(format!(
+                    "actuator.timings.{name} max_ms = {} exceeds the {MAX_TIMING_MS} ms ceiling — that would stall the refresh loop between two clicks",
+                    range.max_ms
+                )));
+            }
+        }
         Ok(())
     }
 
     /// Effective WinDivert filter: only the directions to forward.
     ///
     /// The shop response travels server -> client (`tcp.SrcPort == game_port`).
+    /// A `capture.filter` in the config replaces the derived expression
+    /// wholesale — `validate` has already checked it names `game_port`, without
+    /// which nothing downstream could classify a segment's direction.
     pub fn capture_filter(&self) -> String {
         if let Some(filter) = &self.capture.filter {
             return filter.clone();
@@ -279,17 +366,120 @@ impl Config {
     }
 
     pub fn reconnect_initial(&self) -> Duration {
-        Duration::from_millis(self.reconnect.initial_ms)
+        Duration::from_millis(self.reconnect.initial_ms).max(RECONNECT_FLOOR)
     }
 
     pub fn reconnect_max(&self) -> Duration {
-        Duration::from_millis(self.reconnect.max_ms.max(self.reconnect.initial_ms))
+        Duration::from_millis(self.reconnect.max_ms).max(self.reconnect_initial())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_and_validate(text: &str) -> Result<Config> {
+        let config: Config = toml::from_str(text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn capture_buffer_zero_is_accepted() {
+        let config = parse_and_validate("[capture]\nbuffer_size = 0").expect("zero is compatible");
+        assert_eq!(config.capture.buffer_size, 0);
+    }
+
+    #[test]
+    fn capture_buffer_legacy_lower_value_is_accepted() {
+        let config =
+            parse_and_validate("[capture]\nbuffer_size = 65535").expect("legacy value is valid");
+        assert_eq!(config.capture.buffer_size, 65_535);
+    }
+
+    #[test]
+    fn capture_buffer_larger_than_the_driver_maximum_is_accepted() {
+        let config =
+            parse_and_validate("[capture]\nbuffer_size = 999999").expect("an oversized buffer");
+        assert_eq!(config.capture.buffer_size, 999_999);
+    }
+
+    /// A custom filter replaces the derived one wholesale, so it is accepted —
+    /// but only if it still names `game_port`, the port every direction check
+    /// downstream is made against.
+    #[test]
+    fn custom_capture_filter_is_accepted_and_must_name_the_game_port() {
+        let config = parse_and_validate("[capture]\nfilter = \"tcp and tcp.SrcPort == 3333\"")
+            .expect("a filter naming game_port");
+        assert_eq!(config.capture_filter(), "tcp and tcp.SrcPort == 3333");
+
+        let error = parse_and_validate("[capture]\nfilter = \"tcp and tcp.SrcPort == 4444\"")
+            .expect_err("a filter on another port classifies nothing");
+        assert!(error.to_string().contains("capture.filter"));
+    }
+
+    #[test]
+    fn derived_capture_filter_follows_the_forwarded_directions() {
+        let mut config = Config::default();
+        assert_eq!(config.capture_filter(), "tcp and (tcp.SrcPort == 3333)");
+
+        config.forward.client_to_server = true;
+        assert_eq!(
+            config.capture_filter(),
+            "tcp and (tcp.SrcPort == 3333 or tcp.DstPort == 3333)"
+        );
+
+        config.forward.server_to_client = false;
+        config.game_port = 4444;
+        assert_eq!(config.capture_filter(), "tcp and (tcp.DstPort == 4444)");
+    }
+
+    #[test]
+    fn both_forward_directions_off_is_rejected() {
+        let error =
+            parse_and_validate("[forward]\nserver_to_client = false\nclient_to_server = false")
+                .expect_err("nothing would be captured");
+        assert!(error.to_string().contains("forward"));
+    }
+
+    /// The WinDivert filter expresses either direction, so asking for the
+    /// client -> server context stream is a legitimate configuration.
+    #[test]
+    fn client_to_server_direction_is_accepted() {
+        let config =
+            parse_and_validate("[forward]\nserver_to_client = true\nclient_to_server = true")
+                .expect("both directions are expressible");
+        assert!(config.forward.client_to_server);
+    }
+
+    #[test]
+    fn capture_buffer_overflow_is_rejected_during_deserialization() {
+        let error = parse_and_validate("[capture]\nbuffer_size = 18446744073709551616")
+            .expect_err("integer overflow must fail deserialization");
+        assert!(matches!(error, crate::Error::ConfigParse(_)));
+    }
+
+    #[test]
+    fn capture_buffer_default_is_the_documented_value() {
+        assert_eq!(Config::default().capture.buffer_size, 65_535);
+    }
+
+    #[test]
+    fn reconnect_durations_enforce_floor_and_order() {
+        let mut config = Config::default();
+        assert_eq!(config.reconnect_initial(), Duration::from_millis(1_000));
+        assert_eq!(config.reconnect_max(), Duration::from_millis(30_000));
+
+        config.reconnect.initial_ms = 1;
+        config.reconnect.max_ms = 10;
+        assert_eq!(config.reconnect_initial(), RECONNECT_FLOOR);
+        assert_eq!(config.reconnect_max(), RECONNECT_FLOOR);
+
+        config.reconnect.initial_ms = 2_000;
+        config.reconnect.max_ms = 1_000;
+        assert_eq!(config.reconnect_initial(), Duration::from_millis(2_000));
+        assert_eq!(config.reconnect_max(), Duration::from_millis(2_000));
+    }
 
     #[test]
     fn misspelled_kind_value_is_rejected() {
@@ -424,6 +614,93 @@ mod tests {
     }
 
     #[test]
+    fn reversed_timing_range_is_rejected_and_names_both_values() {
+        // `{ min_ms = 800, max_ms = 200 }` is a plausible typo in this inline
+        // form. Accepted, it is silently reread as a fixed 800 ms delay: the
+        // player gets none of the variability they configured.
+        let error =
+            parse_and_validate("[actuator.timings]\nrefreshed = { min_ms = 800, max_ms = 200 }")
+                .expect_err("a reversed range must not be silently reinterpreted");
+        let message = error.to_string();
+        assert!(matches!(error, crate::Error::Config(_)));
+        assert!(message.contains("actuator.timings.refreshed"), "{message}");
+        assert!(
+            message.contains("800") && message.contains("200"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_timing_range_is_rejected() {
+        // Ten minutes between two clicks is indistinguishable from a hang.
+        let error =
+            parse_and_validate("[actuator.timings]\nrefreshed = { min_ms = 0, max_ms = 600000 }")
+                .expect_err("a ten-minute extra wait must be refused");
+        assert!(matches!(error, crate::Error::Config(_)));
+        assert!(error.to_string().contains("actuator.timings.refreshed"));
+
+        // The overflow case: four bare additions in the timing editor sum this
+        // with a baseline. Rejecting it here is the guard at the root.
+        let error = parse_and_validate(
+            "[actuator.timings]\nshop_opened = { min_ms = 0, max_ms = 18446744073709551615 }",
+        )
+        .expect_err("a u64::MAX extra wait must be refused");
+        assert!(matches!(error, crate::Error::Config(_)));
+        assert!(error.to_string().contains("actuator.timings.shop_opened"));
+    }
+
+    #[test]
+    fn every_timing_range_is_checked_not_just_the_first() {
+        // A per-field guard that only walked one range would leave the other
+        // seven exactly as unvalidated as before.
+        for name in Timings::default().named_ranges().map(|(name, _)| name) {
+            let text = format!("[actuator.timings]\n{name} = {{ min_ms = 9, max_ms = 1 }}");
+            match parse_and_validate(&text) {
+                Ok(_) => panic!("actuator.timings.{name} is not validated"),
+                Err(error) => assert!(error.to_string().contains(name), "{name}: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_timing_range_at_the_ceiling_is_accepted() {
+        // The bound is inclusive, and a wide-but-sane range must stay usable:
+        // the ceiling exists to stop a frozen loop, not to narrow the knob.
+        let config = parse_and_validate(&format!(
+            "[actuator.timings]\nrefreshed = {{ min_ms = 0, max_ms = {MAX_TIMING_MS} }}"
+        ))
+        .expect("the ceiling itself is a legal setting");
+        assert_eq!(config.actuator.timings.refreshed.max_ms, MAX_TIMING_MS);
+        // A point range (min == max) is a fixed extra, not a reversed range.
+        assert!(
+            parse_and_validate("[actuator.timings]\nbuy_modal = { min_ms = 500, max_ms = 500 }")
+                .is_ok()
+        );
+        // And the all-zero default still validates.
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn every_timing_preset_survives_validation() {
+        // The Setup tab writes these verbatim through persist::save; a preset
+        // the loader then refuses would lock the player out on next launch.
+        for preset in crate::actuator::plan::TimingPreset::ALL {
+            let config = Config {
+                actuator: ActuatorConfig {
+                    timings: preset.timings(),
+                    ..ActuatorConfig::default()
+                },
+                ..Config::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "preset {} must round-trip through the config",
+                preset.label()
+            );
+        }
+    }
+
+    #[test]
     fn misspelled_timings_key_is_rejected() {
         // A silently ignored typo would leave the loop at the baseline while
         // the player thinks they slowed it down.
@@ -538,6 +815,189 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
+    }
+
+    #[test]
+    fn bundled_example_config_parses_validates_and_is_restrictive() {
+        // `main::seed_config_if_missing` writes this exact text to
+        // %APPDATA% on every player's first launch. Nothing else ever
+        // deserializes it: as a bare `&'static str` it can rot (a renamed Rust
+        // field, a key retired with a backend swap, a typo in a line someone
+        // uncomments) while CI stays green — and then the shipped exe hands
+        // 100% of new players an "Invalid configuration" window before they see
+        // the app. Every `deny_unknown_fields` in this file is a way for that
+        // to happen.
+        let text = include_str!("../config.example.toml");
+        let config: Config = toml::from_str(text).expect("the bundled example must parse");
+        config
+            .validate()
+            .expect("the bundled example must validate");
+        // The relay refuses to arm on an unrestricted filter (`app::run`), so a
+        // criterion-less example would seed a file that cannot start a hunt.
+        assert!(
+            !config.filter.is_unrestricted(),
+            "the example must carry a hunt criterion"
+        );
+    }
+
+    /// Scratch directory removed on drop — *including* when an assertion
+    /// panics, unlike the hand-rolled after-the-fact cleanup in `crash.rs`,
+    /// which leaks files on every failure. The name mixes the pid with a
+    /// process-local counter so neither two test binaries running at once nor
+    /// two parallel tests in one binary can collide on it.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        /// Note: the directory is deliberately **not** created. The save test
+        /// needs it absent to prove `persist::save` builds it (the first-Apply
+        /// case on a machine whose %APPDATA% subdir does not exist yet).
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "arkyve-refresh-shop-test-{tag}-{}-{unique}",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn join(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn save_then_load_round_trips_the_edited_sections_through_disk() {
+        use crate::actuator::plan::DelayRange;
+        use crate::config::persist::{self, Section};
+
+        let dir = TempDir::new("save-load");
+        assert!(!dir.path().exists(), "the fixture must start absent");
+        let path = dir.join("config.toml");
+
+        let filter = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            ..Filter::default()
+        };
+        let limits = Limits {
+            max_refreshes: Some(10),
+            max_spend: Some(30),
+            ..Limits::default()
+        };
+        let timings = Timings {
+            refreshed: DelayRange {
+                min_ms: 200,
+                max_ms: 800,
+            },
+            ..Timings::default()
+        };
+
+        persist::save(
+            &path,
+            &[
+                Section::Filter(filter.clone()),
+                Section::Limits(limits.clone()),
+                Section::Timings(timings),
+            ],
+        )
+        .expect("save must create the missing directory and the file");
+
+        assert!(path.exists(), "create_dir_all covered the missing parent");
+        assert!(
+            !path.with_extension("toml.tmp").exists(),
+            "the atomic-write temp must not survive a successful save"
+        );
+
+        let config = Config::load(&path).expect("the file we just wrote must load");
+        config.validate().expect("and must validate");
+        assert_eq!(config.filter, filter);
+        assert_eq!(config.limits, limits);
+        assert_eq!(config.actuator.timings, timings);
+    }
+
+    #[test]
+    fn load_on_a_missing_file_yields_the_defaults() {
+        // The `NotFound` branch is what every machine without a config.toml
+        // takes at startup; turning it into an error would be invisible in CI.
+        let dir = TempDir::new("missing");
+        let path = dir.join("config.toml");
+        assert!(!path.exists());
+
+        let config = Config::load(&path).expect("a missing file is not an error");
+        assert_eq!(config.game_port, DEFAULT_GAME_PORT);
+        assert_eq!(config.server_url, Config::default().server_url);
+        assert!(config.forward.server_to_client);
+        assert!(!config.forward.client_to_server);
+        assert!(config.filter.is_unrestricted(), "defaults set no criterion");
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_original_config_intact() {
+        // The atomicity guarantee, pinned: `save` writes a sibling temp and
+        // renames. Squatting the temp path with a directory makes that write
+        // fail — and a "simplification" to a direct `fs::write(path, ..)` would
+        // instead succeed here, having already truncated the player's file.
+        use crate::config::persist::{self, Section};
+
+        let dir = TempDir::new("failed-save");
+        std::fs::create_dir_all(dir.path()).expect("fixture dir");
+        let path = dir.join("config.toml");
+        let original = "# hand-written\ngame_port = 3333\n";
+        std::fs::write(&path, original).expect("seed the original");
+        std::fs::create_dir(path.with_extension("toml.tmp")).expect("squat the temp path");
+
+        let error = persist::save(
+            &path,
+            &[Section::Limits(Limits {
+                max_refreshes: Some(7),
+                ..Limits::default()
+            })],
+        )
+        .expect_err("the temp write cannot succeed onto a directory");
+
+        assert!(
+            matches!(error, crate::Error::ConfigWrite { .. }),
+            "expected a path-carrying write error, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("config.toml"),
+            "the message must name the file: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("original still readable"),
+            original,
+            "a failed save must not touch the player's file"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_config_reports_the_path_not_a_bare_os_error() {
+        // A directory where the file should be: not `NotFound`, so it takes the
+        // read-error branch. Before this carried a path, the player saw
+        // "i/o: Access is denied. (os error 5)" and nothing else — while the
+        // file sits somewhere under %APPDATA% they never navigate to.
+        let dir = TempDir::new("unreadable");
+        std::fs::create_dir_all(dir.join("config.toml")).expect("fixture dir");
+
+        let error = Config::load(dir.join("config.toml")).expect_err("a directory cannot be read");
+        assert!(
+            matches!(error, crate::Error::ConfigRead { .. }),
+            "expected a path-carrying read error, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("config.toml"),
+            "the message must name the file: {error}"
+        );
     }
 
     #[test]

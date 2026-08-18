@@ -1,6 +1,6 @@
 //! TCP reassembly.
 //!
-//! WinDivert operates below TCP, so segments may arrive out of order,
+//! Capture observes traffic below TCP, so segments may arrive out of order,
 //! duplicated (retransmissions), or overlapping. This layer reconstructs, per
 //! half-stream, the ordered byte stream the TCP stack would deliver — which is
 //! what the analysis server expects.
@@ -13,12 +13,413 @@
 //! once a half-stream delivered 2 GiB: the distance would exceed `i32` range
 //! and every later segment would look like an already-delivered retransmission.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::Notify;
+use tracing::{error, warn};
 
 use crate::capture::{Direction, FlowKey, Segment};
 
 /// Cap on out-of-order bytes buffered per half-stream (memory guard).
 const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) const PIPELINE_GLOBAL_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const CAPTURE_STAGE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const REASSEMBLY_STAGE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const OUTBOUND_STAGE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Stage {
+    Capture,
+    Reassembly,
+    Outbound,
+}
+
+#[derive(Clone, Copy)]
+struct BudgetLimits {
+    global: usize,
+    capture: usize,
+    reassembly: usize,
+    outbound: usize,
+}
+
+#[derive(Default)]
+struct Usage {
+    total: usize,
+    capture: usize,
+    reassembly: usize,
+    outbound: usize,
+    high_water: usize,
+}
+
+struct BudgetInner {
+    limits: BudgetLimits,
+    usage: Mutex<Usage>,
+    released: Notify,
+    dropped_segments: AtomicU64,
+    dropped_bytes: AtomicU64,
+    resyncs: AtomicU64,
+}
+
+/// Shared accounting for every owned payload after packet parsing.
+#[derive(Clone)]
+pub(crate) struct PipelineBudget(Arc<BudgetInner>);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PipelineStats {
+    pub current_total: usize,
+    pub current_capture: usize,
+    pub current_reassembly: usize,
+    pub current_outbound: usize,
+    pub high_water_total: usize,
+    pub dropped_segments: u64,
+    pub dropped_bytes: u64,
+    pub resyncs: u64,
+}
+
+impl PipelineBudget {
+    pub(crate) fn new() -> Self {
+        Self::with_limits(BudgetLimits {
+            global: PIPELINE_GLOBAL_BYTES,
+            capture: CAPTURE_STAGE_BYTES,
+            reassembly: REASSEMBLY_STAGE_BYTES,
+            outbound: OUTBOUND_STAGE_BYTES,
+        })
+    }
+
+    fn with_limits(limits: BudgetLimits) -> Self {
+        assert!(limits.capture <= limits.global);
+        assert!(limits.reassembly <= limits.global);
+        assert!(limits.outbound <= limits.global);
+        Self(Arc::new(BudgetInner {
+            limits,
+            usage: Mutex::new(Usage::default()),
+            released: Notify::new(),
+            dropped_segments: AtomicU64::new(0),
+            dropped_bytes: AtomicU64::new(0),
+            resyncs: AtomicU64::new(0),
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_limits(
+        global: usize,
+        capture: usize,
+        reassembly: usize,
+        outbound: usize,
+    ) -> Self {
+        Self::with_limits(BudgetLimits {
+            global,
+            capture,
+            reassembly,
+            outbound,
+        })
+    }
+
+    pub(crate) fn admit_capture(&self, segment: Segment) -> Result<BudgetedSegment, Segment> {
+        let bytes = segment.payload.capacity();
+        if !self.reserve_new(Stage::Capture, bytes) {
+            return Err(segment);
+        }
+        Ok(BudgetedSegment {
+            flow: segment.flow,
+            direction: segment.direction,
+            seq: segment.seq,
+            syn: segment.syn,
+            payload: BudgetedChunk {
+                bytes: segment.payload,
+                lease: PayloadLease {
+                    budget: self.clone(),
+                    bytes,
+                    stage: Stage::Capture,
+                },
+            },
+        })
+    }
+
+    fn reserve_new(&self, stage: Stage, bytes: usize) -> bool {
+        let mut usage = self.0.usage.lock().unwrap_or_else(|err| err.into_inner());
+        let Some(total) = usage.total.checked_add(bytes) else {
+            return false;
+        };
+        let current = stage_bytes(&usage, stage);
+        let Some(stage_total) = current.checked_add(bytes) else {
+            return false;
+        };
+        if total > self.0.limits.global || stage_total > self.stage_limit(stage) {
+            return false;
+        }
+        usage.total = total;
+        *stage_bytes_mut(&mut usage, stage) = stage_total;
+        usage.high_water = usage.high_water.max(total);
+        true
+    }
+
+    fn try_retag(&self, from: Stage, to: Stage, bytes: usize) -> bool {
+        if from == to {
+            return true;
+        }
+        let mut usage = self.0.usage.lock().unwrap_or_else(|err| err.into_inner());
+        let Some(target) = stage_bytes(&usage, to).checked_add(bytes) else {
+            return false;
+        };
+        if target > self.stage_limit(to) {
+            return false;
+        }
+        let source = stage_bytes(&usage, from);
+        assert!(source >= bytes, "pipeline stage accounting underflow");
+        *stage_bytes_mut(&mut usage, from) = source - bytes;
+        *stage_bytes_mut(&mut usage, to) = target;
+        true
+    }
+
+    /// Gives a lease's bytes back to the pool.
+    ///
+    /// Runs from [`PayloadLease::drop`], which the workers execute *while
+    /// unwinding* whenever a `catch_unwind` boundary tears down live
+    /// `BudgetedChunk`/`BudgetedSegment` values. A panic raised from a `Drop`
+    /// during an unwind aborts the process immediately — no banner, and no
+    /// `crash.log`, which is exactly the failure mode `crash.rs` exists to
+    /// prevent. So an accounting bug saturates and is reported here instead of
+    /// asserting; `debug_assert!` keeps the fail-fast in debug and test builds,
+    /// where the abort costs a developer a stack trace, not a player a session.
+    fn release(&self, stage: Stage, bytes: usize) {
+        let mut usage = self.0.usage.lock().unwrap_or_else(|err| err.into_inner());
+        let current = stage_bytes(&usage, stage);
+        if usage.total < bytes || current < bytes {
+            error!(
+                stage = ?stage,
+                released_bytes = bytes,
+                total_bytes = usage.total,
+                stage_bytes = current,
+                "pipeline accounting underflow; saturating the release"
+            );
+            debug_assert!(usage.total >= bytes, "pipeline total accounting underflow");
+            debug_assert!(current >= bytes, "pipeline stage accounting underflow");
+        }
+        usage.total = usage.total.saturating_sub(bytes);
+        *stage_bytes_mut(&mut usage, stage) = current.saturating_sub(bytes);
+        drop(usage);
+        self.0.released.notify_waiters();
+    }
+
+    fn stage_limit(&self, stage: Stage) -> usize {
+        match stage {
+            Stage::Capture => self.0.limits.capture,
+            Stage::Reassembly => self.0.limits.reassembly,
+            Stage::Outbound => self.0.limits.outbound,
+        }
+    }
+
+    // The discarded `fetch_update` results below are not swallowed errors: the
+    // closures always return `Some`, so the call can only report `Ok`.
+    pub(crate) fn record_drop(&self, bytes: usize) {
+        let _ =
+            self.0
+                .dropped_segments
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_add(1))
+                });
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let _ =
+            self.0
+                .dropped_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_add(bytes))
+                });
+    }
+
+    pub(crate) fn record_resync(&self) {
+        let _ = self
+            .0
+            .resyncs
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            });
+    }
+
+    pub(crate) fn snapshot(&self) -> PipelineStats {
+        let usage = self.0.usage.lock().unwrap_or_else(|err| err.into_inner());
+        PipelineStats {
+            current_total: usage.total,
+            current_capture: usage.capture,
+            current_reassembly: usage.reassembly,
+            current_outbound: usage.outbound,
+            high_water_total: usage.high_water,
+            dropped_segments: self.0.dropped_segments.load(Ordering::Relaxed),
+            dropped_bytes: self.0.dropped_bytes.load(Ordering::Relaxed),
+            resyncs: self.0.resyncs.load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_outbound_for_test(&self, bytes: Vec<u8>) -> BudgetedChunk {
+        let capacity = bytes.capacity();
+        assert!(self.reserve_new(Stage::Capture, capacity));
+        let mut chunk = BudgetedChunk {
+            bytes,
+            lease: PayloadLease {
+                budget: self.clone(),
+                bytes: capacity,
+                stage: Stage::Capture,
+            },
+        };
+        assert!(chunk.lease.try_retag(Stage::Outbound));
+        chunk
+    }
+}
+
+fn stage_bytes(usage: &Usage, stage: Stage) -> usize {
+    match stage {
+        Stage::Capture => usage.capture,
+        Stage::Reassembly => usage.reassembly,
+        Stage::Outbound => usage.outbound,
+    }
+}
+
+fn stage_bytes_mut(usage: &mut Usage, stage: Stage) -> &mut usize {
+    match stage {
+        Stage::Capture => &mut usage.capture,
+        Stage::Reassembly => &mut usage.reassembly,
+        Stage::Outbound => &mut usage.outbound,
+    }
+}
+
+pub(crate) struct PayloadLease {
+    budget: PipelineBudget,
+    bytes: usize,
+    stage: Stage,
+}
+
+impl PayloadLease {
+    fn try_retag(&mut self, target: Stage) -> bool {
+        if self.budget.try_retag(self.stage, target, self.bytes) {
+            self.stage = target;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for PayloadLease {
+    fn drop(&mut self) {
+        self.budget.release(self.stage, self.bytes);
+    }
+}
+
+/// Move-only payload and its unique byte-accounting lease.
+pub struct BudgetedChunk {
+    bytes: Vec<u8>,
+    lease: PayloadLease,
+}
+
+impl BudgetedChunk {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.lease.bytes
+    }
+
+    fn try_retag_pending(&mut self) -> bool {
+        self.lease.try_retag(Stage::Reassembly)
+    }
+
+    /// Accounts for a chunk the pipeline could not forward. Consuming it is the
+    /// point: the lease releases the reserved bytes as it drops.
+    pub(crate) fn record_drop(self) {
+        self.lease.budget.record_drop(self.lease.bytes);
+    }
+
+    pub(crate) async fn retag_outbound(mut self) -> Result<Self, Self> {
+        if self.capacity() > self.lease.budget.stage_limit(Stage::Outbound) {
+            return Err(self);
+        }
+        let budget = self.lease.budget.clone();
+        loop {
+            let notified = budget.0.released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.lease.try_retag(Stage::Outbound) {
+                return Ok(self);
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, PayloadLease) {
+        let Self { bytes, lease } = self;
+        (bytes, lease)
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for BudgetedChunk {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.bytes.fmt(formatter)
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<Vec<u8>> for BudgetedChunk {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.bytes == *other
+    }
+}
+
+impl Deref for BudgetedChunk {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+pub(crate) struct BudgetedSegment {
+    pub flow: FlowKey,
+    pub direction: Direction,
+    pub seq: u32,
+    pub syn: bool,
+    payload: BudgetedChunk,
+}
+
+impl BudgetedSegment {
+    pub(crate) fn payload(&self) -> &[u8] {
+        self.payload.as_slice()
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.payload.capacity()
+    }
+}
+
+impl Deref for BudgetedSegment {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.payload()
+    }
+}
+
+// Size canaries for the per-packet types. Every captured packet becomes one of
+// these, and a
+// `CaptureEvent` holding a `BudgetedSegment` is stored *by value* in a 512-slot
+// channel: one extra field in `FlowKey` or `PayloadLease` silently inflates
+// tens of KiB of queue. These are not ABI contracts — the types are `repr(Rust)`
+// and their layout is unspecified — so a failure here means "re-measure and
+// update the number, deliberately", never "work around it".
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    // 24 (Vec) + 24 (PayloadLease: Arc + usize + Stage) = 48.
+    assert!(std::mem::size_of::<BudgetedChunk>() == 48);
+    // 64 (FlowKey) + 48 (BudgetedChunk) + 4 (seq) + 1 + 1, padded to 120.
+    assert!(std::mem::size_of::<BudgetedSegment>() == 120);
+};
 
 /// Cap on the number of tracked half-streams. One armed game connection needs
 /// two (a direction each); reconnections and — since capture is port-wide —
@@ -26,6 +427,116 @@ const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 /// without bound, each able to buffer up to `MAX_PENDING_BYTES`. Well above
 /// legitimate need; the stalest entry is evicted past it.
 const MAX_HALVES: usize = 64;
+
+/// One post-resync burst is deliberately small: it only gives reordered
+/// predecessors a chance to establish the initial sequence anchor.
+pub(crate) const INITIAL_ANCHOR_MAX_BYTES: usize = 256 * 1024;
+pub(crate) const INITIAL_ANCHOR_MAX_SEGMENTS: usize = 128;
+
+/// Segments held during the one-shot initial anchor window.
+///
+/// Ordering is isolated per TCP half-stream. Replacing each half-stream's
+/// original slots with its sequence-ordered segments preserves the observed
+/// inter-flow/inter-direction cadence while letting [`Reassembler`] remain the
+/// sole authority for overlap, deduplication, gaps, and SYN incarnations.
+pub(crate) struct InitialBurst {
+    segments: Vec<BudgetedSegment>,
+    payload_bytes: usize,
+}
+
+impl InitialBurst {
+    pub(crate) fn new() -> Self {
+        Self {
+            segments: Vec::new(),
+            payload_bytes: 0,
+        }
+    }
+
+    pub(crate) fn would_exceed(&self, segment: &BudgetedSegment) -> bool {
+        self.segments.len() >= INITIAL_ANCHOR_MAX_SEGMENTS
+            || self
+                .payload_bytes
+                .checked_add(segment.payload().len())
+                .is_none_or(|bytes| bytes > INITIAL_ANCHOR_MAX_BYTES)
+    }
+
+    pub(crate) fn push(&mut self, segment: BudgetedSegment) {
+        assert!(
+            !self.would_exceed(&segment),
+            "initial anchor burst limits must be checked before insertion"
+        );
+        self.payload_bytes += segment.payload().len();
+        self.segments.push(segment);
+    }
+
+    #[cfg(test)]
+    fn push_test(&mut self, segment: Segment) {
+        self.push(
+            PipelineBudget::new()
+                .admit_capture(segment)
+                .expect("test segment fits the production capture quota"),
+        );
+    }
+
+    /// Whether the burst has reached either cap. `>=` on both terms: the
+    /// segment count lands on its cap exactly, but a byte counter almost never
+    /// hits 262 144 on the nose, so an equality test there would leave the byte
+    /// bound resting entirely on `would_exceed` catching the next segment.
+    pub(crate) fn is_at_limit(&self) -> bool {
+        self.segments.len() >= INITIAL_ANCHOR_MAX_SEGMENTS
+            || self.payload_bytes >= INITIAL_ANCHOR_MAX_BYTES
+    }
+
+    pub(crate) fn into_ordered(self) -> Vec<BudgetedSegment> {
+        // `collect` over a slice iterator is already exact-size (TrustedLen):
+        // one allocation, no growth. Only the map needs a hint — a nominal
+        // burst spans the two halves of a single connection.
+        let slots: Vec<_> = self
+            .segments
+            .iter()
+            .map(|segment| (segment.flow, segment.direction))
+            .collect();
+        let mut halves: HashMap<_, Vec<BudgetedSegment>> = HashMap::with_capacity(2);
+        for segment in self.segments {
+            halves
+                .entry((segment.flow, segment.direction))
+                .or_default()
+                .push(segment);
+        }
+        let mut halves: HashMap<_, VecDeque<BudgetedSegment>> = halves
+            .into_iter()
+            .map(|(key, mut segments)| {
+                // A valid TCP receive window spans less than the signed
+                // sequence half-space; the byte cap bounds memory, not sequence
+                // gaps. Select an origin first so wrap sorting has a transitive
+                // key under that TCP invariant.
+                let origin = segments
+                    .iter()
+                    .map(segment_data_seq)
+                    .reduce(|earliest, candidate| {
+                        if seq_diff(candidate, earliest) < 0 {
+                            candidate
+                        } else {
+                            earliest
+                        }
+                    })
+                    .expect("a burst half-stream is never empty");
+                segments.sort_by_key(|segment| seq_diff(segment_data_seq(segment), origin));
+                (key, segments.into())
+            })
+            .collect();
+
+        slots
+            .into_iter()
+            .map(|key| {
+                halves
+                    .get_mut(&key)
+                    .and_then(VecDeque::pop_front)
+                    .expect("every burst slot has one segment")
+            })
+            .collect()
+    }
+}
 
 /// Reassembles traffic from several connections, keyed by (flow, direction).
 #[derive(Default)]
@@ -47,9 +558,14 @@ impl Reassembler {
     /// half-stream is never torn down, so a segment reordered ahead of a gap
     /// (a FIN-flagged one included) keeps its buffered payload until the gap
     /// fills.
-    pub fn push(&mut self, segment: &Segment) -> Vec<u8> {
+    pub(crate) fn push_budgeted(&mut self, segment: BudgetedSegment) -> ReassemblyOutcome {
         let key = (segment.flow, segment.direction);
+        let dropped_capacity = segment.capacity();
+        let budget = segment.payload.lease.budget.clone();
         self.clock += 1;
+        if segment.syn && self.syn_starts_new_incarnation(&segment) {
+            self.remove_flow(segment.flow);
+        }
         // A genuinely new flow past the cap evicts the stalest one first, so a
         // reconnect churn or a flood of forged source ports cannot grow the
         // map without bound. An existing flow never triggers eviction.
@@ -59,7 +575,77 @@ impl Reassembler {
         let clock = self.clock;
         let half = self.halves.entry(key).or_default();
         half.last_active = clock;
-        half.push(segment.seq, segment.syn, &segment.payload)
+        half.record_segment(segment.seq, segment.syn, segment.payload());
+        let outcome = half.push(segment.seq, segment.syn, segment.payload);
+        // Exhaustive by construction: a variant added to `HalfOutcome` becomes
+        // a compile error here rather than a runtime panic that would kill the
+        // reassembly task and the whole session.
+        match outcome {
+            HalfOutcome::Chunks(chunks) => ReassemblyOutcome::Chunks(chunks),
+            HalfOutcome::Pressure => {
+                // Never jump across a known gap. All anchors are invalid after
+                // a shared pending-quota failure; the next segment starts
+                // cleanly.
+                self.clear();
+                // Drop metrics identify the packet that caused recovery;
+                // pending chunks discarded by the global clear are collateral
+                // state, not additional captured packets.
+                budget.record_drop(dropped_capacity);
+                budget.record_resync();
+                let stats = budget.snapshot();
+                warn!(
+                    current_total = stats.current_total,
+                    capture_bytes = stats.current_capture,
+                    pending_bytes = stats.current_reassembly,
+                    outbound_bytes = stats.current_outbound,
+                    dropped_segments = stats.dropped_segments,
+                    dropped_bytes = stats.dropped_bytes,
+                    resyncs = stats.resyncs,
+                    "reassembly pending-byte pressure; state cleared for a fresh anchor"
+                );
+                ReassemblyOutcome::Pressure
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push(&mut self, segment: &Segment) -> Vec<u8> {
+        let admitted = PipelineBudget::new()
+            .admit_capture(segment.clone())
+            .expect("test segment fits the production capture quota");
+        flatten_chunks(self.push_budgeted(admitted))
+    }
+
+    /// Returns whether this SYN starts a new incarnation of an already tracked
+    /// connection. The ordered checks distinguish retransmissions, a SYN seen
+    /// after a compatible mid-stream anchor, and the peer's handshake SYN.
+    fn syn_starts_new_incarnation(&self, segment: &BudgetedSegment) -> bool {
+        debug_assert!(segment.syn);
+
+        let key = (segment.flow, segment.direction);
+        if let Some(half) = self.halves.get(&key) {
+            if half.syn_seq == Some(segment.seq) {
+                return false;
+            }
+            if half.syn_seq.is_none() && half.baseline == Some(segment.seq.wrapping_add(1)) {
+                return false;
+            }
+            return true;
+        }
+
+        let opposite_key = (segment.flow, opposite(segment.direction));
+        if let Some(opposite) = self.halves.get(&opposite_key) {
+            return opposite.syn_seq.is_none() || opposite.saw_non_syn_data;
+        }
+
+        false
+    }
+
+    /// Drops both sequence spaces for one connection while preserving every
+    /// unrelated flow.
+    fn remove_flow(&mut self, flow: FlowKey) {
+        self.halves
+            .retain(|(tracked_flow, _), _| *tracked_flow != flow);
     }
 
     /// Drops the least-recently-active half-stream. Called only when a new key
@@ -91,15 +677,27 @@ struct HalfStream {
     last_active: u64,
     /// Stream origin (sequence number of the first byte); `None` until first seen.
     baseline: Option<u32>,
+    /// Initial SYN sequence number for this connection incarnation, if seen.
+    syn_seq: Option<u32>,
+    /// Whether this half has observed a non-SYN data segment.
+    saw_non_syn_data: bool,
     /// Offset (from `baseline`) of the next expected byte.
     next_off: i64,
     /// Buffered future segments, keyed by offset (monotonic order, no wrap).
-    pending: BTreeMap<i64, Vec<u8>>,
+    pending: BTreeMap<i64, BudgetedChunk>,
     pending_bytes: usize,
 }
 
 impl HalfStream {
-    fn push(&mut self, seq: u32, syn: bool, payload: &[u8]) -> Vec<u8> {
+    fn record_segment(&mut self, seq: u32, syn: bool, payload: &[u8]) {
+        if syn {
+            self.syn_seq.get_or_insert(seq);
+        } else if !payload.is_empty() {
+            self.saw_non_syn_data = true;
+        }
+    }
+
+    fn push(&mut self, seq: u32, syn: bool, payload: BudgetedChunk) -> HalfOutcome {
         // SYN consumes a sequence number: data starts at seq + 1.
         let data_seq = if syn { seq.wrapping_add(1) } else { seq };
         self.baseline.get_or_insert(data_seq);
@@ -111,80 +709,146 @@ impl HalfStream {
         let offset = self.next_off + seq_diff(data_seq, expected_seq);
 
         let mut out = Vec::new();
-        self.absorb(offset, payload, &mut out);
-        self.drain(&mut out);
-        out
+        if !self.absorb(offset, payload, &mut out) {
+            return HalfOutcome::Pressure;
+        }
+        if !self.drain(&mut out) {
+            return HalfOutcome::Pressure;
+        }
+        HalfOutcome::Chunks(out)
     }
 
     /// Integrates one segment: in order (append), future (buffer), or old (trim).
-    fn absorb(&mut self, offset: i64, payload: &[u8], out: &mut Vec<u8>) {
-        if payload.is_empty() {
-            return;
+    fn absorb(
+        &mut self,
+        offset: i64,
+        mut payload: BudgetedChunk,
+        out: &mut Vec<BudgetedChunk>,
+    ) -> bool {
+        if payload.as_slice().is_empty() {
+            return true;
         }
         if offset > self.next_off {
-            self.buffer_future(offset, payload);
-            return;
+            return self.buffer_future(offset, payload);
         }
 
-        // offset <= next_off: the segment starts at or before the expected byte.
-        let already = (self.next_off - offset) as usize;
-        if already < payload.len() {
-            out.extend_from_slice(&payload[already..]);
-            self.next_off += (payload.len() - already) as i64;
+        // offset <= next_off: the segment starts at or before the expected byte,
+        // so the distance is non-negative and bounded by the sequence window.
+        // Let the conversion carry that invariant instead of an `as` cast: a
+        // negative difference would silently become ~1.8e19, make the length
+        // test below false, and drop the segment — freezing this half-stream
+        // for good with no panic, no log and no metric.
+        let Ok(already) = usize::try_from(self.next_off - offset) else {
+            error!(
+                next_off = self.next_off,
+                offset, "reassembly invariant violated"
+            );
+            debug_assert!(offset <= self.next_off, "absorb offset exceeds next_off");
+            // Same observable behaviour as the retransmission case below:
+            // deliver nothing, but do not claim pressure — a spurious `false`
+            // here would clear every anchor of every flow.
+            return true;
+        };
+        if already < payload.as_slice().len() {
+            if already != 0 {
+                payload.bytes.drain(..already);
+            }
+            self.next_off += payload.as_slice().len() as i64;
+            out.push(payload);
         }
         // else: fully delivered already (retransmission) — ignored.
+        true
     }
 
-    fn buffer_future(&mut self, offset: i64, payload: &[u8]) {
+    fn buffer_future(&mut self, offset: i64, mut payload: BudgetedChunk) -> bool {
         // Keep only the largest segment seen at a given offset.
         if self
             .pending
             .get(&offset)
-            .is_none_or(|v| v.len() < payload.len())
+            .is_some_and(|old| old.as_slice().len() >= payload.as_slice().len())
         {
-            if let Some(old) = self.pending.insert(offset, payload.to_vec()) {
-                self.pending_bytes -= old.len();
-            }
-            self.pending_bytes += payload.len();
+            return true;
         }
-        self.relieve_pressure();
+
+        if let Some(old) = self.pending.remove(&offset) {
+            self.pending_bytes -= old.capacity();
+            drop(old);
+        }
+        let capacity = payload.capacity();
+        if self
+            .pending_bytes
+            .checked_add(capacity)
+            .is_none_or(|bytes| bytes > MAX_PENDING_BYTES)
+            || !payload.try_retag_pending()
+        {
+            return false;
+        }
+        self.pending_bytes += capacity;
+        self.pending.insert(offset, payload);
+        true
     }
 
     /// Flushes buffered segments that became contiguous once `next_off` advanced.
-    fn drain(&mut self, out: &mut Vec<u8>) {
+    fn drain(&mut self, out: &mut Vec<BudgetedChunk>) -> bool {
         while let Some((&offset, _)) = self.pending.first_key_value() {
             if offset > self.next_off {
                 break; // gap still present.
             }
             let (offset, payload) = self.pending.pop_first().expect("peeked above");
-            self.pending_bytes -= payload.len();
-            self.absorb(offset, &payload, out);
+            self.pending_bytes -= payload.capacity();
+            if !self.absorb(offset, payload, out) {
+                return false;
+            }
         }
+        true
     }
 
     /// Sequence number of the next expected byte: `baseline + next_off`, back
     /// in the wrapping `u32` space. `baseline` is always set by the time this
     /// runs (`push` inserts it first).
     fn expected_seq(&self) -> u32 {
-        self.baseline
-            .unwrap_or(0)
-            .wrapping_add(self.next_off as u32)
+        // `next_off` is non-negative and the sequence space is mod 2^32:
+        // keeping the low 32 bits of the offset IS the intended conversion, the
+        // same modular arithmetic the explicit `wrapping_*` calls do elsewhere.
+        // The detour through `u64` spells out that the truncation happens in an
+        // unsigned space, so no sign extension is involved.
+        let offset = (self.next_off as u64) as u32;
+        self.baseline.unwrap_or(0).wrapping_add(offset)
     }
+}
 
-    /// Under memory pressure, *give up on the current gap*: jump `next_off` to
-    /// the nearest buffered segment, which then becomes deliverable (the next
-    /// `drain` flushes it). A byte missed out-of-order by a passive tap is never
-    /// retransmitted — a discontinuity the server resyncs on beats a permanently
-    /// stalled stream.
-    fn relieve_pressure(&mut self) {
-        if self.pending_bytes <= MAX_PENDING_BYTES {
-            return;
+enum HalfOutcome {
+    Chunks(Vec<BudgetedChunk>),
+    Pressure,
+}
+
+pub(crate) enum ReassemblyOutcome {
+    Chunks(Vec<BudgetedChunk>),
+    Pressure,
+}
+
+#[cfg(test)]
+fn flatten_chunks(outcome: ReassemblyOutcome) -> Vec<u8> {
+    match outcome {
+        ReassemblyOutcome::Chunks(chunks) => {
+            chunks.into_iter().flat_map(|chunk| chunk.bytes).collect()
         }
-        if let Some((&offset, _)) = self.pending.first_key_value()
-            && offset > self.next_off
-        {
-            self.next_off = offset;
-        }
+        ReassemblyOutcome::Pressure => Vec::new(),
+    }
+}
+
+fn opposite(direction: Direction) -> Direction {
+    match direction {
+        Direction::ClientToServer => Direction::ServerToClient,
+        Direction::ServerToClient => Direction::ClientToServer,
+    }
+}
+
+fn segment_data_seq(segment: &BudgetedSegment) -> u32 {
+    if segment.syn {
+        segment.seq.wrapping_add(1)
+    } else {
+        segment.seq
     }
 }
 
@@ -210,25 +874,409 @@ mod tests {
         }
     }
 
-    fn seg(seq: u32, syn: bool, payload: &[u8]) -> Segment {
+    fn seg_in(flow: FlowKey, direction: Direction, seq: u32, syn: bool, payload: &[u8]) -> Segment {
         Segment {
-            flow: flow(),
-            direction: Direction::ServerToClient,
+            flow,
+            direction,
             seq,
             syn,
-            payload: payload.to_vec(),
+            payload: Vec::from(payload),
         }
+    }
+
+    fn seg(seq: u32, syn: bool, payload: &[u8]) -> Segment {
+        seg_in(flow(), Direction::ServerToClient, seq, syn, payload)
     }
 
     /// A plain data segment on a given flow (no SYN): for multi-flow tests.
     fn seg_on(flow: FlowKey, seq: u32, payload: &[u8]) -> Segment {
+        seg_in(flow, Direction::ServerToClient, seq, false, payload)
+    }
+
+    fn test_budget(
+        global: usize,
+        capture: usize,
+        reassembly: usize,
+        outbound: usize,
+    ) -> PipelineBudget {
+        PipelineBudget::with_limits(BudgetLimits {
+            global,
+            capture,
+            reassembly,
+            outbound,
+        })
+    }
+
+    fn sized_seg(flow: FlowKey, seq: u32, len: usize, capacity: usize) -> Segment {
+        let mut payload = Vec::with_capacity(capacity);
+        payload.resize(len, b'X');
         Segment {
             flow,
             direction: Direction::ServerToClient,
             seq,
             syn: false,
-            payload: payload.to_vec(),
+            payload,
         }
+    }
+
+    fn flatten_half(outcome: HalfOutcome) -> Vec<u8> {
+        match outcome {
+            HalfOutcome::Chunks(chunks) => {
+                chunks.into_iter().flat_map(|chunk| chunk.bytes).collect()
+            }
+            HalfOutcome::Pressure => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn byte_budget_never_exceeds_global_limit() {
+        let budget = test_budget(96, 96, 64, 64);
+        let first = budget.admit_capture(sized_seg(flow(), 0, 8, 64)).unwrap();
+        assert_eq!(budget.snapshot().current_total, 64);
+        let rejected = budget.admit_capture(sized_seg(flow(), 8, 8, 64));
+        assert!(rejected.is_err());
+        assert_eq!(budget.snapshot().current_total, 64);
+        drop(first);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    #[tokio::test]
+    async fn byte_budget_leases_release_and_retag_stage_bytes() {
+        let budget = test_budget(128, 128, 128, 128);
+        let mut admitted = budget.admit_capture(sized_seg(flow(), 0, 8, 64)).unwrap();
+        assert!(admitted.payload.try_retag_pending());
+        let stats = budget.snapshot();
+        assert_eq!((stats.current_capture, stats.current_reassembly), (0, 64));
+        let chunk = admitted.payload.retag_outbound().await.unwrap();
+        let stats = budget.snapshot();
+        assert_eq!((stats.current_reassembly, stats.current_outbound), (0, 64));
+        drop(chunk);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    #[test]
+    fn byte_budget_high_water_is_monotonic_under_repeated_pressure() {
+        let budget = test_budget(64, 64, 64, 64);
+        for _ in 0..8 {
+            let admitted = budget.admit_capture(sized_seg(flow(), 0, 8, 64)).unwrap();
+            assert!(budget.admit_capture(sized_seg(flow(), 0, 1, 1)).is_err());
+            assert_eq!(budget.snapshot().high_water_total, 64);
+            drop(admitted);
+        }
+        assert_eq!(budget.snapshot().current_total, 0);
+        assert_eq!(budget.snapshot().high_water_total, 64);
+    }
+
+    /// `release` runs from `PayloadLease::drop`, possibly while a worker
+    /// unwinds: in a shipped build an accounting bug must degrade to a
+    /// saturating subtraction plus a log, never to a panic that would turn the
+    /// unwind into an `abort()` with no crash log.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn release_underflow_saturates_instead_of_panicking() {
+        let budget = test_budget(128, 128, 128, 128);
+        budget.release(Stage::Capture, 64);
+        let stats = budget.snapshot();
+        assert_eq!((stats.current_total, stats.current_capture), (0, 0));
+        // Still usable afterwards: the counters are floored, not corrupted.
+        let admitted = budget.admit_capture(sized_seg(flow(), 0, 8, 64)).unwrap();
+        assert_eq!(budget.snapshot().current_total, 64);
+        drop(admitted);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// The same bug in a debug or test build still fails fast, where an abort
+    /// costs a developer a stack trace rather than a player a session.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "pipeline total accounting underflow")]
+    fn release_underflow_fails_fast_in_debug_builds() {
+        test_budget(128, 128, 128, 128).release(Stage::Capture, 64);
+    }
+
+    /// `try_retag` is never reached from a `Drop`, so it keeps a hard assert in
+    /// every profile.
+    #[test]
+    #[should_panic(expected = "pipeline stage accounting underflow")]
+    fn retag_underflow_panics_in_every_profile() {
+        let budget = test_budget(128, 128, 128, 128);
+        budget.try_retag(Stage::Capture, Stage::Outbound, 64);
+    }
+
+    #[test]
+    fn pending_bytes_are_global_across_sixty_four_halves() {
+        let budget = test_budget(4096, 4096, 1024, 4096);
+        let mut reassembler = Reassembler::new();
+        for port in 0..64u16 {
+            let flow = flow_from(port + 1);
+            drop(flatten_chunks(reassembler.push_budgeted(
+                budget.admit_capture(sized_seg(flow, 1000, 1, 16)).unwrap(),
+            )));
+            let outcome = reassembler
+                .push_budgeted(budget.admit_capture(sized_seg(flow, 2000, 1, 16)).unwrap());
+            assert!(matches!(outcome, ReassemblyOutcome::Chunks(ref chunks) if chunks.is_empty()));
+            assert!(budget.snapshot().current_total <= 4096);
+        }
+        assert_eq!(budget.snapshot().current_reassembly, 1024);
+        assert!(matches!(
+            reassembler.push_budgeted(
+                budget
+                    .admit_capture(sized_seg(flow_from(1), 3000, 1, 16))
+                    .unwrap()
+            ),
+            ReassemblyOutcome::Pressure
+        ));
+        assert_eq!(budget.snapshot().current_reassembly, 0);
+        drop(reassembler);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    #[test]
+    fn pressure_clears_state_and_next_segment_reanchors() {
+        let budget = test_budget(256, 256, 8, 256);
+        let mut reassembler = Reassembler::new();
+        drop(flatten_chunks(reassembler.push_budgeted(
+            budget.admit_capture(sized_seg(flow(), 1000, 2, 8)).unwrap(),
+        )));
+        assert!(matches!(
+            reassembler.push_budgeted(
+                budget
+                    .admit_capture(sized_seg(flow(), 2000, 2, 16))
+                    .unwrap()
+            ),
+            ReassemblyOutcome::Pressure
+        ));
+        let output = flatten_chunks(
+            reassembler.push_budgeted(budget.admit_capture(sized_seg(flow(), 9000, 2, 8)).unwrap()),
+        );
+        assert_eq!(output, b"XX");
+        assert_eq!(budget.snapshot().resyncs, 1);
+        drop(reassembler);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    #[test]
+    fn gap_fill_moves_chunks_without_exceeding_budget() {
+        let budget = test_budget(128, 128, 64, 128);
+        let mut reassembler = Reassembler::new();
+        drop(flatten_chunks(reassembler.push_budgeted(
+            budget.admit_capture(seg(1000, false, b"AB")).unwrap(),
+        )));
+        assert!(matches!(
+            reassembler.push_budgeted(
+                budget.admit_capture(seg(1004, false, b"EF")).unwrap()
+            ),
+            ReassemblyOutcome::Chunks(ref chunks) if chunks.is_empty()
+        ));
+        let chunks = match reassembler
+            .push_budgeted(budget.admit_capture(seg(1002, false, b"CD")).unwrap())
+        {
+            ReassemblyOutcome::Chunks(chunks) => chunks,
+            ReassemblyOutcome::Pressure => panic!("unexpected pressure"),
+        };
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].as_slice(), b"CD");
+        assert_eq!(chunks[1].as_slice(), b"EF");
+        assert!(budget.snapshot().current_total <= 128);
+        drop(chunks);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    fn collect_arrivals(segments: &[Segment; 3], permutation: [usize; 3]) -> Vec<u8> {
+        let mut reassembler = Reassembler::new();
+        let mut output = Vec::new();
+        for index in permutation {
+            output.extend(reassembler.push(&segments[index]));
+        }
+        output
+    }
+
+    fn collect_anchored(segments: &[Segment; 3], permutation: [usize; 3]) -> Vec<u8> {
+        let mut burst = InitialBurst::new();
+        for index in permutation {
+            burst.push_test(segments[index].clone());
+        }
+        let mut reassembler = Reassembler::new();
+        burst
+            .into_ordered()
+            .into_iter()
+            .flat_map(|segment| flatten_chunks(reassembler.push_budgeted(segment)))
+            .collect()
+    }
+
+    #[test]
+    fn initial_anchor_burst_orders_all_six_permutations() {
+        let segments = [
+            seg(1000, false, b"AB"),
+            seg(1002, false, b"CD"),
+            seg(1004, false, b"EF"),
+        ];
+
+        for permutation in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            assert_eq!(
+                collect_anchored(&segments, permutation),
+                b"ABCDEF",
+                "arrival permutation {permutation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_anchor_burst_order_is_wrap_safe_and_overlap_stays_centralized() {
+        let wrapped = [
+            seg(u32::MAX - 1, false, b"AB"),
+            seg(0, false, b"CD"),
+            seg(2, false, b"EF"),
+        ];
+        assert_eq!(collect_anchored(&wrapped, [2, 0, 1]), b"ABCDEF");
+
+        let overlap = [
+            seg(1000, false, b"ABCD"),
+            seg(1002, false, b"CDEF"),
+            seg(1006, false, b"GH"),
+        ];
+        assert_eq!(collect_anchored(&overlap, [1, 2, 0]), b"ABCDEFGH");
+    }
+
+    #[test]
+    fn initial_anchor_burst_preserves_inter_half_stream_slots() {
+        let first = flow();
+        let second = flow_from(52000);
+        let mut burst = InitialBurst::new();
+        burst.push_test(seg_in(first, Direction::ServerToClient, 1002, false, b"CD"));
+        burst.push_test(seg_in(
+            second,
+            Direction::ClientToServer,
+            2002,
+            false,
+            b"WX",
+        ));
+        burst.push_test(seg_in(first, Direction::ServerToClient, 1000, false, b"AB"));
+        burst.push_test(seg_in(
+            second,
+            Direction::ClientToServer,
+            2000,
+            false,
+            b"UV",
+        ));
+
+        let ordered = burst.into_ordered();
+        let observed: Vec<_> = ordered
+            .iter()
+            .map(|segment| (segment.flow, segment.direction, segment.seq))
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                (first, Direction::ServerToClient, 1000),
+                (second, Direction::ClientToServer, 2000),
+                (first, Direction::ServerToClient, 1002),
+                (second, Direction::ClientToServer, 2002),
+            ]
+        );
+    }
+
+    #[test]
+    fn initial_anchor_all_six_permutations_keep_the_immediate_suffix() {
+        let segments = [
+            seg(1000, false, b"AB"),
+            seg(1002, false, b"CD"),
+            seg(1004, false, b"EF"),
+        ];
+        let cases: [([usize; 3], &[u8]); 6] = [
+            ([0, 1, 2], b"ABCDEF"),
+            ([0, 2, 1], b"ABCDEF"),
+            ([1, 0, 2], b"CDEF"),
+            ([1, 2, 0], b"CDEF"),
+            ([2, 0, 1], b"EF"),
+            ([2, 1, 0], b"EF"),
+        ];
+
+        for (permutation, expected) in cases {
+            assert_eq!(
+                collect_arrivals(&segments, permutation),
+                expected,
+                "arrival permutation {permutation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_anchor_suffix_characterization_is_wrap_safe() {
+        let segments = [
+            seg(u32::MAX - 1, false, b"AB"),
+            seg(0, false, b"CD"),
+            seg(2, false, b"EF"),
+        ];
+
+        assert_eq!(collect_arrivals(&segments, [0, 2, 1]), b"ABCDEF");
+        assert_eq!(collect_arrivals(&segments, [2, 0, 1]), b"EF");
+    }
+
+    #[test]
+    fn initial_anchor_overlap_keeps_only_bytes_after_the_immediate_suffix() {
+        let mut reassembler = Reassembler::new();
+        let arrivals = [
+            seg(1002, false, b"CDEF"),
+            seg(1000, false, b"ABCD"),
+            seg(1002, false, b"CDEF"),
+            seg(1006, false, b"GH"),
+        ];
+        let mut output = Vec::new();
+        for segment in arrivals {
+            output.extend(reassembler.push(&segment));
+        }
+
+        assert_eq!(output, b"CDEFGH");
+    }
+
+    #[test]
+    fn initial_anchor_is_isolated_by_flow_and_direction() {
+        let mut reassembler = Reassembler::new();
+        let first = flow();
+        let second = flow_from(52000);
+
+        assert_eq!(
+            reassembler.push(&seg_in(
+                first,
+                Direction::ServerToClient,
+                1002,
+                false,
+                b"CD"
+            )),
+            b"CD"
+        );
+        assert_eq!(
+            reassembler.push(&seg_in(
+                first,
+                Direction::ClientToServer,
+                2000,
+                false,
+                b"UV"
+            )),
+            b"UV"
+        );
+        assert_eq!(reassembler.push(&seg_on(second, 1000, b"XY")), b"XY");
+
+        assert!(reassembler.push(&seg_on(first, 1000, b"AB")).is_empty());
+        assert_eq!(
+            reassembler.push(&seg_in(
+                first,
+                Direction::ClientToServer,
+                2002,
+                false,
+                b"WX"
+            )),
+            b"WX"
+        );
+        assert_eq!(reassembler.push(&seg_on(second, 1002, b"Z!")), b"Z!");
     }
 
     #[test]
@@ -310,9 +1358,21 @@ mod tests {
             ..Default::default()
         };
         let expected = half.expected_seq();
-        assert_eq!(half.push(expected, false, b"AB"), b"AB");
+        let budget = PipelineBudget::new();
+        let first = budget
+            .admit_capture(seg(expected, false, b"AB"))
+            .unwrap()
+            .payload;
+        assert_eq!(flatten_half(half.push(expected, false, first)), b"AB");
         // And the following contiguous segment keeps flowing.
-        assert_eq!(half.push(expected.wrapping_add(2), false, b"CD"), b"CD");
+        let second = budget
+            .admit_capture(seg(expected.wrapping_add(2), false, b"CD"))
+            .unwrap()
+            .payload;
+        assert_eq!(
+            flatten_half(half.push(expected.wrapping_add(2), false, second)),
+            b"CD"
+        );
     }
 
     #[test]
@@ -349,5 +1409,134 @@ mod tests {
         // origin instead of being buffered forever.
         r.clear();
         assert_eq!(r.push(&seg(9000, false, b"XY")), b"XY");
+    }
+
+    #[test]
+    fn new_syn_resets_both_halves_for_reused_flow() {
+        let mut r = Reassembler::new();
+        let reused = flow();
+        let unrelated = flow_from(52000);
+
+        assert!(
+            r.push(&seg_in(reused, Direction::ServerToClient, 999, true, b""))
+                .is_empty()
+        );
+        assert!(
+            r.push(&seg_in(reused, Direction::ClientToServer, 1999, true, b""))
+                .is_empty()
+        );
+        assert_eq!(
+            r.push(&seg_in(
+                reused,
+                Direction::ServerToClient,
+                1000,
+                false,
+                b"AB"
+            )),
+            b"AB"
+        );
+        assert!(
+            r.push(&seg_in(
+                reused,
+                Direction::ServerToClient,
+                1004,
+                false,
+                b"EF"
+            ))
+            .is_empty()
+        );
+        assert_eq!(
+            r.push(&seg_in(
+                reused,
+                Direction::ClientToServer,
+                2000,
+                false,
+                b"XY"
+            )),
+            b"XY"
+        );
+        assert_eq!(r.push(&seg_on(unrelated, 3000, b"UV")), b"UV");
+
+        assert!(
+            r.push(&seg_in(reused, Direction::ServerToClient, 8999, true, b""))
+                .is_empty()
+        );
+
+        assert!(!r.halves.contains_key(&(reused, Direction::ClientToServer)));
+        let fresh = &r.halves[&(reused, Direction::ServerToClient)];
+        assert_eq!(fresh.baseline, Some(9000));
+        assert_eq!(fresh.syn_seq, Some(8999));
+        assert_eq!(fresh.next_off, 0);
+        assert!(fresh.pending.is_empty());
+        let untouched = &r.halves[&(unrelated, Direction::ServerToClient)];
+        assert_eq!(untouched.baseline, Some(3000));
+        assert_eq!(untouched.next_off, 2);
+    }
+
+    #[test]
+    fn same_syn_retransmission_preserves_pending_data() {
+        let mut r = Reassembler::new();
+        assert!(r.push(&seg(999, true, b"")).is_empty());
+        assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
+        assert!(r.push(&seg(1004, false, b"EF")).is_empty());
+
+        assert!(r.push(&seg(999, true, b"")).is_empty());
+        assert_eq!(r.push(&seg(1002, false, b"CD")), b"CDEF");
+        assert!(r.push(&seg(1004, false, b"EF")).is_empty());
+    }
+
+    #[test]
+    fn complementary_handshake_syn_does_not_reset_first_half() {
+        let mut r = Reassembler::new();
+        assert!(
+            r.push(&seg_in(flow(), Direction::ClientToServer, 999, true, b""))
+                .is_empty()
+        );
+        assert!(
+            r.push(&seg_in(flow(), Direction::ServerToClient, 1999, true, b""))
+                .is_empty()
+        );
+
+        assert_eq!(r.halves.len(), 2);
+        assert_eq!(
+            r.halves[&(flow(), Direction::ClientToServer)].syn_seq,
+            Some(999)
+        );
+        assert_eq!(
+            r.halves[&(flow(), Direction::ServerToClient)].syn_seq,
+            Some(1999)
+        );
+    }
+
+    #[test]
+    fn late_matching_syn_does_not_reset_midstream_anchor() {
+        let mut r = Reassembler::new();
+        assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
+
+        assert!(r.push(&seg(999, true, b"")).is_empty());
+        assert_eq!(r.push(&seg(1002, false, b"CD")), b"CD");
+
+        let half = &r.halves[&(flow(), Direction::ServerToClient)];
+        assert_eq!(half.baseline, Some(1000));
+        assert_eq!(half.syn_seq, Some(999));
+        assert_eq!(half.next_off, 4);
+    }
+
+    #[test]
+    fn data_bearing_syn_is_delivered_once() {
+        let mut r = Reassembler::new();
+        assert_eq!(r.push(&seg(999, true, b"AB")), b"AB");
+        assert!(r.push(&seg(999, true, b"AB")).is_empty());
+    }
+
+    #[test]
+    fn new_syn_handles_wrapped_data_sequence() {
+        let mut r = Reassembler::new();
+        assert!(r.push(&seg(u32::MAX, true, b"")).is_empty());
+        assert_eq!(
+            r.halves[&(flow(), Direction::ServerToClient)].baseline,
+            Some(0)
+        );
+        assert_eq!(r.push(&seg(0, false, b"AB")), b"AB");
     }
 }

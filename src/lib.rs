@@ -7,7 +7,7 @@
 //! click emulation (refresh and buy), steered by the decoded snapshots.
 //!
 //! ```text
-//! WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket ─▶ server
+//! WinDivert copy ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket ─▶ server
 //!    (blocking)                       (ordered/dedup)                  ▲         │
 //!                                                               snapshots ◀──────┘
 //! ```
@@ -35,6 +35,6 @@ pub use error::{Error, Result};
 pub const APP_NAME: &str = "Arkyve Refresh Shop";
 
 /// Filesystem-safe app folder name, shared by the per-user data locations:
-/// the config under `%APPDATA%` (roaming) and the extracted runtime binaries
-/// under `%LOCALAPPDATA%` (local). One constant so the two never diverge.
+/// the config under `%APPDATA%` (roaming) and the crash log under
+/// `%LOCALAPPDATA%` (local). One constant so the two never diverge.
 pub const APP_DIR: &str = "arkyve-refresh-shop";

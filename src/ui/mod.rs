@@ -25,6 +25,7 @@ use crate::actuator::plan::Timings;
 use crate::app::{Command, SessionHandles};
 use crate::config;
 use crate::journal::LogLine;
+use crate::watch::HaltSource;
 
 use editor::EditorState;
 use view::{ViewState, view_state};
@@ -209,10 +210,23 @@ impl eframe::App for ShopApp {
                 render_tab_content(ui, &view, self.tab, &mut self.editor, session_alive)
             })
             .inner;
-        // Persist the Setup edits before dispatch. Best-effort: the live apply
-        // below is unaffected by a write failure — a read-only or unwritable
-        // config.toml only costs the on-disk copy, journaled and moved past.
-        let sections = persisted_sections(&applied);
+        // Dispatch first, then record. Everything downstream — the editor's
+        // "applied" state and the on-disk copy — is keyed on what the session
+        // actually took, so a click the bounded queue dropped leaves no trace
+        // claiming otherwise. Stop bypasses that queue so saturation can never
+        // suppress the immediate gate cutoff or its durable notification.
+        let mut delivered = Vec::new();
+        for command in clicked.into_iter().chain(applied) {
+            if deliver_command(&self.handles, command.clone()) {
+                delivered.push(command);
+            }
+        }
+        // Only now is a draft "applied": Apply goes dark and the peek clears.
+        self.editor.mark_applied(&delivered);
+        // Persist what the session accepted. Best-effort: a write failure only
+        // costs the on-disk copy — the live retune already went through — so it
+        // is journaled and moved past.
+        let sections = persisted_sections(&delivered);
         if !sections.is_empty()
             && let Err(err) = config::persist::save(&self.config_path, &sections)
         {
@@ -220,14 +234,32 @@ impl eframe::App for ShopApp {
                 .journal
                 .push(&[format!("config.toml not saved: {err}")]);
         }
-        // The status bar sends at most one command; Setup's single Apply may
-        // send several (one per changed draft). A full channel only happens
-        // with a dead session loop, where the banner already explains the
-        // situation: dropping the click is fine.
-        for command in clicked.into_iter().chain(applied) {
-            let _ = self.handles.commands.try_send(command);
-        }
     }
+}
+
+/// Hands one command to the session; `true` when it was taken.
+///
+/// `Stop` is a safety cutoff and never rides the bounded queue — the gate's
+/// durable halt latch takes it, so it cannot be dropped and always counts as
+/// delivered. Everything else goes through the capacity-16 channel, which a
+/// dying or throttled session can leave full or closed. In the shipped build
+/// stdin is inert and this window is the only interface, so a swallowed
+/// `try_send` would make a click a perfectly silent no-op. The same rule the
+/// session already applies to actuator jobs holds here: a lost click must not be
+/// silent, so the drop is journaled *and* reported back to the caller.
+#[must_use]
+fn deliver_command(handles: &SessionHandles, command: Command) -> bool {
+    if command == Command::Stop {
+        handles.gate.request_halt(HaltSource::PlayerStopped);
+        return true;
+    }
+    if handles.commands.try_send(command).is_err() {
+        handles
+            .journal
+            .push(&[">> command dropped — the session is busy, try again".to_owned()]);
+        return false;
+    }
+    true
 }
 
 /// The tab strip: flush selectable labels over a full-width hairline with the
@@ -391,7 +423,6 @@ mod tests {
 
     #[test]
     fn only_setup_commands_become_persisted_sections() {
-        use crate::app::Command;
         let commands = vec![
             Command::Start,
             Command::SetLimits(crate::domain::control::Limits::default()),
@@ -403,6 +434,93 @@ mod tests {
             sections[0],
             crate::config::persist::Section::Limits(_)
         ));
+    }
+
+    /// Live handles built the way `main` builds them, so a field added to
+    /// `SessionHandles` never breaks this file. The `Session` half must stay
+    /// alive for the caller: it owns the command receiver, and dropping it
+    /// would close the channel instead of filling it.
+    fn session_handles() -> (crate::app::Session, SessionHandles) {
+        let (session, handles, _shutdown) = crate::app::setup(config::Config::default());
+        (session, handles)
+    }
+
+    /// Saturates the command queue, so the next `try_send` can only fail.
+    fn fill_command_queue(handles: &SessionHandles) {
+        while handles.commands.try_send(Command::Toggle).is_ok() {}
+    }
+
+    #[tokio::test]
+    async fn full_command_queue_cannot_drop_stop() {
+        let (_session, handles) = session_handles();
+        fill_command_queue(&handles);
+        assert!(matches!(
+            handles.commands.try_send(Command::Toggle),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
+        // Arm the gate first, so the assert below reads the halt, not the
+        // startup state.
+        handles.gate.set(true);
+
+        assert!(deliver_command(&handles, Command::Stop));
+
+        assert!(!handles.gate.is_enabled());
+        assert_eq!(
+            handles.gate.halt_requested().await,
+            HaltSource::PlayerStopped
+        );
+    }
+
+    #[test]
+    fn a_dropped_command_is_journaled_and_reported() {
+        // The window is the only interface in the shipped build: a click the
+        // saturated queue refuses must reach the player, not vanish.
+        let (_session, handles) = session_handles();
+        fill_command_queue(&handles);
+        let before = handles.journal.entries().len();
+
+        assert!(!deliver_command(&handles, Command::Start));
+
+        let entries = handles.journal.entries();
+        assert_eq!(entries.len(), before + 1);
+        let line = &entries.last().expect("a journaled line").text;
+        assert!(line.contains("command dropped"), "unexpected line: {line}");
+    }
+
+    #[test]
+    fn a_dropped_apply_is_persisted_nowhere() {
+        // The other half of the honesty rule (the editor's own twins are
+        // covered in `editor::tests`): what the session refused never reaches
+        // config.toml either, because the persisted batch is the *delivered*
+        // commands, not the emitted ones.
+        let (_session, handles) = session_handles();
+        fill_command_queue(&handles);
+        let command = Command::SetLimits(Limits {
+            max_refreshes: Some(7),
+            ..Limits::default()
+        });
+
+        // The shell's own loop, in miniature.
+        let mut delivered = Vec::new();
+        if deliver_command(&handles, command.clone()) {
+            delivered.push(command);
+        }
+
+        assert!(delivered.is_empty());
+        assert!(persisted_sections(&delivered).is_empty());
+    }
+
+    #[test]
+    fn a_delivered_apply_is_persisted() {
+        let (_session, handles) = session_handles();
+        let command = Command::SetLimits(Limits {
+            max_refreshes: Some(7),
+            ..Limits::default()
+        });
+
+        assert!(deliver_command(&handles, command.clone()));
+
+        assert_eq!(persisted_sections(&[command]).len(), 1);
     }
 
     #[test]

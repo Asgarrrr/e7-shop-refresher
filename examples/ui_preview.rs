@@ -1,6 +1,6 @@
 //! Dashboard preview with injected mock data.
 //!
-//! On a machine without the WinDivert capture backend (mac dev), no shop
+//! On a machine without the native capture backend (mac dev), no shop
 //! snapshot ever arrives, so the live window only shows the welcome screen.
 //! This example builds the *real* `ShopApp` over a hand-seeded controller —
 //! same rendering path as production, just fed fixtures — so the redesigned
@@ -145,7 +145,6 @@ fn main() -> eframe::Result {
                     let event = match command {
                         Command::Start => Some(Event::Start { now_ms }),
                         Command::Stop => Some(Event::Stop),
-                        Command::ActuatorFailed => Some(Event::ActuatorFailed),
                         Command::Toggle => Some(match ctrl.status() {
                             Status::Watching | Status::Paused => Event::Stop,
                             _ => Event::Start { now_ms },

@@ -4,7 +4,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::actuator::plan::{self, Trigger};
 use crate::actuator::{ActuatorHandle, Mode};
@@ -13,12 +13,17 @@ use crate::journal::EventLog;
 use crate::render::{describe, format_item, refusal, render_shop, status_label};
 use crate::uplink::UplinkEvent;
 use crate::uplink::protocol::{PurchaseNotice, ServerMessage};
-use crate::watch::WatchGate;
+use crate::watch::{HaltSource, WatchGate};
 
 use super::Command;
 
+/// One heartbeat every 30 ticks (30 s). A healthy pipeline at rest and a dead
+/// one are otherwise indistinguishable in the logs: both are silent.
+const HEARTBEAT_EVERY_TICKS: u64 = 30;
+
 /// Owns the controller for the session: multiplexes player commands, server
-/// messages, a 1 s tick (time limits), capture failures, and Ctrl+C.
+/// messages, a 1 s tick (time limits), capture failures, the cooperative
+/// shutdown signal, and Ctrl+C.
 ///
 /// The mutex guard is only ever held across synchronous calls, never an
 /// `.await`. The wall clock is read here so the domain stays pure.
@@ -26,6 +31,11 @@ use super::Command;
 /// Returns the fatal failure, if one ended the session: the caller turns it
 /// into an error outcome (banner + exit code), the loop only reports it. The
 /// message is self-describing (`capture: …`, `uplink task panicked`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "four borrowed session handles plus the four channels this loop multiplexes; \
+              bundling them would hide which halves the loop owns and which it only borrows"
+)]
 pub(super) async fn session_loop(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
@@ -34,9 +44,14 @@ pub(super) async fn session_loop(
     mut commands: mpsc::Receiver<Command>,
     mut messages: mpsc::Receiver<UplinkEvent>,
     mut fatal_errors: mpsc::Receiver<String>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Option<String> {
     let now_ms = || journal.now_ms();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    // Burst would replay every tick missed during a CPU stall back to back,
+    // all carrying near-identical `now_ms` — N pointless dispatches (each
+    // taking and releasing the controller mutex) right after a hiccup.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     // Stdin closing (EOF) is not a shutdown: the branch is disabled instead of
@@ -44,18 +59,57 @@ pub(super) async fn session_loop(
     // draining once every supervisor's sender is dropped.
     let mut commands_open = true;
     let mut fatal_open = true;
+    let mut shutdown_open = true;
     let mut fatal_failure = None;
     let mut player_exit = false;
     let mut uplink_closed = false;
+    let mut ticks: u64 = 0;
+    let mut last_shop_ms: Option<u64> = None;
     loop {
+        // Read here rather than in the branch: the signal may already be set
+        // when the loop starts (a window closed during startup), in which case
+        // `changed()` would never fire.
+        if *shutdown.borrow() {
+            journal.emit(&[">> shutting down".to_owned()]);
+            // The window closing is the player's own stop, exactly like
+            // Ctrl+C — not a pipeline death.
+            player_exit = true;
+            break;
+        }
         tokio::select! {
+            biased;
+            source = gate.halt_requested() => {
+                let event = match source {
+                    HaltSource::PlayerStopped => Event::Stop,
+                    HaltSource::ActuatorFailed => Event::ActuatorFailed,
+                };
+                dispatch(controller, gate, journal, actuator, event, now_ms());
+                // The durable cause stays pending through dispatch, so a
+                // cancelled select branch or racing Start cannot re-arm the
+                // safety gate before the controller records the stop.
+                gate.acknowledge_halt(source);
+            },
+            // Only wakes the loop: the value is re-read at the top, so a
+            // signal set before the loop started is honoured too. An `Err`
+            // means the signal's owner is gone and no stop can ever arrive —
+            // disable the branch instead of spinning on it.
+            changed = shutdown.changed(), if shutdown_open => {
+                shutdown_open = changed.is_ok();
+            },
             command = commands.recv(), if commands_open => match command {
                 Some(command) => on_command(controller, gate, journal, actuator, command, now_ms()),
                 None => commands_open = false,
             },
             message = messages.recv() => match message {
                 Some(UplinkEvent::Message(message)) => {
-                    on_message(controller, gate, journal, actuator, message, now_ms());
+                    let now = now_ms();
+                    // Stamped before the message is consumed: the heartbeat
+                    // needs "how long since the last shop" to tell a blind
+                    // capture from a mute server.
+                    if matches!(message, ServerMessage::Shop(_)) {
+                        last_shop_ms = Some(now);
+                    }
+                    on_message(controller, gate, journal, actuator, message, now);
                 }
                 // An armed watch with a dead link looks exactly like a closed
                 // shop: without these lines the player cannot tell them apart.
@@ -91,6 +145,10 @@ pub(super) async fn session_loop(
             _ = ticker.tick() => {
                 let now = now_ms();
                 dispatch(controller, gate, journal, actuator, Event::Tick { now_ms: now }, now);
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(HEARTBEAT_EVERY_TICKS) {
+                    heartbeat(controller, gate, now, last_shop_ms);
+                }
             }
             _ = &mut ctrl_c => {
                 journal.emit(&[">> Ctrl+C, stopping".to_owned()]);
@@ -115,8 +173,9 @@ pub(super) async fn session_loop(
     }
     // The window (GUI build) outlives the loop: leave an honest state behind
     // — controller stopped, gate (and thus capture) off, a journal line
-    // saying why. Only Ctrl+C is the player's own stop; a pipeline death is
-    // a shutdown. The domain ignores both for a never-armed controller.
+    // saying why. Only Ctrl+C and closing the window are the player's own
+    // stop; a pipeline death is a shutdown. The domain ignores both for a
+    // never-armed controller.
     let teardown = if player_exit {
         Event::Stop
     } else {
@@ -124,6 +183,32 @@ pub(super) async fn session_loop(
     };
     dispatch(controller, gate, journal, actuator, teardown, now_ms());
     fatal_failure
+}
+
+/// One periodic line saying the loop is alive and what it is waiting on.
+///
+/// The three ways "it stopped refreshing" happens — capture blind, server
+/// mute, actuator stuck — are indistinguishable in a silent log; this makes
+/// them tell apart. `since_last_shop_s` is `None` until the first shop.
+/// Nothing is awaited here, so the controller guard never crosses an await.
+fn heartbeat(
+    controller: &Mutex<Controller>,
+    gate: &WatchGate,
+    now_ms: u64,
+    last_shop_ms: Option<u64>,
+) {
+    let ctrl = controller.lock().expect("controller mutex poisoned");
+    let status = status_label(&ctrl);
+    let refreshes = ctrl.progress().refreshes;
+    drop(ctrl);
+    let since_last_shop_s = last_shop_ms.map(|at| now_ms.saturating_sub(at) / 1000);
+    tracing::info!(
+        status = %status,
+        refreshes,
+        gate_armed = gate.is_enabled(),
+        since_last_shop_s = ?since_last_shop_s,
+        "session heartbeat"
+    );
 }
 
 /// Translates a player command into a controller event and echoes an outcome:
@@ -153,7 +238,6 @@ fn handle_command(
     let event = match command {
         Command::Start => Event::Start { now_ms },
         Command::Stop => Event::Stop,
-        Command::ActuatorFailed => Event::ActuatorFailed,
         Command::Toggle => match ctrl.status() {
             Status::Watching | Status::Paused => Event::Stop,
             Status::Idle | Status::Stopped(_) => Event::Start { now_ms },

@@ -22,5 +22,9 @@ Thumbs.db
 # Instructions agent — local, jamais publié
 /CLAUDE.md
 
+# Plans d'amélioration et worktrees d'agents — local, jamais commité
+/plans
+/.claude
+
 # Runtime panic log (crash.log; app-data first, temp-dir fallback)
 crash.log

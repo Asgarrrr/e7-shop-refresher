@@ -45,11 +45,22 @@ impl EventLog {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Single sink for player-facing lines: the journal and the console stay
-    /// in step by construction — never print session lines around it.
+    /// Single sink for player-facing lines: the journal, the console and the
+    /// log file stay in step by construction — never print session lines
+    /// around it.
+    ///
+    /// The mirror to `tracing` is what makes these lines survive the process:
+    /// the in-memory ring dies with it, and the windowed build has no console
+    /// at all. `target: "journal"` keeps the player view isolable
+    /// (`RUST_LOG=journal=info`) while a single file interleaves technical and
+    /// player events chronologically.
     pub fn emit(&self, lines: &[String]) {
         self.push(lines);
         for line in lines {
+            tracing::info!(target: "journal", line, "journal");
+            // The windowed build's stdout is an inert sink; only the console
+            // build has a reader.
+            #[cfg(not(feature = "gui"))]
             println!("{line}");
         }
     }
@@ -59,7 +70,14 @@ impl EventLog {
             return;
         }
         let at_ms = self.now_ms();
-        let mut entries = self.entries.lock().expect("journal mutex poisoned");
+        // Poison-tolerant like `entries`: `emit` is called from the session
+        // loop, the actuator executor and the watchdog, so panicking here
+        // after one poisoning would cascade across tasks and freeze the very
+        // history the GUI is meant to still show.
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for text in lines {
             entries.push_back(LogLine {
                 at_ms,

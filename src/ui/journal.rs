@@ -48,14 +48,17 @@ pub(super) fn render_journal_header(
     let response = ui.interact(hit, ui.id().with("journal_toggle"), egui::Sense::click());
 
     // The peek rides in the accessible name too, so assistive tooling (and the
-    // tests) read the latest line, not just "Journal".
+    // tests) read the latest line, not just "Journal". Built inside the closure
+    // — egui only calls it when AccessKit is live, a harness is reading, or the
+    // bar was just clicked; outside, the `format!` would be paid every frame.
     let enabled = ui.is_enabled();
-    let name = match (open, latest) {
-        (false, Some(latest)) => format!("Journal · {latest}"),
-        _ => "Journal".to_owned(),
-    };
-    response
-        .widget_info(move || egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &name));
+    response.widget_info(|| {
+        let name = match (open, latest) {
+            (false, Some(latest)) => format!("Journal · {latest}"),
+            _ => "Journal".to_owned(),
+        };
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &name)
+    });
 
     let hovered = response.hovered();
     let tint = if hovered {

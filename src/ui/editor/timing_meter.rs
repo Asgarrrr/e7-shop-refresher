@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use super::super::theme;
-use crate::actuator::plan::DelayRange;
+use crate::actuator::plan::{self, DelayRange};
 
 /// Names the two segments of every meter so the bars read at a glance: a muted
 /// swatch for the fixed tuned wait, a bright one for the random extra.
@@ -31,7 +31,25 @@ fn legend_swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
 /// baseline with room to drag real slack on top. The width is the row's — the
 /// bars fill to the content edge, aligned under a fixed label column.
 const METER_H: f32 = 22.0;
-const RULER_MS: f32 = 2_500.0;
+/// The ruler's length, kept in ms so the baselines can be checked against it at
+/// compile time; the float twin is the only value the painting math uses.
+const RULER_MS_U64: u64 = 2_500;
+const RULER_MS: f32 = RULER_MS_U64 as f32;
+
+// Tripwires for the ruler's invariant: every tuned baseline `fine_tune_body`
+// paints fits under it. The slack math subtracts the baseline from the ruler, so
+// a constant grown past it (a game patch lengthening an animation) leaves an
+// empty bar with its grip pinned at zero — and, without the total clamp in
+// `slack_from_target`, an `f32::clamp` panic inside an egui interaction, taking
+// the whole window down. Raise `RULER_MS_U64` when one of these is retuned.
+const _: () = assert!(plan::WAIT_SHOP_OPENED_MS <= RULER_MS_U64);
+const _: () = assert!(plan::WAIT_REFRESHED_MS <= RULER_MS_U64);
+const _: () = assert!(plan::WAIT_CONFIRM_REFRESH_MODAL_MS <= RULER_MS_U64);
+const _: () = assert!(plan::WAIT_BUY_MODAL_MS <= RULER_MS_U64);
+const _: () = assert!(plan::WAIT_BETWEEN_BUYS_MS <= RULER_MS_U64);
+const _: () = assert!(plan::WAIT_SCROLL_SETTLE_MS <= RULER_MS_U64);
+const _: () = assert!(plan::WAIT_PURCHASE_RESUMED_MS <= RULER_MS_U64);
+const _: () = assert!(plan::WAIT_RECOVERY_MS <= RULER_MS_U64);
 /// The label column: wide enough for the longest action name ("watchdog
 /// re-issue") so every bar starts at the same x. Painted in an exact-size box so
 /// a long label can never grow the column and shove its bar out of alignment.
@@ -98,9 +116,7 @@ fn timing_meter(ui: &mut egui::Ui, width: f32, baseline: u64, value: &mut DelayR
     // (never negative, never past the ruler's end).
     if let Some(pos) = response.interact_pointer_pos() {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        let target_ms = frac * RULER_MS;
-        let slack = (target_ms - baseline as f32).clamp(0.0, RULER_MS - baseline as f32);
-        value.max_ms = slack.round() as u64;
+        value.max_ms = slack_from_target(frac * RULER_MS, baseline);
         // Keep the invariant a config floor could otherwise break: min never
         // exceeds the max the player just set.
         value.min_ms = value.min_ms.min(value.max_ms);
@@ -112,7 +128,11 @@ fn timing_meter(ui: &mut egui::Ui, width: f32, baseline: u64, value: &mut DelayR
     let painter = ui.painter().clone();
     let radius = egui::CornerRadius::same(4);
     painter.rect_filled(rect, radius, theme::HAIRLINE);
-    let total = baseline + value.max_ms.max(value.min_ms);
+    // Saturating: `[actuator.timings]` is not validated at load, and the engine
+    // deliberately supports a `max_ms` up to `u64::MAX` (`DelayRange::draw`
+    // saturates too). A plain `+` here would panic in debug and, worse, wrap
+    // silently in release — painting a full-ruler wait as a 0.3% sliver.
+    let total = baseline.saturating_add(value.max_ms.max(value.min_ms));
     let base_w = rect.width() * (baseline as f32 / RULER_MS);
     let total_w = rect.width() * (total as f32 / RULER_MS);
     painter.rect_filled(
@@ -154,12 +174,27 @@ fn timing_meter(ui: &mut egui::Ui, width: f32, baseline: u64, value: &mut DelayR
     );
 }
 
+/// The random extra a pointer landing at `target_ms` on the ruler sets: whatever
+/// sits past the fixed baseline, never negative and never past the ruler's end.
+///
+/// The upper bound is floored at zero on purpose. `f32::clamp` asserts
+/// `min <= max`, so `RULER_MS - baseline` alone panics the moment a tuned
+/// baseline grows past the ruler — inside an egui interaction, i.e. the whole
+/// window. The const asserts above make that unreachable today; this keeps the
+/// clamp total anyway, since the two guards protect different edits.
+fn slack_from_target(target_ms: f32, baseline: u64) -> u64 {
+    let headroom = (RULER_MS - baseline as f32).max(0.0);
+    (target_ms - baseline as f32).clamp(0.0, headroom).round() as u64
+}
+
 /// The resolved wait the game will actually take: `baseline + min` to
 /// `baseline + max`, in seconds. A point range (no slack, or a reversed one)
 /// collapses to a single figure, matching the draw.
 fn resolved_band(baseline: u64, value: &DelayRange) -> String {
-    let lo = baseline + value.min_ms;
-    let hi = baseline + value.max_ms.max(value.min_ms);
+    // Saturating for the same reason as the bar's `total`: an unvalidated
+    // config can seed a `u64::MAX` wait, which the engine honours.
+    let lo = baseline.saturating_add(value.min_ms);
+    let hi = baseline.saturating_add(value.max_ms.max(value.min_ms));
     secs_range(lo, hi)
 }
 
@@ -175,5 +210,42 @@ pub(super) fn secs_range(lo_ms: u64, hi_ms: u64) -> String {
             lo_ms as f64 / 1000.0,
             hi_ms as f64 / 1000.0
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_band_saturates_on_an_unvalidated_max() {
+        // `[actuator.timings]` is not validated at load and the engine honours
+        // a full-range wait, so the display must saturate, not overflow.
+        let value = DelayRange {
+            min_ms: 0,
+            max_ms: u64::MAX,
+        };
+        assert_eq!(
+            resolved_band(plan::WAIT_SHOP_OPENED_MS, &value),
+            secs_range(plan::WAIT_SHOP_OPENED_MS, u64::MAX)
+        );
+    }
+
+    #[test]
+    fn slack_is_clamped_even_when_the_baseline_outgrows_the_ruler() {
+        // Today's baselines all fit (the const asserts prove it), but a retuned
+        // constant past the ruler must yield no slack rather than panic in
+        // `f32::clamp` — which would take the window down mid-interaction.
+        assert_eq!(slack_from_target(RULER_MS, RULER_MS_U64 * 2), 0);
+        assert_eq!(slack_from_target(0.0, RULER_MS_U64 * 2), 0);
+    }
+
+    #[test]
+    fn slack_is_the_wait_past_the_baseline() {
+        assert_eq!(slack_from_target(1_000.0, 400), 600);
+        // Left of the baseline: no negative slack.
+        assert_eq!(slack_from_target(100.0, 400), 0);
+        // Past the ruler's end: capped at the remaining headroom.
+        assert_eq!(slack_from_target(RULER_MS * 2.0, 400), RULER_MS_U64 - 400);
     }
 }

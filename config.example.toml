@@ -1,7 +1,9 @@
 # Copy to `config.toml` and adjust. Every key has a default, but the relay
 # refuses to start without at least one [filter] criterion.
 
-# Epic Seven game server TCP port.
+# Epic Seven game server TCP port. Capture is passive throughout: the driver
+# hands the tool a copy of each matching packet and the original travels on
+# untouched. No client port and no proxy setting are needed.
 game_port = 3333
 
 # Analysis server. Defaults to the hosted server over wss:// (TLS). A plain
@@ -16,14 +18,19 @@ server_to_client = true
 client_to_server = false
 
 [reconnect]
+# Values below 100 ms are raised to 100 ms. A max_ms below the effective
+# initial delay is raised to that initial delay.
 initial_ms = 1000
 max_ms = 30000
 
 [capture]
-# Receive buffer per packet; values below 65575 (the WinDivert maximum,
-# reached by coalesced receives) are raised to it.
+# Receive buffer per packet; values below 65575 (the WinDivert maximum, reached
+# by coalesced receives) are raised to it.
 buffer_size = 65575
-# filter = "tcp and tcp.SrcPort == 3333"   # manual WinDivert filter override
+# Manual WinDivert filter override. Replaces the expression derived from
+# game_port + [forward]; it must still mention game_port, since that is the port
+# every direction check is made against. WinDivert filter syntax.
+# filter = "tcp and tcp.SrcPort == 3333"
 
 [filter]
 # Player interest criteria, all ANDed. At least one criterion is required:
@@ -66,7 +73,9 @@ names = ["ticketrare_name", "ticketspecial_name"]
 # swallowed for those few seconds. A game window moved or closed mid-job
 # halts the loop (journaled). "input" drives the real cursor instead (steals
 # focus and mouse) — the fallback if a game update stops honoring posted
-# clicks.
+# clicks. Before each mouse event it revalidates the acquired window and may
+# refocus it; if its identity, rectangle, or focus cannot be verified, the job
+# aborts or the loop stops without injecting that event.
 # backend = "message"
 
 # [actuator.timings]
@@ -76,11 +85,14 @@ names = ["ticketrare_name", "ticketspecial_name"]
 # time. The baselines are calibrated to the game's blocking animations and are
 # the floor: a range only ever slows the loop down, never clicks earlier.
 # Every range defaults to { min_ms = 0, max_ms = 0 } (the fixed calibrated
-# timing, no randomness). min == max is a fixed extra. The same knobs live in
-# the window's Setup tab (Click timings), applied live without editing this
-# file. Baselines, in ms: shop_opened 1180, refreshed 780, purchase_resumed
-# 400, recovery 400, confirm_refresh_modal 270, buy_modal 150, between_buys
-# 600, scroll_settle 100.
+# timing, no randomness). min == max is a fixed extra. min_ms above max_ms is
+# refused at startup rather than quietly read as a fixed min_ms delay, and
+# max_ms is capped at 60000 (one minute) — well past any human-looking pause,
+# and short of the values that stall the loop between two clicks. The same
+# knobs live in the window's Setup tab (Click timings), applied live without
+# editing this file. Baselines, in ms: shop_opened 1180, refreshed 780,
+# purchase_resumed 400, recovery 400, confirm_refresh_modal 270, buy_modal 150,
+# between_buys 600, scroll_settle 100.
 # refreshed = { min_ms = 200, max_ms = 800 }         # after a paid refresh
 # between_buys = { min_ms = 150, max_ms = 500 }       # between two buys
 # shop_opened = { min_ms = 0, max_ms = 0 }

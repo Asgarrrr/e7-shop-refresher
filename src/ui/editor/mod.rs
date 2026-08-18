@@ -66,6 +66,23 @@ impl EditorState {
             fine_tune_open: false,
         }
     }
+
+    /// Re-seeds the applied twins from the commands the session *actually*
+    /// took. This is the only writer of the twins: [`commit_row`] emits, the
+    /// shell delivers, and a draft counts as applied only once its command
+    /// cleared the bounded queue. The value is read back out of the command
+    /// rather than off the draft, so the twin can only ever record what was
+    /// handed over. Non-`Set*` commands (Start/Stop) are none of its business.
+    pub(super) fn mark_applied(&mut self, delivered: &[Command]) {
+        for command in delivered {
+            match command {
+                Command::SetFilter(filter) => self.applied_filter = filter.clone(),
+                Command::SetLimits(limits) => self.applied_limits = limits.clone(),
+                Command::SetTimings(timings) => self.applied_timings = *timings,
+                Command::Start | Command::Stop | Command::Toggle => {}
+            }
+        }
+    }
 }
 
 /// The whole Setup surface in one pass: the three sections over the Apply
@@ -208,14 +225,13 @@ fn count_label(n: usize, singular: &str, plural: &str) -> String {
 /// thing the player sets.
 fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     ui.horizontal(|ui| {
-        // Unknown included: a config-seeded criterion must always be visible
-        // and clearable.
-        for kind in [
-            ItemKind::Equipment,
-            ItemKind::Hero,
-            ItemKind::Token,
-            ItemKind::Unknown,
-        ] {
+        // `ItemKind::Unknown` has no box on purpose. `Config::validate` rejects
+        // "unknown" in `[filter] kinds`, so no config can seed it — the box had
+        // exactly one net effect: ticking it wrote a `kinds = ["unknown"]` the
+        // next launch refuses to load, and the load failure is fatal (error
+        // window, no main window). The only way out was hand-editing the very
+        // file the player is not expected to hand-edit.
+        for kind in [ItemKind::Equipment, ItemKind::Hero, ItemKind::Token] {
             let mut on = editor.filter.kinds.contains(&kind);
             if ui.checkbox(&mut on, kind_label(kind)).changed() {
                 if on {
@@ -284,23 +300,132 @@ fn quick_add_names(ui: &mut egui::Ui, names: &mut Vec<String>) {
     });
 }
 
-/// Stop: the run's safety rails. A uniform numeric block, so it lays in a grid
-/// — the checkboxes and their values line up in two columns instead of drifting
-/// with each label's width.
+/// Stop: the run's safety rails, laid as a quiet ledger — a small squared
+/// checkbox, the unit read down the left column, and the cap aligned in a right
+/// column, the way a system-settings pane lists its toggles. An armed rail's
+/// checkbox fills the app's blue (`theme::accent_checkbox`), the only active
+/// color here; its number is a borderless drag field so the value column stays a
+/// clean column of figures, not a row of heavy pills. An unset rail reads a faint
+/// "none". Rows keep the panel's 8px rhythm so the block breathes.
 fn stop_body(ui: &mut egui::Ui, editor: &mut EditorState) {
-    egui::Grid::new("stop-limits")
-        .num_columns(2)
-        .spacing([theme::SP_SM, theme::SP_XS])
-        .show(ui, |ui| {
-            optional_value(ui, "max refreshes", &mut editor.limits.max_refreshes, 10);
-            ui.end_row();
-            optional_value(ui, "max spend (crystals)", &mut editor.limits.max_spend, 30);
-            ui.end_row();
-            optional_value(ui, "max matches", &mut editor.limits.max_matches, 5);
-            ui.end_row();
-            duration_minutes(ui, &mut editor.limits.max_duration_ms);
-            ui.end_row();
-        });
+    ui.weak("Stop the run at the first limit it reaches.");
+    ui.add_space(theme::SP_SM);
+    limit_row(ui, "refreshes", &mut editor.limits.max_refreshes, 10);
+    limit_row(ui, "crystals spent", &mut editor.limits.max_spend, 30);
+    limit_row(ui, "matches", &mut editor.limits.max_matches, 5);
+    duration_row(ui, &mut editor.limits.max_duration_ms);
+}
+
+/// One ledger row: `☑ unit …… value`. The checkbox arms the cap, the unit sits
+/// in the left column, and the value is pushed flush-right so every cap lines up
+/// in its own column. Mirrors [`optional_value`]'s semantics — unchecked means
+/// "no constraint", a freshly checked box seeds a non-zero value, and
+/// `clamp_existing_to_range(false)` keeps a config-seeded `0` from being silently
+/// rewritten to `1`.
+fn limit_row<T: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    unit: &str,
+    value: &mut Option<T>,
+    seed: T,
+) {
+    limit_ledger_row(ui, unit, value.is_some(), |on, ui| {
+        if on {
+            value.get_or_insert(seed);
+        } else {
+            *value = None;
+        }
+        if let Some(v) = value {
+            compact_drag(ui, |ui| {
+                ui.add(
+                    egui::DragValue::new(v)
+                        .range(T::from_f64(1.0)..=T::MAX)
+                        .clamp_existing_to_range(false),
+                )
+            });
+        } else {
+            ui.colored_label(theme::INK_FAINT, "none");
+        }
+    });
+}
+
+/// The duration rail, edited in whole minutes (stored as ms) — a [`limit_row`]
+/// twin kept apart for its minute↔ms conversion, exactly as `optional_value`
+/// and the old `duration_minutes` were split before.
+fn duration_row(ui: &mut egui::Ui, value: &mut Option<u64>) {
+    limit_ledger_row(ui, "minutes", value.is_some(), |on, ui| {
+        if on {
+            value.get_or_insert(60 * 60_000);
+        } else {
+            *value = None;
+        }
+        if let Some(ms) = value {
+            // Ceil so a sub-minute config value never reads as 0; edits are whole
+            // minutes and only rewrite the stored ms on a real drag.
+            let mut minutes = ms.div_ceil(60_000);
+            compact_drag(ui, |ui| {
+                let r = ui.add(egui::DragValue::new(&mut minutes).range(1..=u64::MAX / 60_000));
+                if r.changed() {
+                    *ms = minutes.saturating_mul(60_000);
+                }
+                r
+            });
+        } else {
+            ui.colored_label(theme::INK_FAINT, "none");
+        }
+    });
+}
+
+/// The shared ledger-row chrome: the arming checkbox and unit label on the left,
+/// then the caller's value flush-right in its own column. `armed` seeds the
+/// checkbox and the unit's ink (muted when live, faint when off); `value` paints
+/// the right column after the toggle has been resolved. Splitting the chrome out
+/// keeps the two rail kinds (numeric / duration) down to just their value widget.
+fn limit_ledger_row(
+    ui: &mut egui::Ui,
+    unit: &str,
+    armed: bool,
+    value: impl FnOnce(bool, &mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        let mut on = armed;
+        theme::accent_checkbox(ui, &mut on);
+        let color = if on {
+            theme::INK_MUTED
+        } else {
+            theme::INK_FAINT
+        };
+        // Fixed-width label cell so the value column starts at the same x on every
+        // row (aligned like a ledger) without flushing to the far edge — which
+        // opened a dead gap between label and value.
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(130.0, 20.0), egui::Sense::hover());
+        ui.painter().with_clip_rect(rect).text(
+            egui::pos2(rect.left(), rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            unit,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+            color,
+        );
+        value(on, ui);
+    });
+}
+
+/// A compact drag field for the ledger's value column: the default filled box —
+/// so it still reads plainly as an editable input — but with tightened padding
+/// and a 3px corner, so each value sits as a small chip instead of the bulky
+/// default pill that would dominate the column.
+fn compact_drag(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> egui::Response) {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
+        let widgets = &mut ui.style_mut().visuals.widgets;
+        for state in [
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+        ] {
+            state.corner_radius = egui::CornerRadius::same(3);
+        }
+        add(ui);
+    });
 }
 
 /// Click timing: each click waits a fixed tuned delay, plus a random extra the
@@ -405,7 +530,13 @@ fn pass_estimate(t: &Timings) -> String {
         t.purchase_resumed,
     ];
     let base_total: u64 = ROUTINE.iter().sum();
-    let hi_total: u64 = base_total + slack.iter().map(|r| r.max_ms.max(r.min_ms)).sum::<u64>();
+    // Folded with `saturating_add` rather than summed then added: the slack
+    // comes from an unvalidated `[actuator.timings]` where a `u64::MAX` wait is
+    // a supported engine value, so a plain `sum::<u64>()` overflows on its own.
+    let hi_total: u64 = slack
+        .iter()
+        .map(|r| r.max_ms.max(r.min_ms))
+        .fold(base_total, u64::saturating_add);
     secs_range(base_total, hi_total)
 }
 
@@ -470,8 +601,12 @@ const ROUTINE: [u64; 4] = [
     plan::WAIT_PURCHASE_RESUMED_MS,
 ];
 
-/// The single commit: one primary Apply that sends every draft that moved and
-/// re-seeds its applied twin. Disabled until something changed — and, when the
+/// The single commit: one primary Apply that emits every draft that moved. The
+/// applied twins are *not* touched here — the shell re-seeds them through
+/// [`EditorState::mark_applied`] for the commands the session actually took, so
+/// a click lost to a saturated queue leaves Apply lit and the peek standing
+/// instead of claiming a setting nobody received. Disabled until something
+/// changed — and, when the
 /// filter is the change, until it is restricted enough to arm (an unrestricted
 /// filter the loop would refuse never reaches the session). Timing/limit-only
 /// edits apply even while the filter sits unrestricted, since the domain only
@@ -510,17 +645,18 @@ pub(super) fn commit_row(
                 .inner
                 .clicked();
             if clicked {
+                // Only *emit* here. The applied twins are re-seeded by
+                // [`EditorState::mark_applied`], once the shell knows the
+                // session actually took the command — marking them here lit
+                // "applied" for a click the bounded queue may have dropped.
                 if dirty_filter {
                     commands.push(Command::SetFilter(editor.filter.clone()));
-                    editor.applied_filter = editor.filter.clone();
                 }
                 if dirty_limits {
                     commands.push(Command::SetLimits(editor.limits.clone()));
-                    editor.applied_limits = editor.limits.clone();
                 }
                 if dirty_timings {
                     commands.push(Command::SetTimings(editor.timings));
-                    editor.applied_timings = editor.timings;
                 }
             }
         });
@@ -649,28 +785,6 @@ fn optional_value<T: egui::emath::Numeric>(
     }
 }
 
-/// The duration limit, edited in whole minutes (stored as ms). A grid row like
-/// `optional_value`, kept apart for its minute↔ms conversion.
-fn duration_minutes(ui: &mut egui::Ui, value: &mut Option<u64>) {
-    let mut on = value.is_some();
-    ui.checkbox(&mut on, "max duration (minutes)");
-    if on {
-        let ms = value.get_or_insert(60 * 60_000);
-        // Ceil so a sub-minute config value never reads as 0; edits are whole
-        // minutes (the player-facing unit) and only rewrite the stored value
-        // when the player actually drags.
-        let mut minutes = ms.div_ceil(60_000);
-        if ui
-            .add(egui::DragValue::new(&mut minutes).range(1..=u64::MAX / 60_000))
-            .changed()
-        {
-            *ms = minutes.saturating_mul(60_000);
-        }
-    } else {
-        *value = None;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -713,6 +827,34 @@ mod tests {
             run_setup(&mut editor),
             vec![Command::SetFilter(named_filter())]
         );
+    }
+
+    #[test]
+    fn apply_leaves_the_draft_dirty_until_the_shell_confirms() {
+        // `commit_row` only emits. The applied twins move on `mark_applied`,
+        // which the shell calls with the commands the session actually took —
+        // so a click the bounded queue dropped keeps Apply lit and the peek
+        // standing instead of claiming a setting nobody received.
+        let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
+        editor.filter = named_filter();
+        let commands = run_setup(&mut editor);
+        assert_eq!(commands, vec![Command::SetFilter(named_filter())]);
+        assert_ne!(editor.filter, editor.applied_filter);
+
+        editor.mark_applied(&commands);
+        assert_eq!(editor.filter, editor.applied_filter);
+        // Now that it landed, Apply goes dark and sends nothing more.
+        assert!(run_setup(&mut editor).is_empty());
+    }
+
+    #[test]
+    fn mark_applied_ignores_the_status_bar_commands() {
+        // Start/Stop/Toggle ride the same dispatch list as the Setup commits;
+        // they carry no draft and must never re-seed one.
+        let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
+        editor.filter = named_filter();
+        editor.mark_applied(&[Command::Start, Command::Stop, Command::Toggle]);
+        assert_ne!(editor.filter, editor.applied_filter);
     }
 
     #[test]
@@ -814,6 +956,44 @@ mod tests {
     }
 
     #[test]
+    fn pass_estimate_saturates_on_an_unvalidated_timing() {
+        // `Config::validate` never inspects `[actuator.timings]`, and the
+        // engine deliberately supports a full-range wait (`DelayRange::draw`
+        // saturates), so the summary must not overflow on the way to the label.
+        let full = DelayRange {
+            min_ms: 0,
+            max_ms: u64::MAX,
+        };
+        let timings = Timings {
+            refreshed: full,
+            buy_modal: full,
+            ..Timings::default()
+        };
+        let base: u64 = ROUTINE.iter().sum();
+        assert_eq!(pass_estimate(&timings), secs_range(base, u64::MAX));
+    }
+
+    #[test]
+    fn hunt_kinds_exclude_the_unknown_bucket() {
+        // Ticking "?" wrote `kinds = ["unknown"]`, which `Config::validate`
+        // rejects on the next launch — a fatal, GUI-less load failure only a
+        // hand-edit of config.toml could undo. The box is gone; the three real
+        // kinds stay.
+        let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
+        let harness = Harness::new_ui(|ui| {
+            edit_setup(ui, &mut editor);
+        });
+        for kind in [ItemKind::Equipment, ItemKind::Hero, ItemKind::Token] {
+            harness.get_by_label(kind_label(kind));
+        }
+        assert!(
+            harness
+                .query_by_label(kind_label(ItemKind::Unknown))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn mode_hint_varies_with_the_active_mode() {
         // Each mode gets its own line; Custom wins over the detected preset so
         // the hint tracks the segment lit in the control.
@@ -907,6 +1087,41 @@ mod tests {
         };
         // The filter is unchanged from its applied twin, so only the limit ships.
         assert_eq!(run_setup(&mut editor), vec![Command::SetLimits(expected)]);
+    }
+
+    #[test]
+    #[ignore = "renders the Setup sections to a PNG for visual iteration; run with --ignored"]
+    fn render_stop_section_png() {
+        let limits = Limits {
+            max_refreshes: Some(49),
+            max_spend: Some(30),
+            ..Limits::default()
+        };
+        let mut editor = EditorState::new(named_filter(), limits, Timings::default());
+        editor.hunt_open = false;
+        editor.stop_open = true;
+        editor.timing_open = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(430.0, 240.0))
+            .with_pixels_per_point(2.0)
+            .wgpu()
+            .build_ui(move |ui| {
+                theme::apply(ui.ctx());
+                let bg = ui.visuals().panel_fill;
+                ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, bg);
+                edit_sections(ui, &mut editor);
+            });
+        harness.run();
+        let image = harness.render().expect("wgpu render");
+        // Set ARKYVE_RENDER_DIR to collect the frames somewhere durable; the
+        // temp directory keeps this runnable for any developer. (`ARKYVE_`, like
+        // every other name the product owns — the old `SHOP_WATCHER_` prefix was
+        // a leftover of the repository name.)
+        let path = std::env::var_os("ARKYVE_RENDER_DIR")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
+            .join("stop.png");
+        image.save(&path).expect("save png");
+        eprintln!("rendered {}", path.display());
     }
 
     #[test]

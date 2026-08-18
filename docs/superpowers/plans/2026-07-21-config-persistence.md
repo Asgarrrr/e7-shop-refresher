@@ -562,7 +562,7 @@ Note: `toml_edit` is used only inside `src/config/persist.rs`, which is compiled
 - [ ] **Step 3: Tests**
 
 Run: `cargo test --no-default-features --features gui`
-Expected: PASS. (The default-feature lanes need Windows/WinDivert and are validated on the game machine per the project's split; the persist logic is platform-independent and fully covered by the gui lane.)
+Expected: PASS. (The default-feature lanes need the native Windows capture backend and are validated on the game machine per the project's split; the persist logic is platform-independent and fully covered by the gui lane.)
 
 - [ ] **Step 4: Manual smoke (mac dev path)**
 

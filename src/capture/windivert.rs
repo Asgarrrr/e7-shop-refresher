@@ -7,10 +7,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tracing::warn;
+use tracing::{debug, info, warn};
 use windivert::prelude::*;
 
-use super::{PacketSource, Segment, parse_segment};
+use super::{CaptureSource, CaptureStop, Direction, PacketSource, Segment, parse_segment};
 use crate::error::{Error, Result};
 
 /// User-mode WinDivert library, embedded in the executable and extracted into
@@ -48,16 +48,84 @@ const LICENSE_FILE: &str = "WinDivert-LICENSE.txt";
 /// buffer makes `recv` fail on the first bulk transfer.
 const MAX_PACKET_BYTES: usize = 65_575;
 
+/// How many delivered packets between two funnel lines. Every captured packet
+/// passes through here, so this is emitted periodically rather than per packet
+/// — plus once on the very first packet, so a capture that is about to reject
+/// everything says so immediately instead of after five hundred packets.
+const FUNNEL_LOG_EVERY: u64 = 500;
+
+/// Where delivered packets go to die.
+///
+/// The abandoned NIC-level capture attempt was diagnosed in minutes because
+/// every discard path was counted; this is the same instrument, sized to
+/// WinDivert's much shorter
+/// path. Only two things can drop a packet here — the driver refusing an
+/// oversized one, and the IP/TCP parser returning `None` — and each is
+/// individually plausible as the reason a healthy-looking session yields
+/// nothing. `delivered` staying at zero is itself the headline result: the
+/// filter matched no traffic at all.
+#[derive(Default)]
+struct Funnel {
+    delivered: u64,
+    oversized: u64,
+    unparsed: u64,
+    admitted: u64,
+    server_to_client: u64,
+}
+
+impl Funnel {
+    /// Emits the funnel on the first delivered packet, then once per
+    /// `FUNNEL_LOG_EVERY`. Called on every path out of the loop body, including
+    /// the admitted one, so the periodic line is anchored on packets delivered
+    /// rather than on packets discarded.
+    fn report(&self) {
+        if self.delivered != 1 && !self.delivered.is_multiple_of(FUNNEL_LOG_EVERY) {
+            return;
+        }
+        debug!(
+            delivered = self.delivered,
+            admitted = self.admitted,
+            server_to_client = self.server_to_client,
+            oversized = self.oversized,
+            unparsed = self.unparsed,
+            "WinDivert capture funnel"
+        );
+    }
+}
+
 pub struct WinDivertSource {
     handle: WinDivert<NetworkLayer>,
     buffer: Vec<u8>,
     game_port: u16,
+    funnel: Funnel,
+}
+
+/// Remote wake for a [`WinDivertSource`] parked in `recv`.
+///
+/// `WinDivertShutdown` is the library's own teardown primitive: it stops the
+/// driver queueing new packets onto the handle and releases the blocked
+/// `recv`, which then drains whatever is already queued and finally reports
+/// `NoData`. It never closes the handle — the capture thread still owns it —
+/// so there is no race between this and an in-flight receive. Idempotent by
+/// construction: a second shutdown on an already-shut handle is a no-op, and
+/// once the source has been dropped the `Weak` fails to upgrade and this is a
+/// silent success.
+struct WinDivertStop {
+    shutdown: ShutdownHandle,
+}
+
+impl CaptureStop for WinDivertStop {
+    fn stop(&mut self) -> Result<()> {
+        self.shutdown
+            .shutdown()
+            .map_err(|err| Error::Capture(format!("WinDivert shutdown: {err}")))
+    }
 }
 
 impl WinDivertSource {
-    /// Opens a read-only network handle for `filter`. Requires administrator
-    /// rights (driver load).
-    pub fn open(filter: &str, game_port: u16, buffer_size: usize) -> Result<Self> {
+    /// Opens a strictly passive network handle for `filter`. Requires
+    /// administrator rights (driver load).
+    pub(crate) fn open(filter: &str, game_port: u16, buffer_size: usize) -> Result<CaptureSource> {
         ensure_runtime_present()?;
         // The DLL loads WinDivert64.sys from the runtime dir during the call below.
         // Re-verify the driver bytes here, mirroring preload_dll's DLL guard, so a
@@ -68,16 +136,52 @@ impl WinDivertSource {
             "WinDivert64.sys",
         )?;
 
+        // The two flags that make this a tap rather than a man-in-the-middle,
+        // and the least invasive mode WinDivert offers:
+        //
+        // - `SNIFF` (`WINDIVERT_FLAG_SNIFF`): the driver hands us a *copy* of
+        //   each matching packet and lets the original continue to its
+        //   destination untouched. Without it, WinDivert *diverts*: the packet
+        //   is removed from the stack and the game's connection stalls until
+        //   we reinject it.
+        // - `RECV_ONLY` (`WINDIVERT_FLAG_RECV_ONLY`): the handle is incapable
+        //   of sending. `WinDivertSend` on it fails, so no code path — present
+        //   or added later — can inject or modify a packet.
+        //
+        // Together they are what backs the README's promise that the game's
+        // traffic is never altered: capture is read-only, out-of-band, and
+        // invisible to both endpoints. Do not add `set_drop`, remove
+        // `set_sniff`, or drop `set_recv_only` without re-reading that promise.
         let flags = WinDivertFlags::new().set_sniff().set_recv_only();
+        // Priority 0: with SNIFF there is no packet ordering to contend for,
+        // so no reason to outrank any other WinDivert consumer on the machine.
         let handle = WinDivert::network(filter, 0, flags)
             .map_err(|err| Error::Capture(format!("WinDivert open: {err}")))?;
-        Ok(Self {
-            handle,
-            // Floor at the driver's own maximum: a smaller buffer turns the
-            // first oversized packet into a recv error.
-            buffer: vec![0u8; buffer_size.max(MAX_PACKET_BYTES)],
+        let stop = WinDivertStop {
+            shutdown: handle.shutdown_handle(),
+        };
+        // Floor at the driver's own maximum: a smaller buffer turns the first
+        // oversized packet into a recv error.
+        let buffer_bytes = buffer_size.max(MAX_PACKET_BYTES);
+        // The *effective* filter, after the config-level override and the
+        // buffer floor have been applied — the single fact that explains an
+        // empty capture, and the one no other log line carries.
+        info!(
+            filter,
             game_port,
-        })
+            buffer_bytes,
+            mode = "sniff+recv_only",
+            "WinDivert capture open (passive copy; originals untouched)"
+        );
+        Ok(CaptureSource::new(
+            Self {
+                handle,
+                buffer: vec![0u8; buffer_bytes],
+                game_port,
+                funnel: Funnel::default(),
+            },
+            stop,
+        ))
     }
 }
 
@@ -90,32 +194,73 @@ impl PacketSource for WinDivertSource {
                 // leaves a reassembly gap, while propagating would kill the
                 // capture for the rest of the session.
                 Err(WinDivertError::Recv(WinDivertRecvError::InsufficientBuffer)) => {
+                    self.funnel.delivered += 1;
+                    self.funnel.oversized += 1;
+                    self.funnel.report();
                     warn!("packet larger than the capture buffer — skipped");
                     continue;
                 }
                 Err(err) => return Err(Error::Capture(format!("recv: {err}"))),
             };
+            self.funnel.delivered += 1;
 
-            if let Some(segment) = parse_segment(&packet.data[..], self.game_port) {
-                return Ok(segment);
+            // WinDivert's network layer delivers whole IP packets, so there is
+            // no link-layer framing to decode and nothing about the adapter
+            // (Ethernet, WiFi, VPN) reaches this parser.
+            let Some(segment) = parse_segment(&packet.data[..], self.game_port) else {
+                self.funnel.unparsed += 1;
+                self.funnel.report();
+                continue;
+            };
+
+            self.funnel.admitted += 1;
+            if segment.direction == Direction::ServerToClient {
+                self.funnel.server_to_client += 1;
+                if self.funnel.server_to_client == 1 {
+                    // The shop response travels in this direction only, so this
+                    // line is the proof that the filter, the port and the
+                    // driver all agree. Its *absence* in a session log means
+                    // capture is open but sees nothing from the game server.
+                    info!(
+                        payload = segment.payload.len(),
+                        syn = segment.syn,
+                        server = %segment.flow.server,
+                        client = %segment.flow.client,
+                        "first server-to-client segment admitted"
+                    );
+                }
             }
+            self.funnel.report();
+            return Ok(segment);
         }
     }
 }
 
-/// Materializes the embedded runtime into a private app-data directory and
+/// Materializes the embedded runtime into a private app-data *subdirectory* and
 /// makes it loadable, so a single shipped exe is a complete install and nothing
 /// lands beside the exe (the Desktop stays clean). Steps, in order:
-///  1. extract `WinDivert.dll` and `WinDivert64.sys` into the runtime dir;
-///  2. `LoadLibrary` the DLL by full path, so the *delay-loaded* import binds to
+///  1. migrate a pre-`runtime\` install off the app-data root (best-effort);
+///  2. extract `WinDivert.dll` and `WinDivert64.sys` into the runtime dir;
+///  3. `LoadLibrary` the DLL by full path, so the *delay-loaded* import binds to
 ///     this copy — the runtime dir is not on the default search path, and the
 ///     import must resolve before the first WinDivert call in `open`.
 ///
 /// WinDivert then loads the driver from the DLL's own directory (the runtime
 /// dir), where the `.sys` was just written. The `.sys` cannot be avoided:
 /// Windows loads a kernel driver only from a file on disk, never from memory.
+///
+/// The runtime lives one level below `%LOCALAPPDATA%\arkyve-refresh-shop`
+/// precisely so that [`harden_runtime_dir`]'s admins-only DACL — which
+/// `SetNamedSecurityInfoW` propagates down into every child holding an
+/// auto-inherited DACL — cannot reach `logs\` or `crash.log`, which sit at the
+/// root and must stay writable by an ordinary, non-elevated process.
 fn ensure_runtime_present() -> Result<()> {
     let dir = runtime_dir()?;
+    // Before creating anything: an install from a build that extracted into the
+    // app-data *root* left that root locked to admins/SYSTEM, and `logs\` /
+    // `crash.log` inherit from it. Undo that first so the new subdirectory is
+    // not created underneath a DACL that is about to be reset anyway.
+    migrate_legacy_runtime_root();
     fs::create_dir_all(&dir)
         .map_err(|err| Error::Capture(format!("runtime dir {}: {err}", dir.display())))?;
     // Best-effort defense-in-depth: restrict the directory to admins/SYSTEM so a
@@ -143,7 +288,10 @@ fn ensure_runtime_present() -> Result<()> {
 /// unaffected; it is defense-in-depth on top of `refuse_if_foreign`'s byte
 /// re-verify, not a replacement for it — callers must treat failure as
 /// non-fatal.
-#[cfg(all(windows, feature = "windivert-backend"))]
+///
+/// `dir` must be the runtime *subdirectory*, never the app-data root: the ACEs
+/// below are inheritable and `SetNamedSecurityInfoW` pushes them into every
+/// child with an auto-inherited DACL. See [`runtime_dir`].
 fn harden_runtime_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
@@ -238,19 +386,245 @@ fn harden_runtime_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Leaf component isolating the extracted runtime from everything else the app
+/// keeps under `%LOCALAPPDATA%\arkyve-refresh-shop` (`logs\`, `crash.log`).
+const RUNTIME_SUBDIR: &str = "runtime";
+
 /// Private per-user directory holding the extracted runtime binaries:
-/// `%LOCALAPPDATA%\arkyve-refresh-shop`. Local (not roaming) app-data is the
-/// right home for machine-specific binaries. Falls back to the exe's own
-/// directory if `LOCALAPPDATA` is somehow unset.
+/// `%LOCALAPPDATA%\arkyve-refresh-shop\runtime`. Local (not roaming) app-data is
+/// the right home for machine-specific binaries.
+///
+/// The `runtime` component is not cosmetic. [`harden_runtime_dir`] puts a
+/// protected admins/SYSTEM-only DACL on whatever this returns, and
+/// `SetNamedSecurityInfoW` propagates that downward into every child whose DACL
+/// is auto-inherited. Pointed at the app-data root it would therefore also lock
+/// `logs\` and `crash.log`, which a non-elevated process has to be able to
+/// write; the app would then lose its log file *silently* (`install_logging`
+/// falls back to an inert sink). One dedicated leaf keeps the blast radius to
+/// the two files that genuinely need it.
+///
+/// Falls back to a `runtime` subdirectory of the exe's own directory if
+/// `LOCALAPPDATA` is somehow unset — a subdirectory there too, and for the same
+/// reason: the hardening would otherwise land on whatever folder the exe was
+/// double-clicked from (a Desktop, a Downloads folder), making the user's own
+/// directory admins-only.
 fn runtime_dir() -> Result<PathBuf> {
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        return Ok(PathBuf::from(local).join(crate::APP_DIR));
+        return Ok(PathBuf::from(local)
+            .join(crate::APP_DIR)
+            .join(RUNTIME_SUBDIR));
     }
     let exe =
         std::env::current_exe().map_err(|err| Error::Capture(format!("executable path: {err}")))?;
     exe.parent()
-        .map(Path::to_path_buf)
+        .map(|dir| dir.join(RUNTIME_SUBDIR))
         .ok_or_else(|| Error::Capture("executable directory not found".to_owned()))
+}
+
+/// The app-data root a pre-`runtime\` build extracted into, and hardened.
+///
+/// `None` when `LOCALAPPDATA` is unset. The exe-directory fallback of
+/// [`runtime_dir`] is deliberately *not* migrated: undoing a DACL and deleting
+/// files in a folder the user chose (a Desktop, a shared network share) is a far
+/// more surprising action than leaving an exotic, effectively-unreachable
+/// configuration alone.
+fn legacy_runtime_root() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|local| PathBuf::from(local).join(crate::APP_DIR))
+}
+
+/// Files a pre-`runtime\` build dropped straight into the app-data root.
+const LEGACY_RUNTIME_FILES: [&str; 3] = [DLL_FILE, DRIVER_FILE, LICENSE_FILE];
+
+/// Undoes a pre-`runtime\` install: resets the app-data root to inherited
+/// permissions and deletes the runtime files stranded there.
+///
+/// Only the elevated side can do this. The old build ran wholly elevated, so the
+/// objects it created are owned by `Administrators`, not by the user — a
+/// medium-integrity process has neither `WRITE_DAC` nor delete rights on them.
+///
+/// Entirely best-effort: every failure logs and capture proceeds. The one thing
+/// worth noticing is the ordering — this runs long after `install_logging()` in
+/// the same launch, so the *first* post-upgrade run still writes its log into a
+/// directory it cannot open and loses it. The `info!` below is emitted so the
+/// second run's log file explains where the first one went.
+fn migrate_legacy_runtime_root() {
+    let Some(root) = legacy_runtime_root() else {
+        return;
+    };
+    if !root.is_dir() {
+        return;
+    }
+
+    let mut reset_dacl = false;
+    match dacl_is_protected(&root) {
+        // Not our doing, but nothing else ever protects this directory, and the
+        // only way out is to undo it: a protected DACL here is exactly the
+        // pre-`runtime\` layout's footprint.
+        Ok(true) => match reset_dacl_to_inherited(&root) {
+            Ok(()) => reset_dacl = true,
+            Err(err) => warn!(dir = %root.display(), error = %err,
+                "could not restore inherited permissions on the app-data root — \
+                 logs and crash.log may stay unwritable without administrator rights"),
+        },
+        Ok(false) => {}
+        Err(err) => warn!(dir = %root.display(), error = %err,
+            "could not read the app-data root permissions — skipping the runtime migration"),
+    }
+
+    let mut removed: Vec<&str> = Vec::new();
+    for name in LEGACY_RUNTIME_FILES {
+        let stale = root.join(name);
+        match fs::remove_file(&stale) {
+            Ok(()) => removed.push(name),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => warn!(path = %stale.display(), error = %err,
+                "could not delete a stale runtime file left at the app-data root"),
+        }
+    }
+
+    if reset_dacl || !removed.is_empty() {
+        info!(
+            root = %root.display(),
+            reset_dacl,
+            removed = %removed.join(", "),
+            "migrated the extracted runtime into its own subdirectory — a previous \
+             version had locked the app-data root to administrators, so this run's \
+             log file (written before the migration) is likely missing"
+        );
+    }
+}
+
+/// True when `dir`'s DACL carries `SE_DACL_PROTECTED`, i.e. inheritance from its
+/// parent is switched off. That flag is the signature of a pre-`runtime\`
+/// install: nothing else in this app sets it, and it is what keeps a
+/// non-elevated process out of `logs\` and `crash.log`.
+fn dacl_is_protected(dir: &Path) -> std::io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR,
+        SE_DACL_PROTECTED,
+    };
+
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: `wide` is a valid null-terminated UTF-16 path, owned by this frame
+    // and alive across the whole call. The four `null_mut()` out-parameters are
+    // documented as optional (we want the descriptor, not the owner/group/ACL
+    // pointers into it). `descriptor` is written by `GetNamedSecurityInfoW` only
+    // when it returns `ERROR_SUCCESS`, which is checked before any read; on
+    // success it points at a single `LocalAlloc` block that owns the ACL as
+    // well, freed exactly once with `LocalFree` on both the success and the
+    // error path below, and never touched afterwards. `control`/`revision` are
+    // stack slots that outlive `GetSecurityDescriptorControl`. Failure mode: a
+    // missing or inaccessible directory returns a `WIN32_ERROR` and nothing is
+    // allocated or freed.
+    unsafe {
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let status = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        );
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        let ok = GetSecurityDescriptorControl(descriptor, &mut control, &mut revision);
+        // GetLastError is per-thread and the very next Win32 call clobbers it:
+        // read it before `LocalFree`, not after.
+        let err = std::io::Error::last_os_error();
+        LocalFree(descriptor.cast());
+        if ok == 0 {
+            return Err(err);
+        }
+        Ok(control & SE_DACL_PROTECTED != 0)
+    }
+}
+
+/// Puts `dir` back on inherited permissions: no explicit ACEs of its own, and
+/// auto-inheritance from the parent switched back on. Children whose DACL is
+/// auto-inherited (`logs\`, `crash.log`) are recomputed by the same call.
+///
+/// The ACL passed in is deliberately **empty but not null**, and that
+/// distinction is the whole point of this function. `SetSecurityInfo`'s
+/// documentation is explicit: `DACL_SECURITY_INFORMATION` with a `NULL` `pDacl`
+/// does not mean "no DACL to set", it installs a *null DACL*, which grants FULL
+/// ACCESS TO EVERYONE. Doing that here would make the parent of the directory an
+/// elevated process loads `WinDivert64.sys` from world-writable — strictly worse
+/// than the over-broad DACL we are undoing. A zero-ACE ACL plus
+/// `UNPROTECTED_DACL_SECURITY_INFORMATION` is the actual "reset to inherited"
+/// spelling: nothing granted explicitly, everything granted by inheritance.
+/// Do not "simplify" the ACL away.
+fn reset_dacl_to_inherited(dir: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows_sys::Win32::Security::{
+        ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // An `ACL` header is 8 bytes and needs 4-byte alignment; a `u32` array gives
+    // that alignment for free, and the extra room costs nothing on the stack.
+    let mut acl_buf = [0u32; 16];
+
+    // SAFETY: `acl_buf` is a `u32`-aligned stack buffer, larger than the `ACL`
+    // header `InitializeAcl` writes into it, and its length is passed as the
+    // exact byte size of that same buffer — so `InitializeAcl` cannot write out
+    // of bounds. The buffer is only read as an `ACL` after that call has
+    // reported success, and it outlives `SetNamedSecurityInfoW`, which does not
+    // retain the pointer. `wide` is a valid null-terminated UTF-16 path alive
+    // for the whole call. The owner, group and SACL pointers are null, which is
+    // "do not change" for the information bits we did not request. Failure mode:
+    // a `WIN32_ERROR` return (typically `ERROR_ACCESS_DENIED` when not
+    // elevated), which the caller treats as non-fatal.
+    unsafe {
+        if InitializeAcl(
+            acl_buf.as_mut_ptr().cast::<ACL>(),
+            std::mem::size_of_val(&acl_buf) as u32,
+            ACL_REVISION,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let result = SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl_buf.as_ptr().cast::<ACL>(),
+            ptr::null(),
+        );
+        if result != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(result as i32));
+        }
+    }
+
+    Ok(())
 }
 
 /// Refuses a runtime file that is readable but is NOT our embedded copy — the
@@ -368,6 +742,48 @@ mod tests {
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("arkyve_{tag}_{}.bin", std::process::id()))
+    }
+
+    #[test]
+    fn the_runtime_dir_is_a_leaf_below_the_app_data_root_never_the_root_itself() {
+        let dir = runtime_dir().unwrap();
+        assert_eq!(
+            dir.file_name().and_then(|name| name.to_str()),
+            Some(RUNTIME_SUBDIR)
+        );
+        // The parent is what holds `logs\` and `crash.log`; hardening must never
+        // be pointed at it, so the two paths must not be the same directory.
+        let parent = dir.parent().expect("runtime dir has a parent");
+        assert_ne!(parent, dir.as_path());
+        if let Some(root) = legacy_runtime_root() {
+            assert_eq!(parent, root.as_path());
+            assert_eq!(
+                root.file_name().and_then(|name| name.to_str()),
+                Some(crate::APP_DIR)
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_file_present_creates_the_file_inside_a_freshly_created_subdirectory() {
+        // Mirrors the first launch after the move: the `runtime` leaf does not
+        // exist yet and everything has to land one level below the app-data root.
+        let root = temp_path("runtime_root").with_extension("d");
+        let dir = root.join(RUNTIME_SUBDIR);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        ensure_file_present(&dir, "embedded.bin", b"embedded").unwrap();
+        let written = dir.join("embedded.bin");
+        assert!(file_has_content(&written, b"embedded"));
+        // Nothing may be dropped at the root beside the leaf directory.
+        assert!(!root.join("embedded.bin").exists());
+
+        // Idempotent, and it replaces content that differs.
+        ensure_file_present(&dir, "embedded.bin", b"embedded").unwrap();
+        ensure_file_present(&dir, "embedded.bin", b"replaced").unwrap();
+        assert!(file_has_content(&written, b"replaced"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

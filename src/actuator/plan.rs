@@ -189,6 +189,13 @@ pub struct DelayRange {
 }
 
 impl DelayRange {
+    /// The inert default (`0..=0`): the calibrated baseline, no extra wait.
+    /// Persistence skips these so a first Apply does not fill
+    /// `[actuator.timings]` with eight no-op ranges the player never set.
+    pub fn is_inert(&self) -> bool {
+        self.min_ms == 0 && self.max_ms == 0
+    }
+
     /// A uniform draw in `[min_ms, max_ms]`; a reversed range is read as a
     /// point at `min_ms` (an obvious misconfiguration never widens the draw).
     fn draw(&self, jitter: &mut Jitter) -> u64 {
@@ -209,28 +216,74 @@ impl DelayRange {
 
 /// Player-set extra-wait ranges, added on top of every tuned baseline above.
 /// All-default (`0..=0`) reproduces the calibrated timing exactly.
+///
+/// Serialization skips every inert range: `config::persist` replaces the whole
+/// `[actuator.timings]` table on each Apply, and writing eight
+/// `{ min_ms = 0, max_ms = 0 }` lines the player never asked for would fight
+/// that module's whole purpose (preserving the shape of a hand-authored file).
+/// The container `#[serde(default)]` makes the omission round-trip exactly.
+/// Only whole ranges are skipped, never a single `min_ms = 0` inside a range
+/// that *is* written: there the zero is the draw's floor, and the readable
+/// `{ min_ms = .., max_ms = .. }` pair is the style the example documents.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Timings {
     /// Before the first click once the shop opens.
+    #[serde(skip_serializing_if = "DelayRange::is_inert")]
     pub shop_opened: DelayRange,
     /// Before the first click after a paid refresh.
+    #[serde(skip_serializing_if = "DelayRange::is_inert")]
     pub refreshed: DelayRange,
     /// Before the first click when resuming after a purchase.
+    #[serde(skip_serializing_if = "DelayRange::is_inert")]
     pub purchase_resumed: DelayRange,
     /// Before a watchdog re-issue (the game sits idle).
+    #[serde(skip_serializing_if = "DelayRange::is_inert")]
     pub recovery: DelayRange,
     /// Between the Refresh click and its confirm click.
+    #[serde(skip_serializing_if = "DelayRange::is_inert")]
     pub confirm_refresh_modal: DelayRange,
     /// Between a Buy click and its confirm click.
+    #[serde(skip_serializing_if = "DelayRange::is_inert")]
     pub buy_modal: DelayRange,
     /// Between two consecutive buys.
+    #[serde(skip_serializing_if = "DelayRange::is_inert")]
     pub between_buys: DelayRange,
     /// After a wheel scroll before the next click.
+    #[serde(skip_serializing_if = "DelayRange::is_inert")]
     pub scroll_settle: DelayRange,
 }
 
 impl Timings {
+    /// Every range paired with its `[actuator.timings]` key, in declaration
+    /// order — what `Config::validate` walks to bound the player's values.
+    ///
+    /// The destructuring is exhaustive on purpose: a ninth action added above
+    /// stops compiling here until it is named, so validation can never
+    /// silently skip a knob that reaches the refresh loop.
+    pub fn named_ranges(&self) -> [(&'static str, DelayRange); 8] {
+        let Timings {
+            shop_opened,
+            refreshed,
+            purchase_resumed,
+            recovery,
+            confirm_refresh_modal,
+            buy_modal,
+            between_buys,
+            scroll_settle,
+        } = *self;
+        [
+            ("shop_opened", shop_opened),
+            ("refreshed", refreshed),
+            ("purchase_resumed", purchase_resumed),
+            ("recovery", recovery),
+            ("confirm_refresh_modal", confirm_refresh_modal),
+            ("buy_modal", buy_modal),
+            ("between_buys", between_buys),
+            ("scroll_settle", scroll_settle),
+        ]
+    }
+
     /// The pre-wait for a trigger: its tuned baseline plus a fresh draw from
     /// the matching range.
     fn pre_wait_ms(&self, trigger: Trigger, jitter: &mut Jitter) -> u64 {
@@ -898,12 +951,62 @@ mod tests {
 
     #[test]
     fn reversed_range_reads_as_its_min_point() {
+        // A reversed range no longer reaches here from a config file:
+        // `Config::validate` rejects `min_ms > max_ms` up front, naming the
+        // field and both values, rather than letting it be silently reread as
+        // a fixed delay the player never asked for. What this test pins is the
+        // safety net underneath — `draw` must stay total for a range built in
+        // memory (a GUI edit, a future preset), never widen the draw, and
+        // never panic. Keep both: the guard is the fix, this is the floor.
         let timings = Timings {
             refreshed: range(600, 100),
             ..Timings::default()
         };
         let job = refresh_job(Trigger::Refreshed, timings, 3, 42);
         assert_eq!(job.steps[0].wait_ms, 780 + 600);
+    }
+
+    #[test]
+    fn only_the_all_zero_range_is_inert() {
+        // Drives the `skip_serializing_if` on every `Timings` field: a range
+        // wrongly reported inert would be dropped from a saved config.toml,
+        // silently reverting the player's setting on the next launch.
+        assert!(DelayRange::default().is_inert());
+        assert!(range(0, 0).is_inert());
+        assert!(!range(0, 1).is_inert());
+        assert!(!range(1, 0).is_inert());
+        assert!(!range(1, 1).is_inert());
+    }
+
+    #[test]
+    fn named_ranges_covers_every_field_under_its_config_key() {
+        // Give each field a distinct value so a copy-paste in the pairing
+        // (two keys reading the same field) cannot pass.
+        let timings = Timings {
+            shop_opened: range(0, 1),
+            refreshed: range(0, 2),
+            purchase_resumed: range(0, 3),
+            recovery: range(0, 4),
+            confirm_refresh_modal: range(0, 5),
+            buy_modal: range(0, 6),
+            between_buys: range(0, 7),
+            scroll_settle: range(0, 8),
+        };
+        let named = timings.named_ranges();
+        assert_eq!(
+            named.map(|(name, _)| name),
+            [
+                "shop_opened",
+                "refreshed",
+                "purchase_resumed",
+                "recovery",
+                "confirm_refresh_modal",
+                "buy_modal",
+                "between_buys",
+                "scroll_settle",
+            ]
+        );
+        assert_eq!(named.map(|(_, r)| r.max_ms), [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]

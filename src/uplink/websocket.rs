@@ -3,6 +3,7 @@
 //! The connection re-establishes automatically (capped exponential backoff). A
 //! closed outbound channel signals a clean shutdown: reconnection then stops.
 
+use std::future::Future;
 use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -10,6 +11,9 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::{debug, info, warn};
+
+use crate::config::RECONNECT_FLOOR;
+use crate::stream::BudgetedChunk;
 
 use super::UplinkEvent;
 use super::protocol::ServerMessage;
@@ -19,6 +23,41 @@ use super::protocol::ServerMessage;
 /// parks the capture thread, and the kernel starts dropping packet copies.
 /// Dropping the connection turns the stall into a normal reconnect cycle.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Normalized, bounded exponential reconnect delay.
+struct Backoff {
+    initial: Duration,
+    current: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    fn new(initial: Duration, max: Duration) -> Self {
+        let initial = initial.max(RECONNECT_FLOOR);
+        let max = max.max(initial);
+        Self {
+            initial,
+            current: initial,
+            max,
+        }
+    }
+
+    fn current(&self) -> Duration {
+        self.current
+    }
+
+    fn advance(&mut self) {
+        self.current = self
+            .current
+            .checked_mul(2)
+            .unwrap_or(self.max)
+            .min(self.max);
+    }
+
+    fn reset(&mut self) {
+        self.current = self.initial;
+    }
+}
 
 /// Outcome of one connection session.
 enum Outcome {
@@ -34,25 +73,47 @@ enum Outcome {
 /// - `inbound`: decoded messages received from the server.
 pub async fn run(
     url: String,
-    mut outbound: mpsc::Receiver<Vec<u8>>,
+    outbound: mpsc::Receiver<BudgetedChunk>,
     inbound: mpsc::Sender<UplinkEvent>,
     initial_backoff: Duration,
     max_backoff: Duration,
 ) {
-    let floor = initial_backoff.max(Duration::from_millis(100));
-    let mut backoff = floor;
+    run_with_connector(
+        url,
+        outbound,
+        inbound,
+        initial_backoff,
+        max_backoff,
+        |url| async move { connect_async(url).await.map(|(stream, _response)| stream) },
+    )
+    .await;
+}
+
+async fn run_with_connector<C, F, S>(
+    url: String,
+    mut outbound: mpsc::Receiver<BudgetedChunk>,
+    inbound: mpsc::Sender<UplinkEvent>,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    mut connect: C,
+) where
+    C: FnMut(String) -> F,
+    F: Future<Output = Result<S, WsError>>,
+    S: Stream<Item = Result<Message, WsError>> + Sink<Message, Error = WsError> + Unpin,
+{
+    let mut backoff = Backoff::new(initial_backoff, max_backoff);
     // The player only hears transitions: the first failure reports the outage,
     // each retry stays a tracing detail, recovery reports once.
     let mut outage_reported = false;
 
     loop {
-        match connect_async(&url).await {
-            Ok((stream, _response)) => {
+        match connect(url.clone()).await {
+            Ok(stream) => {
                 info!(url = %url, "server link established");
                 if std::mem::take(&mut outage_reported) {
                     let _ = inbound.send(UplinkEvent::LinkUp).await;
                 }
-                backoff = floor;
+                backoff.reset();
                 match pump(stream, &mut outbound, &inbound).await {
                     Outcome::Shutdown => return,
                     Outcome::Disconnected => {
@@ -81,17 +142,17 @@ pub async fn run(
         // capture thread — the kernel then drops packets, creating real gaps that
         // can never be filled. Better to drop bytes while the server is
         // unreachable (it resyncs on reconnect).
-        if drain_until(&mut outbound, backoff).await {
+        if drain_until(&mut outbound, backoff.current()).await {
             return; // outbound closed: shutdown requested.
         }
-        backoff = (backoff * 2).min(max_backoff);
+        backoff.advance();
     }
 }
 
 /// Absorbs and discards outbound batches for `wait`, without stalling upstream.
 /// Returns `true` if the outbound channel closed (shutdown), `false` if the
 /// delay simply elapsed.
-async fn drain_until(outbound: &mut mpsc::Receiver<Vec<u8>>, wait: Duration) -> bool {
+async fn drain_until(outbound: &mut mpsc::Receiver<BudgetedChunk>, wait: Duration) -> bool {
     let deadline = tokio::time::sleep(wait);
     tokio::pin!(deadline);
     loop {
@@ -110,7 +171,7 @@ async fn drain_until(outbound: &mut mpsc::Receiver<Vec<u8>>, wait: Duration) -> 
 /// Pumps outbound bytes and inbound messages over one connection.
 async fn pump<S>(
     stream: S,
-    outbound: &mut mpsc::Receiver<Vec<u8>>,
+    outbound: &mut mpsc::Receiver<BudgetedChunk>,
     inbound: &mpsc::Sender<UplinkEvent>,
 ) -> Outcome
 where
@@ -121,7 +182,8 @@ where
     loop {
         tokio::select! {
             outgoing = outbound.recv() => match outgoing {
-                Some(bytes) => {
+                Some(chunk) => {
+                    let (bytes, lease) = chunk.into_parts();
                     let send = write.send(Message::Binary(bytes.into()));
                     match tokio::time::timeout(SEND_TIMEOUT, send).await {
                         Ok(Ok(())) => {}
@@ -131,6 +193,7 @@ where
                             return Outcome::Disconnected;
                         }
                     }
+                    drop(lease);
                 }
                 None => return Outcome::Shutdown,
             },
@@ -160,10 +223,49 @@ async fn forward(payload: &[u8], inbound: &mpsc::Sender<UplinkEvent>) {
 
 #[cfg(test)]
 mod tests {
+    use std::future::ready;
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
     use super::*;
+    use crate::stream::PipelineBudget;
+
+    fn chunk(bytes: Vec<u8>) -> BudgetedChunk {
+        PipelineBudget::new().admit_outbound_for_test(bytes)
+    }
+
+    #[test]
+    fn backoff_normalizes_floor_and_cap() {
+        let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_millis(350));
+        assert_eq!(backoff.current(), Duration::from_millis(100));
+        backoff.advance();
+        assert_eq!(backoff.current(), Duration::from_millis(200));
+        backoff.advance();
+        assert_eq!(backoff.current(), Duration::from_millis(350));
+        backoff.advance();
+        assert_eq!(backoff.current(), Duration::from_millis(350));
+        backoff.reset();
+        assert_eq!(backoff.current(), Duration::from_millis(100));
+
+        let mut below_floor = Backoff::new(Duration::from_millis(1), Duration::from_millis(10));
+        assert_eq!(below_floor.current(), RECONNECT_FLOOR);
+        below_floor.advance();
+        assert_eq!(below_floor.current(), RECONNECT_FLOOR);
+    }
+
+    #[test]
+    fn backoff_growth_caps_without_overflow() {
+        let near_max = Duration::MAX - Duration::from_nanos(1);
+        let mut backoff = Backoff::new(near_max, Duration::MAX);
+        assert_eq!(backoff.current(), near_max);
+        backoff.advance();
+        assert_eq!(backoff.current(), Duration::MAX);
+        backoff.advance();
+        assert_eq!(backoff.current(), Duration::MAX);
+        backoff.reset();
+        assert_eq!(backoff.current(), near_max);
+    }
 
     /// A connected-but-frozen peer: reads pend forever, sends never become
     /// ready (TCP zero-window).
@@ -193,12 +295,166 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stalled_send_disconnects_instead_of_hanging() {
-        let (raw_tx, mut raw_rx) = mpsc::channel::<Vec<u8>>(4);
+    async fn drain_until_discards_batches_until_deadline() {
+        let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        let drain =
+            tokio::spawn(async move { drain_until(&mut raw_rx, Duration::from_millis(100)).await });
+
+        raw_tx.send(chunk(vec![1])).await.unwrap();
+        raw_tx.send(chunk(vec![2])).await.unwrap();
+        tokio::time::advance(Duration::from_millis(99)).await;
+        assert!(!drain.is_finished());
+        raw_tx.send(chunk(vec![3])).await.unwrap();
+        raw_tx.send(chunk(vec![4])).await.unwrap();
+        assert!(!drain.is_finished());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!drain.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_until_reports_closed_outbound() {
+        let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        drop(raw_tx);
+
+        assert!(drain_until(&mut raw_rx, Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_drain_releases_all_outbound_bytes() {
+        let budget = PipelineBudget::with_test_limits(128, 128, 128, 128);
+        let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(4);
+        raw_tx
+            .send(budget.admit_outbound_for_test(vec![1, 2, 3]))
+            .await
+            .unwrap();
+        raw_tx
+            .send(budget.admit_outbound_for_test(vec![4, 5, 6]))
+            .await
+            .unwrap();
+        assert_eq!(budget.snapshot().current_outbound, 6);
+
+        let drain =
+            tokio::spawn(async move { drain_until(&mut raw_rx, Duration::from_millis(100)).await });
+        tokio::task::yield_now().await;
+        assert_eq!(budget.snapshot().current_total, 0);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(!drain.await.unwrap());
+        assert!(budget.snapshot().high_water_total <= 128);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_retries_on_normalized_schedule_without_network() {
+        let (raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        let (event_tx, mut event_rx) = mpsc::channel::<UplinkEvent>(4);
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let recorded_attempts = Arc::clone(&attempts);
+        let started = tokio::time::Instant::now();
+
+        let task = tokio::spawn(run_with_connector(
+            "ws://test.invalid".to_owned(),
+            raw_rx,
+            event_tx,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            move |_url| {
+                recorded_attempts
+                    .lock()
+                    .unwrap()
+                    .push(tokio::time::Instant::now().duration_since(started));
+                ready(Err::<StalledLink, _>(WsError::ConnectionClosed))
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(*attempts.lock().unwrap(), [Duration::ZERO]);
+        raw_tx.send(chunk(vec![1])).await.unwrap();
+        raw_tx.send(chunk(vec![2])).await.unwrap();
+
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*attempts.lock().unwrap(), [Duration::ZERO]);
+        raw_tx.send(chunk(vec![3])).await.unwrap();
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            [Duration::ZERO, Duration::from_millis(100)]
+        );
+        raw_tx.send(chunk(vec![4])).await.unwrap();
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            [
+                Duration::ZERO,
+                Duration::from_millis(100),
+                Duration::from_millis(200)
+            ]
+        );
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(UplinkEvent::LinkDown(_))
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        drop(raw_tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_stops_cleanly_when_outbound_closes_while_connected() {
+        let (raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        let (event_tx, mut event_rx) = mpsc::channel::<UplinkEvent>(4);
+        let attempts = Arc::new(Mutex::new(0));
+        let recorded_attempts = Arc::clone(&attempts);
+
+        let task = tokio::spawn(run_with_connector(
+            "ws://test.invalid".to_owned(),
+            raw_rx,
+            event_tx,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            move |_url| {
+                *recorded_attempts.lock().unwrap() += 1;
+                ready(Ok::<_, WsError>(StalledLink))
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(*attempts.lock().unwrap(), 1);
+        drop(raw_tx);
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+        task.await.unwrap();
+        assert_eq!(*attempts.lock().unwrap(), 1);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_send_releases_outbound_bytes_after_timeout() {
+        let budget = PipelineBudget::with_test_limits(64, 64, 64, 64);
+        let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(4);
         let (event_tx, _event_rx) = mpsc::channel::<UplinkEvent>(4);
-        raw_tx.send(vec![1, 2, 3]).await.unwrap();
+        raw_tx
+            .send(budget.admit_outbound_for_test(vec![1, 2, 3]))
+            .await
+            .unwrap();
+        assert_eq!(budget.snapshot().current_outbound, 3);
 
         let outcome = pump(StalledLink, &mut raw_rx, &event_tx).await;
         assert!(matches!(outcome, Outcome::Disconnected));
+        assert_eq!(budget.snapshot().current_total, 0);
+        assert!(budget.snapshot().high_water_total <= 64);
     }
 }
