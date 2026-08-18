@@ -24,9 +24,9 @@
 
 use std::io::{self, Read, Write};
 
-use tracing::debug;
+use tracing::{debug, info};
 
-use super::{MAX_PACKET_BYTES, PacketSource, Segment, parse_segment};
+use super::{Direction, MAX_PACKET_BYTES, PacketSource, Segment, parse_segment};
 use crate::error::{Error, Result};
 
 /// Payload is one raw IP packet, exactly as the driver delivered it.
@@ -155,6 +155,53 @@ fn frame_text(payload: &[u8]) -> String {
     String::from_utf8_lossy(payload).into_owned()
 }
 
+/// How many packet frames between two funnel lines. Every captured packet
+/// passes through here, so the line is emitted periodically rather than per
+/// packet — plus once on the very first one, so a capture that is about to
+/// reject everything says so immediately instead of after five hundred packets.
+const FUNNEL_LOG_EVERY: u64 = 500;
+
+/// Where packets that reach this process go to die.
+///
+/// The parsing half of the funnel the WinDivert backend used to carry on its
+/// own. It lives here now because this is where the parsing happens: the
+/// elevated broker keeps the raw half (`delivered` / `oversized`, which it ships
+/// down the pipe as diagnostic frames) and does not decode a single byte, so a
+/// verdict like "the packets arrive but none of them parse" can only be reached
+/// on this side.
+///
+/// Two things can drop a packet between the pipe and the reassembler — the
+/// parser returning `None`, and a segment that parses but travels the wrong way
+/// — and each is individually plausible as the reason a healthy-looking session
+/// yields nothing. `packets` staying at zero is itself the headline result: the
+/// broker is connected but the driver's filter matches no traffic.
+#[derive(Default)]
+struct Funnel {
+    packets: u64,
+    unparsed: u64,
+    admitted: u64,
+    server_to_client: u64,
+}
+
+impl Funnel {
+    /// Emits the funnel on the first packet frame, then once per
+    /// [`FUNNEL_LOG_EVERY`]. Called on both paths that finish a packet — the
+    /// unparsed skip and the admitted return — so every line reports a settled
+    /// verdict on the packet that triggered it.
+    fn report(&self) {
+        if self.packets != 1 && !self.packets.is_multiple_of(FUNNEL_LOG_EVERY) {
+            return;
+        }
+        debug!(
+            packets = self.packets,
+            admitted = self.admitted,
+            server_to_client = self.server_to_client,
+            unparsed = self.unparsed,
+            "capture funnel"
+        );
+    }
+}
+
 /// A [`PacketSource`] fed by the elevated broker over `R`.
 ///
 /// Generic over the reader rather than owning a pipe handle: the transport is
@@ -168,6 +215,7 @@ pub struct PipeSource<R> {
     /// the loop polls, so this accumulates across however many frames elapse
     /// between two calls to [`PacketSource::take_capture_loss`].
     capture_loss: bool,
+    funnel: Funnel,
 }
 
 impl<R: Read> PipeSource<R> {
@@ -176,6 +224,7 @@ impl<R: Read> PipeSource<R> {
             reader,
             game_port,
             capture_loss: false,
+            funnel: Funnel::default(),
         }
     }
 }
@@ -201,12 +250,41 @@ impl<R: Read + Send> PacketSource for PipeSource<R> {
                     if frame.flags & FRAME_FLAG_CAPTURE_LOSS != 0 {
                         self.capture_loss = true;
                     }
+                    self.funnel.packets += 1;
+                    // The broker's network layer delivers whole IP packets, so
+                    // there is no link-layer framing to decode and nothing about
+                    // the adapter (Ethernet, WiFi, VPN) reaches this parser.
+                    //
                     // A packet that decodes to nothing of interest (wrong port,
                     // pure ACK, malformed) is skipped, not an error — the same
-                    // semantics `WinDivertSource` applies to the same bytes.
-                    if let Some(segment) = parse_segment(&frame.payload, self.game_port) {
-                        return Ok(segment);
+                    // semantics the WinDivert backend applied to the same bytes
+                    // before this side existed.
+                    let Some(segment) = parse_segment(&frame.payload, self.game_port) else {
+                        self.funnel.unparsed += 1;
+                        self.funnel.report();
+                        continue;
+                    };
+
+                    self.funnel.admitted += 1;
+                    if segment.direction == Direction::ServerToClient {
+                        self.funnel.server_to_client += 1;
+                        if self.funnel.server_to_client == 1 {
+                            // The shop response travels in this direction only,
+                            // so this line is the proof that the filter, the
+                            // port, the driver and the pipe all agree. Its
+                            // *absence* in a session log means capture is open
+                            // but sees nothing from the game server.
+                            info!(
+                                payload = segment.payload.len(),
+                                syn = segment.syn,
+                                server = %segment.flow.server,
+                                client = %segment.flow.client,
+                                "first server-to-client segment admitted"
+                            );
+                        }
                     }
+                    self.funnel.report();
+                    return Ok(segment);
                 }
             }
         }

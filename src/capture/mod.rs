@@ -2,6 +2,13 @@
 
 mod ip;
 
+// The unelevated end of the split: launching the broker and connecting to it.
+// Gated with the backend rather than with `windows` alone, because without the
+// backend there is no broker to launch — and `windows-sys` itself is an optional
+// dependency this feature turns on.
+#[cfg(all(windows, feature = "windivert-backend"))]
+mod elevate;
+
 // Unconditional on purpose. The broker protocol is pure `std::io` with no Win32
 // in it, and gating it on `windivert-backend` would keep its tests out of both
 // portable lanes of `just verify` — the only lanes that ever exercise it, since
@@ -25,6 +32,8 @@ pub use pipe::{
     PipeSource, write_frame,
 };
 
+#[cfg(all(windows, feature = "windivert-backend"))]
+pub(crate) use elevate::spawn_elevated_broker;
 #[cfg(all(windows, feature = "windivert-backend"))]
 pub use windivert::WinDivertSource;
 

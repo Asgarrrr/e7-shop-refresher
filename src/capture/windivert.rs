@@ -7,12 +7,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use windivert::prelude::*;
 
-use super::{
-    CaptureSource, CaptureStop, Direction, MAX_PACKET_BYTES, PacketSource, Segment, parse_segment,
-};
+use super::{CaptureStop, MAX_PACKET_BYTES};
 use crate::error::{Error, Result};
 
 /// User-mode WinDivert library, embedded in the executable and extracted into
@@ -45,64 +43,29 @@ const DRIVER_FILE: &str = "WinDivert64.sys";
 const LICENSE_TEXT: &[u8] = include_bytes!("../../vendor/windivert/LICENSE");
 const LICENSE_FILE: &str = "WinDivert-LICENSE.txt";
 
-/// How many delivered packets between two funnel lines. Every captured packet
-/// passes through here, so this is emitted periodically rather than per packet
-/// — plus once on the very first packet, so a capture that is about to reject
-/// everything says so immediately instead of after five hundred packets.
-const FUNNEL_LOG_EVERY: u64 = 500;
-
-/// Where delivered packets go to die.
+/// Where delivered packets go to die, on this side of the pipe.
 ///
 /// The abandoned NIC-level capture attempt was diagnosed in minutes because
 /// every discard path was counted; this is the same instrument, sized to
-/// WinDivert's much shorter
-/// path. Only two things can drop a packet here — the driver refusing an
-/// oversized one, and the IP/TCP parser returning `None` — and each is
-/// individually plausible as the reason a healthy-looking session yields
-/// nothing. `delivered` staying at zero is itself the headline result: the
-/// filter matched no traffic at all.
+/// WinDivert's much shorter path. Only one thing can drop a packet here — the
+/// driver refusing an oversized one — because this struct now runs exclusively
+/// inside the elevated broker, which parses nothing. The counters that describe
+/// *parsing* moved to `PipeSource`, the other end of the pipe, together with the
+/// code that produces them.
 ///
-/// Its two halves now sit on either side of [`WinDivertSource::recv_packet`]:
-/// `delivered` / `oversized` are counted by the raw receive, `unparsed` /
-/// `admitted` / `server_to_client` by the parsing wrapper layered on top of it.
-/// They deliberately stay in one struct, and one log line, until the unelevated
-/// pipe-backed source is wired in and the parsing half has somewhere else to
-/// live — splitting the struct before then would only split the line.
+/// Neither number is logged from here: the broker installs no tracing
+/// subscriber and the shipped build has no console, so a `debug!` on this side
+/// would go nowhere. [`WinDivertSource::raw_counters`] is how they travel — down
+/// the pipe, as diagnostic frames, into the UI's log file.
 #[derive(Default)]
 struct Funnel {
     delivered: u64,
     oversized: u64,
-    unparsed: u64,
-    admitted: u64,
-    server_to_client: u64,
-}
-
-impl Funnel {
-    /// Emits the funnel on the first delivered packet, then once per
-    /// `FUNNEL_LOG_EVERY`. Called on every path that finishes with a delivered
-    /// packet — the oversized skip, the unparsed skip, and the admitted return
-    /// — so the periodic line is anchored on packets delivered rather than on
-    /// packets discarded, and so every line reports a settled verdict on the
-    /// packet that triggered it.
-    fn report(&self) {
-        if self.delivered != 1 && !self.delivered.is_multiple_of(FUNNEL_LOG_EVERY) {
-            return;
-        }
-        debug!(
-            delivered = self.delivered,
-            admitted = self.admitted,
-            server_to_client = self.server_to_client,
-            oversized = self.oversized,
-            unparsed = self.unparsed,
-            "WinDivert capture funnel"
-        );
-    }
 }
 
 pub struct WinDivertSource {
     handle: WinDivert<NetworkLayer>,
     buffer: Vec<u8>,
-    game_port: u16,
     funnel: Funnel,
 }
 
@@ -134,25 +97,21 @@ impl CaptureStop for WinDivertStop {
 }
 
 impl WinDivertSource {
-    /// Opens a strictly passive network handle for `filter`, boxed into the
-    /// [`CaptureSource`] pair the app consumes. Requires administrator rights
-    /// (driver load).
-    pub(crate) fn open(filter: &str, game_port: u16, buffer_size: usize) -> Result<CaptureSource> {
-        let (source, stop) = Self::open_raw(filter, game_port, buffer_size)?;
-        Ok(CaptureSource::new(source, stop))
-    }
-
-    /// The same open, without the trait-object box around it.
+    /// Opens a strictly passive network handle for `filter`. Requires
+    /// administrator rights (driver load), and therefore only ever runs inside
+    /// the elevated broker.
     ///
-    /// [`WinDivertSource::open`] erases the source into a `Box<dyn PacketSource>`,
-    /// and `PacketSource` deliberately exposes only `next_segment` — the parsing
-    /// entry point. The elevated broker needs the exact opposite: the concrete
+    /// There is deliberately no `open` returning a boxed [`super::CaptureSource`]
+    /// beside this one any more. Such a constructor existed while the app opened
+    /// the driver in its own process; it erased the source into a
+    /// `Box<dyn PacketSource>`, whose only receive path is `next_segment` — the
+    /// *parsing* entry point. The broker needs the exact opposite: the concrete
     /// source, so it can call [`WinDivertSource::recv_packet`] and forward raw
-    /// bytes without ever parsing them, plus the stop handle as a separate value
-    /// it can move onto its writer thread (that thread is what wakes a receive
-    /// parked in the driver when the unelevated end closes the pipe). Neither is
-    /// reachable through `CaptureSource`, hence this second constructor rather
-    /// than a change to the trait.
+    /// bytes without ever interpreting one, plus the stop handle as a separate
+    /// value it can move onto its writer thread (that thread is what wakes a
+    /// receive parked in the driver when the unelevated end closes the pipe).
+    /// The app now gets its `CaptureSource` from the pipe instead, so this is
+    /// the only way in.
     ///
     /// The returned stop type is intentionally unnameable outside this module;
     /// callers bind it by inference or behind a `CaptureStop` bound.
@@ -212,7 +171,6 @@ impl WinDivertSource {
             Self {
                 handle,
                 buffer: vec![0u8; buffer_bytes],
-                game_port,
                 funnel: Funnel::default(),
             },
             stop,
@@ -222,10 +180,10 @@ impl WinDivertSource {
     /// The raw half of the funnel: `(delivered, oversized)`.
     ///
     /// Exists for the elevated broker, which has no tracing subscriber and no
-    /// console — [`Funnel::report`]'s `debug!` line is inert over there, so these
-    /// two numbers can only reach the log file by riding a diagnostic frame down
-    /// the pipe. `oversized` in particular is otherwise unobservable from
-    /// outside: [`WinDivertSource::recv_packet`] swallows the skip.
+    /// console — any `debug!` on this side is inert, so these two numbers can
+    /// only reach the log file by riding a diagnostic frame down the pipe.
+    /// `oversized` in particular is otherwise unobservable from outside:
+    /// [`WinDivertSource::recv_packet`] swallows the skip.
     pub(crate) fn raw_counters(&self) -> (u64, u64) {
         (self.funnel.delivered, self.funnel.oversized)
     }
@@ -281,10 +239,6 @@ impl WinDivertSource {
                 Ok(packet) => {
                     let len = packet.data.len();
                     self.funnel.delivered += 1;
-                    // No `report()` here on purpose. The funnel line for a
-                    // delivered packet is emitted downstream, once its parse
-                    // verdict is known, so that every counter in a given line
-                    // describes the same set of packets.
                     return Ok(len);
                 }
                 // The driver already dropped this copy: skipping one packet
@@ -293,7 +247,6 @@ impl WinDivertSource {
                 Err(WinDivertError::Recv(WinDivertRecvError::InsufficientBuffer)) => {
                     self.funnel.delivered += 1;
                     self.funnel.oversized += 1;
-                    self.funnel.report();
                     warn!("packet larger than the capture buffer — skipped");
                 }
                 Err(err) => return Err(Error::Capture(format!("recv: {err}"))),
@@ -302,51 +255,14 @@ impl WinDivertSource {
     }
 }
 
-/// The parsing half of the source: a thin wrapper that receives raw bytes with
-/// [`WinDivertSource::recv_packet`] and turns them into a [`Segment`]. Every
-/// line of it is work the elevated broker deliberately does not do — it moves
-/// wholesale to the unelevated side once the pipe-backed source replaces this
-/// one there.
-impl PacketSource for WinDivertSource {
-    fn next_segment(&mut self) -> Result<Segment> {
-        loop {
-            // Read out before the receive: the bytes `recv_packet` returns
-            // borrow `*self`, so reading any field of the source while they are
-            // still live — including this `Copy` one — would be a second borrow.
-            let game_port = self.game_port;
-            // WinDivert's network layer delivers whole IP packets, so there is
-            // no link-layer framing to decode and nothing about the adapter
-            // (Ethernet, WiFi, VPN) reaches this parser.
-            let parsed = parse_segment(self.recv_packet()?, game_port);
-
-            let Some(segment) = parsed else {
-                self.funnel.unparsed += 1;
-                self.funnel.report();
-                continue;
-            };
-
-            self.funnel.admitted += 1;
-            if segment.direction == Direction::ServerToClient {
-                self.funnel.server_to_client += 1;
-                if self.funnel.server_to_client == 1 {
-                    // The shop response travels in this direction only, so this
-                    // line is the proof that the filter, the port and the
-                    // driver all agree. Its *absence* in a session log means
-                    // capture is open but sees nothing from the game server.
-                    info!(
-                        payload = segment.payload.len(),
-                        syn = segment.syn,
-                        server = %segment.flow.server,
-                        client = %segment.flow.client,
-                        "first server-to-client segment admitted"
-                    );
-                }
-            }
-            self.funnel.report();
-            return Ok(segment);
-        }
-    }
-}
+// No `impl PacketSource for WinDivertSource`, and that absence is deliberate.
+// The parsing wrapper that used to live here — `parse_segment` plus the
+// `admitted` / `unparsed` / `server_to_client` counters and the
+// "first server-to-client segment admitted" line — moved wholesale to
+// `PipeSource`, on the far side of the pipe. It is the single largest piece of
+// work the elevated process no longer does: `parse_segment` chews on
+// unauthenticated bytes off the wire, and it now does so in a medium-integrity
+// process. Anything added back here would quietly undo that.
 
 /// Materializes the embedded runtime into a private app-data *subdirectory* and
 /// makes it loadable, so a single shipped exe is a complete install and nothing

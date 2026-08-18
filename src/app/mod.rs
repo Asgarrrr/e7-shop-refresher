@@ -1096,19 +1096,34 @@ fn parse_command(line: &str) -> Option<Command> {
 ///
 /// Two arms, so both feature combinations build:
 ///
-/// - **WinDivert**, when its feature is on. It is handed IP-layer copies, so it
-///   is indifferent to the link layer beneath — the reason it keeps working on
-///   a WiFi adapter, where a NIC-level tap delivers 802.11 frames this crate
-///   does not decode.
+/// - **WinDivert, through the elevated broker**, when its feature is on. This
+///   process never touches the driver: it launches a second copy of this exe
+///   with an administrator token and reads raw IP packets back off a named pipe,
+///   so the parser, the reassembler, the TLS client and the UI all stay at
+///   medium integrity. The packets are IP-layer copies, so the pipeline is
+///   indifferent to the link layer beneath — the reason it keeps working on a
+///   WiFi adapter, where a NIC-level tap delivers 802.11 frames this crate does
+///   not decode.
 /// - **No backend** — an error the caller can show, never a panic. This is the
 ///   `--no-default-features` build, where the rest of the pipeline still
 ///   compiles and tests.
+///
+/// Blocking on purpose, and called from `Session::run` on a runtime worker: a
+/// UAC prompt sits in the middle of it. `spawn_elevated_broker` keeps that off
+/// the runtime's back (see its `blocking` helper), which is why this stays a
+/// plain synchronous call.
 #[cfg(all(windows, feature = "windivert-backend"))]
 fn build_source(config: &Config) -> Result<CaptureSource> {
-    use crate::capture::WinDivertSource;
-    let filter = config.capture_filter();
-    info!(filter = %filter, "opening passive WinDivert capture (admin required)");
-    WinDivertSource::open(&filter, config.game_port, config.capture.buffer_size)
+    use crate::capture::{PipeSource, spawn_elevated_broker};
+    info!(
+        port = config.game_port,
+        "starting the elevated capture helper (Windows will ask for approval)"
+    );
+    let (reader, stop) = spawn_elevated_broker(config.game_port)?;
+    Ok(CaptureSource::new(
+        PipeSource::new(reader, config.game_port),
+        stop,
+    ))
 }
 
 #[cfg(not(all(windows, feature = "windivert-backend")))]
