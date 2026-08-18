@@ -14,6 +14,12 @@
 
 pub mod actuator;
 pub mod app;
+// The elevated capture broker. Declared unconditionally even though everything
+// that touches Win32 inside it is gated: the argv validators are pure Rust and
+// are the whole surface the low-privilege side has on the administrator process,
+// so their tests belong in every lane, including the two portable ones that
+// build without `windivert-backend`.
+pub mod broker;
 pub mod capture;
 pub mod config;
 pub mod crash;

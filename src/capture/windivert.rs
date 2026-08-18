@@ -116,7 +116,12 @@ pub struct WinDivertSource {
 /// construction: a second shutdown on an already-shut handle is a no-op, and
 /// once the source has been dropped the `Weak` fails to upgrade and this is a
 /// silent success.
-struct WinDivertStop {
+///
+/// `pub(crate)` only so that it can appear in [`WinDivertSource::open_raw`]'s
+/// signature without tripping the private-interface lint; it stays unnameable
+/// outside this module (`mod windivert` is private), so callers hold it by
+/// inference or behind a `CaptureStop` bound.
+pub(crate) struct WinDivertStop {
     shutdown: ShutdownHandle,
 }
 
@@ -129,9 +134,33 @@ impl CaptureStop for WinDivertStop {
 }
 
 impl WinDivertSource {
-    /// Opens a strictly passive network handle for `filter`. Requires
-    /// administrator rights (driver load).
+    /// Opens a strictly passive network handle for `filter`, boxed into the
+    /// [`CaptureSource`] pair the app consumes. Requires administrator rights
+    /// (driver load).
     pub(crate) fn open(filter: &str, game_port: u16, buffer_size: usize) -> Result<CaptureSource> {
+        let (source, stop) = Self::open_raw(filter, game_port, buffer_size)?;
+        Ok(CaptureSource::new(source, stop))
+    }
+
+    /// The same open, without the trait-object box around it.
+    ///
+    /// [`WinDivertSource::open`] erases the source into a `Box<dyn PacketSource>`,
+    /// and `PacketSource` deliberately exposes only `next_segment` — the parsing
+    /// entry point. The elevated broker needs the exact opposite: the concrete
+    /// source, so it can call [`WinDivertSource::recv_packet`] and forward raw
+    /// bytes without ever parsing them, plus the stop handle as a separate value
+    /// it can move onto its writer thread (that thread is what wakes a receive
+    /// parked in the driver when the unelevated end closes the pipe). Neither is
+    /// reachable through `CaptureSource`, hence this second constructor rather
+    /// than a change to the trait.
+    ///
+    /// The returned stop type is intentionally unnameable outside this module;
+    /// callers bind it by inference or behind a `CaptureStop` bound.
+    pub(crate) fn open_raw(
+        filter: &str,
+        game_port: u16,
+        buffer_size: usize,
+    ) -> Result<(Self, WinDivertStop)> {
         ensure_runtime_present()?;
         // The DLL loads WinDivert64.sys from the runtime dir during the call below.
         // Re-verify the driver bytes here, mirroring preload_dll's DLL guard, so a
@@ -179,7 +208,7 @@ impl WinDivertSource {
             mode = "sniff+recv_only",
             "WinDivert capture open (passive copy; originals untouched)"
         );
-        Ok(CaptureSource::new(
+        Ok((
             Self {
                 handle,
                 buffer: vec![0u8; buffer_bytes],
@@ -188,6 +217,17 @@ impl WinDivertSource {
             },
             stop,
         ))
+    }
+
+    /// The raw half of the funnel: `(delivered, oversized)`.
+    ///
+    /// Exists for the elevated broker, which has no tracing subscriber and no
+    /// console — [`Funnel::report`]'s `debug!` line is inert over there, so these
+    /// two numbers can only reach the log file by riding a diagnostic frame down
+    /// the pipe. `oversized` in particular is otherwise unobservable from
+    /// outside: [`WinDivertSource::recv_packet`] swallows the skip.
+    pub(crate) fn raw_counters(&self) -> (u64, u64) {
+        (self.funnel.delivered, self.funnel.oversized)
     }
 
     /// Blocks until the driver delivers the next matching packet, then hands
