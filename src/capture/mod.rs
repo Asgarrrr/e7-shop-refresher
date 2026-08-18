@@ -66,6 +66,15 @@ pub struct Segment {
     /// TCP sequence number of the first byte of `payload`.
     pub seq: u32,
     pub syn: bool,
+    /// The server-to-client bytes — and, in the capture path, the captured
+    /// frame's own allocation trimmed down to them in place rather than a copy
+    /// carved out of it (see [`parse_segment`]).
+    ///
+    /// So `payload.capacity()` is the whole frame's, headers included, and stays
+    /// that way for the segment's life. That is deliberate: it is the memory
+    /// actually retained, and it is what `PipelineBudget::admit_capture` charges,
+    /// which makes the one per-packet buffer the byte budget used to be blind to
+    /// visible to it.
     pub payload: Vec<u8>,
 }
 
@@ -77,9 +86,9 @@ pub struct Segment {
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     // Two `SocketAddr` (32 each: the IPv6 variant is 28 bytes plus a tag).
-    assert!(std::mem::size_of::<FlowKey>() == 64);
+    assert!(size_of::<FlowKey>() == 64);
     // 64 (FlowKey) + 24 (Vec) + 4 (seq) + 1 (syn), padded to 96.
-    assert!(std::mem::size_of::<Segment>() == 96);
+    assert!(size_of::<Segment>() == 96);
 };
 
 /// Blocking source of TCP segments. Implementations observe traffic without
