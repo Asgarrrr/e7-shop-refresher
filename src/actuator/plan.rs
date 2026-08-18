@@ -33,6 +33,19 @@ pub const WAIT_SCROLL_SETTLE_MS: u64 = 100;
 /// clamps, so overshooting is free and the resulting position deterministic.
 const SCROLL_TO_EXTREME_NOTCHES: i32 = 10;
 
+/// Highest 0-based clickable row: the Secret Shop shows six display slots.
+const MAX_ROW: u8 = 5;
+/// Highest row reachable at scroll-top; anything above it is only clickable
+/// once the list has been scrolled to the bottom.
+const LAST_TOP_ROW: u8 = 3;
+/// `MAX_ROW` and `LAST_TOP_ROW` are two halves of one fact ("six rows, the
+/// first four reachable at scroll-top"), and they used to be bare `<= 5` / `> 3`
+/// literals at three sites with nothing tying them together — a shop row count
+/// changed in one place only would have planned a scroll-to-bottom for a row
+/// still sitting at the top, i.e. a click on the wrong item with real gold
+/// behind it. Editing either alone now stops the build here.
+const _: () = assert!(LAST_TOP_ROW < MAX_ROW);
+
 /// How an element rides a non-16:9 window: HUD elements anchor to a content
 /// edge, modals stay centered. In 16:9 all three coincide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,16 +101,23 @@ const SCROLL_ZONE: Zone = Zone {
 /// The clickable 0-based row of a 1-based display slot; `None` for anything
 /// a degraded shop put outside the six rows — never a click.
 pub fn row_for_slot(slot: u8) -> Option<u8> {
-    slot.checked_sub(1).filter(|&row| row <= 5)
+    slot.checked_sub(1).filter(|&row| row <= MAX_ROW)
 }
 
-/// The Buy button of a 0-based row. Rows 0..=3 are clickable at scroll-top;
-/// 4..=5 only at scroll-bottom, where the whole list sits 217 design px
-/// higher.
+/// Row 0's Buy-button centre at scroll-top, design px.
+const BUY_ROW_TOP_CY: f32 = 166.5;
+/// Design px between two consecutive Buy buttons.
+const BUY_ROW_PITCH: f32 = 145.0;
+/// How far the whole list rides up once scrolled to the bottom, design px.
+const SCROLL_BOTTOM_SHIFT: f32 = 217.0;
+
+/// The Buy button of a 0-based row. Rows `0..=LAST_TOP_ROW` are clickable at
+/// scroll-top; the rest only at scroll-bottom, where the whole list sits
+/// `SCROLL_BOTTOM_SHIFT` design px higher.
 pub fn buy_zone(row: u8, at_bottom: bool) -> Zone {
-    let mut cy = 166.5 + 145.0 * f32::from(row);
+    let mut cy = BUY_ROW_TOP_CY + BUY_ROW_PITCH * f32::from(row);
     if at_bottom {
-        cy -= 217.0;
+        cy -= SCROLL_BOTTOM_SHIFT;
     }
     Zone {
         cx: 1154.0,
@@ -124,22 +144,74 @@ pub struct ClientRect {
     pub height: i32,
 }
 
+impl ClientRect {
+    /// No usable client area at all — which on Windows is what a *minimized*
+    /// window reads back as, so it is the recoverable case everywhere: the next
+    /// `acquire()` re-reads a fresh rect and the watchdog's retry self-heals it.
+    ///
+    /// The single definition matters: this test used to be spelled out four
+    /// times (here, in the executor's post-`acquire` guard, and once per Win32
+    /// backend), and the only thing stopping a transient minimize from halting
+    /// the watch was that one of those copies ran first.
+    #[must_use]
+    pub const fn is_degenerate(self) -> bool {
+        self.width <= 0 || self.height <= 0
+    }
+}
+
+/// Why a design point has no screen coordinate.
+///
+/// Two variants rather than one string because the two want *opposite* verdicts
+/// from the executor — a minimized window aborts one job, an unsupported window
+/// shape halts the watch — and a caller that cannot match on the cause has to
+/// re-derive one of them itself.
+/// `PartialEq` but not `Eq`: `TooNarrow` carries the measured aspect, and the
+/// point of keeping it is the message, not equality.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScreenError {
+    /// The client area has no extent: minimized, or a window that just died.
+    /// Recoverable — the next `acquire()` reads a fresh rect.
+    DegenerateRect { width: i32, height: i32 },
+    /// Narrower than 16:9, so the game caps the view *vertically* and no
+    /// design-space mapping exists. Only the player can fix it.
+    TooNarrow { aspect: f32 },
+}
+
+impl std::fmt::Display for ScreenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ScreenError::DegenerateRect { width, height } => {
+                write!(f, "degenerate client area {width}×{height}")
+            }
+            ScreenError::TooNarrow { aspect } => write!(
+                f,
+                "window aspect {aspect:.3} is narrower than 16:9 — widen the game window"
+            ),
+        }
+    }
+}
+
 /// Design → physical screen pixels, for any window at least 16:9 wide. A
 /// narrower window caps the view vertically instead: unsupported, refused —
 /// the caller must never guess a coordinate.
-pub fn to_screen(rect: ClientRect, point: DesignPoint) -> Result<(i32, i32), String> {
-    if rect.width <= 0 || rect.height <= 0 {
-        return Err(format!(
-            "degenerate client area {}×{}",
-            rect.width, rect.height
-        ));
+///
+/// # Errors
+///
+/// [`ScreenError::DegenerateRect`] when `rect` has no extent (a minimized or
+/// just-closed window), and [`ScreenError::TooNarrow`] when the window is
+/// narrower than the 16:9 design aspect. The distinction is the whole point of
+/// the type: the first is transient, the second is not.
+pub fn to_screen(rect: ClientRect, point: DesignPoint) -> Result<(i32, i32), ScreenError> {
+    if rect.is_degenerate() {
+        return Err(ScreenError::DegenerateRect {
+            width: rect.width,
+            height: rect.height,
+        });
     }
     let (cw, ch) = (rect.width as f32, rect.height as f32);
     let aspect = cw / ch;
     if aspect + 1e-3 < DESIGN_W / DESIGN_H {
-        return Err(format!(
-            "window aspect {aspect:.3} is narrower than 16:9 — widen the game window"
-        ));
+        return Err(ScreenError::TooNarrow { aspect });
     }
     let s = ch / DESIGN_H;
     let view_w = DESIGN_H * aspect.min(MAX_ASPECT);
@@ -166,7 +238,7 @@ pub enum Trigger {
 }
 
 impl Trigger {
-    pub fn pre_wait_ms(self) -> u64 {
+    pub const fn pre_wait_ms(self) -> u64 {
         match self {
             Trigger::ShopOpened => WAIT_SHOP_OPENED_MS,
             Trigger::Refreshed => WAIT_REFRESHED_MS,
@@ -254,13 +326,22 @@ pub struct Timings {
     pub scroll_settle: DelayRange,
 }
 
+/// Eight 16-byte ranges. `Copy` is kept deliberately above the usual 64-byte
+/// guidance — the type has no heap data, jobs are built a few times per refresh
+/// rather than per packet, and every alternative forces a `.clone()` that would
+/// signal a cost there is none of. The canary is here so a ninth action is a
+/// decision rather than a surprise, in the style of `capture`'s and `stream`'s.
+const _: () = assert!(size_of::<Timings>() == 128);
+
 impl Timings {
     /// Every range paired with its `[actuator.timings]` key, in declaration
     /// order — what `Config::validate` walks to bound the player's values.
     ///
     /// The destructuring is exhaustive on purpose: a ninth action added above
     /// stops compiling here until it is named, so validation can never
-    /// silently skip a knob that reaches the refresh loop.
+    /// silently skip a knob that reaches the refresh loop. It destructures
+    /// *through the reference* — same exhaustiveness guarantee, without copying
+    /// all 128 bytes only to copy eight 16-byte ranges back out of them.
     pub fn named_ranges(&self) -> [(&'static str, DelayRange); 8] {
         let Timings {
             shop_opened,
@@ -271,16 +352,16 @@ impl Timings {
             buy_modal,
             between_buys,
             scroll_settle,
-        } = *self;
+        } = self;
         [
-            ("shop_opened", shop_opened),
-            ("refreshed", refreshed),
-            ("purchase_resumed", purchase_resumed),
-            ("recovery", recovery),
-            ("confirm_refresh_modal", confirm_refresh_modal),
-            ("buy_modal", buy_modal),
-            ("between_buys", between_buys),
-            ("scroll_settle", scroll_settle),
+            ("shop_opened", *shop_opened),
+            ("refreshed", *refreshed),
+            ("purchase_resumed", *purchase_resumed),
+            ("recovery", *recovery),
+            ("confirm_refresh_modal", *confirm_refresh_modal),
+            ("buy_modal", *buy_modal),
+            ("between_buys", *between_buys),
+            ("scroll_settle", *scroll_settle),
         ]
     }
 
@@ -382,7 +463,7 @@ impl TimingPreset {
 
 /// Separates the wait-jitter stream from the click-position stream: both seed
 /// from the same `now_ms`, but a shared sequence would make click coordinates
-/// depend on the timing config. XORing the seed keeps positions byte-stable
+/// depend on the timing config. `XOR`ing the seed keeps positions byte-stable
 /// whatever the ranges.
 const DELAY_SEED_SALT: u64 = 0xD31A_7000_D31A_7000;
 
@@ -519,7 +600,7 @@ pub fn refresh_job(trigger: Trigger, timings: Timings, epoch: u64, seed: u64) ->
 pub fn buy_job(trigger: Trigger, timings: Timings, epoch: u64, rows: &[u8], seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
     let mut delay = Jitter::new(seed ^ DELAY_SEED_SALT);
-    let mut rows: Vec<u8> = rows.iter().copied().filter(|&row| row <= 5).collect();
+    let mut rows: Vec<u8> = rows.iter().copied().filter(|&row| row <= MAX_ROW).collect();
     rows.sort_unstable();
     rows.dedup();
     if rows.is_empty() {
@@ -537,7 +618,7 @@ pub fn buy_job(trigger: Trigger, timings: Timings, epoch: u64, rows: &[u8], seed
     let mut wait_ms = timings.scroll_settle_ms(&mut delay);
     let mut at_bottom = false;
     for row in rows {
-        if row > 3 && !at_bottom {
+        if row > LAST_TOP_ROW && !at_bottom {
             steps.push(TimedStep {
                 wait_ms,
                 input: scroll(&mut jitter, -SCROLL_TO_EXTREME_NOTCHES),
@@ -715,12 +796,86 @@ mod tests {
     #[test]
     fn to_screen_refuses_a_narrow_window() {
         let narrow = rect(0, 0, 1280, 800);
-        assert!(to_screen(narrow, point(100.0, 100.0, Anchor::Left)).is_err());
+        let Err(error @ ScreenError::TooNarrow { .. }) =
+            to_screen(narrow, point(100.0, 100.0, Anchor::Left))
+        else {
+            panic!("a sub-16:9 window has no design mapping");
+        };
+        // The wording the executor puts in front of the player, unchanged.
+        assert!(error.to_string().contains("narrower than 16:9"), "{error}");
     }
 
     #[test]
     fn to_screen_refuses_a_degenerate_rect() {
-        assert!(to_screen(rect(0, 0, 0, 0), point(0.0, 0.0, Anchor::Left)).is_err());
+        let Err(error) = to_screen(rect(0, 0, 0, 0), point(0.0, 0.0, Anchor::Left)) else {
+            panic!("a minimized window has no client area to map into");
+        };
+        // Told apart from `TooNarrow` by the *type*, not by its text: this one
+        // aborts a job, the other one halts the watch.
+        assert_eq!(
+            error,
+            ScreenError::DegenerateRect {
+                width: 0,
+                height: 0
+            }
+        );
+        assert_eq!(error.to_string(), "degenerate client area 0×0");
+    }
+
+    #[test]
+    fn a_degenerate_rect_is_recognised_by_either_missing_dimension() {
+        assert!(!rect(0, 0, 1280, 720).is_degenerate());
+        assert!(rect(0, 0, 0, 720).is_degenerate());
+        assert!(rect(0, 0, 1280, 0).is_degenerate());
+        assert!(rect(0, 0, -1, 720).is_degenerate());
+    }
+
+    #[test]
+    fn the_row_count_and_the_scroll_split_stay_one_fact() {
+        // The guard that was missing: `MAX_ROW` and `LAST_TOP_ROW` used to be
+        // bare `<= 5` / `> 3` literals at three sites, and editing one alone
+        // planned a scroll-to-bottom for a row still at the top. Every clause
+        // below is derived from the constants, so a change to either that leaves
+        // the other behind fails here rather than in the shop.
+        assert_eq!(row_for_slot(MAX_ROW + 1), Some(MAX_ROW));
+        assert_eq!(row_for_slot(MAX_ROW + 2), None);
+
+        // The last top-group row is bought without a second scroll; the first
+        // bottom-group row is reached by one, and only one.
+        let top = buy_job(
+            Trigger::ShopOpened,
+            Timings::default(),
+            0,
+            &[LAST_TOP_ROW],
+            42,
+        );
+        assert_eq!(
+            top.steps
+                .iter()
+                .filter(|step| matches!(step.input, Input::Scroll { .. }))
+                .count(),
+            1
+        );
+        let bottom = buy_job(
+            Trigger::ShopOpened,
+            Timings::default(),
+            0,
+            &[LAST_TOP_ROW + 1],
+            42,
+        );
+        assert_eq!(
+            bottom
+                .steps
+                .iter()
+                .filter(|step| matches!(step.input, Input::Scroll { .. }))
+                .count(),
+            2
+        );
+        // And the row the extra scroll exists for really does move by the shift.
+        assert_eq!(
+            buy_zone(LAST_TOP_ROW + 1, false).cy - buy_zone(LAST_TOP_ROW + 1, true).cy,
+            SCROLL_BOTTOM_SHIFT
+        );
     }
 
     #[test]

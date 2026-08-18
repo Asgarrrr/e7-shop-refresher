@@ -3,14 +3,17 @@
 //! (`SendInput`, real cursor, foreground — the fallback). No window is ever
 //! resized: `to_screen` covers any aspect from 16:9 up, refuses narrower.
 
-use std::sync::Once;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::SystemServices::MK_LBUTTON;
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_INVALID,
+    DPI_AWARENESS_PER_MONITOR_AWARE, DPI_AWARENESS_SYSTEM_AWARE, DPI_AWARENESS_UNAWARE,
+    GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+    SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
@@ -36,30 +39,187 @@ const FOCUS_SETTLE_MS: u64 = 100;
 /// Posted messages are retrieved before queued hardware input: a freshly
 /// placed shield must let the game drain stale real moves before we post.
 const SHIELD_DRAIN_MS: u64 = 50;
+/// Full range of a `MOUSEEVENTF_ABSOLUTE` coordinate — a Win32 protocol
+/// constant, like `WHEEL_DELTA` above it.
+const ABSOLUTE_COORD_MAX: i64 = 65_535;
+
+/// An input attempted without a live `acquire()`. Both backends answer this,
+/// with this exact text: it is a contract violation, not a fault of the world,
+/// and it must never be a panic — that would kill the actuator task and take the
+/// whole session with it, where `Fatal` stops the loop with a real reason.
+const NO_TARGET: &str = "input attempted without an acquired game window";
+
+/// The verdict when the window is no longer where the job planned it.
+///
+/// One definition for both backends: a window with no client area is minimized,
+/// anything else has moved or been resized. Both are `Recoverable` — the window
+/// is alive, just elsewhere, and the next job's `acquire()` re-reads a fresh
+/// rect, so the watchdog's retry self-heals it.
+fn rect_change_error(observed: ClientRect) -> SurfaceError {
+    SurfaceError::Recoverable(if observed.is_degenerate() {
+        "the game window was minimized mid-job".to_owned()
+    } else {
+        "the game window moved or resized mid-job".to_owned()
+    })
+}
+
+/// The one implementation of "never leave the left button held".
+///
+/// A successful button-down must always be paired with a release attempt, so the
+/// release is *not* guarded by the target check: it cannot initiate a click and
+/// is strictly safer than leaving the game seeing a held button. Refusal is
+/// retried exactly once, and the retry's own verdict decides which fault is
+/// reported — if the second release also fails the game is left holding the
+/// button, and *that*, not the first refusal, is the fault worth telling.
+///
+/// Both backends route through here. It used to be two independent
+/// implementations of the same three-state decision — 20 lines in
+/// `WinSurface::release_after_down`, 13 inline in `MessageSurface::click` — for
+/// the single most safety-critical invariant this module has.
+///
+/// `revalidate` re-establishes the target (a no-op for a backend that has no
+/// per-event validation), `release` posts or injects the button-up, and `what`
+/// names the release in the fatal message.
+fn release_twice(
+    revalidate: impl FnOnce() -> Result<(), SurfaceError>,
+    mut release: impl FnMut() -> Result<(), SurfaceError>,
+    what: &str,
+) -> Result<(), SurfaceError> {
+    let original = match revalidate() {
+        Ok(()) => match release() {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        },
+        // The target is unsafe, but the button may be down: release anyway, and
+        // report the reason the target was refused rather than inventing one.
+        Err(error) => match release() {
+            Ok(()) => return Err(error),
+            Err(_) => error,
+        },
+    };
+
+    if release().is_ok() {
+        return Err(original);
+    }
+    Err(SurfaceError::Fatal(format!(
+        "left button state could not be proven released after two failed {what} attempts"
+    )))
+}
 
 /// Null-terminated UTF-16, the shape W-suffixed Win32 calls want.
 ///
 /// The buffer *is* the value: dropping it leaves the caller passing a
 /// dangling `as_ptr()` to Win32.
+///
+/// Sized up front rather than `collect()`ed: `EncodeUtf16::size_hint` reports a
+/// *lower* bound of `ceil(len / 3)`, which is what `Vec::from_iter` reserves, so
+/// the ASCII titles this is called with allocated small and then grew.
+/// `WinSurface::validate_target` runs `find_game_window` — hence this — before
+/// every single injected event, so a two-slot buy job took ~60 of those.
+/// `text.len() + 1` is exact for ASCII and never short: one UTF-16 unit per byte
+/// at most, plus the terminator.
 #[must_use]
 pub(super) fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain([0]).collect()
+    let mut buffer = Vec::with_capacity(text.len() + 1);
+    buffer.extend(text.encode_utf16());
+    buffer.push(0);
+    buffer
 }
 
-/// Marks the process DPI-aware once, so client rects come back in physical
-/// pixels. winit already sets this in gui builds; the console build needs it
-/// here — a failed call means it was already set, which is what we want.
-fn ensure_dpi_awareness() {
-    static DPI: Once = Once::new();
-    DPI.call_once(|| {
-        // SAFETY: the argument is a well-known Win32 constant and the call
-        // only flips process-global DPI state — it borrows nothing and hands
-        // back nothing to keep alive. A refusal means the mode was already
-        // set, which is the outcome this function wants anyway.
-        unsafe {
-            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+/// Names an awareness value for the log line and the refusal.
+fn awareness_name(awareness: DPI_AWARENESS) -> &'static str {
+    match awareness {
+        DPI_AWARENESS_UNAWARE => "unaware",
+        DPI_AWARENESS_SYSTEM_AWARE => "system-aware",
+        DPI_AWARENESS_PER_MONITOR_AWARE => "per-monitor-aware",
+        DPI_AWARENESS_INVALID => "invalid",
+        _ => "unrecognized",
+    }
+}
+
+/// The verdict on an awareness value: `Ok(())` only for per-monitor awareness.
+///
+/// Pure, so the wording and the classification can be tested without any Win32
+/// — the same split `preflight_refusal` uses.
+fn awareness_verdict(awareness: DPI_AWARENESS) -> Result<(), SurfaceError> {
+    if awareness == DPI_AWARENESS_PER_MONITOR_AWARE {
+        return Ok(());
+    }
+    Err(SurfaceError::Fatal(format!(
+        "this process is DPI {} rather than per-monitor-aware, so Windows reports the game \
+         window's size in virtualized pixels and every click would be planned at the wrong \
+         place — check for a \"Override high DPI scaling behavior\" compatibility setting on \
+         this app's exe, or a __COMPAT_LAYER environment variable, and remove it",
+        awareness_name(awareness)
+    )))
+}
+
+/// Establishes — once per process — that this process is *per-monitor* DPI aware,
+/// which is what makes every client rect below come back in physical pixels.
+///
+/// # Why this is checked rather than assumed
+///
+/// The whole coordinate chain is physical-pixel arithmetic: `client_rect` reads
+/// `GetClientRect` + `ClientToScreen`, `plan::to_screen` scales design-space
+/// points against that rect, and `move_cursor` normalizes the result against
+/// `SM_CXVIRTUALSCREEN`, which is always physical. A DPI-unaware or system-aware
+/// process gets *virtualized* rects on a scaled display, so every planned point
+/// is off by the scale factor and the clicks land on the wrong buttons — and
+/// nothing reports it, because `SendInput` is documented not to signal that kind
+/// of failure at all (see [`sendinput_result`]) and `PostMessageW` cheerfully
+/// posts a well-formed message to a wrong coordinate.
+///
+/// This code used to call `SetProcessDpiAwarenessContext` and drop the return
+/// with a bare semicolon, on the argument that "a failed call means it was
+/// already set, which is what we want". That conflated *already set* with *set
+/// to what we want*: the call answers `FALSE` for **any** already-set awareness,
+/// `UNAWARE` and `SYSTEM_AWARE` included. And in the shipped GUI build winit sets
+/// the awareness before the actuator's first `acquire()` ever runs, so the call
+/// *always* failed — meaning the entire click chain rested on winit's
+/// undocumented choice, verified nowhere. A compatibility shim, a
+/// `__COMPAT_LAYER` variable or a future winit is enough to change that choice.
+///
+/// So the answer comes from reading the context back, not from the setter: on the
+/// success path because a set value can still be re-read, and on the failure path
+/// because that is the only way to learn *whose* value won. A mis-aimed click is
+/// worse than no click, so anything but per-monitor awareness refuses the acquire
+/// with a `Fatal` the player can read, in the same voice as the UIPI preflight.
+///
+/// # Errors
+///
+/// [`SurfaceError::Fatal`] when the effective awareness is anything other than
+/// per-monitor.
+fn ensure_dpi_awareness() -> Result<(), SurfaceError> {
+    static DPI: OnceLock<Result<(), SurfaceError>> = OnceLock::new();
+    DPI.get_or_init(|| {
+        // SAFETY: the argument is a well-known Win32 constant and the call only
+        // flips process-global DPI state — it borrows nothing and hands back
+        // nothing to keep alive. A zero answer means *some* awareness was
+        // already set, which is why the value is read back below rather than
+        // inferred from this return.
+        let set =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        // SAFETY: neither call takes a pointer or a handle. The context is an
+        // opaque Win32 token passed straight back to the second call, which is
+        // its only documented consumer and answers `DPI_AWARENESS_INVALID` for
+        // anything it does not recognize.
+        let awareness =
+            unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) };
+        let verdict = awareness_verdict(awareness);
+        if set == 0 {
+            // Whoever set it first won: winit in the GUI build, or a shim.
+            // Recorded either way — this one line is the difference between a
+            // reproducible bug report and "the clicks miss sometimes".
+            tracing::info!(
+                awareness = awareness_name(awareness),
+                accepted = verdict.is_ok(),
+                error = %std::io::Error::last_os_error(),
+                "process DPI awareness was already set before the actuator asked"
+            );
         }
-    });
+        verdict
+    })
+    .clone()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +254,7 @@ struct SystemInputDriver;
 
 impl InputDriver for SystemInputDriver {
     fn find_game_window(&mut self) -> Result<isize, SurfaceError> {
-        ensure_dpi_awareness();
+        ensure_dpi_awareness()?;
         find_game_window().map(|hwnd| hwnd as isize)
     }
 
@@ -139,6 +299,16 @@ impl InputDriver for SystemInputDriver {
     }
 }
 
+/// `SendInput` backend: real cursor, real foreground.
+///
+/// The driver stays erased behind `Box<dyn InputDriver>` even though production
+/// only ever holds the one ZST. `trait-002` proposed
+/// `WinSurface<D: InputDriver = SystemInputDriver>` instead, and it does not
+/// stand alone: `InputDriver`/`SystemInputDriver` are private to this module, so
+/// a type parameter over them makes `WinSurface` leak a private type
+/// (`private_bounds`, `private_interfaces` — red under `-D warnings`) and
+/// `run_executor(WinSurface::default(), …)` in `src/app/mod.rs` becomes a hard
+/// error. Measured, not assumed. The allocation is one per session.
 pub struct WinSurface {
     driver: Box<dyn InputDriver>,
     target: Option<Target>,
@@ -163,9 +333,8 @@ impl WinSurface {
     }
 
     fn target(&self) -> Result<Target, SurfaceError> {
-        self.target.ok_or_else(|| {
-            SurfaceError::Fatal("input attempted without an acquired game window".to_owned())
-        })
+        self.target
+            .ok_or_else(|| SurfaceError::Fatal(NO_TARGET.to_owned()))
     }
 
     fn ensure_foreground(&mut self, hwnd: isize) -> Result<(), SurfaceError> {
@@ -195,15 +364,8 @@ impl WinSurface {
         }
 
         let rect = self.driver.client_rect(target.hwnd)?;
-        if rect.width <= 0 || rect.height <= 0 {
-            return Err(SurfaceError::Recoverable(
-                "the game window was minimized mid-job".to_owned(),
-            ));
-        }
-        if rect != target.rect {
-            return Err(SurfaceError::Recoverable(
-                "the game window moved or resized mid-job".to_owned(),
-            ));
+        if rect.is_degenerate() || rect != target.rect {
+            return Err(rect_change_error(rect));
         }
 
         self.ensure_foreground(target.hwnd)
@@ -214,29 +376,15 @@ impl WinSurface {
         self.driver.send(event)
     }
 
-    /// A successful down must always be paired with a release attempt. If the
-    /// target has become unsafe, LEFTUP is the one permitted unguarded event:
-    /// it cannot initiate a click and is safer than leaving the global button
-    /// state held. Refusal is retried exactly once.
+    /// This backend's half of [`release_twice`]: revalidate, then `LEFTUP`.
+    ///
+    /// The borrow has to be split by hand because both closures want
+    /// `&mut self` — hence the raw pointer-free dance of validating first into a
+    /// `Result` and handing `release_twice` a closure that only needs the driver.
     fn release_after_down(&mut self) -> Result<(), SurfaceError> {
-        let original = match self.validate_target() {
-            Ok(()) => match self.driver.send(InputEvent::LeftUp) {
-                Ok(()) => return Ok(()),
-                Err(error) => error,
-            },
-            Err(error) => match self.driver.send(InputEvent::LeftUp) {
-                Ok(()) => return Err(error),
-                Err(_) => error,
-            },
-        };
-
-        if self.driver.send(InputEvent::LeftUp).is_ok() {
-            return Err(original);
-        }
-        Err(SurfaceError::Fatal(
-            "left button state could not be proven released after two failed LEFTUP attempts"
-                .to_owned(),
-        ))
+        let validated = self.validate_target();
+        let driver = &mut self.driver;
+        release_twice(|| validated, || driver.send(InputEvent::LeftUp), "LEFTUP")
     }
 }
 
@@ -347,7 +495,7 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
 ///   `SetWindowPos`, which used to be reported as "the window is gone or its
 ///   queue is full" and retried forever.
 /// - The `Input` backend fails **silently**. `SendInput` is documented as
-///   "neither GetLastError nor the return value will indicate the failure was
+///   "neither `GetLastError` nor the return value will indicate the failure was
 ///   caused by UIPI blocking": it reports one event injected, the executor
 ///   reports success, and nothing whatsoever moves in the game. No per-call
 ///   error classification anywhere can see that, which is why the diagnosis has
@@ -461,15 +609,15 @@ fn move_cursor(at: (i32, i32)) -> Result<(), SurfaceError> {
     // Widen *before* subtracting: `left`/`top` go negative as soon as a
     // monitor sits left of or above the primary one, and an i32 subtraction
     // done first would be the thing that overflows.
-    let dx = (i64::from(at.0) - i64::from(left)) * 65_535 / i64::from(width);
-    let dy = (i64::from(at.1) - i64::from(top)) * 65_535 / i64::from(height);
+    let dx = (i64::from(at.0) - i64::from(left)) * ABSOLUTE_COORD_MAX / i64::from(width);
+    let dy = (i64::from(at.1) - i64::from(top)) * ABSOLUTE_COORD_MAX / i64::from(height);
     send_input(MOUSEINPUT {
         // Clamped, not truncated: a failed `GetSystemMetrics` reads 0, the
         // `.max(1)` above turns that into a width of 1, and the ratio then
         // leaves i32 entirely. Landing on the desktop edge is wrong but
         // bounded; a wrapped `as i32` would aim anywhere.
-        dx: dx.clamp(0, 65_535) as i32,
-        dy: dy.clamp(0, 65_535) as i32,
+        dx: dx.clamp(0, ABSOLUTE_COORD_MAX) as i32,
+        dy: dy.clamp(0, ABSOLUTE_COORD_MAX) as i32,
         mouseData: 0,
         dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         time: 0,
@@ -481,7 +629,11 @@ fn send_mouse(data: i32, flags: u32) -> Result<(), SurfaceError> {
     send_input(MOUSEINPUT {
         dx: 0,
         dy: 0,
-        mouseData: data as _,
+        // `mouseData` is a `u32` holding a signed wheel delta in its low word:
+        // spelled out rather than left to `as _`, so the reinterpretation is
+        // visible instead of inferred from the field's declaration in another
+        // crate.
+        mouseData: data.cast_unsigned(),
         dwFlags: flags,
         time: 0,
         dwExtraInfo: 0,
@@ -499,7 +651,7 @@ fn send_input(mi: MOUSEINPUT) -> Result<(), SurfaceError> {
     // not the byte length of the array. Passing the total size there is the
     // classic mistake that makes `SendInput` reject everything; this is the
     // correct form.
-    let inserted = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    let inserted = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
     sendinput_result(inserted)
 }
 
@@ -508,7 +660,7 @@ fn send_input(mi: MOUSEINPUT) -> Result<(), SurfaceError> {
 /// Recoverable: the watchdog re-issues against a fresh acquire.
 ///
 /// Note what is *not* in that list: UIPI. The documentation is explicit —
-/// "neither GetLastError nor the return value will indicate the failure was
+/// "neither `GetLastError` nor the return value will indicate the failure was
 /// caused by UIPI blocking" — so a window out of this process's reach makes this
 /// function answer `Ok(())` while nothing moves in the game. That blind spot is
 /// covered at acquire time by [`probe_window_reachable`], and it cannot be
@@ -558,7 +710,7 @@ fn post_refusal(error: &std::io::Error) -> SurfaceError {
 /// `PostMessageW` backend (the default): posts synthetic mouse messages to
 /// the game window — no focus stolen, the player keeps the mouse. The engine
 /// tracks its cursor through move messages, so every input re-asserts the
-/// [`shield`](super::shield) over the game until [`release`](Surface).
+/// [`shield`] over the game until [`release`](Surface::release).
 #[derive(Default)]
 pub struct MessageSurface {
     /// Job-scoped; the handle is stored as an integer so the executor's
@@ -569,13 +721,13 @@ pub struct MessageSurface {
 impl MessageSurface {
     /// The job-scoped target. An input attempted without a prior `acquire()`
     /// is a contract violation, not a fault of the world: it answers with the
-    /// same [`SurfaceError::Fatal`] `WinSurface::target` raises rather than
-    /// panicking — a panic here would kill the actuator task and take the
-    /// whole session down, where `Fatal` stops the loop with a real reason.
+    /// same [`NO_TARGET`] fatal `WinSurface::target` raises — literally the same
+    /// constant now — rather than panicking, since a panic here would kill the
+    /// actuator task and take the whole session down, where `Fatal` stops the
+    /// loop with a real reason.
     fn target(&self) -> Result<Target, SurfaceError> {
-        self.target.ok_or_else(|| {
-            SurfaceError::Fatal("input attempted without an acquired game window".to_owned())
-        })
+        self.target
+            .ok_or_else(|| SurfaceError::Fatal(NO_TARGET.to_owned()))
     }
 
     fn cleanup(&mut self) {
@@ -621,21 +773,13 @@ impl Target {
         if rect == self.rect {
             return Ok(());
         }
-        // The window is alive, just elsewhere: the next job's acquire()
-        // re-reads a fresh rect, so the watchdog's retry self-heals this.
-        Err(SurfaceError::Recoverable(
-            if rect.width <= 0 || rect.height <= 0 {
-                "the game window was minimized mid-job".to_owned()
-            } else {
-                "the game window moved or resized mid-job".to_owned()
-            },
-        ))
+        Err(rect_change_error(rect))
     }
 }
 
 impl Surface for MessageSurface {
     fn acquire(&mut self) -> Result<ClientRect, SurfaceError> {
-        ensure_dpi_awareness();
+        ensure_dpi_awareness()?;
         let hwnd = find_game_window()?;
         // One probe per job, at the only moment a clear answer is still useful:
         // the alternative is `shield::raise` failing on the first click of every
@@ -658,21 +802,14 @@ impl Surface for MessageSurface {
         post(target.hwnd, WM_LBUTTONDOWN, MK_LBUTTON as usize, lparam)?;
         std::thread::sleep(Duration::from_millis(press_ms));
         // Button is down: always post the release, retrying once on failure so a
-        // refused click never leaves the game seeing a held left button.
-        if let Err(original) = post(target.hwnd, WM_LBUTTONUP, 0, lparam) {
-            // The retry's own verdict decides which error is told: same rule
-            // as `WinSurface::release_after_down`. If both posts fail the
-            // game is left holding the button, and *that* — not the first
-            // refusal — is the fault worth reporting.
-            if post(target.hwnd, WM_LBUTTONUP, 0, lparam).is_ok() {
-                return Err(original);
-            }
-            return Err(SurfaceError::Fatal(
-                "left button state could not be proven released after two failed WM_LBUTTONUP posts"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
+        // refused click never leaves the game seeing a held left button. This
+        // backend re-verifies per post rather than up front, so there is nothing
+        // to revalidate here — the decision itself is `release_twice`'s.
+        release_twice(
+            || Ok(()),
+            || post(target.hwnd, WM_LBUTTONUP, 0, lparam),
+            "WM_LBUTTONUP",
+        )
     }
 
     fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError> {
@@ -685,13 +822,11 @@ impl Surface for MessageSurface {
             pack_point(target.to_client(at))?,
         )?;
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
-        // WM_MOUSEWHEEL takes screen coordinates; the delta rides wParam's
-        // high word.
-        let delta = notches.saturating_mul(WHEEL_DELTA);
+        // `WM_MOUSEWHEEL` takes screen coordinates; the delta rides wParam.
         post(
             target.hwnd,
             WM_MOUSEWHEEL,
-            ((delta as u32) << 16) as usize,
+            wheel_wparam(notches)?,
             pack_point(at)?,
         )?;
         Ok(())
@@ -716,6 +851,24 @@ impl Surface for MessageSurface {
 /// would then sign-extend into the upper half of a 64-bit LPARAM. Windows
 /// only reads the low 32 bits, so the old form worked by accident; this one
 /// builds the value the doc comment promises.
+/// `WM_MOUSEWHEEL`'s wParam: the wheel delta in the high word, *signed 16-bit*.
+///
+/// Validated exactly like the coordinate sibling below, and for the same reason.
+/// The old form was `((delta as u32) << 16)`, which discarded everything above
+/// bit 15 with no diagnostic — a shift never reports lost bits, not even in
+/// debug — so a large notch count would have scrolled a wrong distance in the
+/// *opposite* direction while `PostMessageW` reported success. `Recoverable`
+/// because nothing here can heal it but nothing is left half-done either: no
+/// message is posted at all.
+fn wheel_wparam(notches: i32) -> Result<usize, SurfaceError> {
+    let delta = i16::try_from(notches.saturating_mul(WHEEL_DELTA)).map_err(|_| {
+        SurfaceError::Recoverable(format!(
+            "wheel delta for {notches} notches is out of wParam range"
+        ))
+    })?;
+    Ok(usize::from(delta.cast_unsigned()) << 16)
+}
+
 fn pack_point((x, y): (i32, i32)) -> Result<isize, SurfaceError> {
     let x = i16::try_from(x)
         .map_err(|_| SurfaceError::Recoverable(format!("x {x} out of LPARAM range")))?;
@@ -1349,7 +1502,7 @@ mod tests {
         std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
     }
 
-    /// ERROR_INVALID_WINDOW_HANDLE: the window really did die.
+    /// `ERROR_INVALID_WINDOW_HANDLE`: the window really did die.
     fn dead_handle() -> std::io::Error {
         std::io::Error::from_raw_os_error(1400)
     }
@@ -1494,6 +1647,75 @@ mod tests {
             let y = i32::from((packed >> 16) as u16 as i16);
             assert_eq!((x, y), point, "round trip of {point:?}");
         }
+    }
+
+    /// The finding this replaces: the old code dropped
+    /// `SetProcessDpiAwarenessContext`'s return on the argument that a failure
+    /// means "already set, which is what we want" — but the call answers FALSE
+    /// for *any* already-set awareness. Only per-monitor gives physical-pixel
+    /// client rects, which is what every coordinate below assumes.
+    #[test]
+    fn only_per_monitor_awareness_is_accepted_for_the_coordinate_maths() {
+        assert_eq!(awareness_verdict(DPI_AWARENESS_PER_MONITOR_AWARE), Ok(()));
+        for (awareness, name) in [
+            (DPI_AWARENESS_UNAWARE, "unaware"),
+            (DPI_AWARENESS_SYSTEM_AWARE, "system-aware"),
+            (DPI_AWARENESS_INVALID, "invalid"),
+            // A future Windows value must refuse too, not fall through.
+            (99, "unrecognized"),
+        ] {
+            let Err(SurfaceError::Fatal(reason)) = awareness_verdict(awareness) else {
+                panic!("{name} awareness must refuse: a mis-aimed click is worse than none");
+            };
+            assert!(reason.contains(name), "{reason}");
+            // The player is pointed at something they can actually change.
+            assert!(reason.contains("compatibility setting"), "{reason}");
+            assert!(reason.contains("__COMPAT_LAYER"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_refused_awareness_is_named_rather_than_reported_as_a_raw_number() {
+        assert_eq!(awareness_name(DPI_AWARENESS_UNAWARE), "unaware");
+        assert_eq!(awareness_name(DPI_AWARENESS_SYSTEM_AWARE), "system-aware");
+        assert_eq!(
+            awareness_name(DPI_AWARENESS_PER_MONITOR_AWARE),
+            "per-monitor-aware"
+        );
+        assert_eq!(awareness_name(DPI_AWARENESS_INVALID), "invalid");
+        assert_eq!(awareness_name(7), "unrecognized");
+    }
+
+    /// The wheel path used to mask the delta into wParam's high word with
+    /// `(delta as u32) << 16`, twelve lines below the doc comment that refuses
+    /// exactly that for coordinates. Not reachable from the crate's own
+    /// `±10` notches — which is the point: the trait boundary is what a future
+    /// caller reaches, and a truncated delta scrolls the wrong distance in the
+    /// opposite direction with every layer reporting success.
+    #[test]
+    fn a_wheel_delta_outside_the_signed_word_is_refused_instead_of_truncated() {
+        // 300 notches × 120 = 36 000, past `i16::MAX`: the old form posted
+        // 36 000 − 65 536 = −29 536, i.e. a scroll the other way.
+        assert!(matches!(
+            wheel_wparam(300),
+            Err(SurfaceError::Recoverable(reason)) if reason.contains("out of wParam range")
+        ));
+        assert!(matches!(
+            wheel_wparam(-300),
+            Err(SurfaceError::Recoverable(_))
+        ));
+    }
+
+    /// The notch counts the planner actually emits, and the sign convention
+    /// Win32 reads back out of the high word.
+    #[test]
+    fn wheel_wparam_carries_the_notches_as_a_signed_high_word() {
+        assert_eq!(wheel_wparam(10).unwrap() >> 16, 1_200);
+        let down = wheel_wparam(-10).unwrap();
+        assert_eq!((down >> 16) as u16 as i16, -1_200);
+        assert_eq!(wheel_wparam(0).unwrap(), 0);
+        // The low word is wParam's button-state field and must stay clear.
+        assert_eq!(wheel_wparam(10).unwrap() & 0xFFFF, 0);
     }
 
     #[test]

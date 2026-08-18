@@ -3,7 +3,7 @@
 //! cursor, so the shield absorbs the player's mouse over the game while the
 //! posted messages — addressed to the game's handle — pass untouched.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
@@ -17,6 +17,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
+use super::lock;
 use super::plan::ClientRect;
 use super::win::wide;
 
@@ -26,15 +27,22 @@ const CLASS_NAME: &str = "arkyve-refresh-shop-shield";
 /// backend for the process lifetime.
 static WINDOW: Mutex<Option<isize>> = Mutex::new(None);
 
-/// Poisoning carries no meaning here: the guarded state is a plain handle,
-/// and a panic elsewhere must not turn every later click into a fatal — the
-/// promise `WINDOW` makes right above.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
+// Poisoning carries no meaning here: the guarded state is a plain handle, and a
+// panic elsewhere must not turn every later click into a fatal — the promise
+// `WINDOW` makes right above. That is now the actuator-wide policy, so the lock
+// helper lives one module up (`super::lock`) instead of being a second copy of
+// it here.
 
 /// Ensures the shield sits directly above the game, covering `rect`;
 /// `Ok(true)` means it was (re)placed — the game may still hold real moves.
+///
+/// # Errors
+///
+/// The message a refused `SetWindowPos` deserves, from
+/// [`placement_refusal`] — an integrity-level mismatch named as one, anything
+/// else as the plain action that failed plus the OS error. Also carries the
+/// reason the shield window could not be created or its pump thread started.
+/// Every one of them is fatal to the caller: never click shieldless.
 pub(super) fn raise(game: HWND, rect: ClientRect) -> Result<bool, String> {
     let shield = handle()? as HWND;
     // SAFETY: `game` is the handle the caller revalidated through
@@ -43,19 +51,22 @@ pub(super) fn raise(game: HWND, rect: ClientRect) -> Result<bool, String> {
     // "the shield is not directly above it" instead of faulting. Nothing is
     // borrowed past the call: the result is only compared.
     let directly_above = unsafe { GetWindow(game, GW_HWNDPREV) } == shield;
-    // SAFETY: `shield` was proven alive by the `IsWindow` check inside
-    // `handle()` on this same thread; `IsWindowVisible` only reports and
-    // returns 0 for a handle it does not know.
+    // SAFETY: `IsWindowVisible` is defined over any HWND — it validates the
+    // handle itself, only reports, and answers 0 for one it does not know. The
+    // shield's aliveness is deliberately *not* claimed here: it dies with its
+    // pump thread, which can exit at any moment after `handle()` returns, so no
+    // caller of `raise` could hold that precondition.
     let visible = unsafe { IsWindowVisible(shield) } != 0;
     if directly_above && visible {
         return Ok(false);
     }
     // Two-step swap into the game's own Z-slot: anchoring on the window
     // above it instead would catch Win32's topmost contagion.
-    // SAFETY: both handles are top-level windows owned by live threads, the
-    // geometry is plain integers, and `SWP_NOACTIVATE` keeps this a Z-order
-    // and placement edit only — no focus is stolen and nothing outlives the
-    // call. A dead handle is reported as FALSE, checked right below.
+    // SAFETY: `SetWindowPos` validates both handles itself, the geometry is
+    // plain integers, and `SWP_NOACTIVATE` keeps this a Z-order and placement
+    // edit only — no focus is stolen and nothing outlives the call. Neither
+    // window is claimed to be alive: a dead handle is reported as FALSE, which
+    // is checked right below, and that tolerance is the whole justification.
     let placed = unsafe {
         SetWindowPos(
             shield,
@@ -157,20 +168,23 @@ fn handle() -> Result<isize, String> {
 /// The window lives on its own pumping thread: unpumped, it would count as
 /// hung precisely while it absorbs the player's input.
 fn spawn_window() -> Result<isize, String> {
-    // The verdict travels in a shared slot and the channel only signals
-    // readiness: that way a detailed `create_window` failure survives even
-    // when the signal never arrives, instead of being flattened into the
-    // generic "the thread died" below.
-    let outcome: Arc<Mutex<Option<Result<isize, String>>>> = Arc::new(Mutex::new(None));
-    let thread_outcome = Arc::clone(&outcome);
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    // The channel carries the verdict itself, not a bare readiness signal: a
+    // successful `recv` *is* the detailed `create_window` answer, and a
+    // `RecvError` — the sender dropped without sending — is exactly "the thread
+    // died during setup". The `Arc<Mutex<Option<…>>>` this replaces existed to
+    // keep a detailed failure alive if the signal never arrived, but the only
+    // window for that was between filling the slot and sending, two adjacent
+    // statements that cannot panic. One fewer lock in a module the actuator
+    // touches on every job.
+    let (tx, rx) = std::sync::mpsc::channel::<Result<isize, String>>();
     let spawned = std::thread::Builder::new()
         .name("shield".to_owned())
         .spawn(move || {
             let created = create_window();
             let run = created.is_ok();
-            *lock(&thread_outcome) = Some(created);
-            let _ = tx.send(());
+            // A send failure means the requester is already gone; `run` was read
+            // before the move, so the pump decision does not depend on it.
+            let _ = tx.send(created);
             if run {
                 pump();
             }
@@ -179,12 +193,8 @@ fn spawn_window() -> Result<isize, String> {
         // The OS reason (thread limit, out of memory) is the whole diagnosis.
         return Err(format!("could not start the shield thread ({error})"));
     }
-    // Either the slot has been filled or the sender died with the thread;
-    // both end the wait, and the slot tells which.
-    let _ = rx.recv();
-    lock(&outcome)
-        .take()
-        .unwrap_or_else(|| Err("the shield thread died during setup".to_owned()))
+    rx.recv()
+        .unwrap_or_else(|_| Err("the shield thread died during setup".to_owned()))
 }
 
 /// The class outlives its windows: already-registered is success on

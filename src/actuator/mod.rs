@@ -10,7 +10,7 @@ mod shield;
 pub mod win;
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -18,23 +18,43 @@ use tokio::sync::mpsc;
 use crate::journal::EventLog;
 use crate::watch::{HaltSource, WatchGate};
 
-use plan::{Input, Job, Timings};
+use plan::{Input, Job, ScreenError, Timings};
+
+/// The actuator's poison-tolerant lock, matching the policy the journal, the
+/// view and the stream budget already state: a panic on some other thread must
+/// not turn every later click into a fatal, and none of the state guarded here
+/// can be left half-written (`Timings` is `Copy` and copied straight out; the
+/// shield's slot is a plain handle).
+///
+/// The alternative — `.expect("… mutex poisoned")` — used to be the two loudest
+/// exceptions to that policy in the crate, on a `pub` API of a windowed build
+/// where a panic is the one failure the player cannot read.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Generation counter of the shop state, bumped on every shop message. A job
 /// carries the epoch it was planned against and the executor refuses to act
 /// on any other: clicks aimed at a shop that no longer exists must die, not
 /// land.
+///
+/// The ordering is `Relaxed` on purpose, and it is not a weakening: the epoch is
+/// only ever compared for equality, and nothing is published *through* it. The
+/// value reaches the executor baked into a `Job` travelling over an `mpsc`
+/// channel, whose `send`/`recv` is what creates the happens-before edge; the
+/// snapshot itself arrives under the controller's own mutex. A stronger load
+/// would not be a fresher one.
 #[derive(Clone, Default)]
 pub struct SnapshotEpoch(Arc<AtomicU64>);
 
 impl SnapshotEpoch {
     pub fn bump(&self) {
-        self.0.fetch_add(1, Ordering::AcqRel);
+        self.0.fetch_add(1, Ordering::Relaxed);
     }
 
     #[must_use]
     pub fn current(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
+        self.0.load(Ordering::Relaxed)
     }
 }
 
@@ -55,7 +75,7 @@ pub struct ActuatorHandle {
     pub mode: Mode,
     pub epoch: SnapshotEpoch,
     jobs: mpsc::Sender<Job>,
-    /// Shared with [`setup`]'s live-edit path: the session thread swaps this
+    /// Shared with [`crate::app::setup`]'s live-edit path: the session thread swaps this
     /// on a `SetTimings` command and reads it when building each job. Jobs
     /// bake the resolved waits at submit time, so the executor never touches
     /// it.
@@ -79,6 +99,13 @@ impl ActuatorHandle {
 
     /// Queues a job for the executor, naming *why* it was lost when it was —
     /// the caller journals the drop, a lost click must not be silent.
+    ///
+    /// # Errors
+    ///
+    /// [`SubmitError::QueueFull`] when the executor is alive but behind, which
+    /// the next tick clears on its own, and [`SubmitError::ExecutorGone`] when
+    /// nobody is reading any more. The two need opposite advice, which is why
+    /// they are not one flag — see [`SubmitError`].
     #[must_use = "a rejected job means a lost click — journal the drop"]
     pub fn submit(&self, job: Job) -> Result<(), SubmitError> {
         match self.jobs.try_send(job) {
@@ -90,20 +117,20 @@ impl ActuatorHandle {
 
     /// The extra waits to bake into the next job, copied out from under the
     /// lock (never held across a plan build).
+    ///
+    /// Poison-tolerant, like every other lock in the crate: `Timings` is `Copy`
+    /// and copied straight out, so a panic elsewhere can have left nothing
+    /// half-written, and this is called while building *every* queued job —
+    /// panicking here would take the session down over an unrelated fault.
     #[must_use]
     pub fn timings(&self) -> Timings {
-        *self
-            .timings
-            .lock()
-            .expect("actuator timings mutex poisoned")
+        *lock(&self.timings)
     }
 
     /// Swaps in the player's retuned waits; the next queued job uses them.
+    /// Poison-tolerant for the same reason as [`timings`](Self::timings).
     pub fn set_timings(&self, timings: Timings) {
-        *self
-            .timings
-            .lock()
-            .expect("actuator timings mutex poisoned") = timings;
+        *lock(&self.timings) = timings;
     }
 }
 
@@ -115,29 +142,42 @@ impl ActuatorHandle {
 /// other end and no amount of waiting will help. Journaling the first when it
 /// is really the second sends the player looking for a slow actuator that does
 /// not exist — that mistake already cost one full investigation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The `Display` texts are the neutral one-liners a log or a crash chain wants.
+/// The journal deliberately says something longer and different at each of the
+/// two call sites, because there the *advice* is the point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitError {
     /// The executor is alive but behind: the bounded queue is at capacity.
+    #[error("the actuator queue is full — the executor is behind")]
     QueueFull,
     /// The receiving end is gone, so nothing will ever run this job. Since a
     /// fatal no longer ends [`run_executor`], this is reachable only once the
     /// session is tearing its workers down.
+    #[error("the actuator executor is gone — nothing will run this job")]
     ExecutorGone,
 }
 
 /// How a surface failure must be handled. Classified at the error's birth
 /// site (the backend knows what broke), never blanket-mapped per trait
 /// method.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Both payloads are already operator-facing text assembled so a human can read
+/// it, so `Display` is `{0}` verbatim: that is what lets an actuator failure
+/// appear in a `error = %err` field or a crash chain at all, instead of only as
+/// whatever prose one match arm happened to build.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SurfaceError {
     /// The world moved under the job (window dragged, resized, minimized):
     /// abort the remainder, keep the loop — the next job's `acquire()`
     /// re-reads a fresh rect, so the watchdog's retry self-heals it.
+    #[error("{0}")]
     Recoverable(String),
     /// Acting again would be blind (window gone, shield unraisable): the
     /// executor halts the watch — gate off, cause latched — and drops every
     /// further job before touching the surface, until the player fixes the
     /// cause and re-arms.
+    #[error("{0}")]
     Fatal(String),
 }
 
@@ -300,15 +340,6 @@ pub async fn run_executor(
             }
         };
         let mut surface = SurfaceJobGuard::new(&mut surface);
-        // A minimized window acquires with an empty client area: same fault
-        // as minimized mid-job, same recoverable abort.
-        if rect.width <= 0 || rect.height <= 0 {
-            abort(
-                &journal,
-                &format!("degenerate client area {}×{}", rect.width, rect.height),
-            );
-            continue;
-        }
         for step in &job.steps {
             tokio::time::sleep(Duration::from_millis(step.wait_ms)).await;
             if let Some(reason) = drop_reason(&job, &epoch, &gate) {
@@ -317,10 +348,20 @@ pub async fn run_executor(
             }
             let at = match plan::to_screen(rect, step.input.at()) {
                 Ok(at) => at,
-                Err(reason) => {
-                    // Abandon the remaining steps, keep the task: the guard
-                    // still releases on the way out of this iteration.
-                    fail(&journal, &gate, &reason);
+                // A minimized window acquires with an empty client area: same
+                // fault as minimized mid-job, same recoverable abort. This used
+                // to be a second copy of the degenerate-rect test run before the
+                // loop, purely because a `String` error could not be matched on;
+                // the classification now lives where the policy is.
+                Err(error @ ScreenError::DegenerateRect { .. }) => {
+                    abort(&journal, &error.to_string());
+                    break;
+                }
+                // Nothing the loop can heal: the player has to widen the window.
+                // Abandon the remaining steps, keep the task — the guard still
+                // releases on the way out of this iteration.
+                Err(error @ ScreenError::TooNarrow { .. }) => {
+                    fail(&journal, &gate, &error.to_string());
                     break;
                 }
             };
@@ -421,6 +462,39 @@ mod tests {
                 .iter()
                 .any(|l| l.text.contains("window gone"))
         );
+    }
+
+    /// The two loudest exceptions to the crate's poison policy used to be here.
+    ///
+    /// `apply()` reaches `actuator.timings()` while holding the controller guard,
+    /// so a panic under the timings lock poisoned that one too — and from then on
+    /// every dispatch panicked and the session died for good. Nothing guarded
+    /// here can be half-written (`Timings` is `Copy` and copied straight out), so
+    /// degrading is unconditionally safe and is what the journal, the view and
+    /// the stream budget all already do.
+    #[test]
+    fn a_poisoned_timings_mutex_still_serves_reads_and_writes() {
+        let timings = Arc::new(Mutex::new(Timings::default()));
+        let poisoner = Arc::clone(&timings);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoner.lock().expect("first lock is clean");
+            panic!("some other thread's fault");
+        }));
+        assert!(unwound.is_err());
+        assert!(timings.is_poisoned(), "the test needs a poisoned lock");
+
+        let (job_tx, _job_rx) = mpsc::channel(1);
+        let handle = ActuatorHandle::new(
+            Mode::Live,
+            SnapshotEpoch::default(),
+            job_tx,
+            Arc::clone(&timings),
+        );
+        // Neither of these may panic, and the write must still be observable.
+        assert_eq!(handle.timings(), Timings::default());
+        let retuned = plan::TimingPreset::Cautious.timings();
+        handle.set_timings(retuned);
+        assert_eq!(handle.timings(), retuned);
     }
 
     /// The whole point of the flavor probe: `block_in_place` panics off the
@@ -1057,6 +1131,12 @@ mod tests {
         // A minimized window acquires with an empty client area: same fault
         // as minimized mid-job, same recoverable abort — the loop halts only
         // if the watchdog's retries stay broken.
+        //
+        // The classification now comes from `ScreenError::DegenerateRect`, not
+        // from a duplicate `rect.width <= 0` test the executor used to run
+        // before the step loop. That is what this test guards: with a `String`
+        // error, deleting the duplicate turned a transient minimize into a hard
+        // halt with no compiler complaint.
         let rig = rig();
         let (surface, events) = FakeSurface::new(Ok(ClientRect {
             left: 0,
@@ -1119,6 +1199,10 @@ mod tests {
         assert_eq!(*releases.lock().unwrap(), 1);
     }
 
+    /// The other half of the classification: the same converter, the opposite
+    /// verdict. A window narrower than 16:9 is not something the loop can heal,
+    /// so it halts the watch — and the two arms are now told apart by
+    /// `ScreenError`'s variant rather than by which check ran first.
     #[tokio::test(start_paused = true)]
     async fn executor_stops_the_loop_on_a_narrow_window() {
         let rig = rig();
