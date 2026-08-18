@@ -34,6 +34,25 @@ use crate::error::{Error, Result};
 /// Length of the pipe nonce, in hexadecimal characters — 128 bits.
 pub const PIPE_NONCE_HEX_CHARS: usize = 32;
 
+/// The argv token that puts a copy of this exe into broker mode.
+///
+/// One exe, two roles: without this flag the process is the window the player
+/// sees, with it the process is the short-lived administrator half that opens
+/// the WinDivert handle and does nothing else. There is no second binary to
+/// extract and elevate — a program written by a medium-integrity process and
+/// then launched as administrator is an elevation pattern this design refuses,
+/// so the image that gets elevated is exactly the one the player double-clicked.
+///
+/// Lives here, unconditionally, for the same reason as [`pipe_name`]: the two
+/// sides cannot be allowed to drift. `capture::elevate` writes this token onto
+/// the elevated command line and the argv dispatch in `main` is what answers to
+/// it, and *the dispatch has to exist in builds that have no `elevate` at all* —
+/// refusing the flag on a build with no capture backend is the whole point of
+/// that arm. Two literals would have compiled happily while disagreeing, and the
+/// symptom would have been a second, elevated, invisible window plus a UI timing
+/// out on a channel nobody serves.
+pub const BROKER_ARGV_FLAG: &str = "--capture-broker";
+
 /// Validates the `--port` token: a TCP port, never zero.
 ///
 /// Pure and side-effect-free on purpose. This value is interpolated into the
@@ -92,6 +111,22 @@ pub fn parse_ui_pid(raw: &str) -> Result<u32> {
 #[must_use]
 pub fn pipe_name(nonce: &str) -> String {
     format!(r"\\.\pipe\arkyve-{nonce}")
+}
+
+/// The complete command line the unelevated side hands to the elevated copy.
+///
+/// Here rather than in `capture::elevate` so that the side which *writes* the
+/// command line and the side which *parses* it can be bolted together by a
+/// single test (`the_command_line_the_launcher_writes_is_the_one_the_dispatch_parses`
+/// in `main.rs`) instead of trusting four literals — the flag and the three
+/// argument names — to stay in agreement across two files, one of which does not
+/// exist in every build. The values are formatted, never quoted or escaped:
+/// [`parse_port`], [`parse_pipe_nonce`] and [`parse_ui_pid`] on the receiving end
+/// only accept tokens with no whitespace and no shell-significant characters, so
+/// there is nothing here that a space could split in two.
+#[must_use]
+pub fn broker_command_line(port: u16, pipe_nonce: &str, ui_pid: u32) -> String {
+    format!("{BROKER_ARGV_FLAG} --port {port} --pipe {pipe_nonce} --ui-pid {ui_pid}")
 }
 
 #[cfg(all(windows, feature = "windivert-backend"))]
@@ -971,6 +1006,28 @@ mod tests {
                 "{raw:?} must not pass pid validation"
             );
         }
+    }
+
+    #[test]
+    fn the_broker_command_line_leads_with_the_role_flag_and_carries_the_three_arguments() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let line = broker_command_line(3333, nonce, 4242);
+        // The flag first, because that is what `capture_broker_argv` scans for
+        // before anything else in `main` has run.
+        assert!(line.starts_with(BROKER_ARGV_FLAG), "{line}");
+        assert_eq!(
+            line,
+            format!("{BROKER_ARGV_FLAG} --port 3333 --pipe {nonce} --ui-pid 4242")
+        );
+    }
+
+    #[test]
+    fn every_token_of_the_broker_command_line_survives_being_split_on_whitespace() {
+        // The elevated side receives argv already split by the shell, so a value
+        // that could contain a space would silently become two arguments — and
+        // the one that carries a secret would be the one that broke.
+        let line = broker_command_line(1, "0123456789ABCDEF0123456789ABCDEF", u32::MAX);
+        assert_eq!(line.split_whitespace().count(), 7, "{line}");
     }
 
     #[test]

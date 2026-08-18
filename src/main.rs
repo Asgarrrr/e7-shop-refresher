@@ -13,24 +13,14 @@ use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 use arkyve_refresh_shop::{Config, app, crash};
 
-/// The argv token that puts this exe into capture-broker mode.
-///
-/// One exe, two roles: without this flag the process is the window the player
-/// sees, with it the process is the short-lived administrator half that opens
-/// the WinDivert handle and does nothing else (`src/broker.rs`). There is no
-/// second binary to extract and elevate — a program written by a
-/// medium-integrity process and then launched as administrator is an elevation
-/// pattern this design refuses, so the image that gets elevated is exactly the
-/// one the player double-clicked.
-///
-/// Spelled here *and* in `capture::elevate`, which writes the command line this
-/// reads. The two cannot share a constant today: `elevate` is a private module
-/// behind `windivert-backend`, while this dispatch has to exist in builds that
-/// do not have the backend at all — refusing the flag there is the point. A
-/// disagreement between the two spellings is at least loud rather than silent:
-/// the elevated copy would fall through into a second window and the UI would
-/// time out on a channel nobody serves.
-const CAPTURE_BROKER_FLAG: &str = "--capture-broker";
+// The argv token this dispatch answers to, taken from the module that also
+// writes it (`broker::broker_command_line`, used by `capture::elevate`) rather
+// than spelled a second time here. `broker` is declared unconditionally for
+// exactly this: `capture::elevate` is a private module behind
+// `windivert-backend`, while this dispatch has to exist in builds that have no
+// backend at all — refusing the flag there is the point — so the shared home had
+// to be somewhere both can reach.
+use arkyve_refresh_shop::broker::BROKER_ARGV_FLAG;
 
 /// Location of the config file. The app owns this file (the GUI's Setup/Apply
 /// writes it); the player isn't expected to hand-edit it, so it lives out of
@@ -131,7 +121,7 @@ fn capture_broker_argv() -> Option<Vec<String>> {
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     args.iter()
-        .any(|arg| arg == CAPTURE_BROKER_FLAG)
+        .any(|arg| arg == BROKER_ARGV_FLAG)
         .then_some(args)
 }
 
@@ -172,7 +162,7 @@ fn run_capture_broker(args: Vec<String>) -> ExitCode {
 #[cfg(not(all(windows, feature = "windivert-backend")))]
 fn run_capture_broker(_args: Vec<String>) -> ExitCode {
     eprintln!(
-        "{CAPTURE_BROKER_FLAG} needs the `windivert-backend` feature: this build has no capture \
+        "{BROKER_ARGV_FLAG} needs the `windivert-backend` feature: this build has no capture \
          backend, so it cannot serve a capture channel."
     );
     ExitCode::FAILURE
@@ -192,7 +182,7 @@ fn parse_broker_command(args: &[String]) -> arkyve_refresh_shop::Result<(u16, St
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            CAPTURE_BROKER_FLAG => {}
+            BROKER_ARGV_FLAG => {}
             "--port" => port = Some(parse_port(next_value(&mut rest, "--port")?)?),
             "--pipe" => {
                 nonce = Some(parse_pipe_nonce(next_value(&mut rest, "--pipe")?)?.to_owned())
@@ -453,6 +443,34 @@ mod tests {
     }
 
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The one test that ties the two halves of the command line together.
+    ///
+    /// Everything else in this module feeds the parser literals. This feeds it
+    /// the *producer's* output: `broker::broker_command_line` is what
+    /// `capture::elevate` hands to `ShellExecuteExW`, and `parse_broker_command`
+    /// is what the elevated copy reads it back with. Rename a flag on either
+    /// side, reorder the tokens, quote a value — and this fails, where two
+    /// independent sets of literals would both have kept passing while the
+    /// product silently opened a second elevated window and timed out on a
+    /// channel nobody served.
+    #[test]
+    fn the_command_line_the_launcher_writes_is_the_one_the_dispatch_parses() {
+        use arkyve_refresh_shop::broker::broker_command_line;
+
+        let line = broker_command_line(3333, NONCE, 4242);
+        // Split the way the shell splits argv before `capture_broker_argv` sees
+        // it, so a value that grew a space would break here too.
+        let args = argv(&line);
+        assert!(
+            args.iter().any(|arg| arg == BROKER_ARGV_FLAG),
+            "the dispatch would never recognise its own command line: {line}"
+        );
+        assert_eq!(
+            parse_broker_command(&args).expect("the launcher's own command line must parse"),
+            (3333, NONCE.to_owned(), 4242)
+        );
+    }
 
     #[test]
     fn a_complete_broker_command_line_yields_the_three_validated_values() {

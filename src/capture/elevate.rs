@@ -65,16 +65,8 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use super::CaptureStop;
-use crate::broker::pipe_name;
+use crate::broker::{broker_command_line, pipe_name};
 use crate::error::{Error, Result};
-
-/// The argv token that puts the elevated copy of this exe into broker mode.
-///
-/// Spelled here and matched by the dispatch in `main`. Both sides also agree on
-/// the three arguments below; the broker validates every one of them
-/// ([`crate::broker::parse_port`] and friends) because this command line is the
-/// entire surface the medium-integrity side has on the administrator process.
-const BROKER_ARGV_FLAG: &str = "--capture-broker";
 
 /// Nonce length in bytes. Hex-encoded it must come out at exactly
 /// [`crate::broker::PIPE_NONCE_HEX_CHARS`] characters, which the unit test below
@@ -338,10 +330,10 @@ fn spawn_elevated_broker_inner(port: u16) -> Result<(PipeReader, PipeStop)> {
     let exe = current_executable_path()?;
     let ui_pid = std::process::id();
 
-    let broker = elevate_self(
-        &exe,
-        &format!("{BROKER_ARGV_FLAG} --port {port} --pipe {nonce} --ui-pid {ui_pid}"),
-    )?;
+    // Built by `broker`, not spelled out here: the module that owns the
+    // validators for these three tokens is the one that owns their spelling, so
+    // this side cannot drift away from the dispatch that reads them back.
+    let broker = elevate_self(&exe, &broker_command_line(port, &nonce, ui_pid))?;
     let pipe = connect_to_broker(&name, &broker)?;
     verify_server_identity(&pipe, &broker)?;
     info!(port, "capture broker running elevated; channel connected");
