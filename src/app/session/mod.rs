@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 use crate::actuator::plan::{self, Trigger};
-use crate::actuator::{ActuatorHandle, Mode};
+use crate::actuator::{ActuatorHandle, Mode, SubmitError};
 use crate::domain::control::{Action, BuyTarget, Controller, Event, Recovery, Status};
 use crate::journal::EventLog;
 use crate::render::{describe, format_item, refusal, render_shop, status_label};
@@ -500,17 +500,29 @@ fn queue_refresh(
     submit_or_report(lines, actuator, job, "refresh dropped");
 }
 
-/// Submits a job, journaling the drop if the actuator queue is full — a lost
-/// click must never be silent. `dropped` names what was lost, e.g. "refresh
-/// dropped".
+/// Submits a job, journaling the drop — a lost click must never be silent.
+/// `dropped` names what was lost, e.g. "refresh dropped".
+///
+/// The two causes get two different lines because they ask the player for two
+/// different things. A full queue is back-pressure that clears itself; a
+/// closed channel means the executor task is gone, and no retry, no re-arm and
+/// no amount of patience brings it back — only relaunching the app does.
+/// Blaming the queue for that sends the player debugging the wrong half of the
+/// program while the session still looks perfectly alive.
 fn submit_or_report(
     lines: &mut Vec<String>,
     actuator: &ActuatorHandle,
     job: plan::Job,
     dropped: &str,
 ) {
-    if !actuator.submit(job) {
-        lines.push(format!(">> actuator queue full — {dropped}"));
+    match actuator.submit(job) {
+        Ok(()) => {}
+        Err(SubmitError::QueueFull) => lines.push(format!(">> actuator queue full — {dropped}")),
+        Err(SubmitError::ExecutorGone) => {
+            lines.push(format!(
+                ">> the actuator is gone, restart the app — {dropped}"
+            ));
+        }
     }
 }
 

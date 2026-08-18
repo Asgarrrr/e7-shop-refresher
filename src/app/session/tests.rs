@@ -1118,6 +1118,41 @@ fn full_job_queue_journals_the_drop() {
     );
 }
 
+/// A closed channel is not a full one, and must not be reported as one.
+///
+/// The two are one `false` apart if the submit result is collapsed to a bool,
+/// and the wrong label sends the player hunting a slow actuator while the real
+/// problem is that nobody is at the other end — a state no retry and no re-arm
+/// can fix.
+#[test]
+fn a_gone_executor_is_journaled_as_gone_not_as_a_full_queue() {
+    let gate = WatchGate::new(true);
+    let journal = EventLog::default();
+    let (job_tx, job_rx) = mpsc::channel(8);
+    drop(job_rx); // the executor task is over: the queue is empty, not full
+    let actuator = ActuatorHandle::new(Mode::Live, SnapshotEpoch::default(), job_tx, timings());
+    let controller = armed();
+    on_message(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        ServerMessage::Shop(dud_shop(10)),
+        1,
+    );
+    let lines = journal.entries();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text.contains("the actuator is gone, restart the app")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.text.contains("queue full")),
+        "{lines:?}"
+    );
+}
+
 /// An armed controller with the recovery watchdog on, matching
 /// `ShopItem::default()`.
 fn armed_recovering() -> Mutex<Controller> {

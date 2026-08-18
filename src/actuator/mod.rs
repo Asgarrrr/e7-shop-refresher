@@ -77,11 +77,15 @@ impl ActuatorHandle {
         }
     }
 
-    /// Queues a job for the executor; `false` when the queue is full — the
-    /// caller journals the drop, a lost click must not be silent.
-    #[must_use = "a full queue means a lost click — journal the drop"]
-    pub fn submit(&self, job: Job) -> bool {
-        self.jobs.try_send(job).is_ok()
+    /// Queues a job for the executor, naming *why* it was lost when it was —
+    /// the caller journals the drop, a lost click must not be silent.
+    #[must_use = "a rejected job means a lost click — journal the drop"]
+    pub fn submit(&self, job: Job) -> Result<(), SubmitError> {
+        match self.jobs.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(SubmitError::QueueFull),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SubmitError::ExecutorGone),
+        }
     }
 
     /// The extra waits to bake into the next job, copied out from under the
@@ -103,6 +107,24 @@ impl ActuatorHandle {
     }
 }
 
+/// Why a job never reached the executor.
+///
+/// Both are lost clicks, but they need opposite advice, so they must not
+/// collapse back into one flag: a full queue is transient back-pressure the
+/// next tick clears on its own, while a closed channel means nobody is at the
+/// other end and no amount of waiting will help. Journaling the first when it
+/// is really the second sends the player looking for a slow actuator that does
+/// not exist — that mistake already cost one full investigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitError {
+    /// The executor is alive but behind: the bounded queue is at capacity.
+    QueueFull,
+    /// The receiving end is gone, so nothing will ever run this job. Since a
+    /// fatal no longer ends [`run_executor`], this is reachable only once the
+    /// session is tearing its workers down.
+    ExecutorGone,
+}
+
 /// How a surface failure must be handled. Classified at the error's birth
 /// site (the backend knows what broke), never blanket-mapped per trait
 /// method.
@@ -113,7 +135,9 @@ pub enum SurfaceError {
     /// re-reads a fresh rect, so the watchdog's retry self-heals it.
     Recoverable(String),
     /// Acting again would be blind (window gone, shield unraisable): the
-    /// executor stops the whole loop.
+    /// executor halts the watch — gate off, cause latched — and drops every
+    /// further job before touching the surface, until the player fixes the
+    /// cause and re-arms.
     Fatal(String),
 }
 
@@ -134,7 +158,7 @@ pub trait Surface {
     /// the client rect that produced it. Implementations must answer a
     /// violation with [`SurfaceError::Fatal`], never a panic — the executor
     /// runs inside a supervised task, so a panic ends the whole session while
-    /// `Fatal` stops the loop with a reason the player can read.
+    /// `Fatal` halts the watch with a reason the player can read.
     fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError>;
     /// Wheel notches at a screen point. Same precondition and same
     /// fail-closed rule as [`click`](Surface::click).
@@ -217,6 +241,28 @@ impl<S: Surface> Drop for SurfaceJobGuard<'_, S> {
 /// and the epoch: a stop or a fresh shop mid-job aborts the remaining steps —
 /// never click blind. With `dry_run` the resolved screen input is journaled
 /// instead of sent.
+///
+/// A fatal fault ends the job, never the task, and that is not a weakening of
+/// "an actuator that cannot act safely stops acting":
+///
+/// - [`fail`] calls `WatchGate::request_halt`, which disables the gate
+///   *synchronously* and latches the cause so nothing can re-arm behind the
+///   player's back.
+/// - [`drop_reason`] re-reads that gate at the top of every job and again
+///   before every step, and answers `"the watch is off"` while it is down.
+/// - So from the fatal onwards every job is dropped before `acquire` is even
+///   called: not one input can be delivered. The loop stops acting; only the
+///   task survives. It also means `fail` cannot spam — nothing reaches a
+///   surface call again until the player re-arms.
+///
+/// The task has to survive because it is spawned exactly once per session and
+/// nothing respawns it. Returning would drop the job receiver, and every later
+/// submit would then fail against a channel nobody reads — while `Start` from
+/// `Status::Stopped` happily re-arms the gate and the whole session goes on
+/// *looking* alive. Staying in the loop makes the advice the halt prints
+/// ("relaunch Epic Seven without administrator rights") actually work: the
+/// player fixes the cause, presses Start, the next job re-runs `acquire`, the
+/// preflight re-probes, and the actuator recovers with no process restart.
 pub async fn run_executor(
     mut surface: impl Surface,
     mut jobs: mpsc::Receiver<Job>,
@@ -243,8 +289,11 @@ pub async fn run_executor(
                 continue;
             }
             Err(SurfaceError::Fatal(reason)) => {
+                // Nothing was acquired, so there is nothing to release. The
+                // gate is down now: every job behind this one is dropped at
+                // the top of the loop until the player re-arms.
                 fail(&journal, &gate, &reason);
-                return;
+                continue;
             }
         };
         let mut surface = SurfaceJobGuard::new(&mut surface);
@@ -266,8 +315,10 @@ pub async fn run_executor(
             let at = match plan::to_screen(rect, step.input.at()) {
                 Ok(at) => at,
                 Err(reason) => {
+                    // Abandon the remaining steps, keep the task: the guard
+                    // still releases on the way out of this iteration.
                     fail(&journal, &gate, &reason);
-                    return;
+                    break;
                 }
             };
             let delivered = match step.input {
@@ -303,8 +354,9 @@ pub async fn run_executor(
                         abort(&journal, &reason);
                     }
                     SurfaceError::Fatal(reason) => {
+                        // Same as above: landed inputs stay landed, the rest
+                        // of the job dies with the gate, the task lives on.
                         fail(&journal, &gate, &reason);
-                        return;
                     }
                 }
                 break;
@@ -332,8 +384,16 @@ fn abort(journal: &EventLog, reason: &str) {
     journal.emit(&[format!(">> actuator: {reason} — aborted remaining clicks")]);
 }
 
-/// An actuator that cannot act safely stops the whole loop — with its own
-/// label, never the player's.
+/// An actuator that cannot act safely stops acting — with its own label,
+/// never the player's.
+///
+/// `request_halt` disables the gate synchronously and latches the cause, so
+/// every job after this one is refused by [`drop_reason`] before `acquire` is
+/// reached: the loop is inert from here even though its task keeps running
+/// (see [`run_executor`] for why the task must not die). That also makes this
+/// self-limiting — no surface call happens again until the player
+/// acknowledges the halt and re-arms, so a standing fault cannot flood the
+/// journal with repeats.
 fn fail(journal: &EventLog, gate: &WatchGate, reason: &str) {
     journal.emit(&[format!(">> actuator: {reason} — stopping the loop")]);
     gate.request_halt(HaltSource::ActuatorFailed);
@@ -639,6 +699,10 @@ mod tests {
             ))
             .await
             .unwrap();
+        // The fatal no longer ends the task, so the producer has to close the
+        // channel for the loop to finish; the timeout still fails the test if
+        // the fatal ever stops consuming.
+        drop(rig.job_tx);
         let journal = rig.journal.clone();
         let gate = rig.gate.clone();
         tokio::time::timeout(
@@ -646,7 +710,7 @@ mod tests {
             run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
         )
         .await
-        .expect("fatal acquire must return with the producer still alive");
+        .expect("the executor must keep draining after a fatal acquire, then end on EOF");
         assert!(events.lock().unwrap().is_empty());
         assert!(!gate.is_enabled());
         assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
@@ -684,6 +748,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        drop(rig.job_tx);
         let journal = rig.journal.clone();
         let gate = rig.gate.clone();
         tokio::time::timeout(
@@ -691,7 +756,7 @@ mod tests {
             run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
         )
         .await
-        .expect("a refused preflight must return with the producer still alive");
+        .expect("a refused preflight must halt the watch, not wedge the executor");
 
         assert!(events.lock().unwrap().is_empty(), "nothing may be clicked");
         assert!(!gate.is_enabled());
@@ -734,6 +799,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        drop(rig.job_tx);
         let journal = rig.journal.clone();
         let gate = rig.gate.clone();
         tokio::time::timeout(
@@ -741,7 +807,7 @@ mod tests {
             run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
         )
         .await
-        .expect("fatal input must return with the producer still alive");
+        .expect("a fatal input must end the job, then the loop ends on EOF");
         assert!(events.lock().unwrap().is_empty());
         assert!(!gate.is_enabled());
         assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
@@ -757,6 +823,10 @@ mod tests {
         // Three inputs land, the fourth fails fatally: landed inputs stay
         // recorded, exactly one halt goes out, the surface is still
         // released.
+        //
+        // The job queued behind it is the point of the second submit: the
+        // executor now lives long enough to pick it up, and must drop it on
+        // the downed gate rather than act on it.
         let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         surface.deny_after = Some((
@@ -783,6 +853,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        drop(rig.job_tx);
         let journal = rig.journal.clone();
         let gate = rig.gate.clone();
         tokio::time::timeout(
@@ -790,16 +861,117 @@ mod tests {
             run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
         )
         .await
-        .expect("fatal mid-job input must return with queued work and a live producer");
+        .expect("a fatal mid-job input must drop the queued work, then end on EOF");
         assert_eq!(events.lock().unwrap().len(), 3);
         assert!(!gate.is_enabled());
         assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        // Only the first job ever acquired: the queued one was refused before
+        // the surface was touched.
         assert_eq!(*releases.lock().unwrap(), 1);
+        let lines = journal.entries();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.text.contains("stopping the loop"))
+                .count(),
+            1,
+            "exactly one halt — the downed gate keeps `fail` from re-firing"
+        );
+        assert!(lines.iter().any(|line| {
+            line.text
+                .contains("the watch is off — dropped planned clicks")
+        }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_re_armed_watch_acts_again_after_a_fatal_without_a_process_restart() {
+        // The whole reason the fatal paths stopped returning.
+        //
+        // The player is told to relaunch Epic Seven without administrator
+        // rights and press Start again. That advice is only true if the
+        // executor task outlived the halt: it is spawned once per session, so
+        // a `return` here would leave the re-armed session submitting into a
+        // channel nobody reads.
+        let rig = rig();
+        let (mut surface, events) = FakeSurface::new(design_rect());
+        // One-shot, like the shield refusing to raise against an elevated
+        // window: it fails the first input and never again, standing in for
+        // the player fixing the cause between the two jobs.
+        surface.deny_after = Some((
+            0,
+            SurfaceError::Fatal("could not raise the input shield".to_owned()),
+        ));
+        let releases = surface.releases.clone();
+        let gate = rig.gate.clone();
+        let journal = rig.journal.clone();
+        // Moved, not cloned: this is the only producer, so dropping it below
+        // is what ends the loop.
+        let job_tx = rig.job_tx;
+        let executor = tokio::spawn(run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            false,
+        ));
+
+        job_tx
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert!(!gate.is_enabled());
         assert!(
+            events.lock().unwrap().is_empty(),
+            "the fatal must deliver nothing"
+        );
+
+        // What the session does once it has dispatched the halt and the player
+        // presses Start again.
+        gate.acknowledge_halt(HaltSource::ActuatorFailed);
+        gate.set(true);
+        assert!(
+            gate.is_enabled(),
+            "the acknowledged cause must let it re-arm"
+        );
+
+        job_tx
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                2,
+            ))
+            .await
+            .unwrap();
+        drop(job_tx);
+        tokio::time::timeout(Duration::from_secs(10), executor)
+            .await
+            .expect("the executor must still be running to serve the second job")
+            .expect("the executor task must not panic");
+
+        // Both of the second job's steps landed, on a rect it re-acquired
+        // itself, and nothing halted again.
+        assert_eq!(events.lock().unwrap().len(), 2);
+        assert_eq!(
+            *releases.lock().unwrap(),
+            2,
+            "each job acquired and released"
+        );
+        assert!(gate.is_enabled(), "the recovered job must not re-halt");
+        assert_eq!(
             journal
                 .entries()
                 .iter()
-                .any(|line| line.text.contains("stopping the loop"))
+                .filter(|line| line.text.contains("stopping the loop"))
+                .count(),
+            1
         );
     }
 
@@ -962,6 +1134,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        drop(rig.job_tx);
         let journal = rig.journal.clone();
         let gate = rig.gate.clone();
         tokio::time::timeout(
@@ -969,7 +1142,7 @@ mod tests {
             run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
         )
         .await
-        .expect("fatal coordinate conversion must return with the producer alive");
+        .expect("a fatal coordinate conversion must end the job, then the loop ends on EOF");
         assert!(events.lock().unwrap().is_empty());
         assert!(!gate.is_enabled());
         assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
