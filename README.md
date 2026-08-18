@@ -279,3 +279,8 @@ Raise or narrow the verbosity with `RUST_LOG`, e.g. `RUST_LOG=journal=info`
 for the player-facing lines only, or `RUST_LOG=arkyve_refresh_shop=debug` for the
 capture internals. `debug` is as detailed as it gets: nothing in the app logs at
 `trace`, so asking for that level changes nothing.
+
+Narrowing all the way to `RUST_LOG=warn` is safe for triage: the lines that say
+the product stopped doing its job — `session aborted` and `actuator: … stopping
+the loop` — are recorded at `error`, and `server link down` and an aborted job at
+`warn`, so they survive. Only the routine player narration is dropped.

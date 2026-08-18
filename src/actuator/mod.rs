@@ -428,7 +428,13 @@ fn drop_reason(job: &Job, epoch: &SnapshotEpoch, gate: &WatchGate) -> Option<&'s
 /// A recoverable fault ends the job, never the loop: journaled, then the
 /// watchdog turns the silence into a retry.
 fn abort(journal: &EventLog, reason: &str) {
-    journal.emit(&[format!(">> actuator: {reason} — aborted remaining clicks")]);
+    // `warn`, not `info`, for the same reason as a link-down: the job did not
+    // do what the journal already promised it would, and the watchdog's retry
+    // only makes sense to a reader who can still see this line.
+    journal.emit_at(
+        tracing::Level::WARN,
+        &[format!(">> actuator: {reason} — aborted remaining clicks")],
+    );
 }
 
 /// An actuator that cannot act safely stops acting — with its own label,
@@ -442,7 +448,13 @@ fn abort(journal: &EventLog, reason: &str) {
 /// acknowledges the halt and re-arms, so a standing fault cannot flood the
 /// journal with repeats.
 fn fail(journal: &EventLog, gate: &WatchGate, reason: &str) {
-    journal.emit(&[format!(">> actuator: {reason} — stopping the loop")]);
+    // `error`, matching a session abort: this is one of the two lines that say
+    // the product stopped doing its job. It is also self-limiting (see above),
+    // so it cannot flood the file at this level.
+    journal.emit_at(
+        tracing::Level::ERROR,
+        &[format!(">> actuator: {reason} — stopping the loop")],
+    );
     gate.request_halt(HaltSource::ActuatorFailed);
 }
 
