@@ -6,7 +6,7 @@
 use std::sync::Once;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::SystemServices::MK_LBUTTON;
 use windows_sys::Win32::UI::HiDpi::{
@@ -18,8 +18,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetClientRect, GetForegroundWindow, GetSystemMetrics, PostMessageW,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SetForegroundWindow, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
 };
 
 use super::plan::ClientRect;
@@ -74,6 +75,14 @@ enum InputEvent {
 /// happens before injection without ever touching the real cursor or focus.
 trait InputDriver: Send {
     fn find_game_window(&mut self) -> Result<isize, SurfaceError>;
+    /// The preflight probe of [`probe_window_reachable`], raw.
+    ///
+    /// Hands back the thread's last-error untouched instead of a
+    /// [`SurfaceError`] so that the *classification* — which message the player
+    /// reads, and whether the loop stops — stays in one pure function
+    /// ([`preflight_refusal`]) that the tests can drive with a synthetic
+    /// `ERROR_ACCESS_DENIED` and no Win32 anywhere.
+    fn probe_reachable(&mut self, hwnd: isize) -> std::io::Result<()>;
     fn foreground_window(&mut self) -> isize;
     fn request_foreground(&mut self, hwnd: isize);
     fn client_rect(&mut self, hwnd: isize) -> Result<ClientRect, SurfaceError>;
@@ -87,6 +96,10 @@ impl InputDriver for SystemInputDriver {
     fn find_game_window(&mut self) -> Result<isize, SurfaceError> {
         ensure_dpi_awareness();
         find_game_window().map(|hwnd| hwnd as isize)
+    }
+
+    fn probe_reachable(&mut self, hwnd: isize) -> std::io::Result<()> {
+        probe_window_reachable(hwnd as HWND)
     }
 
     fn foreground_window(&mut self) -> isize {
@@ -231,6 +244,13 @@ impl Surface for WinSurface {
     fn acquire(&mut self) -> Result<ClientRect, SurfaceError> {
         self.target = None;
         let hwnd = self.driver.find_game_window()?;
+        // Before the foreground is stolen and before any coordinate is planned:
+        // a window this process may not drive is not worth pulling forward, and
+        // `SendInput` will not report the refusal later — see
+        // [`probe_window_reachable`].
+        self.driver
+            .probe_reachable(hwnd)
+            .map_err(|error| preflight_refusal(&error))?;
         self.ensure_foreground(hwnd)?;
         let rect = self.driver.client_rect(hwnd)?;
         self.target = Some(Target { hwnd, rect });
@@ -311,6 +331,94 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
     })
 }
 
+/// Asks Windows, once per acquire, whether this process may drive `hwnd` at
+/// all — before any input is planned against it.
+///
+/// # Why this exists
+///
+/// Since the capture backend moved into its own elevated broker, the window
+/// this process owns runs at *medium* integrity. If the player starts Epic
+/// Seven as administrator, UIPI puts its window out of reach and every backend
+/// fails — but neither fails in a way that names the cause:
+///
+/// - The default `Message` backend gets `ERROR_ACCESS_DENIED` from the shield's
+///   `SetWindowPos`, which used to be reported as "the window is gone or its
+///   queue is full" and retried forever.
+/// - The `Input` backend fails **silently**. `SendInput` is documented as
+///   "neither GetLastError nor the return value will indicate the failure was
+///   caused by UIPI blocking": it reports one event injected, the executor
+///   reports success, and nothing whatsoever moves in the game. No per-call
+///   error classification anywhere can see that, which is why the diagnosis has
+///   to be a preflight rather than a better error message.
+///
+/// # Why a no-op `SetWindowPos`, and emphatically *not* `PostMessageW(WM_NULL)`
+///
+/// `WM_NULL` is the obvious probe and it does not work: it is on UIPI's default
+/// allow-list, so a medium-integrity process posting it to a high-integrity
+/// window gets `TRUE` back. Measured on Windows 11 26200 — a medium-integrity
+/// prober against a high-integrity window answered `TRUE` for `WM_NULL` and
+/// `FALSE` + `ERROR_ACCESS_DENIED` for `WM_MOUSEMOVE`, `WM_LBUTTONDOWN`,
+/// `WM_MOUSEWHEEL` (the three this backend actually posts), `WM_USER`, `WM_APP`
+/// and every form of `SetWindowPos`. A `WM_NULL` probe would therefore have
+/// passed in exactly the situation it was written to catch.
+///
+/// `SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE` asks Win32 to
+/// change nothing at all: no geometry, no Z-order, no focus. It is inert on a
+/// window we *can* reach — unlike a synthetic mouse message, which would nudge
+/// the game's own cursor tracking — and it is refused on one we cannot, through
+/// the very same gate `shield::raise` hits a moment later.
+fn probe_window_reachable(hwnd: HWND) -> std::io::Result<()> {
+    // SAFETY: `hwnd` is the handle `find_game_window` just returned; a window
+    // that died in between is reported as FALSE rather than faulting. The null
+    // insert-after handle is ignored under `SWP_NOZORDER`, the geometry is inert
+    // under `SWP_NOMOVE | SWP_NOSIZE`, and nothing is borrowed past the call —
+    // Win32 keeps no pointer into this frame.
+    let answered = unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    };
+    if answered == 0 {
+        // Read before any other Win32 call: `GetLastError` is per-thread and the
+        // very next call overwrites it.
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The verdict a refused preflight produces, and the one line the player gets.
+///
+/// Fatal, not recoverable: an integrity-level mismatch cannot heal while both
+/// processes keep running, so retrying is a loop that never terminates and never
+/// explains itself. The executor's `fail` puts this text in the journal as
+/// `>> actuator: <this> — stopping the loop`, at acquire time, *before* the
+/// first click — which is the whole difference from the per-click message this
+/// replaces, one the player only ever read after the executor had already given
+/// up for good.
+///
+/// The refusal itself is the signal: the branch below only picks wording. The
+/// code was measured to be `ERROR_ACCESS_DENIED` for a UIPI-blocked window (see
+/// [`probe_window_reachable`]) but Microsoft does not document it, so a future
+/// Windows answering something else must still stop the loop and still point at
+/// the likely cause rather than fall through to a raw Win32 dump.
+pub(super) fn preflight_refusal(error: &std::io::Error) -> SurfaceError {
+    let cause = if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+        "the game window runs at a higher integrity level than this app, so Windows refuses every \
+         click aimed at it — relaunch Epic Seven without administrator rights"
+    } else {
+        "the game window refused a harmless preflight, so no click aimed at it would arrive \
+         either — if Epic Seven was started as administrator, relaunch it without administrator \
+         rights"
+    };
+    SurfaceError::Fatal(format!("{cause} ({error})"))
+}
+
 /// One `SM_*` metric. Win32 has no error channel here: an unknown index (or
 /// a metric the session cannot answer) simply reads back 0.
 fn system_metric(index: i32) -> i32 {
@@ -373,8 +481,15 @@ fn send_input(mi: MOUSEINPUT) -> Result<(), SurfaceError> {
 }
 
 /// `SendInput` returns the number of events inserted; we always send 1, so
-/// anything else means the input was blocked (UIPI, foreground lock, full
-/// queue). Recoverable: the watchdog re-issues against a fresh acquire.
+/// anything else means the input was blocked (foreground lock, full queue).
+/// Recoverable: the watchdog re-issues against a fresh acquire.
+///
+/// Note what is *not* in that list: UIPI. The documentation is explicit —
+/// "neither GetLastError nor the return value will indicate the failure was
+/// caused by UIPI blocking" — so a window out of this process's reach makes this
+/// function answer `Ok(())` while nothing moves in the game. That blind spot is
+/// covered at acquire time by [`probe_window_reachable`], and it cannot be
+/// covered here.
 fn sendinput_result(inserted: u32) -> Result<(), SurfaceError> {
     if inserted == 1 {
         Ok(())
@@ -386,16 +501,33 @@ fn sendinput_result(inserted: u32) -> Result<(), SurfaceError> {
     }
 }
 
-/// `PostMessageW` returns a BOOL; false means the post failed (window gone,
-/// queue full). Recoverable for the same reason.
-fn postmessage_result(ok: bool) -> Result<(), SurfaceError> {
-    if ok {
-        Ok(())
+/// Why a refused `PostMessageW` is fatal or merely recoverable.
+///
+/// `ERROR_ACCESS_DENIED` here is UIPI, and it used to be classified
+/// `Recoverable` under the text "window gone or queue full" — two causes that
+/// are both wrong for it, and a verdict that had the watchdog re-issuing clicks
+/// forever against a condition which cannot heal while the game keeps running.
+/// It is `Fatal`: acting again would be acting blind, exactly what that variant
+/// is for.
+///
+/// In practice the preflight at acquire catches this first and this branch is
+/// the backstop for a game *relaunched as administrator mid-session* — so it
+/// names the cause in one clause and leaves the full explanation and the fix to
+/// [`preflight_refusal`], rather than repeating a paragraph on every click.
+///
+/// Everything else keeps the old verdict, minus the invented certainty: a queue
+/// that is genuinely full, or a window that closed between the shield going up
+/// and the click going out, both self-heal on the next acquire.
+fn post_refusal(error: &std::io::Error) -> SurfaceError {
+    if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+        SurfaceError::Fatal(format!(
+            "Windows refused the click: the game window is at a higher integrity level than this \
+             app ({error})"
+        ))
     } else {
-        Err(SurfaceError::Recoverable(format!(
-            "PostMessageW failed — window gone or queue full ({})",
-            std::io::Error::last_os_error()
-        )))
+        SurfaceError::Recoverable(format!(
+            "PostMessageW failed — the game window may have closed, or its queue is full ({error})"
+        ))
     }
 }
 
@@ -481,6 +613,10 @@ impl Surface for MessageSurface {
     fn acquire(&mut self) -> Result<ClientRect, SurfaceError> {
         ensure_dpi_awareness();
         let hwnd = find_game_window()?;
+        // One probe per job, at the only moment a clear answer is still useful:
+        // the alternative is `shield::raise` failing on the first click of every
+        // job with a message that names the wrong cause.
+        probe_window_reachable(hwnd).map_err(|error| preflight_refusal(&error))?;
         let rect = client_rect(hwnd)?;
         self.target = Some(Target {
             hwnd: hwnd as isize,
@@ -571,7 +707,13 @@ fn post(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> Result<(), Surfa
     // borrowed by the queue: `wparam`/`lparam` carry packed coordinates and
     // button flags only, never a pointer into this process.
     let ok = unsafe { PostMessageW(hwnd as HWND, msg, wparam, lparam) } != 0;
-    postmessage_result(ok)
+    if ok {
+        return Ok(());
+    }
+    // Read before any other Win32 call: `GetLastError` is per-thread and the
+    // very next call overwrites it. Here it is not colour for a bug report — it
+    // is what decides whether the loop stops or the watchdog retries.
+    Err(post_refusal(&std::io::Error::last_os_error()))
 }
 
 #[cfg(test)]
@@ -597,6 +739,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum DriverCall {
         FindWindow,
+        Probe(isize),
         Foreground,
         RequestForeground(isize),
         ClientRect(isize),
@@ -610,6 +753,10 @@ mod tests {
         foreground: isize,
         rect: ClientRect,
         find_results: VecDeque<Result<isize, SurfaceError>>,
+        /// Scripted preflight outcomes, raw: an `Err` here is the thread's
+        /// last-error as Win32 would have left it, so the tests exercise the
+        /// real classification instead of a pre-classified verdict.
+        probe_results: VecDeque<std::io::Result<()>>,
         foreground_results: VecDeque<isize>,
         rect_results: VecDeque<Result<ClientRect, SurfaceError>>,
         send_results: VecDeque<Result<(), SurfaceError>>,
@@ -623,6 +770,7 @@ mod tests {
                 foreground: GAME_HWND,
                 rect: game_rect(),
                 find_results: VecDeque::new(),
+                probe_results: VecDeque::new(),
                 foreground_results: VecDeque::new(),
                 rect_results: VecDeque::new(),
                 send_results: VecDeque::new(),
@@ -643,6 +791,12 @@ mod tests {
             } else {
                 Ok(state.window)
             }
+        }
+
+        fn probe_reachable(&mut self, hwnd: isize) -> std::io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(DriverCall::Probe(hwnd));
+            state.probe_results.pop_front().unwrap_or(Ok(()))
         }
 
         fn foreground_window(&mut self) -> isize {
@@ -764,6 +918,10 @@ mod tests {
             calls(&state),
             vec![
                 DriverCall::FindWindow,
+                // The preflight comes before the foreground steal: a window this
+                // process may not drive is not worth pulling in front of the
+                // player's own.
+                DriverCall::Probe(GAME_HWND),
                 DriverCall::Foreground,
                 DriverCall::RequestForeground(GAME_HWND),
                 DriverCall::Sleep(FOCUS_SETTLE_MS),
@@ -1158,17 +1316,103 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn postmessage_true_is_ok() {
-        assert!(postmessage_result(true).is_ok());
+    /// What a UIPI-blocked call actually answers, measured on Windows 11 26200
+    /// with a medium-integrity prober against a high-integrity window:
+    /// `PostMessageW` of every mouse message and `SetWindowPos` in every form
+    /// return FALSE with this code. Microsoft documents none of that, which is
+    /// why the code chooses wording only and never the verdict.
+    fn uipi_refusal() -> std::io::Error {
+        std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
+    }
+
+    /// ERROR_INVALID_WINDOW_HANDLE: the window really did die.
+    fn dead_handle() -> std::io::Error {
+        std::io::Error::from_raw_os_error(1400)
     }
 
     #[test]
-    fn postmessage_false_is_recoverable() {
+    fn an_access_denied_post_stops_the_loop_instead_of_being_retried_forever() {
+        // It was `Recoverable`, so the watchdog re-issued clicks against a
+        // condition that cannot heal while both processes keep running.
+        let SurfaceError::Fatal(reason) = post_refusal(&uipi_refusal()) else {
+            panic!("a UIPI refusal must be fatal");
+        };
+        assert!(reason.contains("integrity level"), "{reason}");
+        // The two causes the old text named are both wrong for this one.
+        assert!(!reason.contains("queue is full"), "{reason}");
+        assert!(!reason.contains("closed"), "{reason}");
+    }
+
+    #[test]
+    fn any_other_post_failure_stays_recoverable_and_keeps_its_plain_wording() {
+        let SurfaceError::Recoverable(reason) = post_refusal(&dead_handle()) else {
+            panic!("only a UIPI refusal is fatal here");
+        };
+        assert!(reason.contains("PostMessageW failed"), "{reason}");
+        assert!(!reason.contains("integrity"), "{reason}");
+    }
+
+    #[test]
+    fn a_refused_preflight_names_the_integrity_level_and_the_fix_the_player_can_apply() {
+        let SurfaceError::Fatal(reason) = preflight_refusal(&uipi_refusal()) else {
+            panic!("a window this process cannot drive is not something to retry");
+        };
+        assert!(reason.contains("higher integrity level"), "{reason}");
+        assert!(
+            reason.contains("relaunch Epic Seven without administrator rights"),
+            "{reason}"
+        );
+    }
+
+    /// The verdict hangs on the call failing, not on the code being 5 — the
+    /// code is undocumented, and a Windows that answered something else must
+    /// still stop the loop rather than click into the void.
+    #[test]
+    fn a_preflight_refused_with_any_other_code_is_still_fatal_and_still_points_at_the_cause() {
+        let SurfaceError::Fatal(reason) = preflight_refusal(&dead_handle()) else {
+            panic!("any refused preflight must stop the loop");
+        };
+        assert!(reason.contains("administrator rights"), "{reason}");
+    }
+
+    #[test]
+    fn a_refused_preflight_stops_acquire_before_the_foreground_is_stolen() {
+        let (mut surface, state) = fake_surface();
+        state
+            .lock()
+            .unwrap()
+            .probe_results
+            .push_back(Err(uipi_refusal()));
+
         assert!(matches!(
-            postmessage_result(false),
-            Err(SurfaceError::Recoverable(_))
+            surface.acquire(),
+            Err(SurfaceError::Fatal(reason)) if reason.contains("higher integrity level")
         ));
+        // Nothing was focused, nothing was measured, no target was stored: the
+        // job never becomes clickable.
+        assert_eq!(
+            calls(&state),
+            vec![DriverCall::FindWindow, DriverCall::Probe(GAME_HWND)]
+        );
+        assert!(surface.target.is_none());
+    }
+
+    /// The whole reason the probe is a preflight rather than a better error
+    /// message: with this backend the injection itself reports success.
+    #[test]
+    fn a_refused_preflight_is_the_only_signal_this_backend_gets() {
+        let (mut surface, state) = fake_surface();
+        state
+            .lock()
+            .unwrap()
+            .probe_results
+            .push_back(Err(uipi_refusal()));
+
+        assert!(surface.acquire().is_err());
+        // `sendinput_result` answers `Ok(())` for a UIPI-blocked injection —
+        // documented, and unfixable at the injection site.
+        assert!(sendinput_result(1).is_ok());
+        assert!(sent_events(&state).is_empty());
     }
 
     /// The default backend must fail closed exactly like `WinSurface`: a

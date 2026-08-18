@@ -5,7 +5,9 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use windows_sys::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+};
 use windows_sys::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -70,7 +72,7 @@ pub(super) fn raise(game: HWND, rect: ClientRect) -> Result<bool, String> {
         // the very next call would overwrite it. UIPI refusals and dead
         // windows are indistinguishable without it.
         let error = std::io::Error::last_os_error();
-        return Err(format!("could not raise the input shield ({error})"));
+        return Err(placement_refusal("raise the input shield", &error));
     }
     // SAFETY: same two live top-level handles, same no-activate contract;
     // `SWP_NOMOVE | SWP_NOSIZE` makes the zeroed geometry inert.
@@ -86,12 +88,39 @@ pub(super) fn raise(game: HWND, rect: ClientRect) -> Result<bool, String> {
         )
     };
     if swapped == 0 {
+        // Same rule, same reason: read it before anything else touches Win32.
         let error = std::io::Error::last_os_error();
-        return Err(format!(
-            "could not slot the game under the input shield ({error})"
+        return Err(placement_refusal(
+            "slot the game under the input shield",
+            &error,
         ));
     }
     Ok(true)
+}
+
+/// Why a `SetWindowPos` refusal reads the way it does.
+///
+/// The comment above used to concede that "UIPI refusals and dead windows are
+/// indistinguishable without it" — the error code — and then not use the
+/// distinction. It is used now, because the two want opposite things from the
+/// player: a dead window is nothing to do, an integrity-level mismatch is
+/// "relaunch Epic Seven without administrator rights".
+///
+/// That fix deliberately does **not** appear here. `MessageSurface::acquire`
+/// probes the window once per job and stops the loop with the full explanation
+/// (`actuator::win::preflight_refusal`) before a single click is planned, so by
+/// the time this line can fire the game has changed integrity level *mid-job* —
+/// a real case, and a rare one. Naming the cause is what this owes the log;
+/// repeating the paragraph on every click is what would bury it.
+fn placement_refusal(action: &str, error: &std::io::Error) -> String {
+    if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+        format!(
+            "Windows now refuses to {action}: the game window sits at a higher integrity level \
+             than this app ({error})"
+        )
+    } else {
+        format!("could not {action} ({error})")
+    }
 }
 
 /// Lowers the shield if it exists — never creates one.
@@ -248,5 +277,45 @@ fn pump() {
         // SAFETY: `msg` was filled by the `GetMessageW` that gated this
         // branch and is still owned by this thread.
         unsafe { DispatchMessageW(&msg) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Measured, not assumed: a medium-integrity process calling `SetWindowPos`
+    /// against a high-integrity window is refused with this exact code.
+    fn uipi_refusal() -> std::io::Error {
+        std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
+    }
+
+    #[test]
+    fn an_access_denied_placement_names_the_integrity_level_instead_of_a_dead_window() {
+        let message = placement_refusal("raise the input shield", &uipi_refusal());
+        assert!(message.contains("integrity level"), "{message}");
+        assert!(message.contains("raise the input shield"), "{message}");
+    }
+
+    #[test]
+    fn an_access_denied_placement_leaves_the_fix_to_the_preflight() {
+        // The preflight stops the loop with the "relaunch Epic Seven without
+        // administrator rights" line before any click is planned. Repeating it
+        // per click would bury the one line that matters.
+        let message = placement_refusal("slot the game under the input shield", &uipi_refusal());
+        assert!(!message.contains("relaunch"), "{message}");
+    }
+
+    #[test]
+    fn any_other_placement_failure_keeps_its_plain_wording() {
+        // ERROR_INVALID_WINDOW_HANDLE: the window really did die mid-job, and
+        // an integrity-level lecture would be the wrong diagnosis.
+        let error = std::io::Error::from_raw_os_error(1400);
+        let message = placement_refusal("raise the input shield", &error);
+        assert!(
+            message.starts_with("could not raise the input shield"),
+            "{message}"
+        );
+        assert!(!message.contains("integrity"), "{message}");
     }
 }

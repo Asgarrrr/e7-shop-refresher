@@ -657,6 +657,62 @@ mod tests {
         }));
     }
 
+    /// The preflight's verdict has to *reach the player*, not just exist.
+    ///
+    /// `win::preflight_refusal` is what `Surface::acquire` answers when the game
+    /// window is out of this process's reach; this is the rest of the trip —
+    /// through `fail`, into the journal the window renders, at acquire time and
+    /// before a single click is planned. Built from the real classifier rather
+    /// than from a copy of its text, so a reworded diagnosis cannot pass here
+    /// while shipping something else.
+    #[cfg(all(windows, feature = "actuator"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_preflight_reaches_the_journal_naming_the_integrity_level() {
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+        let refusal = win::preflight_refusal(&std::io::Error::from_raw_os_error(
+            ERROR_ACCESS_DENIED as i32,
+        ));
+        let rig = rig();
+        let (surface, events) = FakeSurface::new(Err(refusal));
+        rig.job_tx
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                0,
+                1,
+            ))
+            .await
+            .unwrap();
+        let journal = rig.journal.clone();
+        let gate = rig.gate.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
+        )
+        .await
+        .expect("a refused preflight must return with the producer still alive");
+
+        assert!(events.lock().unwrap().is_empty(), "nothing may be clicked");
+        assert!(!gate.is_enabled());
+        let line = journal
+            .entries()
+            .into_iter()
+            .find(|line| line.text.contains("stopping the loop"))
+            .expect("the halt must be journaled");
+        assert!(
+            line.text.contains("higher integrity level"),
+            "{}",
+            line.text
+        );
+        assert!(
+            line.text
+                .contains("relaunch Epic Seven without administrator rights"),
+            "{}",
+            line.text
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn executor_stops_the_loop_when_an_input_fails() {
         // A fatal input failure (e.g. the shield refused to raise) halts
