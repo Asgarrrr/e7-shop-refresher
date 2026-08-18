@@ -152,21 +152,49 @@ fn main() -> ExitCode {
     // filter is a BPF expression built from `game_port` inside the Npcap
     // backend, the receive buffer is the snaplen that backend picks, and the
     // forward directions stopped being a choice when the pipeline dropped the
-    // client -> server half it never decoded. They are still accepted because
-    // deleting them would make `Config::load` fail on every config file written
-    // by an earlier release, which is every config file that exists.
+    // client -> server half it never decoded. They are still *accepted* because
+    // deleting the fields would make `Config::load` fail on every config file
+    // written by an earlier release, which is every config file that exists.
     //
-    // One line per section rather than one merged list: the sections were
-    // retired for unrelated reasons and in different releases, so a player
-    // searching the log for the key they set finds it next to its own story.
-    for keys in [config.capture.retired_keys(), config.forward.retired_keys()]
+    // "Once" used to be a lie: nothing removed the keys, and `persist::save`
+    // rewrites only the GUI-editable sections, so the warning came back every
+    // launch with no cure but hand-editing a file the app owns. So strip them
+    // here, and say which of the two things happened.
+    //
+    // Placed after `Config::load` on purpose. We only ever rewrite a file the
+    // app has just parsed *and* validated — a run that is about to die on an
+    // invalid config touches nothing — and the loaded `Config` is what tells us
+    // whether there is anything to strip at all, so the normal case (no retired
+    // key, every install from here on) costs no second read and no log line.
+    let retired: Vec<String> = [config.capture.retired_keys(), config.forward.retired_keys()]
         .into_iter()
         .flatten()
-    {
-        tracing::warn!(
-            keys = %keys,
-            "these config keys are accepted but ignored, and will be refused in a later release"
-        );
+        .collect();
+    if !retired.is_empty() {
+        let still_set = retired.join(", ");
+        // Best-effort throughout: the keys are inert, so failing to delete them
+        // costs a log line, never a startup.
+        match arkyve_refresh_shop::config::persist::strip_retired_keys(&config_path) {
+            Ok(Some(removed)) => tracing::warn!(
+                keys = %removed,
+                "these config keys were already being ignored and have now been removed from config.toml; no setting of yours was changed"
+            ),
+            // The rewrite failed: the keys really are still on disk, so this
+            // stays a "you may want to act" warning rather than a past-tense
+            // one — it will repeat on the next launch.
+            Err(err) => tracing::warn!(
+                keys = %still_set,
+                error = %err,
+                "these config keys are accepted but ignored, and will be refused in a later release; config.toml could not be rewritten to drop them"
+            ),
+            // Loaded from the file, absent from the file: something rewrote it
+            // underneath us between the two reads. Nothing to do, and worth a
+            // line, because the warning will come back next launch.
+            Ok(None) => tracing::warn!(
+                keys = %still_set,
+                "these config keys are accepted but ignored, and will be refused in a later release; they were already gone from config.toml when it was re-read, so nothing was written"
+            ),
+        }
     }
     // No `server_url` here: it can carry a credential (see
     // `app::redacted_server_url`), and this file is what the player is asked

@@ -182,16 +182,18 @@ The GUI owns this file — the Setup tab's Apply writes the edited sections back
 to it — so it normally isn't hand-edited. On first run the bundled
 `config.example.toml` (compiled into the exe) is written to that path, so a
 real, commented, valid file is always there to inspect or edit; later runs
-leave it untouched. Delete it to regenerate the example on the next launch.
+leave it untouched — with one exception: a file still carrying the retired keys
+below has them deleted, once, at the startup that warns about them. Delete the
+file to regenerate the example on the next launch.
 
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `game_port` | `3333` | Game server TCP port |
 | `server_url` | `wss://ingest.arkyve.dev/refresh-shop` | Analysis server |
-| `forward.server_to_client` | — | **Retired.** Still parsed so older files keep loading; ignored (the server → client stream is the only one captured) |
-| `forward.client_to_server` | — | **Retired.** Still parsed so older files keep loading; ignored (the client → server stream is never captured) |
-| `capture.buffer_size` | — | **Retired.** Still parsed so older files keep loading; ignored (the backend sizes its own buffer) |
-| `capture.filter` | — | **Retired.** Still parsed so older files keep loading; ignored (the backend builds its own filter from `game_port`) |
+| `forward.server_to_client` | — | **Retired.** Still parsed so older files keep loading, then removed from your `config.toml` at the next startup; ignored (the server → client stream is the only one captured) |
+| `forward.client_to_server` | — | **Retired.** Still parsed so older files keep loading, then removed from your `config.toml` at the next startup; ignored (the client → server stream is never captured) |
+| `capture.buffer_size` | — | **Retired.** Still parsed so older files keep loading, then removed from your `config.toml` at the next startup; ignored (the backend sizes its own buffer) |
+| `capture.filter` | — | **Retired.** Still parsed so older files keep loading, then removed from your `config.toml` at the next startup; ignored (the backend builds its own filter from `game_port`) |
 | `[filter]` | matches everything | Item interest criteria (kinds, sets, substats, price) |
 | `[limits]` | no limits | Session stop limits (refreshes, crystals, matches, duration) |
 | `[actuator]` | live | `dry_run = true` journals planned clicks without sending input |

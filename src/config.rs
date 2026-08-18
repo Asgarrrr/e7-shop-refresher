@@ -92,6 +92,12 @@ pub struct Config {
 /// warning `main` emits from [`ForwardConfig::retired_keys`], then delete both
 /// fields (and this struct with them) in a later one, once a player upgrading
 /// across two releases is no longer plausible.
+///
+/// The warning is one-time in fact and not just in intent:
+/// [`persist::strip_retired_keys`] deletes these keys from `config.toml` at the
+/// same startup that warns about them, so a file that has been through one
+/// launch of this release no longer sets them. That is also what makes the
+/// deletion above safe *sooner* than "never touched" files would allow.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ForwardConfig {
@@ -167,6 +173,11 @@ pub enum ActuatorBackend {
 /// warning `main` emits from [`CaptureConfig::retired_keys`], then delete both
 /// fields (and this struct with them) in a later one, once a player upgrading
 /// across two releases is no longer plausible.
+///
+/// The warning is one-time in fact and not just in intent:
+/// [`persist::strip_retired_keys`] deletes these keys from `config.toml` at the
+/// same startup that warns about them, so a file that has been through one
+/// launch of this release no longer sets them.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
@@ -963,6 +974,32 @@ mod tests {
             !config.filter.is_unrestricted(),
             "the example must carry a hunt criterion"
         );
+        // And it must not re-plant the retired keys it warns about: uncommenting
+        // either line here would hand every *new* player a first launch that
+        // warns about the example the app just seeded, then rewrites it.
+        assert_eq!(config.capture.retired_keys(), None);
+        assert_eq!(config.forward.retired_keys(), None);
+
+        // The same thing proved on disk, through the real entry point: seeded
+        // and immediately offered to the stripper, the example comes back
+        // untouched — no rewrite, no log line, and its `[capture]`/`[forward]`
+        // headers (whose comments are where the retired keys are explained)
+        // still there. An empty table nobody touched is a commented section,
+        // not a leftover.
+        let dir = TempDir::new("example-strip");
+        std::fs::create_dir_all(dir.path()).expect("fixture dir");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, text).expect("seed the example");
+        assert_eq!(
+            crate::config::persist::strip_retired_keys(&path).expect("must not fail"),
+            None,
+            "a fresh install must have nothing to strip"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("still readable"),
+            text,
+            "the seeded example must be left byte-identical"
+        );
     }
 
     /// Scratch directory removed on drop — *including* when an assertion
@@ -1048,6 +1085,100 @@ mod tests {
         assert_eq!(config.filter, filter);
         assert_eq!(config.limits, limits);
         assert_eq!(config.actuator.timings, timings);
+    }
+
+    #[test]
+    fn stripping_a_players_config_clears_the_retired_warning_for_good() {
+        // The whole point, end to end: a file that warns on this launch must
+        // not warn on the next one. Load -> the keys are set -> strip -> load
+        // again -> nothing set, and everything else the player wrote is intact.
+        let dir = TempDir::new("strip-retired");
+        std::fs::create_dir_all(dir.path()).expect("fixture dir");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "# hand-written\ngame_port = 3333\n\n[forward]\nserver_to_client = true\n\n\
+             [capture]\nbuffer_size = 65575\n\n[filter]\nnames = [\"ticketrare_name\"]\n",
+        )
+        .expect("seed a pre-retirement config");
+
+        let before = Config::load(&path).expect("an upgrading player's config still loads");
+        assert!(before.capture.retired_keys().is_some());
+        assert!(before.forward.retired_keys().is_some());
+
+        let removed = crate::config::persist::strip_retired_keys(&path)
+            .expect("the rewrite must succeed on a writable file")
+            .expect("both keys were set, so it must have rewritten");
+        assert_eq!(removed, "capture.buffer_size, forward.server_to_client");
+        assert!(
+            !path.with_extension("toml.tmp").exists(),
+            "the atomic-write temp must not survive a successful strip"
+        );
+
+        let after = Config::load(&path).expect("the stripped file must still load");
+        assert_eq!(after.capture.retired_keys(), None, "no warning next launch");
+        assert_eq!(after.forward.retired_keys(), None, "no warning next launch");
+        assert_eq!(after.game_port, 3333);
+        assert_eq!(after.filter, before.filter, "the hunt is untouched");
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(text.contains("# hand-written"), "comments survive: {text}");
+
+        // Idempotent: the second launch finds nothing and writes nothing.
+        assert_eq!(
+            crate::config::persist::strip_retired_keys(&path).expect("must not fail"),
+            None
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("readable"),
+            text,
+            "a second pass must leave the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_failed_strip_leaves_the_retired_keys_in_place_to_warn_about() {
+        // The best-effort path: the strip is not allowed to be fatal, and when
+        // it fails the keys really are still on disk — which is why `main` keeps
+        // the present-tense warning for this branch.
+        let dir = TempDir::new("failed-strip");
+        std::fs::create_dir_all(dir.path()).expect("fixture dir");
+        let path = dir.join("config.toml");
+        let original = "[capture]\nbuffer_size = 65575\n";
+        std::fs::write(&path, original).expect("seed the original");
+        std::fs::create_dir(path.with_extension("toml.tmp")).expect("squat the temp path");
+
+        let error = crate::config::persist::strip_retired_keys(&path)
+            .expect_err("the temp write cannot succeed onto a directory");
+        assert!(
+            matches!(error, crate::Error::ConfigWrite { .. }),
+            "expected a path-carrying write error, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("original still readable"),
+            original,
+            "a failed strip must not touch the player's file"
+        );
+        assert!(
+            Config::load(&path)
+                .expect("and the app must still start")
+                .capture
+                .retired_keys()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stripping_a_missing_config_is_not_an_error() {
+        // `seed_config_if_missing` can fail (unwritable %APPDATA%), leaving
+        // `Config::load` on the in-memory defaults. Those set no retired key so
+        // `main` never calls this — but a missing file must be "nothing to do",
+        // not a startup-time error report.
+        let dir = TempDir::new("strip-missing");
+        assert_eq!(
+            crate::config::persist::strip_retired_keys(dir.join("config.toml"))
+                .expect("a missing file is not an error"),
+            None
+        );
     }
 
     #[test]

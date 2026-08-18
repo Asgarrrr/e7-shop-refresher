@@ -14,8 +14,9 @@ server_url = "wss://ingest.arkyve.dev/refresh-shop"
 [forward]
 # Both keys below are retired: still accepted so that config files written by
 # earlier versions keep loading, but ignored, and a later release will refuse
-# them outright. If yours sets either, the log says so once at startup — delete
-# the line, nothing depends on it.
+# them outright. Nothing here sets them, so nothing warns. If an older file of
+# yours does, the app says so once at startup and deletes those lines from it
+# then and there — no setting of yours is changed, they had no effect already.
 #
 # Only the server -> client half of the connection is captured at all: it is the
 # one that carries the shop contents, and it is the only one the analysis server
@@ -32,8 +33,9 @@ max_ms = 30000
 [capture]
 # Both keys below are retired: still accepted so that config files written by
 # earlier versions keep loading, but ignored, and a later release will refuse
-# them outright. If yours sets either, the log says so once at startup — delete
-# the line, nothing depends on it.
+# them outright. Nothing here sets them, so nothing warns. If an older file of
+# yours does, the app says so once at startup and deletes those lines from it
+# then and there — no setting of yours is changed, they had no effect already.
 #
 # The capture backend builds its own filter from game_port and sizes its own
 # buffer; neither is expressible here any more. That is deliberate: this file is
