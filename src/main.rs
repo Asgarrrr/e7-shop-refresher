@@ -139,12 +139,22 @@ fn main() -> ExitCode {
             return fatal(format!("Failed to start the async runtime: {err}"));
         }
     };
-    run_mode(runtime, config, config_path)
+    run_mode(runtime, config, config_path, log_setup.destination())
 }
 
 /// Console-only build: the session blocks the main thread, as before.
+///
+/// `_log_file` is unused here on purpose: when every log directory refuses,
+/// `install_logging` falls back to a stdout subscriber, and this is the lane with
+/// a real terminal — so "there is no log file" is already on screen. The windowed
+/// arm below has no such surface and has to say it in the journal.
 #[cfg(not(feature = "gui"))]
-fn run_mode(runtime: tokio::runtime::Runtime, config: Config, _config_path: PathBuf) -> ExitCode {
+fn run_mode(
+    runtime: tokio::runtime::Runtime,
+    config: Config,
+    _config_path: PathBuf,
+    _log_file: Option<&std::path::Path>,
+) -> ExitCode {
     let outcome = runtime.block_on(app::run(config));
     // Not a plain drop: tokio::io::stdin parks an uncancelable blocking read,
     // and dropping the runtime would hang exit until the player presses Enter.
@@ -166,7 +176,12 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config, _config_path: Path
 /// main thread; the session's outcome lands in the window banner instead of
 /// killing the window.
 #[cfg(feature = "gui")]
-fn run_mode(runtime: tokio::runtime::Runtime, config: Config, config_path: PathBuf) -> ExitCode {
+fn run_mode(
+    runtime: tokio::runtime::Runtime,
+    config: Config,
+    config_path: PathBuf,
+    log_file: Option<&std::path::Path>,
+) -> ExitCode {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -182,6 +197,22 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config, config_path: PathB
     // the window's timing editor (no controller home for them).
     let seed_timings = config.actuator.timings;
     let (session, handles, shutdown) = app::setup(config);
+    // The journal half of the no-log-file report. `LogSetup::report` already said
+    // it at `error` level — into a subscriber writing to a stdout this build does
+    // not have, which is the whole problem: the one failure that hides itself is
+    // the failure of the channel it would be reported on. The journal panel is
+    // the only surface a windowed build has, and this is the earliest point it
+    // exists. Emitted here rather than inside `app::setup` because it is a
+    // property of *this* process's startup, not of a session.
+    if log_file.is_none() {
+        handles.journal.emit_at(
+            tracing::Level::WARN,
+            &[
+                ">> no log file could be opened — this session leaves no diagnostic trail (see Troubleshooting in the README)"
+                    .to_owned(),
+            ],
+        );
+    }
     let error = ui::SessionErrorSlot::default();
     let failed = Arc::new(AtomicBool::new(false));
     // Spelled `Arc::clone`, not `.clone()`: refcount bumps, not deep copies —

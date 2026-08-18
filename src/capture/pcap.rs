@@ -45,6 +45,7 @@
 //! retransmissions.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -563,7 +564,7 @@ pub struct PcapSource {
     /// producers are already rate-limited by the kernel filter, which admits
     /// only one TCP port's server-to-client traffic.
     packets: Receiver<Vec<u8>>,
-    game_port: u16,
+    game_port: NonZeroU16,
     /// Set by any capture thread whose `pcap_stats` drop counter moved, and left
     /// set until the capture loop asks for it.
     capture_loss: Arc<AtomicBool>,
@@ -596,9 +597,8 @@ pub(crate) struct PcapStop {
 }
 
 impl CaptureStop for PcapStop {
-    fn stop(&mut self) -> Result<()> {
+    fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        Ok(())
     }
 }
 
@@ -629,7 +629,7 @@ impl PcapSource {
     /// - a capture thread could not be spawned. Unlike the two above this leaves
     ///   the already-spawned threads to be joined by [`Drop`], and is the only one
     ///   that is not about the machine's Npcap install.
-    pub(crate) fn open(game_port: u16) -> Result<(Self, PcapStop)> {
+    pub(crate) fn open(game_port: NonZeroU16) -> Result<(Self, PcapStop)> {
         let (wpcap, loaded_from) = Wpcap::load()?;
         info!(
             path = loaded_from,
@@ -1293,6 +1293,7 @@ mod tests {
         use etherparse::PacketBuilder;
 
         const GAME_PORT: u16 = 3333;
+        let game_port = NonZeroU16::new(GAME_PORT).expect("3333 is not zero");
         let builder = PacketBuilder::ipv4([104, 116, 20, 111], [192, 168, 1, 10], 64)
             .tcp(GAME_PORT, 51_000, 1000, 64_240);
         let mut packet = Vec::with_capacity(builder.size(2));
@@ -1300,7 +1301,7 @@ mod tests {
 
         let frame = ethernet_frame(&[], &packet);
         let ip = LinkStrip::Ethernet.ip_bytes(&frame).expect("strip");
-        let segment = parse_segment(ip.to_vec(), GAME_PORT).expect("parse");
+        let segment = parse_segment(ip.to_vec(), game_port).expect("parse");
         assert_eq!(segment.seq, 1000);
         assert_eq!(segment.payload, b"AB");
     }
@@ -1356,10 +1357,11 @@ mod tests {
     #[test]
     #[ignore = "needs Npcap and a real adapter"]
     fn the_tap_opens_on_this_machine_without_elevation() {
-        let (source, mut stop) = PcapSource::open(3333).expect("open the Npcap tap");
+        let (source, mut stop) = PcapSource::open(NonZeroU16::new(3333).expect("3333 is not zero"))
+            .expect("open the Npcap tap");
         assert!(!source.threads.is_empty(), "at least one adapter must open");
         println!("adapters capturing: {}", source.threads.len());
-        stop.stop().expect("stop is infallible");
+        stop.stop();
     }
 
     #[test]

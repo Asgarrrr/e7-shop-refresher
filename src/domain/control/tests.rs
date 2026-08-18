@@ -13,7 +13,7 @@
 
 use super::*;
 use crate::domain::shop::ItemKind::{self, Equipment, Token};
-use crate::domain::shop::{PurchaseLimit, ShopItem};
+use crate::domain::shop::{CatalogId, PurchaseLimit, ShopItem};
 
 fn item(slot: u8, kind: ItemKind) -> ShopItem {
     ShopItem {
@@ -52,11 +52,17 @@ fn meta(crystal_balance: u32, cost: u32) -> RefreshMeta {
     }
 }
 
+/// A fixture catalog id. Panics on `0` — which is exactly what [`CatalogId`]
+/// exists to make impossible: the wire's "no id" is `None`, not a magic number.
+fn cid(id: u32) -> CatalogId {
+    CatalogId::new(id).expect("a fixture catalog id is never zero")
+}
+
 /// Assigns stable non-zero catalog ids (`100 + index`) so dedup and the
 /// checklist engage; `hit_shop`'s matching slot 3 gets id 102.
 fn with_ids(mut snapshot: ShopSnapshot) -> ShopSnapshot {
     for (index, item) in snapshot.slots.iter_mut().enumerate() {
-        item.id = 100 + index as u32;
+        item.id = Some(cid(100 + index as u32));
     }
     snapshot
 }
@@ -66,12 +72,27 @@ fn snap(snapshot: ShopSnapshot, now_ms: u64) -> Event {
 }
 
 fn target(slot: u8, id: Option<u32>) -> BuyTarget {
-    BuyTarget { slot, id }
+    BuyTarget {
+        slot,
+        id: id.map(cid),
+    }
 }
 
+/// A purchase echo naming `item`. `0` is not spellable as an id any more, so
+/// the "the server omitted it" case has its own fixture below rather than being
+/// this one called with a magic argument.
 fn buy(item: u32, now_ms: u64) -> Event {
     Event::Purchase {
-        item,
+        item: Some(cid(item)),
+        gold: None,
+        now_ms,
+    }
+}
+
+/// A purchase echo the server sent no id with.
+fn buy_unidentified(now_ms: u64) -> Event {
+    Event::Purchase {
+        item: None,
         gold: None,
         now_ms,
     }
@@ -79,7 +100,7 @@ fn buy(item: u32, now_ms: u64) -> Event {
 
 fn buy_with_gold(item: u32, gold: u32, now_ms: u64) -> Event {
     Event::Purchase {
-        item,
+        item: Some(cid(item)),
         gold: Some(gold),
         now_ms,
     }
@@ -261,7 +282,7 @@ fn auto_resume_refresh_is_counted() {
     for round in 0..3u32 {
         let mut shop = with_ids(hit_shop(None));
         for item in &mut shop.slots {
-            item.id += round * 100;
+            item.id = item.id.map(|id| cid(id.get() + round * 100));
         }
         let now = u64::from(round) * 2;
         let _ = ctrl.handle(snap(shop, now + 1));
@@ -287,7 +308,7 @@ fn purchase_clears_one_item_stays_paused() {
     assert_eq!(ctrl.status(), Status::Paused);
     assert!(ctrl.handle(buy(100, 2)).is_empty());
     assert_eq!(ctrl.status(), Status::Paused);
-    assert_eq!(ctrl.checklist(), &[102]);
+    assert_eq!(ctrl.checklist(), &[cid(102)]);
 }
 
 #[test]
@@ -320,7 +341,7 @@ fn stop_clears_the_checklist() {
     // yesterday's matches as "wanted" in the view.
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
-    assert_eq!(ctrl.checklist(), &[102]);
+    assert_eq!(ctrl.checklist(), &[cid(102)]);
     let _ = ctrl.handle(Event::Stop);
     assert!(ctrl.checklist().is_empty());
 }
@@ -353,7 +374,7 @@ fn purchase_of_unknown_id_ignored() {
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     assert!(ctrl.handle(buy(999, 2)).is_empty());
     assert_eq!(ctrl.status(), Status::Paused);
-    assert_eq!(ctrl.checklist(), &[102]);
+    assert_eq!(ctrl.checklist(), &[cid(102)]);
 }
 
 #[test]
@@ -381,17 +402,21 @@ fn replayed_echo_of_consumed_purchase_is_ignored() {
     // so the duplicate must not stand in for the remaining item's buy.
     assert!(ctrl.handle(buy(100, 3)).is_empty());
     assert_eq!(ctrl.status(), Status::Paused);
-    assert_eq!(ctrl.checklist(), &[102]);
+    assert_eq!(ctrl.checklist(), &[cid(102)]);
 }
 
 #[test]
-fn zero_id_matches_pause_until_new_shop() {
+fn an_idless_match_pauses_until_a_new_shop() {
     let mut ctrl = started(Limits::default());
-    let _ = ctrl.handle(snap(hit_shop(None), 1)); // fixture ids are all 0
+    // The bare fixture leaves every id absent (`with_ids` is what supplies them),
+    // so the match is untrackable: no echo can ever name it.
+    let _ = ctrl.handle(snap(hit_shop(None), 1));
     assert_eq!(ctrl.status(), Status::Paused);
     assert!(ctrl.checklist().is_empty());
-    // No echo can clear an untrackable match; only a new shop unpauses.
-    assert!(ctrl.handle(buy(0, 2)).is_empty());
+    // No echo can clear an untrackable match; only a new shop unpauses. This used
+    // to be spelled `buy(0, 2)` — a `0` standing in for "the server sent no id",
+    // which is now a shape of its own rather than a value.
+    assert!(ctrl.handle(buy_unidentified(2)).is_empty());
     assert_eq!(ctrl.status(), Status::Paused);
     let actions = ctrl.handle(snap(with_ids(dud_shop(None)), 3));
     assert_eq!(actions, vec![Action::Refresh]);
@@ -435,7 +460,7 @@ fn duplicate_hit_shop_while_paused_does_not_rematch() {
     assert_eq!(ctrl.progress().matches_found, 1);
     assert!(ctrl.handle(snap(with_ids(hit_shop(None)), 2)).is_empty());
     assert_eq!(ctrl.progress().matches_found, 1);
-    assert_eq!(ctrl.checklist(), &[102]);
+    assert_eq!(ctrl.checklist(), &[cid(102)]);
     assert_eq!(ctrl.status(), Status::Paused);
 }
 
@@ -506,7 +531,7 @@ fn restart_reopen_keeps_unbought_match_clickable() {
         }]
     );
     assert_eq!(ctrl.status(), Status::Paused);
-    assert_eq!(ctrl.checklist(), &[102]);
+    assert_eq!(ctrl.checklist(), &[cid(102)]);
 }
 
 #[test]
@@ -527,16 +552,17 @@ fn new_roll_makes_a_bought_id_buyable_again() {
         }]
     );
     assert_eq!(ctrl.status(), Status::Paused);
-    assert_eq!(ctrl.checklist(), &[102]);
+    assert_eq!(ctrl.checklist(), &[cid(102)]);
 }
 
 #[test]
-fn zero_id_echo_never_enters_the_bought_set() {
-    // `catalog_id()` is never `Some(0)`, so a stored 0 could never match a
-    // slot — but the sentinel must not accumulate as phantom state either.
+fn an_idless_echo_never_enters_the_bought_set() {
+    // There is no `0` to store any more — an echo without an id is `None`, which
+    // the `if let Some(item) = item` in `on_purchase` cannot push. This pins that
+    // it also accumulates no phantom state, which is what the sentinel risked.
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(hit_shop(None), 1)); // untrackable match: Paused
-    assert!(ctrl.handle(buy(0, 2)).is_empty());
+    assert!(ctrl.handle(buy_unidentified(2)).is_empty());
     assert!(ctrl.bought.is_empty());
 }
 
@@ -548,7 +574,7 @@ fn fail_open_reevaluation_does_not_rebuy() {
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
     let mut holed = with_ids(hit_shop(None));
-    holed.slots[5].id = 0; // fingerprint gone: fail-open re-evaluation
+    holed.slots[5].id = None; // fingerprint gone: fail-open re-evaluation
     let actions = ctrl.handle(snap(holed, 3));
     assert_eq!(
         actions,
@@ -563,10 +589,10 @@ fn fail_open_reevaluation_does_not_rebuy() {
 }
 
 #[test]
-fn zero_id_slot_disables_dedup() {
+fn an_idless_slot_disables_dedup() {
     let mut ctrl = started(Limits::default());
     let mut holed = with_ids(dud_shop(None));
-    holed.slots[5].id = 0;
+    holed.slots[5].id = None;
     assert_eq!(ctrl.handle(snap(holed.clone(), 1)), vec![Action::Refresh]);
     // No usable identity: the identical re-send evaluates again (fail open).
     assert_eq!(ctrl.handle(snap(holed, 2)), vec![Action::Refresh]);
@@ -581,7 +607,7 @@ fn new_shop_while_paused_no_match_refreshes() {
     // Hourly auto-refresh replaced the shop: different ids, no match.
     let mut fresh = with_ids(dud_shop(None));
     for item in &mut fresh.slots {
-        item.id += 100;
+        item.id = item.id.map(|id| cid(id.get() + 100));
     }
     let actions = ctrl.handle(snap(fresh, 2));
     assert_eq!(actions, vec![Action::Refresh]);
@@ -594,7 +620,7 @@ fn new_shop_while_paused_rebuilds_checklist() {
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1)); // checklist [102]
     let mut fresh = with_ids(hit_shop(None));
     for item in &mut fresh.slots {
-        item.id += 100; // new shop, matching slot now id 202
+        item.id = item.id.map(|id| cid(id.get() + 100)); // new shop, matching slot now id 202
     }
     let actions = ctrl.handle(snap(fresh, 2));
     assert_eq!(
@@ -603,7 +629,7 @@ fn new_shop_while_paused_rebuilds_checklist() {
             targets: vec![target(3, Some(202))]
         }]
     );
-    assert_eq!(ctrl.checklist(), &[202]);
+    assert_eq!(ctrl.checklist(), &[cid(202)]);
     // The stale id is gone; only the new one clears the pause.
     assert!(ctrl.handle(buy(102, 3)).is_empty());
     assert_eq!(ctrl.status(), Status::Paused);
@@ -651,7 +677,7 @@ fn empty_snapshot_while_paused_is_stored_not_evaluated() {
     // A degraded slotless message must not wipe the pending checklist.
     assert!(ctrl.handle(snap(empty_shop(), 2)).is_empty());
     assert_eq!(ctrl.status(), Status::Paused);
-    assert_eq!(ctrl.checklist(), &[102]);
+    assert_eq!(ctrl.checklist(), &[cid(102)]);
     // Still stored for the view.
     assert!(ctrl.last_snapshot().unwrap().slots.is_empty());
 }
@@ -672,7 +698,7 @@ fn unidentifiable_snapshot_while_paused_stored_only() {
     // nothing may be re-evaluated over the pending purchase.
     assert!(ctrl.handle(snap(dud_shop(None), 2)).is_empty());
     assert_eq!(ctrl.status(), Status::Paused);
-    assert_eq!(ctrl.checklist(), &[102]);
+    assert_eq!(ctrl.checklist(), &[cid(102)]);
     assert_eq!(ctrl.progress().refreshes, 0);
 }
 
@@ -701,7 +727,7 @@ fn fail_open_snapshot_keeps_last_identity() {
     // An unidentifiable shop evaluates (fail open) but must not erase
     // the remembered identity...
     let mut holed = with_ids(dud_shop(None));
-    holed.slots[5].id = 0;
+    holed.slots[5].id = None;
     assert_eq!(ctrl.handle(snap(holed, 2)), vec![Action::Refresh]);
     // ...so a stale verbatim duplicate of the first shop is still muted.
     assert!(ctrl.handle(snap(with_ids(dud_shop(None)), 3)).is_empty());
@@ -751,7 +777,7 @@ fn untrackable_but_in_stock_match_still_pauses() {
     let mut ctrl = Controller::new(filter, Limits::default());
     let _ = ctrl.handle(Event::Start { now_ms: 0 });
     let mut two_hits = shop(&[Equipment, Equipment, Token, Token, Token, Token], None);
-    two_hits.slots[0].id = 100;
+    two_hits.slots[0].id = Some(cid(100));
     two_hits.slots[0].limit = Some(PurchaseLimit {
         remaining: 0,
         total: 1,
@@ -780,7 +806,7 @@ fn echoed_gold_blocks_unaffordable_next_match() {
     // clicked, and the hunt continues.
     let mut pricey = with_ids(hit_shop(None));
     for item in &mut pricey.slots {
-        item.id += 100;
+        item.id = item.id.map(|id| cid(id.get() + 100));
     }
     pricey.slots[2].price = Some(184_000);
     let actions = ctrl.handle(snap(pricey, 3));
@@ -809,7 +835,7 @@ fn gold_debits_cumulatively_within_one_shop() {
         None,
     ));
     for item in &mut twins.slots {
-        item.id += 100;
+        item.id = item.id.map(|id| cid(id.get() + 100));
     }
     twins.slots[0].price = Some(184_000);
     twins.slots[1].price = Some(184_000);
@@ -820,7 +846,7 @@ fn gold_debits_cumulatively_within_one_shop() {
             targets: vec![target(1, Some(200)), target(2, None)]
         }]
     );
-    assert_eq!(ctrl.checklist(), &[200]);
+    assert_eq!(ctrl.checklist(), &[cid(200)]);
     assert_eq!(ctrl.status(), Status::Paused);
 }
 
@@ -850,7 +876,7 @@ fn unknown_price_with_known_gold_fails_open() {
     // so it stays clickable.
     let mut fresh = with_ids(hit_shop(None));
     for item in &mut fresh.slots {
-        item.id += 100;
+        item.id = item.id.map(|id| cid(id.get() + 100));
     }
     let actions = ctrl.handle(snap(fresh, 3));
     assert_eq!(
@@ -1179,7 +1205,7 @@ fn max_matches_boundary_uses_ge() {
     assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
     let mut second = with_ids(hit_shop(None));
     for item in &mut second.slots {
-        item.id += 100; // a new roll, not a deduped re-send
+        item.id = item.id.map(|id| cid(id.get() + 100)); // a new roll, not a deduped re-send
     }
     let actions = ctrl.handle(snap(second, 3));
     assert_eq!(
@@ -1337,12 +1363,12 @@ fn buy_targets_align_with_checklist() {
         &[Equipment, Equipment, Equipment, Token, Token, Token],
         None,
     );
-    shop.slots[0].id = 100;
+    shop.slots[0].id = Some(cid(100));
     shop.slots[2].limit = Some(PurchaseLimit {
         remaining: 0,
         total: 1,
     });
-    shop.slots[2].id = 102;
+    shop.slots[2].id = Some(cid(102));
     let actions = ctrl.handle(snap(shop, 1));
     assert_eq!(
         actions,
@@ -1350,7 +1376,7 @@ fn buy_targets_align_with_checklist() {
             targets: vec![target(1, Some(100)), target(2, None), target(3, None)]
         }]
     );
-    assert_eq!(ctrl.checklist(), &[100]);
+    assert_eq!(ctrl.checklist(), &[cid(100)]);
 }
 
 #[test]
@@ -1442,7 +1468,7 @@ fn new_snapshot_rearms_a_fresh_snapshot_deadline() {
     // and the advised refresh arms a fresh full window.
     let mut next = with_ids(dud_shop(None));
     for item in &mut next.slots {
-        item.id += 100;
+        item.id = item.id.map(|id| cid(id.get() + 100));
     }
     assert_eq!(ctrl.handle(snap(next, 9_000)), vec![Action::Refresh]);
     // The original deadline passes silently...
@@ -1726,7 +1752,7 @@ fn purchase_echo_while_watching_leaves_snapshot_expectation_alone() {
 /// resolves back to the item's wire name for the haul tally.
 fn named_shop() -> ShopSnapshot {
     let named = |id: u32, name: Option<&str>| ShopItem {
-        id,
+        id: Some(cid(id)),
         name: name.map(str::to_owned),
         ..ShopItem::default()
     };
@@ -1803,7 +1829,7 @@ fn haul_drops_a_stale_echo_after_the_roll_rotates() {
     let roll_b = ShopSnapshot {
         merchant: None,
         slots: vec![ShopItem {
-            id: 200,
+            id: Some(cid(200)),
             ..ShopItem::default()
         }],
         refresh: None,

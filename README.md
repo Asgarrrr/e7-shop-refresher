@@ -274,6 +274,16 @@ Reading it yourself:
   with the `server link down` lines (is the server reachable?).
 - No `session heartbeat` at all → the session loop itself is gone; look for
   `session aborted` just before.
+- `the application window could not be created` → the relay started but the
+  window never opened, so nothing after it in this list will be there. The `error`
+  field names the cause; the usual ones are a machine with no usable OpenGL
+  context (a stale or generic display driver), an RDP or remote session, and a
+  service account with no desktop. The log ends right there because a windowed
+  build has no console for the same message to go to.
+- `startup failed` followed by `the error window could not be shown either` →
+  the app refused to start (a bad `config.toml`, no capture backend) *and* could
+  not put the reason on screen, so the player saw a double-clicked exe do
+  nothing at all. The `startup failed` record above it carries the real cause.
 
 Raise or narrow the verbosity with `RUST_LOG`, e.g. `RUST_LOG=journal=info`
 for the player-facing lines only, or `RUST_LOG=arkyve_refresh_shop=debug` for the

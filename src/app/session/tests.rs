@@ -24,7 +24,7 @@ use super::*;
 use crate::actuator::SnapshotEpoch;
 use crate::domain::control::{Limits, StopReason, past_rung};
 use crate::domain::filter::Filter;
-use crate::domain::shop::{ItemKind, PurchaseLimit, ShopItem, ShopSnapshot};
+use crate::domain::shop::{CatalogId, ItemKind, PurchaseLimit, ShopItem, ShopSnapshot};
 
 /// A shutdown signal nobody ever raises: the loop must exit through its own
 /// paths. The sender is dropped straight away, which the loop reads as "no
@@ -58,13 +58,20 @@ fn recording(mode: Mode) -> (ActuatorHandle, mpsc::Receiver<plan::Job>) {
     )
 }
 
+/// A fixture catalog id. Panics on `0`, which is the whole point of
+/// [`CatalogId`]: the wire's "no id" spelling is `None`, not a magic number a
+/// test could pass by accident.
+fn cid(id: u32) -> CatalogId {
+    CatalogId::new(id).expect("a fixture catalog id is never zero")
+}
+
 /// No match for `Filter::matching_default_items()` (kind `Unknown`):
 /// the controller advises a refresh.
 fn dud_shop(id: u32) -> ShopSnapshot {
     ShopSnapshot {
         merchant: None,
         slots: vec![ShopItem {
-            id,
+            id: Some(cid(id)),
             kind: ItemKind::Equipment,
             ..ShopItem::default()
         }],
@@ -555,10 +562,7 @@ fn set_timings_swaps_the_actuator_waits() {
     let controller = Mutex::new(Controller::new(Filter::default(), Limits::default()));
     let actuator = off();
     let timings = plan::Timings {
-        refreshed: plan::DelayRange {
-            min_ms: 200,
-            max_ms: 800,
-        },
+        refreshed: plan::DelayRange::try_new(200, 800).expect("a valid fixture range"),
         ..plan::Timings::default()
     };
     let lines = handle_command(
@@ -674,7 +678,7 @@ fn purchase_message_auto_resumes_controller() {
     ));
     on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
     let mut snapshot = one_item_shop();
-    snapshot.slots[0].id = 42;
+    snapshot.slots[0].id = Some(cid(42));
     // Default filter matches the default item -> Paused, checklist [42].
     on_message(
         &controller,
@@ -687,7 +691,7 @@ fn purchase_message_auto_resumes_controller() {
     assert_eq!(controller.lock().unwrap().status(), Status::Paused);
 
     let notice = PurchaseNotice {
-        item: 42,
+        item: Some(cid(42)),
         gold: Some(100),
     };
     on_message(
@@ -707,7 +711,7 @@ fn purchase_message_auto_resumes_controller() {
 fn controller_with_named_item() -> Controller {
     let mut controller = Controller::new(Filter::default(), Limits::default());
     let mut snapshot = one_item_shop();
-    snapshot.slots[0].id = 42;
+    snapshot.slots[0].id = Some(cid(42));
     snapshot.slots[0].name = Some("Reforged Sword".to_owned());
     let _ = controller.handle(Event::Snapshot {
         snapshot,
@@ -719,7 +723,7 @@ fn controller_with_named_item() -> Controller {
 #[test]
 fn purchase_line_names_item_from_snapshot() {
     let notice = PurchaseNotice {
-        item: 42,
+        item: Some(cid(42)),
         gold: Some(250_000),
     };
     assert_eq!(
@@ -732,7 +736,7 @@ fn purchase_line_names_item_from_snapshot() {
 fn purchase_line_falls_back_to_id_when_name_unknown() {
     let controller = Controller::new(Filter::default(), Limits::default());
     let notice = PurchaseNotice {
-        item: 7,
+        item: Some(cid(7)),
         gold: Some(100),
     };
     assert_eq!(
@@ -744,7 +748,7 @@ fn purchase_line_falls_back_to_id_when_name_unknown() {
 #[test]
 fn purchase_line_omits_missing_gold() {
     let notice = PurchaseNotice {
-        item: 42,
+        item: Some(cid(42)),
         gold: None,
     };
     assert_eq!(
@@ -765,7 +769,7 @@ fn match_hint_warns_when_some_matches_untracked() {
         slots: vec![
             ShopItem::default(),
             ShopItem {
-                id: 42,
+                id: Some(cid(42)),
                 ..ShopItem::default()
             },
         ],
@@ -923,7 +927,7 @@ fn purchase_resume_job_waits_for_the_post_buy_animation() {
     let (actuator, mut jobs) = recording(Mode::Live);
     let controller = armed();
     let mut snapshot = one_item_shop();
-    snapshot.slots[0].id = 42;
+    snapshot.slots[0].id = Some(cid(42));
     on_message(
         &controller,
         &gate,
@@ -935,7 +939,7 @@ fn purchase_resume_job_waits_for_the_post_buy_animation() {
     jobs.try_recv().expect("buy job");
 
     let notice = PurchaseNotice {
-        item: 42,
+        item: Some(cid(42)),
         gold: None,
     };
     on_message(
@@ -964,7 +968,7 @@ fn buy_job_clicks_only_trackable_targets() {
         merchant: None,
         slots: vec![
             ShopItem {
-                id: 42,
+                id: Some(cid(42)),
                 ..ShopItem::default()
             },
             ShopItem::default(), // id 0: untrackable
@@ -1033,7 +1037,7 @@ fn dry_run_wording_marks_planned_actions() {
         1,
     );
     let mut hit = one_item_shop();
-    hit.slots[0].id = 42;
+    hit.slots[0].id = Some(cid(42));
     on_message(
         &controller,
         &gate,
@@ -1076,7 +1080,7 @@ fn dead_stock_match_keeps_refreshing_without_clicks() {
     let snapshot = ShopSnapshot {
         merchant: None,
         slots: vec![ShopItem {
-            id: 42,
+            id: Some(cid(42)),
             limit: Some(PurchaseLimit {
                 remaining: 0,
                 total: 1,
@@ -1272,11 +1276,11 @@ fn watchdog_buy_reissue_clicks_only_outstanding_rows() {
         merchant: None,
         slots: vec![
             ShopItem {
-                id: 42,
+                id: Some(cid(42)),
                 ..ShopItem::default()
             },
             ShopItem {
-                id: 43,
+                id: Some(cid(43)),
                 ..ShopItem::default()
             },
         ],
@@ -1298,7 +1302,7 @@ fn watchdog_buy_reissue_clicks_only_outstanding_rows() {
         &journal,
         &actuator,
         ServerMessage::Purchase(PurchaseNotice {
-            item: 42,
+            item: Some(cid(42)),
             gold: None,
         }),
         2,
@@ -1351,7 +1355,7 @@ fn watchdog_buy_reissue_without_clickable_rows_journals_the_gap() {
         })
         .collect();
     slots.push(ShopItem {
-        id: 42,
+        id: Some(cid(42)),
         ..ShopItem::default()
     });
     let snapshot = ShopSnapshot {

@@ -11,8 +11,9 @@ use crate::domain::shop::{ItemKind, ShopItem};
 /// fail-closed on grade, so every item is dropped, while `is_unrestricted`
 /// counts any floor as a real criterion — the loop arms and then refreshes
 /// forever, debiting crystals, without ever matching. Rejected while
-/// deserializing so the invalid value never exists, the way `Config::validate`
-/// rejects an unrecognized `[filter] kinds` entry.
+/// deserializing so the invalid value never exists — the same shape, for the same
+/// reason, as [`hunt_kinds`] below, which is where the `[filter] kinds` rule now
+/// lives too (it used to be a clause in `Config::validate`).
 const GRADE_MIN: u8 = 2;
 const GRADE_MAX: u8 = 4;
 
@@ -35,8 +36,12 @@ const GRADE_MAX: u8 = 4;
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Filter {
-    /// Kept item kinds (any-of); empty keeps all, including `Unknown`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Kept item kinds (any-of); empty keeps all, `Unknown` items included.
+    ///
+    /// A `Vec<ItemKind>` and not a narrower hunt-only enum, deliberately — see
+    /// [`hunt_kinds`], which refuses the catch-all at the *file* boundary where
+    /// it is ambiguous, and explains why the field itself stays open.
+    #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "hunt_kinds")]
     pub kinds: Vec<ItemKind>,
     /// Kept items (any-of), by exact internal name (`ticketrare_name`, ...);
     /// empty keeps all.
@@ -77,6 +82,63 @@ where
         )));
     }
     Ok(Some(grade))
+}
+
+/// The kinds a criterion may name, in the order the Setup tab lists them.
+///
+/// Public because the checkbox row is built from it: the list used to be spelled
+/// out there, which is how the fourth box — `Unknown`, the one whose only net
+/// effect was writing a `kinds = ["unknown"]` the next launch refused — got
+/// added in the first place.
+pub const HUNTABLE_KINDS: [ItemKind; 3] = [ItemKind::Equipment, ItemKind::Hero, ItemKind::Token];
+
+/// Parses `[filter] kinds`, refusing the wire's catch-all.
+///
+/// [`ItemKind`] is deliberately lenient: its `#[serde(other)] Unknown` keeps a
+/// *snapshot* decodable when the server adds a kind this build has never heard
+/// of, which is the forward-compatibility the whole inbound surface is designed
+/// for. Arriving as config text, that same leniency turns `kinds = ["equipement"]`
+/// into a criterion no item can satisfy while [`Filter::is_unrestricted`] counts
+/// it as a real one — so the loop arms and then refreshes forever, debiting
+/// crystals, without ever buying. Refused here, naming the value it could not
+/// read, so `toml` can point at the line.
+///
+/// Refused at the *boundary*, and not by narrowing the field's type to a
+/// hunt-only enum — which is what the audit asked for, and which was written and
+/// then reverted. `ItemKind::Unknown` is a meaningful criterion *in the domain*:
+/// [`Filter::matches`] compares it against a kind the wire actually reported, and
+/// `Filter::matching_default_items` — the only restricted-yet-matching fixture
+/// 30 tests have, because a default [`ShopItem`] has kind `Unknown` — is built on
+/// exactly that. It is ambiguous only as text, where a typo and a deliberate
+/// "hunt the kind you cannot name" are the same six bytes. So the ambiguity is
+/// resolved where it exists.
+///
+/// Same shape and same reason as [`grade_floor`] above. It replaces a clause in
+/// `Config::validate`, which matters for more than tidiness: the Setup tab reaches
+/// the file through `persist::save` with no `Config` in the path, and that is the
+/// boundary the old clause never covered.
+fn hunt_kinds<'de, D>(de: D) -> Result<Vec<ItemKind>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Read as text first, then through `ItemKind`'s own `Deserialize`: the
+    // accepted spellings stay whatever its `rename_all = "snake_case"` produces
+    // (never re-listed here, so they cannot drift), and the raw string survives
+    // long enough for the error to quote what the player actually typed — which
+    // `serde(other)` would otherwise have swallowed.
+    let raw = Vec::<String>::deserialize(de)?;
+    let mut kinds = Vec::with_capacity(raw.len());
+    for name in raw {
+        let kind =
+            ItemKind::deserialize(serde::de::value::StrDeserializer::<D::Error>::new(&name))?;
+        if kind == ItemKind::Unknown {
+            return Err(serde::de::Error::custom(format!(
+                "unrecognized kind {name:?} in [filter] kinds (expected: equipment, hero, token)"
+            )));
+        }
+        kinds.push(kind);
+    }
+    Ok(kinds)
 }
 
 /// One required substat, by exact internal name (`speed`, `cri`, ...). `min` is
@@ -189,7 +251,7 @@ mod tests {
 
     fn equip() -> ShopItem {
         ShopItem {
-            id: 4562,
+            id: crate::domain::shop::CatalogId::new(4562),
             slot: 1,
             kind: ItemKind::Equipment,
             name: None,
@@ -550,6 +612,45 @@ mod tests {
                 .min_grade,
             None
         );
+    }
+
+    #[test]
+    fn a_kind_the_wire_would_tolerate_is_refused_in_a_config_file() {
+        // The rule used to be a clause in `Config::validate`, which left the Setup
+        // tab's write path (`persist::save`, no `Config` in it) uncovered — the
+        // path a checkbox once used to write a `kinds = ["unknown"]` that the next
+        // launch refused fatally. It lives on the field now.
+        let error = toml::from_str::<Filter>("kinds = [\"equipement\"]")
+            .expect_err("a typo must not become a criterion nothing satisfies");
+        let message = error.to_string();
+        // Names what was typed — which `ItemKind`'s `serde(other)` had already
+        // swallowed by the time the old check ran — and what is legal.
+        assert!(message.contains("equipement"), "{message}");
+        for legal in ["equipment", "hero", "token"] {
+            assert!(message.contains(legal), "{message}");
+        }
+        // The catch-all's own spelling goes the same way.
+        assert!(toml::from_str::<Filter>("kinds = [\"unknown\"]").is_err());
+
+        // Every huntable kind still parses, and the accepted spellings are
+        // `ItemKind`'s own — not a second list inside `hunt_kinds`.
+        for kind in HUNTABLE_KINDS {
+            let name = toml::to_string(&Filter {
+                kinds: vec![kind],
+                ..Filter::default()
+            })
+            .expect("serialize");
+            let back: Filter = toml::from_str(&name).expect("a huntable kind round-trips");
+            assert_eq!(back.kinds, vec![kind]);
+        }
+
+        // And `Unknown` stays a legal criterion *in memory*: it is what
+        // `matching_default_items` restricts on, and `matches` compares it against
+        // a kind the wire really reported.
+        let unknown_hunter = Filter::matching_default_items();
+        assert_eq!(unknown_hunter.kinds, vec![ItemKind::Unknown]);
+        assert!(!unknown_hunter.is_unrestricted());
+        assert!(unknown_hunter.matches(&ShopItem::default()));
     }
 
     #[test]

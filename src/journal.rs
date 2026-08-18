@@ -10,10 +10,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// One journal entry: a console line stamped with the session clock.
+///
+/// `text` is an `Arc<str>`, not a `String`, because of the asymmetry between the
+/// two operations on it: it is written once, by [`EventLog::push`], and copied out
+/// wholesale up to four times a second by [`EventLog::to_entries`], which the GUI
+/// calls to repaint. As a `String` that snapshot was up to [`JOURNAL_CAP`] heap
+/// allocations *and* the same number of memcpys, per repaint, for text nothing
+/// ever mutates; as an `Arc<str>` it is that many refcount bumps. `push` pays the
+/// one real allocation it already paid.
+///
+/// `Arc<str>` and not `Arc<String>`: one pointer-and-length, one allocation, no
+/// second indirection to reach the bytes. Every reader that only formats or
+/// searches the line is unaffected — `Deref<Target = str>` and `Display` serve
+/// `{}`, `.contains(..)` and `&line.text` unchanged.
 #[derive(Debug, Clone)]
 pub struct LogLine {
     pub at_ms: u64,
-    pub text: String,
+    pub text: Arc<str>,
 }
 
 /// Oldest entries drop out first: a session left running for hours must not
@@ -124,7 +137,10 @@ impl EventLog {
         for text in lines {
             entries.push_back(LogLine {
                 at_ms,
-                text: text.clone(),
+                // The one allocation on this path, exactly as `text.clone()` was:
+                // `Arc<str>` has to copy the bytes into its own allocation. What
+                // it buys is every *later* copy of this line — see `LogLine`.
+                text: Arc::from(text.as_str()),
             });
         }
         while entries.len() > JOURNAL_CAP {
@@ -141,10 +157,14 @@ impl EventLog {
         self.generation.load(Ordering::Relaxed)
     }
 
-    /// Deep-copies the whole ring — up to [`JOURNAL_CAP`] `LogLine`s, each with
-    /// its own `String` allocation. The `to_` prefix is the warning: this is not
-    /// a getter, and calling it per frame is what made the GUI grow
-    /// [`EventLog::generation`] and a cache in front of it.
+    /// Copies the whole ring out — up to [`JOURNAL_CAP`] `LogLine`s. The `to_`
+    /// prefix is the warning: this is not a getter, and calling it per frame is
+    /// what made the GUI grow [`EventLog::generation`] and a cache in front of it.
+    ///
+    /// It is no longer a *deep* copy: [`LogLine::text`] is an `Arc<str>`, so each
+    /// entry costs a refcount bump rather than a fresh `String`. The cache in
+    /// front stays — the lock, the `Vec`, and the 500 bumps are still real work
+    /// to do 4 times a second for a ring that usually has not changed.
     ///
     /// Poison-tolerant: the GUI reads this after a session panic and must
     /// still show the history that led there.
@@ -170,9 +190,9 @@ mod tests {
         }
         let entries = journal.to_entries();
         assert_eq!(entries.len(), JOURNAL_CAP);
-        assert_eq!(entries.first().unwrap().text, "line 100");
+        assert_eq!(&*entries.first().unwrap().text, "line 100");
         assert_eq!(
-            entries.last().unwrap().text,
+            &*entries.last().unwrap().text,
             format!("line {}", JOURNAL_CAP + 99)
         );
     }
@@ -215,7 +235,7 @@ mod tests {
         let texts: Vec<String> = journal
             .to_entries()
             .into_iter()
-            .map(|line| line.text)
+            .map(|line| line.text.to_string())
             .collect();
         assert_eq!(texts, ["ERROR", "WARN", "INFO"]);
     }

@@ -47,12 +47,6 @@ pub enum Section {
 /// - [`Error::ConfigSerialize`] — a section could not be rendered back to TOML.
 ///   Unreachable for the three concrete section types today, and kept typed so
 ///   it stays distinguishable from the parse failure above.
-/// - [`Error::Config`] — a [`Section::Timings`] range is reversed or over the
-///   ceiling. Nothing can produce one today (the editor clamps, and every preset
-///   is covered by a test), and that is exactly why it is checked here: refusing
-///   the Apply costs one journal line, whereas writing it costs the player their
-///   *next launch* — `Config::load` refuses the same value, fatally, with
-///   hand-editing the only way out.
 /// - [`Error::ConfigWrite`] — creating the parent directory, writing the
 ///   sibling temp file, or renaming it over the target failed. The path is in
 ///   the message: this is the read-only / OneDrive-locked `config.toml` case,
@@ -355,10 +349,14 @@ fn write_sections(text: &str, edits: &[Section]) -> Result<String> {
             Section::Filter(filter) => set_table(root, "filter", section_table(filter)?),
             Section::Limits(limits) => set_table(root, "limits", section_table(limits)?),
             Section::Timings(timings) => {
-                // The write boundary the loader's `validate` never sees: the
-                // Setup tab hands `Timings` straight to this module, with no
-                // `Config` in the path. One check, called from both.
-                super::validate_timings(timings)?;
+                // This is the write boundary the loader's `validate` never sees:
+                // the Setup tab hands `Timings` straight to this module, with no
+                // `Config` in the path. It used to call `config::validate_timings`
+                // for exactly that reason; it does not need to any more, because
+                // `plan::DelayRange` carries `min_ms <= max_ms <= MAX_TIMING_MS`
+                // by construction. A `Timings` that reaches here at all is one
+                // the next `Config::load` will accept — the guarantee is in the
+                // argument type now, not in this call.
                 let mut table = section_table(timings)?;
                 inline_ranges(&mut table);
                 set_nested_table(root, "actuator", "timings", table);
@@ -426,6 +424,13 @@ mod tests {
         }
     }
 
+    /// A range the type accepts — the only kind that can reach this module, now
+    /// that `DelayRange` carries `min_ms <= max_ms <= MAX_TIMING_MS`.
+    fn range(min_ms: u64, max_ms: u64) -> crate::actuator::plan::DelayRange {
+        crate::actuator::plan::DelayRange::try_new(min_ms, max_ms)
+            .expect("the fixture range must be valid")
+    }
+
     #[test]
     fn untouched_sections_and_header_comments_survive() {
         let text = "\
@@ -479,10 +484,7 @@ names = [\"old_name\"]
             ..Limits::default()
         };
         let timings = Timings {
-            refreshed: crate::actuator::plan::DelayRange {
-                min_ms: 200,
-                max_ms: 800,
-            },
+            refreshed: range(200, 800),
             ..Timings::default()
         };
         let out = write_sections(
@@ -523,10 +525,7 @@ dry_run = true
 backend = \"input\"
 ";
         let timings = Timings {
-            between_buys: crate::actuator::plan::DelayRange {
-                min_ms: 100,
-                max_ms: 500,
-            },
+            between_buys: range(100, 500),
             ..Timings::default()
         };
         let out = write_sections(text, &[Section::Timings(timings)]).expect("write");
@@ -540,10 +539,7 @@ backend = \"input\"
     fn inline_actuator_keeps_its_mode_keys() {
         let text = "actuator = { dry_run = true, backend = \"input\" }\n";
         let timings = Timings {
-            buy_modal: crate::actuator::plan::DelayRange {
-                min_ms: 50,
-                max_ms: 250,
-            },
+            buy_modal: range(50, 250),
             ..Timings::default()
         };
         let out = write_sections(text, &[Section::Timings(timings)]).expect("write");
@@ -567,10 +563,7 @@ backend = \"input\"
         // wrote all eight ranges — seven of them `{ min_ms = 0, max_ms = 0 }`
         // no-ops — into a file this module exists to leave alone.
         let timings = Timings {
-            refreshed: crate::actuator::plan::DelayRange {
-                min_ms: 200,
-                max_ms: 800,
-            },
+            refreshed: range(200, 800),
             ..Timings::default()
         };
         let out = write_sections("", &[Section::Timings(timings)]).expect("write");
@@ -635,38 +628,31 @@ backend = \"input\"
     }
 
     #[test]
-    fn a_timing_range_the_loader_would_refuse_is_never_written() {
-        // The second write boundary. `Config::validate` guards the loader, but
-        // the Setup tab reaches this module with no `Config` in the path, so an
-        // unclamped `Timings` used to land on disk and take out the *next*
-        // launch — an error window with hand-editing the only way out. Nothing
-        // can produce one today; the point is that it cannot become possible
-        // without this failing.
-        let reversed = Timings {
-            refreshed: crate::actuator::plan::DelayRange {
-                min_ms: 800,
-                max_ms: 200,
-            },
+    fn the_widest_writable_timings_reload_through_the_loader() {
+        // The second write boundary, pinned from the writing side. `Config::load`
+        // guards the loader, but the Setup tab reaches this module with no
+        // `Config` in the path, so an unclamped `Timings` used to land on disk and
+        // take out the *next* launch — an error window with hand-editing the only
+        // way out. This used to be `a_timing_range_the_loader_would_refuse_is_
+        // never_written`, asserting that `write_sections` refused a reversed and
+        // an over-ceiling range; neither is constructible now, so the assertion
+        // moved to `plan`'s `try_new` tests and what is left to prove here is the
+        // other direction: the extreme a `Timings` *can* hold still survives the
+        // round trip through the file this module writes.
+        let widest = Timings {
+            refreshed: range(0, crate::actuator::plan::MAX_TIMING_MS),
+            shop_opened: range(
+                crate::actuator::plan::MAX_TIMING_MS,
+                crate::actuator::plan::MAX_TIMING_MS,
+            ),
             ..Timings::default()
         };
-        let err = write_sections("", &[Section::Timings(reversed)])
-            .expect_err("a reversed range must not be written");
-        assert!(matches!(err, Error::Config(_)), "got {err:?}");
-        assert!(
-            err.to_string().contains("actuator.timings.refreshed"),
-            "the message must name the key: {err}"
-        );
-
-        let oversized = Timings {
-            shop_opened: crate::actuator::plan::DelayRange {
-                min_ms: 0,
-                max_ms: 600_000,
-            },
-            ..Timings::default()
-        };
-        let err = write_sections("", &[Section::Timings(oversized)])
-            .expect_err("a ten-minute extra wait must not be written");
-        assert!(matches!(err, Error::Config(_)), "got {err:?}");
+        let out = write_sections("", &[Section::Timings(widest)]).expect("write");
+        let config: crate::config::Config = toml::from_str(&out).expect("reload");
+        config
+            .validate()
+            .expect("what we write must load and validate");
+        assert_eq!(config.actuator.timings, widest);
     }
 
     #[test]
@@ -739,7 +725,7 @@ filter = \"tcp and tcp.SrcPort == 3333\"
         // And what is left still loads: stripping must not produce a file the
         // next launch refuses.
         let config: crate::config::Config = toml::from_str(&stripped.text).expect("reload");
-        assert_eq!(config.game_port, 3333);
+        assert_eq!(config.game_port.get(), 3333);
         assert_eq!(config.capture.retired_keys(), None);
         assert_eq!(config.forward.retired_keys(), None);
     }

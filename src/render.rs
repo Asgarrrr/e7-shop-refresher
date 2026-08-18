@@ -193,7 +193,10 @@ pub(crate) fn format_item(item: &ShopItem, index: usize) -> String {
 /// and stdin is inert — the line would be written to a sink nobody can read,
 /// while `journal.rs` holds the invariant that player-facing text has one sink.
 /// The `#[cfg]` sits on the body, not the item, so the one caller
-/// (`app::supervise`) stays feature-independent.
+/// ([`Session::run`](crate::app::Session::run)) stays feature-independent — the
+/// other way round was tried and reverted: gating the *call* leaves this
+/// `pub(crate)` item with no caller in a `gui` build, i.e. `dead_code` under
+/// `-D warnings`.
 pub(crate) fn print_controls() {
     #[cfg(not(feature = "gui"))]
     println!("Commands: start, stop, [Enter] toggle, Ctrl+C to quit");

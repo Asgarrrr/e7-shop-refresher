@@ -11,11 +11,21 @@ use serde::Deserialize;
 use crate::actuator::plan::Timings;
 use crate::domain::control::Limits;
 use crate::domain::filter::Filter;
+// Only the tests name a kind now: the `[filter] kinds` rule moved into
+// `filter::hunt_kinds`, at the boundary where the ambiguity actually is.
+#[cfg(test)]
 use crate::domain::shop::ItemKind;
+use std::num::NonZeroU16;
+
 use crate::error::Result;
 
 /// TCP port of the Epic Seven game server (`msg://`).
-pub const DEFAULT_GAME_PORT: u16 = 3333;
+///
+/// A [`NonZeroU16`] because [`Config::game_port`] is one: the `const` context
+/// makes the `expect` a compile error rather than a runtime one, which is the
+/// whole reason the constant is spelled this way round.
+pub const DEFAULT_GAME_PORT: NonZeroU16 =
+    NonZeroU16::new(3333).expect("the default game port is not zero");
 
 /// The hosted analysis server, used when `config.toml` sets no `server_url`.
 /// Named because [`Config::default`] has to push it through
@@ -27,28 +37,23 @@ pub(crate) const RECONNECT_FLOOR: Duration = Duration::from_millis(100);
 
 /// Ceiling on a single `[actuator.timings]` extra wait, in milliseconds.
 ///
-/// One minute. The click baselines this adds onto are calibrated to the game's
-/// blocking animations and span 100 ms (`scroll_settle`) to 1180 ms
-/// (`shop_opened`), and the Setup tab's own meter tops out at 2500 ms total —
-/// so 60 000 ms is roughly fifty times the slowest baseline and twenty-four
-/// times anything the GUI can produce. Every legitimate "pause like a slow,
-/// distracted human" setting stays reachable, plus a wide margin for
-/// experimenting past what the UI offers.
-///
-/// What it makes unreachable is the two ways an unbounded value hurt:
-/// a `max_ms` in the tens of minutes silently freezes the refresh loop between
-/// two clicks with nothing to distinguish it from a hang, and a value near
-/// `u64::MAX` overflows the plain `baseline + extra` sums the timing editor
-/// does while painting a range (panic in debug, silent wrap in release). Every
-/// other knob in this file is validated aggressively; this one was not
-/// validated at all.
-const MAX_TIMING_MS: u64 = 60_000;
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// TCP port of the game server, remote side.
-    pub game_port: u16,
+    ///
+    /// A [`NonZeroU16`], not a `u16`, for the same reason [`server_url`] is a
+    /// [`ServerUrl`]: `game_port = 0` was refused by a clause in
+    /// [`Config::validate`], which made the loader the only producer that could
+    /// not express it. It reaches two places that have no `Config` in scope — the
+    /// BPF filter string (`tcp and src port {game_port}`) and `parse_segment`'s
+    /// server-side test — and port 0 is not a port in either: the filter would
+    /// match nothing and the test would classify every packet as client-sent, so
+    /// the relay would run, forward nothing, and look exactly like a wrong port.
+    /// `serde` refuses the zero at parse time with the offending line quoted.
+    ///
+    /// [`server_url`]: Config::server_url
+    pub game_port: NonZeroU16,
 
     /// Analysis server URL (`ws://` or `wss://`).
     ///
@@ -451,57 +456,25 @@ impl TryFrom<String> for ServerUrl {
     }
 }
 
-/// Reject an `[actuator.timings]` table the refresh loop cannot honour.
-///
-/// Separate from [`Config::validate`], and `pub(crate)`, because there are
-/// **two** write boundaries and only one of them has a `Config`: the loader, and
-/// [`persist::save`], which serializes whatever `Timings` the Setup tab hands it
-/// with no `Config` anywhere in the path. Enforced at the loader alone, the GUI
-/// was one missing clamp away from writing a file the *next* launch refuses —
-/// the exact shape of the `kinds = ["unknown"]` checkbox that shipped, whose
-/// only cure was hand-editing the file the app owns.
-///
-/// Better still would be for `DelayRange` to carry the invariant itself, where no
-/// producer at all could bypass it. That is a bigger move than it looks: the type
-/// lives in [`crate::actuator::plan`] and [`MAX_TIMING_MS`] lives here, so it
-/// inverts the current dependency direction — and the reversed-range message
-/// below, which names the key *and* says what the value would be read as, has to
-/// survive the move.
-///
-/// # Errors
-///
-/// [`Error::Config`] — a range is reversed (`min_ms > max_ms`), or its `max_ms`
-/// exceeds the [`MAX_TIMING_MS`] ceiling. The message names the key.
-///
-/// [`Error::Config`]: crate::Error::Config
-pub(crate) fn validate_timings(timings: &Timings) -> Result<()> {
-    // `[actuator.timings]` reaches both the refresh loop and the Setup meter
-    // unchecked otherwise. Two shapes have to be refused:
-    //
-    // - a reversed range. With this TOML's inline form
-    //   (`{ min_ms = 800, max_ms = 200 }`) swapping the two is an ordinary
-    //   typo, and `DelayRange::draw` reads it as a fixed 800 ms delay — the
-    //   player configures variability and silently gets none, while the
-    //   Setup tab shows "Custom" with no clue why.
-    // - an unbounded `max_ms`. It is what freezes the loop for ten minutes
-    //   between two clicks, and what overflows the editor's `baseline + max`
-    //   sums near `u64::MAX`.
-    for (name, range) in timings.named_ranges() {
-        if range.min_ms > range.max_ms {
-            return Err(crate::Error::Config(format!(
-                "actuator.timings.{name} is reversed: min_ms = {} is above max_ms = {} — swap them (it would be read as a fixed {} ms delay, not a range)",
-                range.min_ms, range.max_ms, range.min_ms
-            )));
-        }
-        if range.max_ms > MAX_TIMING_MS {
-            return Err(crate::Error::Config(format!(
-                "actuator.timings.{name} max_ms = {} exceeds the {MAX_TIMING_MS} ms ceiling — that would stall the refresh loop between two clicks",
-                range.max_ms
-            )));
-        }
-    }
-    Ok(())
-}
+// There is no `validate_timings` here any more, and the absence is the fix.
+//
+// `[actuator.timings]` used to be bounded by a loop in this file that walked
+// `Timings::named_ranges()` — first from `Config::validate` alone, then from
+// `persist::write_sections` too, because there are **two** write boundaries and
+// only one of them has a `Config`: the loader, and the Setup tab, which hands a
+// `Timings` straight to `config::persist` with no `Config` anywhere in the path.
+// Enforced at the loader alone, the GUI was one missing clamp away from writing a
+// file the *next* launch refuses — the exact shape of the `kinds = ["unknown"]`
+// checkbox that shipped, whose only cure was hand-editing the file the app owns.
+//
+// Both boundaries are now closed by the type instead of by two callers
+// remembering to call one function: `plan::DelayRange` has private fields, a
+// `try_new` carrying `min_ms <= max_ms <= plan::MAX_TIMING_MS`, and a
+// `#[serde(try_from)]` hook, so an invalid range cannot be deserialized, built,
+// or dragged into existence. The ceiling constant moved down to `plan` with the
+// check — see `plan::MAX_TIMING_MS` for why the value is one minute, and
+// `plan::DelayRangeError` for the two messages, which still say what a bad value
+// *would have done* rather than merely that it is invalid.
 
 impl Config {
     /// Loads the configuration from `path`. A missing file yields the defaults.
@@ -517,16 +490,21 @@ impl Config {
     ///   `deny_unknown_fields`, so a typo is refused rather than silently
     ///   ignored), wrong type, or an integer out of range.
     /// - [`Error::Config`] — it parsed but breaks an invariant:
-    ///   - `game_port = 0`;
     ///   - an empty `server_url`, a scheme other than `ws://` / `wss://`, or a
     ///     `ws://` URL pointing anywhere but loopback (it would forward the
     ///     captured game stream, session tokens included, in cleartext);
-    ///   - an unrecognized value in `[filter] kinds`, which the wire-tolerant
-    ///     `ItemKind` would otherwise fold into `Unknown` and match nothing;
     ///   - a non-finite `[[filter.required_substats]] min` (`nan`/`inf` are
-    ///     legal TOML floats), which no substat value can ever satisfy;
-    ///   - an `[actuator.timings]` range that is reversed (`min_ms > max_ms`)
-    ///     or whose `max_ms` exceeds the 60 000 ms ceiling.
+    ///     legal TOML floats), which no substat value can ever satisfy.
+    ///
+    /// Four rules are absent from that list because they are enforced where the
+    /// value is *built*, so they surface as [`Error::ConfigParse`] with the
+    /// offending line quoted rather than as [`Error::Config`]: `server_url`'s
+    /// cleartext rule ([`ServerUrl`]), `game_port = 0` ([`NonZeroU16`]),
+    /// `[actuator.timings]`'s reversed / over-ceiling ranges
+    /// ([`plan::DelayRange`](crate::actuator::plan::DelayRange)), and an
+    /// unrecognized `[filter] kinds` entry, which the wire-tolerant `ItemKind`
+    /// would otherwise fold into `Unknown` and match nothing
+    /// (`filter::hunt_kinds`).
     ///
     /// [`Error::Config`]: crate::Error::Config
     /// [`Error::ConfigParse`]: crate::Error::ConfigParse
@@ -550,22 +528,27 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.game_port == 0 {
-            return Err(crate::Error::Config("game_port cannot be 0".into()));
-        }
+        // No `game_port` clause here, deliberately, and for the same reason as
+        // `server_url` and `[actuator.timings]` below: the field is a
+        // `NonZeroU16`, so the zero this used to refuse cannot be built — on the
+        // load path *or* in a struct literal — and both consumers (the BPF filter
+        // and `parse_segment`) now receive the proof rather than a bare `u16`.
         // No `server_url` clause here, deliberately. It receives the reassembled
         // game stream, which can carry session tokens, so it must be TLS
         // (`wss://`) unless the host is loopback — and that rule is now carried
         // by the field's type: a `ServerUrl` exists only if `ServerUrl::parse`
         // accepted it, on the load path *and* in a struct literal. Re-checking
         // it here would be a second implementation of a proof we already hold.
-        // `ItemKind` is wire-tolerant (`serde(other)` -> Unknown), which in a
-        // config file would let a typo silently match nothing: reject it here.
-        if self.filter.kinds.contains(&ItemKind::Unknown) {
-            return Err(crate::Error::Config(
-                "unrecognized kind in [filter] kinds (expected: equipment, hero, token)".into(),
-            ));
-        }
+        // No `[filter] kinds` clause either. `ItemKind` is wire-tolerant
+        // (`serde(other)` -> `Unknown`), which in a config file would let a typo
+        // silently match nothing — so the field does not hold an `ItemKind` any
+        // more. `filter::HuntKind` has the game's three kinds and no catch-all, so
+        // `kinds = ["equipement"]` is an `unknown variant` parse error naming the
+        // three that are legal, and the typo cannot survive as far as this
+        // function. That also closes the boundary this clause never covered: the
+        // Setup tab writes `[filter]` through `persist::save` with no `Config` in
+        // the path, which is how a checkbox once wrote a `kinds = ["unknown"]`
+        // that the next launch refused fatally.
         // The same failure mode as `kinds`, by a different route, and TOML 1.0
         // supplies the literal: `min = nan` parses. Nothing can then satisfy
         // `value >= min`, so the filter matches nothing while `is_unrestricted`
@@ -600,10 +583,12 @@ impl Config {
         // Refusing any `[forward]` value would only lock out a player whose
         // file predates the change, which is every player's file.
         //
-        // The timing ranges are checked by the free `validate_timings`, which
-        // `persist::save` calls too — the disk is written from the GUI without a
-        // `Config` in the path, so the loader cannot be the only boundary.
-        validate_timings(&self.actuator.timings)
+        // No `[actuator.timings]` clause either, for the same reason as
+        // `server_url`: `plan::DelayRange` cannot hold a reversed or
+        // over-ceiling pair, on the load path *and* in a struct literal, so a
+        // check here would be a second implementation of a proof we already
+        // hold — and it would only cover the loader, not the GUI's write.
+        Ok(())
     }
 
     pub fn reconnect_initial(&self) -> Duration {
@@ -802,12 +787,25 @@ mod tests {
 
     #[test]
     fn misspelled_kind_value_is_rejected() {
-        // serde(other) folds unknown kind strings into Unknown; validate()
-        // must catch it or the typo silently matches nothing.
-        let config: Config =
-            toml::from_str("[filter]\nkinds = [\"equipement\"]").expect("parses tolerant");
-        assert_eq!(config.filter.kinds, vec![ItemKind::Unknown]);
-        assert!(config.validate().is_err());
+        // This used to *parse* — `ItemKind`'s `serde(other)` folded the typo into
+        // `Unknown` — and `validate()` was what caught it afterwards.
+        // `Filter::kinds` holds `HuntKind` now, which has no catch-all, so the
+        // refusal is serde's and names the three legal values at the offending
+        // line. A typo here silently matches nothing while `is_unrestricted`
+        // counts it as a criterion: the loop arms and burns crystals forever.
+        let error = parse_and_validate("[filter]\nkinds = [\"equipement\"]")
+            .expect_err("a misspelled kind must not silently match nothing");
+        assert!(matches!(error, crate::Error::ConfigParse(_)), "{error:?}");
+        let message = error.report();
+        for expected in ["equipement", "equipment", "hero", "token"] {
+            assert!(message.contains(expected), "{message}");
+        }
+        // And the value the shipped checkbox wrote goes the same way, instead of
+        // parsing into a criterion nothing can ever satisfy.
+        assert!(matches!(
+            parse_and_validate("[filter]\nkinds = [\"unknown\"]"),
+            Err(crate::Error::ConfigParse(_))
+        ));
     }
 
     #[test]
@@ -855,6 +853,30 @@ mod tests {
         assert_eq!(config.limits.max_spend, Some(300));
         assert_eq!(config.limits.max_matches, Some(5));
         assert_eq!(config.limits.max_duration_ms, Some(3_600_000));
+    }
+
+    #[test]
+    fn a_zero_game_port_is_rejected_by_the_type() {
+        // `game_port = 0` used to be a clause in `Config::validate`, and it had no
+        // test at all. It is `NonZeroU16` now, so the refusal is serde's and lands
+        // as a parse error with the offending line quoted — and, more to the point,
+        // the two consumers that have no `Config` in scope (the BPF filter string
+        // and `parse_segment`'s server-side test) can no longer be handed the zero.
+        // Port 0 would have built a filter matching nothing while classifying every
+        // packet as client-sent: a relay that runs, forwards nothing, and looks
+        // exactly like a mistyped port.
+        let error = parse_and_validate("game_port = 0").expect_err("port 0 is not a port");
+        assert!(matches!(error, crate::Error::ConfigParse(_)), "{error:?}");
+        assert!(error.report().contains("game_port"), "{}", error.report());
+        // The neighbouring values still parse, so the bound is exactly `> 0`.
+        assert_eq!(
+            parse_and_validate("game_port = 1")
+                .expect("port 1 is a port")
+                .game_port
+                .get(),
+            1
+        );
+        assert_eq!(Config::default().game_port, DEFAULT_GAME_PORT);
     }
 
     #[test]
@@ -924,12 +946,12 @@ mod tests {
             "#,
         )
         .expect("config should parse");
-        assert_eq!(config.actuator.timings.refreshed.min_ms, 200);
-        assert_eq!(config.actuator.timings.refreshed.max_ms, 800);
-        assert_eq!(config.actuator.timings.between_buys.max_ms, 500);
+        assert_eq!(config.actuator.timings.refreshed.min_ms(), 200);
+        assert_eq!(config.actuator.timings.refreshed.max_ms(), 800);
+        assert_eq!(config.actuator.timings.between_buys.max_ms(), 500);
         // Unset ranges stay at the calibrated baseline (0..=0 extra).
-        assert_eq!(config.actuator.timings.shop_opened.max_ms, 0);
-        assert_eq!(Config::default().actuator.timings.refreshed.max_ms, 0);
+        assert_eq!(config.actuator.timings.shop_opened.max_ms(), 0);
+        assert_eq!(Config::default().actuator.timings.refreshed.max_ms(), 0);
     }
 
     #[test]
@@ -937,16 +959,26 @@ mod tests {
         // `{ min_ms = 800, max_ms = 200 }` is a plausible typo in this inline
         // form. Accepted, it is silently reread as a fixed 800 ms delay: the
         // player gets none of the variability they configured.
+        //
+        // Refused by `DelayRange`'s `try_from` now, not by `validate`, so it is a
+        // *parse* error — which is why the key is asserted rather than the
+        // dotted path: `toml` quotes the offending line and points a caret at
+        // the value, which is more actionable in a file the player must edit.
         let error =
             parse_and_validate("[actuator.timings]\nrefreshed = { min_ms = 800, max_ms = 200 }")
                 .expect_err("a reversed range must not be silently reinterpreted");
-        let message = error.to_string();
-        assert!(matches!(error, crate::Error::Config(_)));
-        assert!(message.contains("actuator.timings.refreshed"), "{message}");
+        // `report()`, not `to_string()`: `ConfigParse`'s own `Display` is one
+        // layer ("config.toml is not valid") and the chain walk is what the two
+        // report sites print, so that is the text a player actually reads.
+        let message = error.report();
+        assert!(matches!(error, crate::Error::ConfigParse(_)), "{error:?}");
+        assert!(message.contains("refreshed"), "{message}");
         assert!(
             message.contains("800") && message.contains("200"),
             "{message}"
         );
+        // And the reason survives the trip through serde, unchanged.
+        assert!(message.contains("fixed 800 ms delay"), "{message}");
     }
 
     #[test]
@@ -955,28 +987,32 @@ mod tests {
         let error =
             parse_and_validate("[actuator.timings]\nrefreshed = { min_ms = 0, max_ms = 600000 }")
                 .expect_err("a ten-minute extra wait must be refused");
-        assert!(matches!(error, crate::Error::Config(_)));
-        assert!(error.to_string().contains("actuator.timings.refreshed"));
+        assert!(matches!(error, crate::Error::ConfigParse(_)), "{error:?}");
+        assert!(error.report().contains("refreshed"), "{}", error.report());
+        assert!(error.report().contains("ceiling"), "{}", error.report());
 
         // The overflow case: four bare additions in the timing editor sum this
-        // with a baseline. Rejecting it here is the guard at the root.
+        // with a baseline. Rejecting it at the type is the guard at the root.
         let error = parse_and_validate(
             "[actuator.timings]\nshop_opened = { min_ms = 0, max_ms = 18446744073709551615 }",
         )
         .expect_err("a u64::MAX extra wait must be refused");
-        assert!(matches!(error, crate::Error::Config(_)));
-        assert!(error.to_string().contains("actuator.timings.shop_opened"));
+        assert!(matches!(error, crate::Error::ConfigParse(_)), "{error:?}");
+        assert!(error.report().contains("shop_opened"), "{}", error.report());
     }
 
     #[test]
     fn every_timing_range_is_checked_not_just_the_first() {
         // A per-field guard that only walked one range would leave the other
-        // seven exactly as unvalidated as before.
+        // seven exactly as unvalidated as before. `DelayRange`'s `try_from`
+        // cannot have that bug by construction — every field is the same type —
+        // but the eight keys must still each *be* a `DelayRange`, which is what
+        // this walks.
         for name in Timings::default().named_ranges().map(|(name, _)| name) {
             let text = format!("[actuator.timings]\n{name} = {{ min_ms = 9, max_ms = 1 }}");
             match parse_and_validate(&text) {
                 Ok(_) => panic!("actuator.timings.{name} is not validated"),
-                Err(error) => assert!(error.to_string().contains(name), "{name}: {error}"),
+                Err(error) => assert!(error.report().contains(name), "{name}: {}", error.report()),
             }
         }
     }
@@ -985,11 +1021,12 @@ mod tests {
     fn a_timing_range_at_the_ceiling_is_accepted() {
         // The bound is inclusive, and a wide-but-sane range must stay usable:
         // the ceiling exists to stop a frozen loop, not to narrow the knob.
+        let ceiling = crate::actuator::plan::MAX_TIMING_MS;
         let config = parse_and_validate(&format!(
-            "[actuator.timings]\nrefreshed = {{ min_ms = 0, max_ms = {MAX_TIMING_MS} }}"
+            "[actuator.timings]\nrefreshed = {{ min_ms = 0, max_ms = {ceiling} }}"
         ))
         .expect("the ceiling itself is a legal setting");
-        assert_eq!(config.actuator.timings.refreshed.max_ms, MAX_TIMING_MS);
+        assert_eq!(config.actuator.timings.refreshed.max_ms(), ceiling);
         // A point range (min == max) is a fixed extra, not a reversed range.
         assert!(
             parse_and_validate("[actuator.timings]\nbuy_modal = { min_ms = 500, max_ms = 500 }")
@@ -1153,9 +1190,19 @@ mod tests {
         // still there. An empty table nobody touched is a commented section,
         // not a leftover.
         let dir = TempDir::new("example-strip");
-        std::fs::create_dir_all(dir.path()).expect("fixture dir");
         let path = dir.join("config.toml");
-        std::fs::write(&path, text).expect("seed the example");
+        // Through `seed_config_if_missing`, not a hand-rolled `fs::write` of the
+        // same `include_str!`: that is the function every player's first launch
+        // actually runs, and it also creates the parent directory — so this
+        // fixture no longer has to (the `create_dir_all` above it is gone), and a
+        // change to the real seeder cannot leave this test passing against a copy
+        // of what the seeder used to do.
+        crate::seed_config_if_missing(&path);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the seeder created it"),
+            text,
+            "the seeder must write the bundled example verbatim"
+        );
         assert_eq!(
             persist::strip_retired_keys(&path).expect("must not fail"),
             None,
@@ -1223,10 +1270,7 @@ mod tests {
             ..Limits::default()
         };
         let timings = Timings {
-            refreshed: DelayRange {
-                min_ms: 200,
-                max_ms: 800,
-            },
+            refreshed: DelayRange::try_new(200, 800).expect("a valid fixture range"),
             ..Timings::default()
         };
 
@@ -1284,7 +1328,7 @@ mod tests {
         let after = Config::load(&path).expect("the stripped file must still load");
         assert_eq!(after.capture.retired_keys(), None, "no warning next launch");
         assert_eq!(after.forward.retired_keys(), None, "no warning next launch");
-        assert_eq!(after.game_port, 3333);
+        assert_eq!(after.game_port.get(), 3333);
         assert_eq!(after.filter, before.filter, "the hunt is untouched");
         let text = std::fs::read_to_string(&path).expect("readable");
         assert!(text.contains("# hand-written"), "comments survive: {text}");

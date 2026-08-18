@@ -189,7 +189,7 @@ mod tests {
     fn journal_lines_render_with_timestamps() {
         let lines = vec![LogLine {
             at_ms: 61_000,
-            text: "refresh advised".to_owned(),
+            text: "refresh advised".into(),
         }];
         let harness = Harness::new_ui(|ui| render_journal_body(ui, &lines));
         harness.get_by_label("+1:01  refresh advised");

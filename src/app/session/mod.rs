@@ -433,19 +433,23 @@ fn handle_purchase(
     lines
 }
 
-/// An omitted-id notice never resolves a name: `catalog_id()` is never
-/// `Some(0)`.
+/// An omitted-id notice never resolves a name: an echo with no id is `None`, and
+/// `None == item.id` is only true for an item that also has none — which is why
+/// the `is_some()` guard is there rather than implied.
 fn purchase_line(controller: &Controller, notice: &PurchaseNotice) -> String {
     let name = controller.last_snapshot().and_then(|snapshot| {
         snapshot
             .slots
             .iter()
-            .find(|item| item.catalog_id() == Some(notice.item))
+            .find(|item| item.id.is_some() && item.id == notice.item)
             .and_then(|item| item.name.as_deref())
     });
     let label = match name {
         Some(name) => name.to_owned(),
-        None => format!("item {}", notice.item),
+        None => match notice.item {
+            Some(id) => format!("item {id}"),
+            None => "an unidentified item".to_owned(),
+        },
     };
     match notice.gold {
         Some(gold) => format!(">> bought: {label} — {gold} gold left"),
@@ -736,7 +740,7 @@ fn render_match(lines: &mut Vec<String>, targets: &[BuyTarget], controller: &Con
     // slot-number fallback (non-injective on a degraded shop).
     for (index, item) in snapshot.slots.iter().enumerate() {
         let shown = targets.iter().any(|target| match target.id {
-            Some(id) => item.catalog_id() == Some(id),
+            Some(id) => item.id == Some(id),
             None => item.effective_slot(index) == target.slot,
         });
         if shown {

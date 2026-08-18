@@ -174,7 +174,7 @@ impl Controller {
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
-                let id = item.catalog_id()?;
+                let id = item.id?;
                 self.checklist.contains(&id).then(|| BuyTarget {
                     slot: item.effective_slot(index),
                     id: Some(id),

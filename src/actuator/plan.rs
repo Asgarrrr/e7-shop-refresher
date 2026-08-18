@@ -317,19 +317,173 @@ impl Trigger {
     }
 }
 
+/// The ceiling on a single extra wait: one minute.
+///
+/// The click baselines this adds onto are calibrated to the game's blocking
+/// animations and span 100 ms (`scroll_settle`) to 1180 ms (`shop_opened`), and
+/// the Setup tab's own meter tops out at 2500 ms total — so 60 000 ms is roughly
+/// fifty times the slowest baseline and twenty-four times anything the GUI can
+/// produce. Every legitimate "pause like a slow, distracted human" setting stays
+/// reachable, plus a wide margin for experimenting past what the UI offers.
+///
+/// What it makes unreachable is the two ways an unbounded value hurt: a `max_ms`
+/// in the tens of minutes silently freezes the refresh loop between two clicks
+/// with nothing to distinguish it from a hang, and a value near `u64::MAX`
+/// overflows the plain `baseline + extra` sums the timing editor does while
+/// painting a range (panic in debug, silent wrap in release).
+///
+/// It lives here, next to [`DelayRange`], rather than in `config` where it was
+/// first written: the type carries the bound now, so the constant belongs where
+/// the check is, and the loader is no longer the only place that could apply it.
+pub const MAX_TIMING_MS: u64 = 60_000;
+
+/// Why a `(min_ms, max_ms)` pair is not a [`DelayRange`].
+///
+/// Both messages say what the value *would have done*, because this is the text
+/// a player reads in an error window over a file they are told not to hand-edit.
+/// Neither names the key: the pair reaches this type either from `config.toml`
+/// through `toml`, which prefixes the failing key's line and span, or from a
+/// struct literal, where the compiler names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelayRangeError {
+    /// `min_ms > max_ms`. With the inline TOML form this table uses
+    /// (`{ min_ms = 800, max_ms = 200 }`) swapping the two is an ordinary typo,
+    /// and read leniently it becomes a fixed 800 ms delay — the player
+    /// configures variability and silently gets none, while the Setup tab shows
+    /// "Custom" with no clue why.
+    Reversed { min_ms: u64, max_ms: u64 },
+    /// `max_ms` past [`MAX_TIMING_MS`]. This is what freezes the loop for ten
+    /// minutes between two clicks, and what overflowed the editor's
+    /// `baseline + max` sums near `u64::MAX`.
+    AboveCeiling { max_ms: u64 },
+}
+
+impl std::fmt::Display for DelayRangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            DelayRangeError::Reversed { min_ms, max_ms } => write!(
+                f,
+                "the range is reversed: min_ms = {min_ms} is above max_ms = {max_ms} — swap them (it would be read as a fixed {min_ms} ms delay, not a range)"
+            ),
+            DelayRangeError::AboveCeiling { max_ms } => write!(
+                f,
+                "max_ms = {max_ms} exceeds the {MAX_TIMING_MS} ms ceiling — that would stall the refresh loop between two clicks"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DelayRangeError {}
+
+/// The wire shape of a [`DelayRange`] — the two keys as `config.toml` spells
+/// them, carrying no invariant. It exists only as the `#[serde(try_from)]` hook:
+/// deriving `Deserialize` on the newtype itself would let serde fill the private
+/// fields directly and skip the check, which is the whole defect this pair fixes.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawDelayRange {
+    min_ms: u64,
+    max_ms: u64,
+}
+
+impl TryFrom<RawDelayRange> for DelayRange {
+    type Error = DelayRangeError;
+
+    fn try_from(raw: RawDelayRange) -> Result<Self, Self::Error> {
+        DelayRange::try_new(raw.min_ms, raw.max_ms)
+    }
+}
+
 /// An inclusive extra-wait range, in milliseconds. Each resolved wait draws a
 /// uniform value in `[min_ms, max_ms]` and adds it to a tuned baseline, so the
 /// loop's pauses vary like a human's instead of being byte-identical every
 /// time. The default (`0..=0`) reproduces the calibrated timing exactly; the
 /// baseline is the floor, so a range only ever slows the loop down.
+///
+/// `min_ms <= max_ms <= MAX_TIMING_MS` holds **by construction**: the fields are
+/// private and the three ways in ([`try_new`](Self::try_new),
+/// [`ceiling`](Self::ceiling), [`set_max_ms`](Self::set_max_ms)) each enforce it,
+/// with `Deserialize` routed through `RawDelayRange` so `config.toml` is no
+/// exception. That is a change of kind, not of degree: the two rules used to live
+/// in a loop in `config::validate_timings`, so every *other* producer — a
+/// preset, a GUI drag, `persist::save` writing what the Setup tab handed it —
+/// re-derived them, absorbed them by clamping, or bypassed them. The file the
+/// GUI wrote was one missing clamp away from being a file the next launch
+/// refused, which is exactly the shape of the `kinds = ["unknown"]` checkbox that
+/// shipped and whose only cure was hand-editing the file the app owns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(try_from = "RawDelayRange")]
 pub struct DelayRange {
-    pub min_ms: u64,
-    pub max_ms: u64,
+    min_ms: u64,
+    max_ms: u64,
 }
 
 impl DelayRange {
+    /// The range `min_ms..=max_ms`, or why it is not one.
+    ///
+    /// # Errors
+    ///
+    /// [`DelayRangeError::Reversed`] when `min_ms > max_ms`, and
+    /// [`DelayRangeError::AboveCeiling`] when `max_ms` is past
+    /// [`MAX_TIMING_MS`]. The order matters for the message a player sees: a
+    /// reversed pair is reported as reversed even when it also breaks the
+    /// ceiling, because swapping it is the fix.
+    pub const fn try_new(min_ms: u64, max_ms: u64) -> Result<Self, DelayRangeError> {
+        if min_ms > max_ms {
+            return Err(DelayRangeError::Reversed { min_ms, max_ms });
+        }
+        if max_ms > MAX_TIMING_MS {
+            return Err(DelayRangeError::AboveCeiling { max_ms });
+        }
+        Ok(Self { min_ms, max_ms })
+    }
+
+    /// A range with no floor — `0..=max_ms`, clamped to [`MAX_TIMING_MS`].
+    ///
+    /// Infallible, and that is the point: this is the shape both producers
+    /// inside the app make (a preset dials the random ceiling, the Setup tab's
+    /// drag sets it), so neither needs a `Result` it could only `expect` on.
+    /// `min_ms = 0` cannot reverse the range, and the clamp answers the ceiling.
+    #[must_use]
+    pub const fn ceiling(max_ms: u64) -> Self {
+        Self {
+            min_ms: 0,
+            max_ms: if max_ms > MAX_TIMING_MS {
+                MAX_TIMING_MS
+            } else {
+                max_ms
+            },
+        }
+    }
+
+    /// The floor of the draw: extra wait always added.
+    #[must_use]
+    pub const fn min_ms(self) -> u64 {
+        self.min_ms
+    }
+
+    /// The ceiling of the draw, at most [`MAX_TIMING_MS`], never below
+    /// [`min_ms`](Self::min_ms).
+    #[must_use]
+    pub const fn max_ms(self) -> u64 {
+        self.max_ms
+    }
+
+    /// Move the ceiling to what the player just dragged to, keeping the
+    /// invariant: the value is clamped to [`MAX_TIMING_MS`], and a
+    /// config-seeded floor above it comes down with it (min never exceeds the
+    /// max the player just set).
+    pub const fn set_max_ms(&mut self, max_ms: u64) {
+        self.max_ms = if max_ms > MAX_TIMING_MS {
+            MAX_TIMING_MS
+        } else {
+            max_ms
+        };
+        if self.min_ms > self.max_ms {
+            self.min_ms = self.max_ms;
+        }
+    }
+
     /// The inert default (`0..=0`): the calibrated baseline, no extra wait.
     /// Persistence skips these so a first Apply does not fill
     /// `[actuator.timings]` with eight no-op ranges the player never set.
@@ -337,21 +491,20 @@ impl DelayRange {
         self.min_ms == 0 && self.max_ms == 0
     }
 
-    /// A uniform draw in `[min_ms, max_ms]`; a reversed range is read as a
-    /// point at `min_ms` (an obvious misconfiguration never widens the draw).
+    /// A uniform draw in `[min_ms, max_ms]`.
+    ///
+    /// Plain arithmetic, where the unvalidated version needed a `saturating_sub`
+    /// and a `checked_add`: the type's invariant makes every step provable. The
+    /// span cannot underflow (`min_ms <= max_ms`); the inclusive `span + 1`
+    /// modulus cannot overflow, which is what used to make `% 0` reachable from
+    /// a `max_ms = u64::MAX` config file; and the result is at most `max_ms`,
+    /// hence at most `MAX_TIMING_MS`.
     fn draw(&self, jitter: &mut Jitter) -> u64 {
-        let span = self.max_ms.saturating_sub(self.min_ms);
+        let span = self.max_ms - self.min_ms;
         if span == 0 {
             return self.min_ms;
         }
-        // The modulus is `span + 1` (inclusive range). A full-u64 span
-        // (`min_ms = 0, max_ms = u64::MAX`) overflows that add — but there the
-        // whole domain is in range, so the raw sample is already a valid draw.
-        // Without this guard a `max_ms = u64::MAX` config would panic (`% 0`).
-        match span.checked_add(1) {
-            Some(modulus) => self.min_ms.saturating_add(jitter.next() % modulus),
-            None => self.min_ms.saturating_add(jitter.next()),
-        }
+        self.min_ms + jitter.next() % (span + 1)
     }
 }
 
@@ -505,10 +658,7 @@ impl TimingPreset {
             TimingPreset::Human => 1,
             TimingPreset::Cautious => 2,
         };
-        let x = |base: u64| DelayRange {
-            min_ms: 0,
-            max_ms: base * human,
-        };
+        let x = |base: u64| DelayRange::ceiling(base * human);
         Timings {
             shop_opened: x(500),
             refreshed: x(350),
@@ -751,7 +901,7 @@ mod tests {
     #[test]
     fn a_fine_tuned_timings_matches_no_preset() {
         let mut custom = TimingPreset::Human.timings();
-        custom.refreshed.max_ms += 5;
+        custom.refreshed.set_max_ms(custom.refreshed.max_ms() + 5);
         assert_eq!(TimingPreset::from_timings(&custom), None);
     }
 
@@ -771,7 +921,7 @@ mod tests {
                 t.between_buys,
                 t.scroll_settle,
             ] {
-                assert_eq!(range.min_ms, 0);
+                assert_eq!(range.min_ms(), 0);
             }
         }
     }
@@ -911,6 +1061,98 @@ mod tests {
             }
         );
         assert_eq!(error.to_string(), "degenerate client area 0×0");
+    }
+
+    /// The three properties `to_screen` is *defined* by, over a deliberate
+    /// lattice of window shapes rather than five hand-picked resolutions.
+    ///
+    /// This is where `20-test.md`'s `test-007` asked for `proptest`, and it is
+    /// declined here on the merits rather than skipped. `to_screen` is piecewise
+    /// linear: within a branch nothing surprising can happen between two sample
+    /// points, so all of its interesting behaviour is at the boundaries — exactly
+    /// 16:9, exactly the aspect cap, the anchor extremes, the design-space edges.
+    /// A lattice hits every one of those *deliberately* and deterministically;
+    /// 256 uniform random rects hit them by luck, in exchange for eight test-only
+    /// crates on nine `--locked` lanes and a `proptest-regressions/` file this
+    /// repository has no convention for. The generator would also have to
+    /// construct at-least-16:9 rects by the same arithmetic the function under
+    /// test uses, which is the failure mode the report itself warns about
+    /// elsewhere ("a generator would mostly restate the implementation").
+    ///
+    /// What is *not* declined is the coverage: 1 152 cases here against the five
+    /// resolutions above, and the properties are stated rather than sampled.
+    #[test]
+    fn to_screen_maps_every_shape_inside_the_client_area() {
+        // Heights across the range a real window takes, plus the extremes; extra
+        // width walks the three regimes — exactly 16:9, wider, and past the
+        // `MAX_ASPECT` cap where the view pillarboxes.
+        let heights = [1, 200, 719, 720, 721, 1080, 1440, 2160];
+        let extras = [0, 1, 7, 400, 1920, 8000];
+        let points = [
+            point(0.0, 0.0, Anchor::Left),
+            point(1280.0, 720.0, Anchor::Right),
+            point(640.0, 360.0, Anchor::Center),
+            point(1154.0, 664.0, Anchor::Right),
+        ];
+        let mut cases = 0_u32;
+        for height in heights {
+            // The narrowest width that is still at least 16:9, so every rect in
+            // the sweep is one `to_screen` must accept.
+            let min_width = (f64::from(height) * f64::from(DESIGN_W) / f64::from(DESIGN_H)).ceil();
+            for extra in extras {
+                let width = min_width as i32 + extra;
+                for left in [-4000, -1, 0, 1, 2560] {
+                    let r = rect(left, -3000, width, height);
+                    for p in points {
+                        let (px, py) = to_screen(r, p).unwrap_or_else(|err| {
+                            panic!("{width}×{height} is 16:9 or wider: {err}")
+                        });
+                        // 1. Inside the client area. This is the property the
+                        //    executor relies on and no example test stated: a
+                        //    coordinate outside the window clicks another
+                        //    application, or nothing, with real gold behind it.
+                        assert!(
+                            (r.left..=r.left + r.width).contains(&px),
+                            "x {px} outside {}..={} for {width}×{height}",
+                            r.left,
+                            r.left + r.width
+                        );
+                        assert!(
+                            (r.top..=r.top + r.height).contains(&py),
+                            "y {py} outside {}..={} for {width}×{height}",
+                            r.top,
+                            r.top + r.height
+                        );
+                        cases += 1;
+                    }
+                    // 2. The pillarbox bars are symmetric: the design-space left
+                    //    and right edges sit the same distance from their window
+                    //    edges. An asymmetric offset is how a centred modal's
+                    //    confirm button drifts off it on an ultrawide.
+                    let (left_edge, _) = to_screen(r, point(0.0, 0.0, Anchor::Left)).expect("edge");
+                    let (right_edge, _) =
+                        to_screen(r, point(DESIGN_W, 0.0, Anchor::Right)).expect("edge");
+                    let (bar_left, bar_right) = (left_edge - r.left, r.left + r.width - right_edge);
+                    assert!(
+                        (bar_left - bar_right).abs() <= 1,
+                        "bars {bar_left}/{bar_right} differ by more than rounding at {width}×{height}"
+                    );
+                    // 3. Monotone in the design x within one anchor: a larger
+                    //    design x never maps to a smaller pixel. `Anchor::Left`
+                    //    alone, because the three anchors measure from different
+                    //    edges and are not comparable to each other.
+                    let mut last = i32::MIN;
+                    for x in [0.0, 1.0, 320.0, 640.0, 1279.0, DESIGN_W] {
+                        let (px, _) = to_screen(r, point(x, 0.0, Anchor::Left)).expect("in range");
+                        assert!(px >= last, "x is not monotone at {width}×{height}");
+                        last = px;
+                    }
+                }
+            }
+        }
+        // The sweep is worth what it covers; a refactor that silently shrinks it
+        // should fail here rather than pass quietly.
+        assert_eq!(cases, 8 * 6 * 5 * 4);
     }
 
     #[test]
@@ -1141,8 +1383,11 @@ mod tests {
         assert!(job.steps.is_empty());
     }
 
+    /// A range the type accepts. Panics on a reversed or over-ceiling pair,
+    /// which is the whole point of [`DelayRange::try_new`]: a fixture cannot
+    /// smuggle in a range the loader would have refused.
     fn range(min_ms: u64, max_ms: u64) -> DelayRange {
-        DelayRange { min_ms, max_ms }
+        DelayRange::try_new(min_ms, max_ms).expect("the fixture range must be valid")
     }
 
     #[test]
@@ -1228,31 +1473,73 @@ mod tests {
     }
 
     #[test]
-    fn reversed_range_reads_as_its_min_point() {
-        // A reversed range no longer reaches here from a config file:
-        // `Config::validate` rejects `min_ms > max_ms` up front, naming the
-        // field and both values, rather than letting it be silently reread as
-        // a fixed delay the player never asked for. What this test pins is the
-        // safety net underneath — `draw` must stay total for a range built in
-        // memory (a GUI edit, a future preset), never widen the draw, and
-        // never panic. Keep both: the guard is the fix, this is the floor.
-        let timings = Timings {
-            refreshed: range(600, 100),
-            ..Timings::default()
-        };
-        let job = refresh_job(Trigger::Refreshed, timings, Epoch(3), 42);
-        assert_eq!(job.steps[0].wait_ms, 780 + 600);
+    fn a_reversed_range_cannot_be_built_at_all() {
+        // This used to be `reversed_range_reads_as_its_min_point`: a reversed
+        // range was constructible, `Config::validate` refused it at the loader,
+        // and `draw` read it leniently as a fixed delay for everyone else. Now
+        // there is no "everyone else" — a GUI edit, a future preset and a
+        // `config.toml` all go through `try_new`, so the lenient reading has no
+        // input to be lenient about. The message still says what the value would
+        // have been read as, because that is what tells the player it was a typo.
+        let err = DelayRange::try_new(600, 100).expect_err("a reversed range is not a range");
+        assert_eq!(
+            err,
+            DelayRangeError::Reversed {
+                min_ms: 600,
+                max_ms: 100
+            }
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("600") && message.contains("100"),
+            "{message}"
+        );
+        assert!(message.contains("fixed 600 ms delay"), "{message}");
+    }
+
+    #[test]
+    fn a_range_past_the_ceiling_cannot_be_built_and_the_ceiling_itself_can() {
+        // The `u64::MAX` case is what used to make `draw`'s modulus overflow and
+        // the editor's `baseline + max` sums wrap; ten minutes is what freezes
+        // the loop between two clicks. Both are now unrepresentable rather than
+        // refused-at-the-loader, and the inclusive bound stays usable — the
+        // ceiling exists to stop a frozen loop, not to narrow the knob.
+        assert_eq!(
+            DelayRange::try_new(0, u64::MAX),
+            Err(DelayRangeError::AboveCeiling { max_ms: u64::MAX })
+        );
+        assert_eq!(
+            DelayRange::try_new(0, 600_000),
+            Err(DelayRangeError::AboveCeiling { max_ms: 600_000 })
+        );
+        assert_eq!(range(0, MAX_TIMING_MS).max_ms(), MAX_TIMING_MS);
+        // `ceiling` is the infallible door, so it clamps instead of failing.
+        assert_eq!(DelayRange::ceiling(u64::MAX).max_ms(), MAX_TIMING_MS);
+        assert_eq!(DelayRange::ceiling(0), DelayRange::default());
+    }
+
+    #[test]
+    fn set_max_ms_keeps_the_invariant_it_could_break() {
+        // The Setup tab's drag is the one mutating producer. Dragging below a
+        // config-seeded floor must bring the floor down, not leave a reversed
+        // range behind — the check `timing_meter` used to make by hand, one line
+        // after writing `max_ms` and one line before anything could observe it.
+        let mut r = range(400, 900);
+        r.set_max_ms(100);
+        assert_eq!((r.min_ms(), r.max_ms()), (100, 100));
+        r.set_max_ms(u64::MAX);
+        assert_eq!((r.min_ms(), r.max_ms()), (100, MAX_TIMING_MS));
     }
 
     #[test]
     fn only_the_all_zero_range_is_inert() {
         // Drives the `skip_serializing_if` on every `Timings` field: a range
         // wrongly reported inert would be dropped from a saved config.toml,
-        // silently reverting the player's setting on the next launch.
+        // silently reverting the player's setting on the next launch. The old
+        // `(1, 0)` case is gone — the type no longer has that value.
         assert!(DelayRange::default().is_inert());
         assert!(range(0, 0).is_inert());
         assert!(!range(0, 1).is_inert());
-        assert!(!range(1, 0).is_inert());
         assert!(!range(1, 1).is_inert());
     }
 
@@ -1284,19 +1571,20 @@ mod tests {
                 "scroll_settle",
             ]
         );
-        assert_eq!(named.map(|(_, r)| r.max_ms), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(named.map(|(_, r)| r.max_ms()), [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
-    fn full_u64_range_draws_without_panicking() {
-        // A `max_ms = u64::MAX, min_ms = 0` range makes the modulus `span + 1`
-        // overflow: the draw must fall back to the raw sample, never `% 0`.
+    fn the_widest_legal_range_draws_inside_itself() {
+        // `draw` is plain arithmetic now that `try_new` bounds the range, so the
+        // widest thing it can ever see is the one worth pinning: the inclusive
+        // `span + 1` modulus must not overflow (that is what `% 0` used to come
+        // from) and the draw must land in the range it was asked for.
         let timings = Timings {
-            refreshed: range(0, u64::MAX),
+            refreshed: range(0, MAX_TIMING_MS),
             ..Timings::default()
         };
-        // No panic, and the baseline still saturates the result.
         let job = refresh_job(Trigger::Refreshed, timings, Epoch(3), 42);
-        assert!(job.steps[0].wait_ms >= 780);
+        assert!((780..=780 + MAX_TIMING_MS).contains(&job.steps[0].wait_ms));
     }
 }

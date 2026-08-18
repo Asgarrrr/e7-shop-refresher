@@ -85,6 +85,13 @@ multiple_unsafe_ops_per_block = "warn" # 0
 # starts producing false positives, demote that line rather than the group.
 redundant_clone = "warn"     # 0
 format_push_string = "warn"  # 0
+# Pedantic, named individually for the same reason as the two above: this crate's
+# docs navigate by identifier (`WinDivert`, `QinQ`, `EtherType`, `DryRun`,
+# `dry_run`), and an unbackticked one reads as prose while linking to nothing. It
+# went from 18 sites to 0 the honest way — every one of them was a real identifier
+# except `domain::filter`'s "ANDed", which was reworded to "combined with a
+# logical AND" because backticking English would have been the wrong fix.
+doc_markdown = "warn"        # 0
 # Zero in the test harness too, unlike `unwrap_used`/`panic` above.
 todo = "warn"           # 0
 unimplemented = "warn"  # 0
@@ -182,7 +189,14 @@ windows-sys = { version = "0.61", features = [
 # Headless widget-interaction tests for the ui module (no renderer needed).
 # Dev-deps cannot be feature-gated: the console-only test lane builds egui
 # once too; the kittest tests themselves are behind the `gui` feature.
-egui_kittest = { version = "0.35", default-features = false, features = ["wgpu", "snapshot"] }
+# No `snapshot`: nothing in the crate calls `assert_snapshot`/`try_snapshot`,
+# there is no `snapshots/` directory and no `.snap` file, and the feature is not
+# free — it pulls `dify`, `open` and `tempfile` into the resolution of all nine
+# `--locked` lanes. It also contradicted the reason `eframe` is restricted to
+# `glow` twenty lines up. The alternative considered and rejected was keeping it
+# for `tempfile`: `crash.rs`'s test module carries its own ~20-line RAII
+# `TempFile` guard, so nothing here needs `tempfile` compiled at all.
+egui_kittest = { version = "0.35", default-features = false, features = ["wgpu"] }
 # Paused-clock tests (`start_paused`) for the uplink send timeout.
 tokio = { version = "1", features = ["test-util"] }
 

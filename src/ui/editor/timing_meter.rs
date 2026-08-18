@@ -116,10 +116,12 @@ fn timing_meter(ui: &mut egui::Ui, width: f32, baseline: u64, value: &mut DelayR
     // (never negative, never past the ruler's end).
     if let Some(pos) = response.interact_pointer_pos() {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        value.max_ms = slack_from_target(frac * RULER_MS, baseline);
-        // Keep the invariant a config floor could otherwise break: min never
-        // exceeds the max the player just set.
-        value.min_ms = value.min_ms.min(value.max_ms);
+        // One call, not two: `set_max_ms` is also what brings a config-seeded
+        // floor down with the ceiling the player just dragged past it. That used
+        // to be a second line here — the invariant held because this widget
+        // remembered to restore it, which is precisely what `DelayRange`'s
+        // private fields removed the need for.
+        value.set_max_ms(slack_from_target(frac * RULER_MS, baseline));
     }
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -128,13 +130,14 @@ fn timing_meter(ui: &mut egui::Ui, width: f32, baseline: u64, value: &mut DelayR
     let painter = ui.painter().clone();
     let radius = egui::CornerRadius::same(4);
     painter.rect_filled(rect, radius, theme::HAIRLINE);
-    // Saturating: `DelayRange` itself carries no invariant, and the engine
-    // deliberately supports a `max_ms` up to `u64::MAX` (`DelayRange::draw`
-    // saturates too). The loader's `validate_timings` bounds what `config.toml`
-    // may seed, but the type it produces does not, so the widget must still cope
-    // with any `u64`. A plain `+` here would panic in debug and, worse, wrap
-    // silently in release — painting a full-ruler wait as a 0.3% sliver.
-    let total = baseline.saturating_add(value.max_ms.max(value.min_ms));
+    // A plain `+` over `max_ms` alone, where this used to saturate over
+    // `max_ms.max(min_ms)`: `DelayRange` carries
+    // `min_ms <= max_ms <= plan::MAX_TIMING_MS` by construction now, so `max_ms`
+    // *is* the top of the band and a baseline under the 2500 ms ruler plus at
+    // most one minute cannot overflow. It can still be many times the ruler — the
+    // ceiling is deliberately far above what this widget can produce — so the bar
+    // paints past its own rect and the grip clamp below is what keeps it readable.
+    let total = baseline + value.max_ms();
     let base_w = rect.width() * (baseline as f32 / RULER_MS);
     let total_w = rect.width() * (total as f32 / RULER_MS);
     painter.rect_filled(
@@ -199,11 +202,10 @@ fn slack_from_target(target_ms: f32, baseline: u64) -> u64 {
 /// `baseline + max`, in seconds. A point range (no slack, or a reversed one)
 /// collapses to a single figure, matching the draw.
 fn resolved_band(baseline: u64, value: &DelayRange) -> String {
-    // Saturating for the same reason as the bar's `total`: `DelayRange` carries
-    // no invariant of its own, and the engine honours a `u64::MAX` wait.
-    let lo = baseline.saturating_add(value.min_ms);
-    let hi = baseline.saturating_add(value.max_ms.max(value.min_ms));
-    secs_range(lo, hi)
+    // Plain addition for the same reason as the bar's `total`: the range is
+    // ordered and bounded by construction, so neither sum can overflow and
+    // `max_ms` needs no second look at `min_ms`.
+    secs_range(baseline + value.min_ms(), baseline + value.max_ms())
 }
 
 /// `lo..hi` milliseconds as seconds; a zero-width range shows one figure. The
@@ -226,17 +228,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolved_band_saturates_on_an_unbounded_max() {
-        // `DelayRange` carries no invariant — the loader bounds what config.toml
-        // may seed, the type does not — and the engine honours a full-range
-        // wait, so the display must saturate, not overflow.
-        let value = DelayRange {
-            min_ms: 0,
-            max_ms: u64::MAX,
-        };
+    fn resolved_band_reads_the_widest_range_the_type_allows() {
+        // This was `resolved_band_saturates_on_an_unbounded_max`, built from
+        // `max_ms = u64::MAX` — a value `DelayRange` can no longer hold, because
+        // it carries `min_ms <= max_ms <= MAX_TIMING_MS` by construction. The
+        // ceiling is still twenty-four times what this widget's ruler can produce,
+        // so the display must read a range far past its own scale without
+        // clamping the *number* it prints.
+        let value = DelayRange::ceiling(plan::MAX_TIMING_MS);
         assert_eq!(
             resolved_band(plan::WAIT_SHOP_OPENED_MS, &value),
-            secs_range(plan::WAIT_SHOP_OPENED_MS, u64::MAX)
+            secs_range(
+                plan::WAIT_SHOP_OPENED_MS,
+                plan::WAIT_SHOP_OPENED_MS + plan::MAX_TIMING_MS
+            )
         );
     }
 

@@ -22,7 +22,7 @@ use arkyve_refresh_shop::app::{Command, SessionHandles};
 use arkyve_refresh_shop::domain::control::{Controller, Event, Limits, Status};
 use arkyve_refresh_shop::domain::filter::Filter;
 use arkyve_refresh_shop::domain::shop::{
-    ItemKind, PurchaseLimit, RefreshMeta, ShopItem, ShopSnapshot,
+    CatalogId, ItemKind, PurchaseLimit, RefreshMeta, ShopItem, ShopSnapshot,
 };
 use arkyve_refresh_shop::journal::EventLog;
 use arkyve_refresh_shop::ui::{SessionErrorSlot, ShopApp};
@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 /// gear, a hero, and one sold-out slot to exercise every row style.
 fn mock_snapshot() -> ShopSnapshot {
     let item = |id: u32, slot: u8, kind: ItemKind, name: &str, price: u32| ShopItem {
-        id,
+        id: CatalogId::new(id),
         slot,
         kind,
         name: Some(name.to_owned()),
@@ -112,12 +112,12 @@ fn main() -> eframe::Result {
             now_ms: journal.now_ms(),
         });
         let _ = ctrl.handle(Event::Purchase {
-            item: 101,
+            item: CatalogId::new(101),
             gold: Some(300_184_000),
             now_ms: journal.now_ms(),
         });
         let _ = ctrl.handle(Event::Purchase {
-            item: 201,
+            item: CatalogId::new(201),
             gold: Some(300_000_000),
             now_ms: journal.now_ms(),
         });

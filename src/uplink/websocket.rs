@@ -6,12 +6,12 @@
 use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
-use crate::config::RECONNECT_FLOOR;
+use crate::config::{RECONNECT_FLOOR, ServerUrl};
 use crate::stream::BudgetedChunk;
 
 use super::UplinkEvent;
@@ -87,14 +87,23 @@ enum Outcome {
 
 /// Connection loop, to be spawned in its own task.
 ///
+/// - `url`: the server, as a [`ServerUrl`] rather than a `String`. The dial form
+///   comes out through [`ServerUrl::as_str`] at the one place that dials, and
+///   every log line in this module gets the redacted form through the type's own
+///   `Display`, so no `%url` here can put a credential in the file the README
+///   asks the player to send us. This used to be the raw dial string, and two
+///   lines interpolated it.
 /// - `outbound`: raw byte batches to send (closing it stops the loop).
 /// - `inbound`: decoded messages received from the server.
+/// - `shutdown`: the session-wide stop signal. Raced against every window this
+///   loop can park in, so teardown does not have to reach the task by `abort`.
 pub async fn run(
-    url: String,
+    url: ServerUrl,
     outbound: mpsc::Receiver<BudgetedChunk>,
     inbound: mpsc::Sender<UplinkEvent>,
     initial_backoff: Duration,
     max_backoff: Duration,
+    shutdown: watch::Receiver<bool>,
 ) {
     run_with_connector(
         url,
@@ -102,17 +111,19 @@ pub async fn run(
         inbound,
         initial_backoff,
         max_backoff,
+        shutdown,
         |url| async move { connect_async(url).await.map(|(stream, _response)| stream) },
     )
     .await;
 }
 
 async fn run_with_connector<C, S>(
-    url: String,
+    url: ServerUrl,
     mut outbound: mpsc::Receiver<BudgetedChunk>,
     inbound: mpsc::Sender<UplinkEvent>,
     initial_backoff: Duration,
     max_backoff: Duration,
+    mut shutdown: watch::Receiver<bool>,
     mut connect: C,
 ) where
     C: AsyncFnMut(String) -> Result<S, WsError>,
@@ -122,36 +133,64 @@ async fn run_with_connector<C, S>(
     // The player only hears transitions: the first failure reports the outage,
     // each retry stays a tracing detail, recovery reports once.
     let mut outage_reported = false;
-    // `url` is never a log field. It is `Config::server_url`'s dial string
-    // verbatim, userinfo and query intact — either can carry a credential, and
-    // the log file is what the README asks the player to send us, under an
-    // explicit promise that it contains neither. The redacted form is written
-    // once at startup, from `config::ServerUrl::redacted`, the only spelling of
-    // this URL that may be logged; there is exactly one server per process, so
-    // these lines only need to say *which attempt*, which is also what makes
-    // the 1st reconnect legible from the 40th.
+    // `server` is `url`'s **redacted** `scheme://host[:port]` form, and it cannot
+    // be anything else: `%url` goes through `ServerUrl`'s `Display`, which prints
+    // only that. The dial string — userinfo and query intact, either able to
+    // carry a credential — is reachable solely through `as_str()`, used once
+    // below to hand to the connector. That is the difference between the promise
+    // in `README.md` ("the log never contains the server URL's credentials")
+    // being kept by every author of every line here and being kept by the type.
+    // `attempt` rides along because it is what makes the 1st reconnect legible
+    // from the 40th.
     let mut attempt: u64 = 0;
 
     loop {
+        // Read before the attempt, not only in the races below: the signal may
+        // already be set when the task first runs (a window closed during
+        // startup), in which case `changed()` would never fire.
+        if is_stopping(&shutdown) {
+            return;
+        }
         attempt += 1;
-        match tokio::time::timeout(CONNECT_TIMEOUT, connect(url.clone())).await {
+        let connecting = tokio::time::timeout(CONNECT_TIMEOUT, connect(url.as_str().to_owned()));
+        let connected = tokio::select! {
+            biased;
+            // A stop during the handshake window: up to CONNECT_TIMEOUT, 15 s,
+            // which is 15 s of the player staring at a closed window before the
+            // process goes. Dropping `connecting` here cancels the handshake,
+            // which owns nothing but the socket it is opening.
+            () = wait_for_shutdown(&mut shutdown) => return,
+            result = connecting => result,
+        };
+        match connected {
             Ok(Ok(stream)) => {
-                info!(attempt, "server link established");
+                info!(server = %url, attempt, "server link established");
                 if std::mem::take(&mut outage_reported) {
                     let _ = inbound.send(UplinkEvent::LinkUp).await;
                 }
                 backoff.reset();
-                match pump(stream, &mut outbound, &inbound).await {
+                // The connected half is the only part of this module whose events
+                // do not already carry `attempt` — `send failed`, `send stalled`,
+                // `WebSocket read error` and `forward`'s two decode lines are all
+                // emitted inside. A span carries the pair down to them, so a read
+                // error in a long session is attributable to *which* connection.
+                // `.instrument()`, not an `.entered()` guard: `pump` awaits, and a
+                // guard held across an await is the classic way a span leaks onto
+                // whatever task the executor polls next.
+                match pump(stream, &mut outbound, &inbound, &mut shutdown)
+                    .instrument(tracing::info_span!("link", server = %url, attempt))
+                    .await
+                {
                     Outcome::Shutdown => return,
                     Outcome::Disconnected(reason) => {
-                        warn!(attempt, reason = %reason, "server link interrupted");
+                        warn!(server = %url, attempt, reason = %reason, "server link interrupted");
                         outage_reported = true;
                         let _ = inbound.send(UplinkEvent::LinkDown(reason)).await;
                     }
                 }
             }
             Ok(Err(err)) => {
-                warn!(attempt, error = ?err, "server connection failed");
+                warn!(server = %url, attempt, error = ?err, "server connection failed");
                 if !outage_reported {
                     outage_reported = true;
                     // Safe to mirror into the journal: of the `WsError` variants
@@ -163,7 +202,7 @@ async fn run_with_connector<C, S>(
                 }
             }
             Err(_elapsed) => {
-                warn!(attempt, "server handshake stalled — retrying");
+                warn!(server = %url, attempt, "server handshake stalled — retrying");
                 if !outage_reported {
                     outage_reported = true;
                     let _ = inbound
@@ -181,21 +220,60 @@ async fn run_with_connector<C, S>(
         // capture thread — the kernel then drops packets, creating real gaps that
         // can never be filled. Better to drop bytes while the server is
         // unreachable (it resyncs on reconnect).
-        if drain_until(&mut outbound, backoff.current()).await {
-            return; // outbound closed: shutdown requested.
+        if drain_until(&mut outbound, backoff.current(), &mut shutdown).await {
+            return; // outbound closed or shutdown requested.
         }
         backoff.advance();
     }
 }
 
+/// The signal's current value, read without awaiting.
+///
+/// A named helper rather than an inline `*shutdown.borrow()` in each `if`:
+/// `watch::Ref` is not `Send`, and a borrow guard whose temporary outlives an
+/// `await` in the same statement would make the whole future non-`Send`, which
+/// `SessionWorkers::spawn` requires. Confining it to a sync `fn` makes that
+/// impossible rather than merely avoided.
+fn is_stopping(shutdown: &watch::Receiver<bool>) -> bool {
+    *shutdown.borrow()
+}
+
+/// Parks until the session-wide stop signal is set, or until the last sender is
+/// gone.
+///
+/// `watch::Receiver::changed` only reports a *change*, so the current value is
+/// checked first — the signal may already be set. A dropped sender resolves this
+/// too rather than parking forever: it can only mean the session that owns the
+/// signal is already gone, which is the same instruction.
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if is_stopping(shutdown) {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Absorbs and discards outbound batches for `wait`, without stalling upstream.
-/// Returns `true` if the outbound channel closed (shutdown), `false` if the
-/// delay simply elapsed.
-async fn drain_until(outbound: &mut mpsc::Receiver<BudgetedChunk>, wait: Duration) -> bool {
+/// Returns `true` if the loop should stop — the outbound channel closed, or the
+/// session asked to shut down — and `false` if the delay simply elapsed.
+///
+/// The shutdown arm matters more here than anywhere else in this module: `wait`
+/// is `backoff.current()`, which climbs to `reconnect.max_ms`, so a stop
+/// requested one tick into a backed-off retry used to wait the whole delay out.
+async fn drain_until(
+    outbound: &mut mpsc::Receiver<BudgetedChunk>,
+    wait: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
     let deadline = tokio::time::sleep(wait);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
+            biased;
+            () = wait_for_shutdown(shutdown) => return true,
             _ = &mut deadline => return false,
             batch = outbound.recv() => {
                 if batch.is_none() {
@@ -222,10 +300,19 @@ async fn drain_until(outbound: &mut mpsc::Receiver<BudgetedChunk>, wait: Duratio
 /// flight when the read half ends is dropped along with its budget lease: the
 /// same "drop bytes while the link is gone, the server resyncs on reconnect"
 /// tolerance `drain_until` documents.
+///
+/// A third arm races the session's stop signal against both, because a connected
+/// link parks indefinitely on purpose — the reader waits for a server that may
+/// have nothing to say for minutes — and a `SEND_TIMEOUT` write can hold the
+/// writer for 10 s. Without it the only thing that reached this task at teardown
+/// was `SessionWorkers`' `abort` after the grace deadline, which `report_join`
+/// then deliberately says nothing about: the one worker with no cooperative exit
+/// was also the one that could not report that it had been cancelled.
 async fn pump<S>(
     stream: S,
     outbound: &mut mpsc::Receiver<BudgetedChunk>,
     inbound: &mpsc::Sender<UplinkEvent>,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Outcome
 where
     S: Stream<Item = Result<Message, WsError>> + Sink<Message, Error = WsError> + Unpin,
@@ -282,8 +369,25 @@ where
         }
     };
 
-    tokio::pin!(writer, reader);
+    // A cooperative stop, reported as the same `Shutdown` a closed outbound
+    // channel produces: both mean "do not reconnect". The in-flight send, if any,
+    // is dropped with its budget lease — the tolerance the module header
+    // documents for a link that goes away mid-write.
+    let stopping = async {
+        wait_for_shutdown(shutdown).await;
+        Outcome::Shutdown
+    };
+
+    tokio::pin!(writer, reader, stopping);
+    // `biased`, so a requested stop wins over a writer or reader that happens to
+    // be ready in the same poll. It also makes the writer/reader order between
+    // themselves deterministic, which is a change with no consequence: both end
+    // the connection, and the outer loop decides what happens next from the
+    // `Outcome` — of the two, the writer's `Shutdown` is the more conservative
+    // reading when both are ready at once.
     tokio::select! {
+        biased;
+        outcome = &mut stopping => outcome,
         outcome = &mut writer => outcome,
         outcome = &mut reader => outcome,
     }
@@ -321,6 +425,20 @@ mod tests {
 
     use super::*;
     use crate::stream::{BudgetLimits, PipelineBudget};
+
+    /// The server every connector test dials. `wss://`, not the `ws://test.invalid`
+    /// these tests used before `run` took a `ServerUrl`: `ServerUrl::parse` refuses
+    /// cleartext to a non-loopback host, which is the rule the type carries.
+    fn test_url() -> ServerUrl {
+        ServerUrl::parse("wss://test.invalid").expect("a wss:// URL is dialable")
+    }
+
+    /// A stop signal nothing ever sets. The sender is handed back so the caller
+    /// can keep it alive: dropping the last sender *is* a stop, since a signal
+    /// with no owner can only mean the session is already gone.
+    fn no_shutdown() -> (watch::Sender<bool>, watch::Receiver<bool>) {
+        watch::channel(false)
+    }
 
     fn chunk(bytes: Vec<u8>) -> BudgetedChunk {
         PipelineBudget::new().admit_outbound_for_test(bytes)
@@ -461,7 +579,8 @@ mod tests {
         let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(1);
         let (event_tx, mut event_rx) = mpsc::channel::<UplinkEvent>(8);
 
-        let outcome = pump(link, &mut raw_rx, &event_tx).await;
+        let (_stop_tx, mut stop_rx) = no_shutdown();
+        let outcome = pump(link, &mut raw_rx, &event_tx, &mut stop_rx).await;
 
         drop(event_tx);
         drop(raw_tx);
@@ -583,7 +702,8 @@ mod tests {
         // The peer has a shop for us and a frozen receive window: the read half
         // must not wait out `SEND_TIMEOUT` behind the write half.
         let link = ScriptedLink::new(vec![Ok(Message::text(r#"{"type":"ack"}"#))]).stalling_sends();
-        let mut pumping = std::pin::pin!(pump(link, &mut raw_rx, &event_tx));
+        let (_stop_tx, mut stop_rx) = no_shutdown();
+        let mut pumping = std::pin::pin!(pump(link, &mut raw_rx, &event_tx, &mut stop_rx));
 
         tokio::select! {
             _ = &mut pumping => panic!("the stalled send must not have completed yet"),
@@ -601,8 +721,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn drain_until_discards_batches_until_deadline() {
         let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(1);
-        let drain =
-            tokio::spawn(async move { drain_until(&mut raw_rx, Duration::from_millis(100)).await });
+        let (_stop_tx, mut stop_rx) = no_shutdown();
+        let drain = tokio::spawn(async move {
+            drain_until(&mut raw_rx, Duration::from_millis(100), &mut stop_rx).await
+        });
 
         raw_tx.send(chunk(vec![1])).await.unwrap();
         raw_tx.send(chunk(vec![2])).await.unwrap();
@@ -622,7 +744,8 @@ mod tests {
         let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(1);
         drop(raw_tx);
 
-        assert!(drain_until(&mut raw_rx, Duration::from_secs(1)).await);
+        let (_stop_tx, mut stop_rx) = no_shutdown();
+        assert!(drain_until(&mut raw_rx, Duration::from_secs(1), &mut stop_rx).await);
     }
 
     #[tokio::test(start_paused = true)]
@@ -644,8 +767,10 @@ mod tests {
             .unwrap();
         assert_eq!(budget.snapshot().current_outbound, 6);
 
-        let drain =
-            tokio::spawn(async move { drain_until(&mut raw_rx, Duration::from_millis(100)).await });
+        let (_stop_tx, mut stop_rx) = no_shutdown();
+        let drain = tokio::spawn(async move {
+            drain_until(&mut raw_rx, Duration::from_millis(100), &mut stop_rx).await
+        });
         tokio::task::yield_now().await;
         assert_eq!(budget.snapshot().current_total, 0);
         tokio::time::advance(Duration::from_millis(100)).await;
@@ -660,13 +785,15 @@ mod tests {
         let attempts = Arc::new(Mutex::new(Vec::new()));
         let recorded_attempts = Arc::clone(&attempts);
         let started = tokio::time::Instant::now();
+        let (_stop_tx, stop_rx) = no_shutdown();
 
         let task = tokio::spawn(run_with_connector(
-            "ws://test.invalid".to_owned(),
+            test_url(),
             raw_rx,
             event_tx,
             Duration::from_millis(1),
             Duration::from_millis(10),
+            stop_rx,
             move |_url| {
                 recorded_attempts
                     .lock()
@@ -724,13 +851,15 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel::<UplinkEvent>(4);
         let attempts = Arc::new(Mutex::new(0));
         let recorded_attempts = Arc::clone(&attempts);
+        let (_stop_tx, stop_rx) = no_shutdown();
 
         let task = tokio::spawn(run_with_connector(
-            "ws://test.invalid".to_owned(),
+            test_url(),
             raw_rx,
             event_tx,
             Duration::from_millis(100),
             Duration::from_secs(1),
+            stop_rx,
             move |_url| {
                 *recorded_attempts.lock().unwrap() += 1;
                 ready(Ok::<_, WsError>(StalledLink))
@@ -766,7 +895,8 @@ mod tests {
             .unwrap();
         assert_eq!(budget.snapshot().current_outbound, 3);
 
-        let outcome = pump(StalledLink, &mut raw_rx, &event_tx).await;
+        let (_stop_tx, mut stop_rx) = no_shutdown();
+        let outcome = pump(StalledLink, &mut raw_rx, &event_tx, &mut stop_rx).await;
         assert_eq!(disconnect_reason(outcome), "send stalled");
         assert_eq!(budget.snapshot().current_total, 0);
         assert!(budget.snapshot().high_water_total <= 64);
@@ -782,12 +912,14 @@ mod tests {
 
         // A connector that opens and never finishes: without CONNECT_TIMEOUT the
         // task parks here forever, emitting no LinkDown and never retrying.
+        let (_stop_tx, stop_rx) = no_shutdown();
         let task = tokio::spawn(run_with_connector(
-            "ws://test.invalid".to_owned(),
+            test_url(),
             raw_rx,
             event_tx,
             Duration::from_millis(100),
             Duration::from_millis(100),
+            stop_rx,
             move |_url| {
                 recorded_attempts
                     .lock()
@@ -816,5 +948,114 @@ mod tests {
 
         drop(raw_tx);
         task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_ends_a_stalled_handshake_without_waiting_for_the_timeout() {
+        // The uplink was the one worker with no cooperative shutdown: teardown
+        // reached it only through `SessionWorkers`' `abort` after the grace
+        // deadline, and `report_join` suppresses the cancelled-join line, so
+        // nothing said so either. The worst window was a handshake that opens and
+        // never completes: 15 s of `CONNECT_TIMEOUT` with the window already gone.
+        // `_raw_tx` is held on purpose — a closed outbound channel is the *other*
+        // way this loop stops, and it would pass this test for the wrong reason.
+        let (_raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        let (event_tx, _event_rx) = mpsc::channel::<UplinkEvent>(4);
+        let (stop_tx, stop_rx) = no_shutdown();
+
+        let task = tokio::spawn(run_with_connector(
+            test_url(),
+            raw_rx,
+            event_tx,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            stop_rx,
+            move |_url| pending::<Result<StalledLink, WsError>>(),
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "parked in the handshake, as intended");
+
+        stop_tx.send(true).expect("the receiver is in the task");
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "a requested stop must not wait out CONNECT_TIMEOUT"
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_ends_the_backoff_wait_instead_of_sitting_it_out() {
+        // The longest window of the three, and the one nothing else covered: the
+        // backoff drain waits `backoff.current()`, which climbs to
+        // `reconnect.max_ms`. A stop one tick into it used to wait the whole delay
+        // out before the loop even looked at the signal again.
+        let (_raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        let (event_tx, _event_rx) = mpsc::channel::<UplinkEvent>(4);
+        let (stop_tx, stop_rx) = no_shutdown();
+
+        let task = tokio::spawn(run_with_connector(
+            test_url(),
+            raw_rx,
+            event_tx,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            stop_rx,
+            move |_url| ready(Err::<StalledLink, _>(WsError::ConnectionClosed)),
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "parked in the backoff drain");
+
+        stop_tx.send(true).expect("the receiver is in the task");
+        tokio::task::yield_now().await;
+        assert!(task.is_finished(), "a requested stop ends the backoff");
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_ends_a_connected_link_that_has_nothing_to_say() {
+        // The third window: a link that connected and is simply quiet. Both halves
+        // of `pump` park indefinitely there — the reader on a server with nothing
+        // to send, the writer on an empty outbound channel — which is the normal
+        // state of a healthy idle relay, not an error case.
+        let (_raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        let (event_tx, _event_rx) = mpsc::channel::<UplinkEvent>(4);
+        let (stop_tx, stop_rx) = no_shutdown();
+
+        let task = tokio::spawn(run_with_connector(
+            test_url(),
+            raw_rx,
+            event_tx,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            stop_rx,
+            // `StalledLink` never yields a message and never completes a send.
+            move |_url| ready(Ok::<_, WsError>(StalledLink)),
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "connected and idle");
+
+        stop_tx.send(true).expect("the receiver is in the task");
+        tokio::task::yield_now().await;
+        assert!(task.is_finished(), "a requested stop drops the connection");
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn what_this_module_can_log_is_the_redacted_authority() {
+        // `obs-001`'s last piece, asserted at the module that writes the lines
+        // rather than only at the type. `run` takes a `ServerUrl`, so every
+        // `server = %url` field above resolves through `Display` — the redacted
+        // authority — whatever the author of the next line intends. The
+        // credential-bearing spelling has exactly one exit, `as_str()`, used once,
+        // to hand the connector a dial string.
+        let url = ServerUrl::parse("wss://token:secret@ingest.arkyve.dev:8443/path?key=abc")
+            .expect("a wss:// URL with userinfo is dialable, just not loggable");
+        assert_eq!(url.to_string(), "wss://ingest.arkyve.dev:8443");
+        assert!(!format!("{url:?}").contains("secret"));
+        assert!(url.as_str().contains("token:secret"));
     }
 }

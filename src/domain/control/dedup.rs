@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::domain::shop::{ShopSnapshot, Substat};
+use crate::domain::shop::{CatalogId, ShopSnapshot, Substat};
 
 /// One slot's contribution to a snapshot's identity: the catalog id plus the
 /// per-roll fields the filter can match on — a re-roll redrawing the same
@@ -13,7 +13,7 @@ use crate::domain::shop::{ShopSnapshot, Substat};
 /// still count as the same shop.
 #[derive(Clone, PartialEq)]
 pub(super) struct SlotIdentity {
-    id: u32,
+    id: CatalogId,
     price: Option<u32>,
     grade: Option<u8>,
     set: Option<String>,
@@ -36,7 +36,7 @@ pub(super) fn fingerprint(snapshot: &ShopSnapshot) -> Option<Fingerprint> {
         .slots
         .iter()
         .map(|item| {
-            item.catalog_id().map(|id| SlotIdentity {
+            item.id.map(|id| SlotIdentity {
                 id,
                 price: item.price,
                 grade: item.grade,

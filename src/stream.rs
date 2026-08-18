@@ -154,6 +154,28 @@ impl PipelineBudget {
     /// Reserves capture-stage bytes for `segment`'s payload and takes ownership
     /// of it, pairing the buffer with the lease that will give the bytes back.
     ///
+    /// `capacity()`, not `len()`, and since `parse_segment` began trimming the
+    /// frame in place rather than copying the payload out, that capacity is the
+    /// *whole frame's*: payload plus the IP and TCP headers plus any Ethernet
+    /// padding, roughly 40–60 bytes more per admitted packet. That is the honest
+    /// number — it is the memory actually retained, and it makes the one
+    /// per-packet buffer this budget used to be blind to visible to it. It is
+    /// also self-consistent: [`PayloadLease`] records the bytes charged and
+    /// [`BudgetedChunk::capacity`] returns them, never a fresh
+    /// `Vec::capacity()`, so a later `truncate` cannot make a release disagree
+    /// with its reservation.
+    ///
+    /// [`CAPTURE_STAGE_BYTES`] was deliberately **not** re-baselined for it. The
+    /// overhead is at worst ~50% on a minimum-size segment and ~4% on a
+    /// full-MTU one, so the quota now holds proportionally fewer packets — but
+    /// the quota is a memory bound, not a packet-count target, and 8 MiB is the
+    /// memory it was chosen to bound. Nothing in this crate has been profiled
+    /// (see `Cargo.toml`'s `[profile.release]` on why `lto = "thin"`), so a new
+    /// number here would be an unmeasured claim replacing a measured byte count.
+    /// The one relation that *could* have broken is checked at compile time:
+    /// [`INITIAL_ANCHOR_MAX_BYTES`] (256 KiB) still fits inside it with three
+    /// orders of magnitude to spare.
+    ///
     /// # Errors
     ///
     /// The `Err` payload is not a description of a failure: it is `segment`
@@ -764,6 +786,16 @@ impl HalfStream {
         // retransmission, a segment buffered behind a gap, a bare SYN) now
         // allocate one slot where `Vec::new()` allocated none. They are the rare
         // ones — `capture::ip` already drops empty non-SYN payloads upstream.
+        //
+        // A `SmallVec<[BudgetedChunk; 1]>` would remove even that one allocation,
+        // and it was weighed and declined rather than deferred. It costs a
+        // dependency, and it would inline 48 bytes into `HalfOutcome` and
+        // `ReassemblyOutcome`, both of which are returned by value up two call
+        // frames per packet — trading a malloc for a memcpy of the same order,
+        // with no measurement either way. Nothing in this crate has been profiled
+        // (`Cargo.toml`'s `[profile.release]` says so, at length, about `lto`), and
+        // `mem-smallvec` itself asks for a profile first. The exact `Vec` keeps the
+        // whole win that is provable from the numbers above.
         let mut out = Vec::with_capacity(1);
         if !self.absorb(offset, payload, &mut out) {
             return HalfOutcome::Pressure;
@@ -1323,6 +1355,141 @@ mod tests {
                 "arrival permutation {permutation:?}"
             );
         }
+    }
+
+    /// The suffix rule for **every** arrival order of six segments, at four
+    /// origins — including two that straddle the `u32` wrap.
+    ///
+    /// This is the generalization `20-test.md`'s `test-007` asked `proptest` for,
+    /// and it is done without the dependency because the space is *small enough to
+    /// exhaust*: 6! = 720 orders × 4 origins = 2 880 cases, in a few
+    /// milliseconds. Exhaustion is strictly stronger than sampling — there is no
+    /// order left for a random generator to have missed, and no
+    /// `proptest-regressions/` file to commit for a suite that cannot find a case
+    /// the next run would not also find. The two properties are the documented
+    /// rule from `docs/initial-stream-anchor.md`, which the hand-written
+    /// six-permutation table above proves for n = 3 only.
+    #[test]
+    fn every_arrival_order_yields_the_immediate_suffix_of_the_stream() {
+        // Origins: an ordinary one, the last sequence before the wrap, one
+        // straddling it exactly, and zero.
+        for origin in [1_000_u32, u32::MAX - 5, u32::MAX - 11, 0] {
+            let payloads: [&[u8]; 6] = [b"AB", b"CD", b"EF", b"GH", b"IJ", b"KL"];
+            let whole: Vec<u8> = payloads.concat();
+            let segments: Vec<Segment> = payloads
+                .iter()
+                .enumerate()
+                .map(|(index, bytes)| {
+                    // `wrapping_add`: the point of the near-`u32::MAX` origins is
+                    // that the sequence space wraps under the segments.
+                    seg(origin.wrapping_add(index as u32 * 2), false, bytes)
+                })
+                .collect();
+
+            for order in permutations(payloads.len()) {
+                let mut reassembler = Reassembler::new();
+                let mut delivered = Vec::new();
+                for index in order.iter().copied() {
+                    delivered.extend(reassembler.push(&segments[index]));
+                }
+                // 1. Whatever the order, what comes out is a *suffix* of the
+                //    original byte stream — never a permutation of it, never a
+                //    gap in the middle. That is the guarantee the analysis server
+                //    decodes against: it can resync from any point, but it cannot
+                //    survive reordered or hole-punched bytes.
+                assert!(
+                    whole.ends_with(&delivered),
+                    "origin {origin}, order {order:?} delivered {delivered:?}, not a suffix"
+                );
+                // 2. And the suffix starts exactly at the first segment to
+                //    arrive: that arrival is what anchors the stream, and
+                //    everything before it is already history.
+                let anchor = order[0];
+                assert_eq!(
+                    delivered.len(),
+                    whole.len() - anchor * 2,
+                    "origin {origin}, order {order:?} did not anchor on segment {anchor}"
+                );
+            }
+        }
+    }
+
+    /// The three algebraic properties `seq_diff` is defined by, over a lattice of
+    /// bases that includes every wrap boundary.
+    ///
+    /// `test-007`'s third named target. Dependency-free for the same reason as the
+    /// permutation sweep: the interesting inputs are *exactly* the boundaries —
+    /// `0`, `u32::MAX`, `i32::MAX` (where the signed reading flips), and their
+    /// neighbours — which a lattice names and a uniform generator reaches with
+    /// probability ~0. `seq_diff` is `const fn`, so this could in principle be a
+    /// `const _: () = assert!(…)`; it is a test instead because the loop covers
+    /// 1 000+ pairs and a const block would have to spell each one out.
+    #[test]
+    fn seq_diff_is_antisymmetric_and_wrap_relative() {
+        let bases = [
+            0_u32,
+            1,
+            1_000,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0x8000_0001,
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+        let deltas: [i64; 9] = [-1_000, -2, -1, 0, 1, 2, 1_000, 65_535, 1_048_576];
+        for base in bases {
+            // 1. Reflexive: a sequence number is zero from itself, at every base
+            //    including both sides of the wrap.
+            assert_eq!(seq_diff(base, base), 0, "base {base}");
+            for delta in deltas {
+                let other = base.wrapping_add(delta as u32);
+                // 2. It reads the *relative* distance, so a wrap between the two
+                //    is invisible. This is the property `HalfStream::push` relies
+                //    on: the offset is derived from the distance to the currently
+                //    expected byte, never to the fixed origin, so the signed
+                //    window tracks a stream that has advanced past 2 GiB.
+                assert_eq!(seq_diff(other, base), delta, "base {base}, delta {delta}");
+                // 3. Antisymmetric. `i32::MIN` is the one value that cannot be
+                //    negated, and no `delta` here reaches it — deliberately: at
+                //    exactly half the space apart, "ahead" and "behind" are the
+                //    same answer, which is a property of the circle and not of
+                //    this function.
+                assert_eq!(
+                    seq_diff(base, other),
+                    -delta,
+                    "base {base}, delta {delta} is not antisymmetric"
+                );
+            }
+        }
+        // The half-space edge, stated rather than left implicit: 2^31 apart reads
+        // as `i32::MIN` in both directions, which is why `MAX_PENDING_BYTES` and
+        // the anchor logic bound how far out of order a segment may be.
+        assert_eq!(seq_diff(0, 0x8000_0000), i64::from(i32::MIN));
+        assert_eq!(seq_diff(0x8000_0000, 0), i64::from(i32::MIN));
+    }
+
+    /// Every permutation of `0..n`, in lexicographic order. Ten lines, no
+    /// dependency, and deterministic — the alternative was a random generator
+    /// that would sample a space this test exhausts.
+    fn permutations(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for head in 0..n {
+            for mut rest in permutations(n - 1) {
+                // Shift the tail indices that sit at or above `head` up by one,
+                // so `rest` becomes a permutation of `0..n` minus `head`.
+                for index in &mut rest {
+                    if *index >= head {
+                        *index += 1;
+                    }
+                }
+                rest.insert(0, head);
+                out.push(rest);
+            }
+        }
+        out
     }
 
     #[test]

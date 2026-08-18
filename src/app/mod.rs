@@ -434,15 +434,19 @@ impl Session {
             "uplink",
             &fatal_tx,
             crate::uplink::run(
-                // The dial string, taken out of the proof deliberately:
-                // `uplink::run` still takes a `String`. Widening it to
-                // `ServerUrl` is `obs-001`'s remaining half, which wants the
-                // redacted form in there too.
-                config.server_url.as_str().to_owned(),
+                // The whole proof, not the dial string out of it: `uplink::run`
+                // takes the `ServerUrl`, so the redacted form travels with the
+                // URL and the credential-bearing spelling is reachable there
+                // only through `as_str()`, at the one line that dials.
+                config.server_url.clone(),
                 raw_rx,
                 message_tx,
                 config.reconnect_initial(),
                 config.reconnect_max(),
+                // The uplink was the one worker with no cooperative stop: it was
+                // reached only by `abort` after the grace deadline. It now races
+                // this against the handshake, the connected pump and the backoff.
+                shutdown_rx.clone(),
             ),
         );
 
@@ -546,9 +550,10 @@ impl CaptureWorker {
     /// Wakes and joins the OS thread synchronously. A timeout here would only
     /// detach an unabortable thread, so shutdown capability is the finite join.
     fn stop_and_join(&mut self) {
-        if let Err(err) = self.stop.stop() {
-            error!(error = ?err, "capture stop failed during teardown");
-        }
+        // No `if let Err(…)` around this: `CaptureStop::stop` is infallible, and
+        // the branch that used to be here was unreachable in all three
+        // implementors — see the trait.
+        self.stop.stop();
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
         {
@@ -1417,21 +1422,18 @@ mod tests {
     }
 
     impl CaptureStop for BlockingStop {
-        fn stop(&mut self) -> Result<()> {
+        fn stop(&mut self) {
             let (lock, wake) = &*self.state;
             let mut state = lock.lock().expect("blocking capture mutex poisoned");
             state.stopped = true;
             wake.notify_all();
-            Ok(())
         }
     }
 
     struct NoopStop;
 
     impl CaptureStop for NoopStop {
-        fn stop(&mut self) -> Result<()> {
-            Ok(())
-        }
+        fn stop(&mut self) {}
     }
 
     struct ImmediateErrorSource(&'static str);

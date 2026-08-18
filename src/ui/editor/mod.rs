@@ -15,7 +15,10 @@ use crate::actuator::plan::DelayRange;
 use crate::actuator::plan::{self, TimingPreset, Timings};
 use crate::app::Command;
 use crate::domain::control::Limits;
-use crate::domain::filter::{Filter, SubstatReq};
+use crate::domain::filter::{Filter, HUNTABLE_KINDS, SubstatReq};
+// The checkbox row reads `HUNTABLE_KINDS`; only the tests still name a kind
+// directly.
+#[cfg(test)]
 use crate::domain::shop::ItemKind;
 use crate::render::kind_label;
 
@@ -236,13 +239,14 @@ fn count_label(n: usize, singular: &str, plural: &str) -> String {
 /// thing the player sets.
 fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     ui.horizontal(|ui| {
-        // `ItemKind::Unknown` has no box on purpose. `Config::validate` rejects
-        // "unknown" in `[filter] kinds`, so no config can seed it — the box had
-        // exactly one net effect: ticking it wrote a `kinds = ["unknown"]` the
-        // next launch refuses to load, and the load failure is fatal (error
-        // window, no main window). The only way out was hand-editing the very
-        // file the player is not expected to hand-edit.
-        for kind in [ItemKind::Equipment, ItemKind::Hero, ItemKind::Token] {
+        // There is no "unknown" box, and there can no longer be one: the list is
+        // `HuntKind::ALL`, and `HuntKind` has no catch-all variant. The box that
+        // used to be here had exactly one net effect — ticking it wrote a
+        // `kinds = ["unknown"]` that the next launch refused to load, fatally
+        // (error window, no main window), with hand-editing the very file the
+        // player is not expected to hand-edit the only way out. Removing the box
+        // fixed the symptom; the type is what makes it unspellable.
+        for kind in HUNTABLE_KINDS {
             let mut on = editor.filter.kinds.contains(&kind);
             if ui.checkbox(&mut on, kind_label(kind)).changed() {
                 if on {
@@ -558,14 +562,12 @@ fn pass_estimate(t: &Timings) -> String {
         t.buy_modal,
         t.purchase_resumed,
     ];
-    // Folded with `saturating_add` rather than summed then added: the slack
-    // comes from a `DelayRange` that carries no invariant of its own, where a
-    // `u64::MAX` wait is a supported engine value, so a plain `sum::<u64>()`
-    // overflows on its own.
-    let hi_total: u64 = slack
-        .iter()
-        .map(|r| r.max_ms.max(r.min_ms))
-        .fold(ROUTINE_TOTAL_MS, u64::saturating_add);
+    // A plain sum, where this used to fold with `saturating_add` over
+    // `max_ms.max(min_ms)`: `DelayRange` now carries
+    // `min_ms <= max_ms <= MAX_TIMING_MS` by construction, so `max_ms` is the
+    // band's top without a second look at `min_ms`, and four of them plus the
+    // routine total cannot come near `u64::MAX`.
+    let hi_total: u64 = ROUTINE_TOTAL_MS + slack.iter().map(|r| r.max_ms()).sum::<u64>();
     secs_range(ROUTINE_TOTAL_MS, hi_total)
 }
 
@@ -1039,14 +1041,13 @@ mod tests {
     }
 
     #[test]
-    fn pass_estimate_saturates_on_an_unvalidated_timing() {
-        // `DelayRange` carries no invariant of its own, and the engine
-        // deliberately supports a full-range wait (`DelayRange::draw`
-        // saturates), so the summary must not overflow on the way to the label.
-        let full = DelayRange {
-            min_ms: 0,
-            max_ms: u64::MAX,
-        };
+    fn pass_estimate_tops_out_at_the_widest_range_the_type_allows() {
+        // This was `pass_estimate_saturates_on_an_unvalidated_timing`, built from
+        // two `max_ms = u64::MAX` ranges — a value `DelayRange` can no longer
+        // hold. The widest legal pair is the ceiling on both, so that is what the
+        // label arithmetic is pinned against instead: the sum must be exact, not
+        // saturated, and it must be the *four* slack steps and no others.
+        let full = DelayRange::ceiling(plan::MAX_TIMING_MS);
         let timings = Timings {
             refreshed: full,
             buy_modal: full,
@@ -1056,21 +1057,23 @@ mod tests {
         // used to be independent copies of the same arithmetic.
         assert_eq!(
             pass_estimate(&timings),
-            secs_range(ROUTINE_TOTAL_MS, u64::MAX)
+            secs_range(ROUTINE_TOTAL_MS, ROUTINE_TOTAL_MS + 2 * plan::MAX_TIMING_MS)
         );
     }
 
     #[test]
     fn hunt_kinds_exclude_the_unknown_bucket() {
-        // Ticking "?" wrote `kinds = ["unknown"]`, which `Config::validate`
-        // rejects on the next launch — a fatal, GUI-less load failure only a
-        // hand-edit of config.toml could undo. The box is gone; the three real
-        // kinds stay.
+        // Ticking "?" wrote `kinds = ["unknown"]`, which the next launch refused
+        // — a fatal, GUI-less load failure only a hand-edit of config.toml could
+        // undo. The box is gone, and `Filter::kinds` holds `HuntKind` now, so the
+        // row is driven by `HuntKind::ALL` and a fourth box cannot appear without
+        // a fourth kind existing. The three real kinds stay.
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         let harness = Harness::new_ui(|ui| {
             edit_setup(ui, &mut editor);
         });
-        for kind in [ItemKind::Equipment, ItemKind::Hero, ItemKind::Token] {
+        assert_eq!(HUNTABLE_KINDS.len(), 3);
+        for kind in HUNTABLE_KINDS {
             harness.get_by_label(kind_label(kind));
         }
         assert!(
@@ -1215,10 +1218,7 @@ mod tests {
     fn apply_sends_changed_timings() {
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         let timings = Timings {
-            refreshed: DelayRange {
-                min_ms: 200,
-                max_ms: 800,
-            },
+            refreshed: DelayRange::try_new(200, 800).expect("a valid fixture range"),
             ..Timings::default()
         };
         editor.timings = timings;

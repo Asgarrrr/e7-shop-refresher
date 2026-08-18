@@ -43,8 +43,18 @@ impl CaptureSource {
 ///
 /// Implementations must not close a raw OS handle concurrently with receive.
 /// Calling `stop` more than once has the same effect as calling it once.
+///
+/// Infallible, and narrowed to say so. It returned `Result<()>` and all three
+/// implementors — `PcapStop` (one relaxed atomic store), and the two test doubles
+/// — returned `Ok(())` unconditionally, so `CaptureWorker::stop_and_join`'s
+/// `if let Err(err) = self.stop.stop()` was a branch that could not be taken and
+/// an error line that could not be logged. A `Result` a trait cannot produce is
+/// worse than no `Result`: it tells the caller to handle a case that does not
+/// exist, and the handling is then untested by construction. A future
+/// implementor whose wake genuinely can fail should widen this back, with the
+/// call site's recovery written at the same time.
 pub(crate) trait CaptureStop: Send {
-    fn stop(&mut self) -> Result<()>;
+    fn stop(&mut self);
 }
 
 /// Identifies the TCP connection a segment belongs to.

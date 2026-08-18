@@ -98,7 +98,7 @@ pub(super) fn view_state(controller: &Controller) -> ViewState {
                     name: item.name.clone(),
                     price: item.price,
                     sold_out: item.is_sold_out(),
-                    wanted: item.catalog_id().is_some_and(|id| checklist.contains(&id)),
+                    wanted: item.id.is_some_and(|id| checklist.contains(&id)),
                 })
                 .collect()
         })
@@ -181,11 +181,11 @@ mod tests {
         // checklist — the id-0 sentinel row must never read as wanted.
         let slots = vec![
             ShopItem {
-                id: 42,
+                id: crate::domain::shop::CatalogId::new(42),
                 ..ShopItem::default()
             },
             ShopItem {
-                id: 0,
+                id: crate::domain::shop::CatalogId::new(0),
                 ..ShopItem::default()
             },
         ];
@@ -282,7 +282,7 @@ mod tests {
         let mut ctrl = controller();
         assert_eq!(view_state(&ctrl).gold_balance, None);
         let _ = ctrl.handle(Event::Purchase {
-            item: 42,
+            item: crate::domain::shop::CatalogId::new(42),
             gold: Some(1_204_000),
             now_ms: 0,
         });
@@ -305,7 +305,7 @@ mod tests {
     fn slot_detail_matches_format_item() {
         let mut ctrl = controller();
         let item = ShopItem {
-            id: 7,
+            id: crate::domain::shop::CatalogId::new(7),
             slot: 3,
             name: Some("Covenant Bookmark".to_owned()),
             price: Some(184_000),

@@ -2,6 +2,8 @@
 //! display and filter. Only this shape crosses the link; how the server
 //! produces it is not the client's concern.
 
+use std::num::NonZeroU32;
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// One shop roll as the analysis server trimmed it: the merchant, the slots on
@@ -21,24 +23,76 @@ pub struct ShopSnapshot {
     pub refresh: Option<RefreshMeta>,
 }
 
-/// Interprets a wire item id: `0` means the server omitted it, anything else is
-/// a global catalog id.
+/// A global catalog id — the identity the purchase echo uses to name the item
+/// the player asked for.
 ///
-/// **The only place the `0` sentinel is interpreted.** [`ShopItem::catalog_id`]
-/// is the usual way in; this free form exists for the ids that arrive without a
-/// slot around them (a purchase echo's `item`), which is exactly where the
-/// comparison used to be re-derived.
-pub fn catalog_id(id: u32) -> Option<u32> {
-    (id != 0).then_some(id)
+/// Two things at once, both of which used to be `u32`:
+///
+/// 1. **The `0` sentinel is gone.** `NonZeroU32` inside, so "the server omitted
+///    the id" is `None` and nothing else. It used to be `id: u32` with `0`
+///    standing in for absent, interpreted by a free `shop::catalog_id(id)`
+///    documented as *"the only place the `0` sentinel is interpreted — do not
+///    re-derive the comparison"*. That contract was broken while it was being
+///    written: `Controller::on_purchase` re-derived it as `if item != 0 && …`.
+///    A sentinel's whole cost is that every reader has to remember it, and the
+///    only fix that does not depend on remembering is not being able to spell it.
+///    Both interpreters — the free function and `ShopItem::catalog_id` — are gone
+///    with it; the conversion happens once, in [`optional_catalog_id`], at the
+///    only place a raw wire number arrives.
+/// 2. **It is not a counter.** The id space used to be assignable from any
+///    `u32` in the crate: a gold balance, a price, a crystal cost, a refresh
+///    count. `checklist`, `bought`, `BuyTarget::id` and `PurchaseNotice::item`
+///    all speak this type now, so an id and an amount cannot be swapped.
+///
+/// `#[serde(transparent)]`, so the wire shape is a bare number, unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct CatalogId(NonZeroU32);
+
+impl CatalogId {
+    /// The id `raw` names, or `None` for the `0` the server sends when it has
+    /// none. The single interpreter of that number — see the type.
+    #[must_use]
+    pub const fn new(raw: u32) -> Option<Self> {
+        match NonZeroU32::new(raw) {
+            Some(id) => Some(Self(id)),
+            None => None,
+        }
+    }
+
+    /// The number, for a wire field or a log line.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Display for CatalogId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Reads a wire catalog id: absent, `null` and `0` all mean "no id".
+///
+/// The one place a raw id number is interpreted, which is the whole point of
+/// [`CatalogId`]. `0` is the server's own spelling of absent, so it has to be
+/// accepted and folded here rather than refused — the message is still a good
+/// message, it just cannot be tied back to a slot.
+pub(crate) fn optional_catalog_id<'de, D>(de: D) -> Result<Option<CatalogId>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<u32>::deserialize(de)?.and_then(CatalogId::new))
 }
 
 impl ShopSnapshot {
     /// The slot bearing this catalog id, if any. Ids are unique within a
     /// snapshot (the shop never lists an item twice), so at most one matches.
-    /// The single home for a find-by-id, keyed through `catalog_id` so the `0`
-    /// sentinel is never a match.
-    pub fn slot_by_id(&self, id: u32) -> Option<&ShopItem> {
-        self.slots.iter().find(|item| item.catalog_id() == Some(id))
+    /// The single home for a find-by-id; an item whose id the server omitted
+    /// can no longer be matched by accident, because it has no id to compare.
+    pub fn slot_by_id(&self, id: CatalogId) -> Option<&ShopItem> {
+        self.slots.iter().find(|item| item.id == Some(id))
     }
 }
 
@@ -116,10 +170,14 @@ where
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ShopItem {
-    /// Wire item id; `0` if the server omits it. Lets a purchase confirmation
-    /// (whose `item` is this id) be tied back to the slot the player wanted.
-    #[serde(default)]
-    pub id: u32,
+    /// The item's catalog id, `None` when the server omits it. Lets a purchase
+    /// confirmation (whose `item` is this id) be tied back to the slot the player
+    /// wanted.
+    ///
+    /// An `Option<CatalogId>` and not a `u32` with `0` for absent — see
+    /// [`CatalogId`] for what that sentinel cost.
+    #[serde(default, deserialize_with = "optional_catalog_id")]
+    pub id: Option<CatalogId>,
     /// Shop slot (1..=6); `0` if the server omits it.
     #[serde(default)]
     pub slot: u8,
@@ -152,13 +210,6 @@ impl ShopItem {
     /// Sold out when a purchase limit is present and exhausted.
     pub fn is_sold_out(&self) -> bool {
         self.limit.is_some_and(|limit| limit.remaining == 0)
-    }
-
-    /// The global catalog id, or `None` when the server omitted it
-    /// (`id == 0`). Delegates to [`catalog_id`] so the sentinel comparison
-    /// exists once — do not re-derive it.
-    pub fn catalog_id(&self) -> Option<u32> {
-        catalog_id(self.id)
     }
 
     /// Player-facing slot number: the wire slot, or the 1-based position when
@@ -293,22 +344,29 @@ mod tests {
     }
 
     #[test]
-    fn slot_by_id_finds_the_slot_and_never_matches_the_zero_sentinel() {
-        // The haul-recording lookup. `0` means "the server omitted the id", so
-        // it must never resolve to the slot that happens to carry it.
+    fn slot_by_id_finds_the_slot_and_the_zero_sentinel_becomes_no_id() {
+        // The haul-recording lookup. `0` is the server's spelling of "I have no
+        // id for this", so it must never resolve to the slot that carries it —
+        // and it cannot, because `CatalogId::new(0)` is `None` and there is no
+        // `slot_by_id(0)` left to call.
         let snapshot = parse(r#"{"slots":[{"id":0,"slot":1},{"id":102,"slot":2}]}"#);
-        assert_eq!(
-            snapshot.slot_by_id(102).and_then(ShopItem::catalog_id),
-            Some(102)
+        assert_eq!(snapshot.slots[0].id, None, "the 0 folds to absent at parse");
+        let hit = snapshot
+            .slot_by_id(CatalogId::new(102).expect("102 is not zero"))
+            .expect("the slot carrying 102");
+        assert_eq!(hit.slot, 2);
+        assert_eq!(CatalogId::new(0), None);
+        assert!(
+            snapshot
+                .slot_by_id(CatalogId::new(999).expect("999 is not zero"))
+                .is_none()
         );
-        assert!(snapshot.slot_by_id(0).is_none());
-        assert!(snapshot.slot_by_id(999).is_none());
     }
 
     #[test]
     fn mistyped_substats_degrade_to_empty() {
         let snapshot = parse(r#"{"slots":[{"id":9,"substats":"corrupt"}]}"#);
         assert!(snapshot.slots[0].substats.is_empty());
-        assert_eq!(snapshot.slots[0].id, 9);
+        assert_eq!(snapshot.slots[0].id, CatalogId::new(9));
     }
 }

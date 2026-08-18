@@ -4,7 +4,7 @@
 
 use serde::Deserialize;
 
-use crate::domain::shop::ShopSnapshot;
+use crate::domain::shop::{CatalogId, ShopSnapshot, optional_catalog_id};
 
 /// Downstream message from the server to the relay.
 ///
@@ -42,10 +42,13 @@ pub enum ServerMessage {
 /// Payload of a `{type:"purchase"}` message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct PurchaseNotice {
-    /// Global catalog id — same id space as [`crate::domain::shop::ShopItem`]'s
-    /// `id`; `0` when the server omits it.
-    #[serde(default)]
-    pub item: u32,
+    /// The bought item's catalog id — the same space as
+    /// [`crate::domain::shop::ShopItem`]'s `id`, and now the same type, so a
+    /// purchase echo cannot be matched against a price or a balance. `None` when
+    /// the server omits it, which it spells as `0`; that fold happens once, in
+    /// `shop::optional_catalog_id`.
+    #[serde(default, deserialize_with = "optional_catalog_id")]
+    pub item: Option<CatalogId>,
     /// Gold balance after the buy (not the price). Always present in
     /// practice; tolerated absent per convention.
     #[serde(default)]
@@ -94,7 +97,7 @@ mod tests {
         assert_eq!(snapshot.slots.len(), 1);
 
         let item = &snapshot.slots[0];
-        assert_eq!(item.catalog_id(), Some(102));
+        assert_eq!(item.id, CatalogId::new(102));
         assert_eq!(item.slot, 3);
         assert_eq!(item.kind, ItemKind::Equipment);
         assert_eq!(item.name.as_deref(), Some("Covenant Bookmark"));
@@ -108,8 +111,9 @@ mod tests {
         assert!(!item.is_sold_out());
 
         // The haul-recording lookup, on the only shape it ever sees off the wire.
-        assert!(snapshot.slot_by_id(102).is_some());
-        assert!(snapshot.slot_by_id(103).is_none());
+        let cid = |raw: u32| CatalogId::new(raw).expect("a nonzero fixture id");
+        assert!(snapshot.slot_by_id(cid(102)).is_some());
+        assert!(snapshot.slot_by_id(cid(103)).is_none());
     }
 
     /// The three `ItemKind` spellings and the `other` fallback, which decide
@@ -146,7 +150,7 @@ mod tests {
         assert_eq!(
             notice,
             PurchaseNotice {
-                item: 102,
+                item: CatalogId::new(102),
                 gold: Some(250_000),
             }
         );
@@ -162,12 +166,22 @@ mod tests {
     }
 
     #[test]
-    fn purchase_item_absent_defaults_to_zero() {
-        let message = parse(r#"{"type":"purchase"}"#);
-        let ServerMessage::Purchase(notice) = message else {
-            panic!("expected Purchase, got {message:?}");
-        };
-        assert_eq!(notice.item, 0);
+    fn purchase_item_absent_and_the_zero_sentinel_both_read_as_no_id() {
+        // The wire spells "I have no id for this buy" two ways — the key absent,
+        // and the key present as `0`. Both fold to `None` at the boundary, so
+        // `on_purchase` has no sentinel left to re-derive (it used to, in
+        // contradiction of `shop::catalog_id`'s own "do not re-derive" contract).
+        for json in [
+            r#"{"type":"purchase"}"#,
+            r#"{"type":"purchase","item":0}"#,
+            r#"{"type":"purchase","item":null}"#,
+        ] {
+            let message = parse(json);
+            let ServerMessage::Purchase(notice) = message else {
+                panic!("expected Purchase, got {message:?} for {json}");
+            };
+            assert_eq!(notice.item, None, "{json}");
+        }
     }
 
     #[test]

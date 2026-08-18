@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::filter::Filter;
-use crate::domain::shop::{RefreshMeta, ShopSnapshot, catalog_id};
+use crate::domain::shop::{CatalogId, RefreshMeta, ShopSnapshot};
 
 use dedup::{Fingerprint, fingerprint};
 use watchdog::Expectation;
@@ -130,8 +130,11 @@ pub enum Event {
     /// A server-confirmed buy: checks the item off the checklist; clearing
     /// the last entry auto-resumes the loop.
     Purchase {
-        /// Global catalog id, same space as `ShopItem::id`; `0` when omitted.
-        item: u32,
+        /// The bought item's catalog id, `None` when the server omitted it. Was
+        /// a `u32` with `0` for absent, which is the sentinel `on_purchase`
+        /// re-derived (`if item != 0 && …`) despite `shop::catalog_id` being
+        /// documented as its only interpreter — see [`CatalogId`].
+        item: Option<CatalogId>,
         /// Gold balance after the buy — feeds the affordability planning of
         /// the next matches.
         gold: Option<u32>,
@@ -161,7 +164,7 @@ pub enum Event {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuyTarget {
     pub slot: u8,
-    pub id: Option<u32>,
+    pub id: Option<CatalogId>,
 }
 
 /// Actions are to be consumed in order: a `Buy` can precede another action
@@ -270,7 +273,7 @@ pub struct Controller {
     gold_balance: Option<u32>,
     last_snapshot: Option<ShopSnapshot>,
     /// Matched-but-unbought catalog ids from the last evaluated snapshot.
-    checklist: Vec<u32>,
+    checklist: Vec<CatalogId>,
     /// Identity of the last snapshot evaluated while armed
     /// (`Watching | Paused`): an identical re-arrival is stored for the view
     /// but never re-evaluated, so it cannot double-bill a refresh. Cleared
@@ -282,7 +285,7 @@ pub struct Controller {
     /// re-buying an already-bought slot. Both fields survive `Start`: a
     /// restart clears `acted_fingerprint`, and keying the clear off that
     /// alone would let a same-roll re-open wrongly forget the buys.
-    bought: Vec<u32>,
+    bought: Vec<CatalogId>,
     /// The roll `bought` is scoped to; a snapshot with a different identity
     /// is fresh stock and empties the set. Shares the `Arc` with
     /// `acted_fingerprint` rather than deep-copying every slot's strings — the
@@ -368,7 +371,7 @@ impl Controller {
 
     /// Matched-but-unbought catalog ids; untrackable matches (id 0, sold
     /// out) never enter it.
-    pub fn checklist(&self) -> &[u32] {
+    pub fn checklist(&self) -> &[CatalogId] {
         &self.checklist
     }
 
@@ -557,9 +560,7 @@ impl Controller {
                 (Some(balance), Some(price)) => price <= balance,
                 _ => true,
             };
-            let already_bought = item
-                .catalog_id()
-                .is_some_and(|id| self.bought.contains(&id));
+            let already_bought = item.id.is_some_and(|id| self.bought.contains(&id));
             let in_reach = !item.is_sold_out() && affordable && !already_bought;
             if in_reach && let (Some(balance), Some(price)) = (gold, item.price) {
                 // `saturating_sub`, not `-`: both operands are wire-supplied, and
@@ -572,12 +573,12 @@ impl Controller {
             buyable |= in_reach;
             targets.push(BuyTarget {
                 slot: item.effective_slot(index),
-                // Only ids a purchase echo can actually name AND a buy can
-                // actually land: the id-0 sentinel never appears in an echo,
-                // and a sold-out, unaffordable or already-bought slot cannot
-                // be bought — none may hold the checklist open (nor be
-                // clicked).
-                id: item.catalog_id().filter(|_| in_reach),
+                // Only ids a buy can actually land on: a sold-out,
+                // unaffordable or already-bought slot may not hold the
+                // checklist open (nor be clicked). An item the server gave no
+                // id is already `None` — that used to need the sentinel test
+                // spliced in here too.
+                id: item.id.filter(|_| in_reach),
             });
         }
         (targets, buyable)
@@ -586,20 +587,26 @@ impl Controller {
     /// A server-confirmed buy: records the echoed gold balance, then — only
     /// meaningful while `Paused` — checks the item off the checklist; the
     /// buy clearing the last entry resumes the hunt through the limits gate.
-    fn on_purchase(&mut self, item: u32, gold: Option<u32>, now_ms: u64) -> Vec<Action> {
+    fn on_purchase(
+        &mut self,
+        item: Option<CatalogId>,
+        gold: Option<u32>,
+        now_ms: u64,
+    ) -> Vec<Action> {
         if gold.is_some() {
             // The echoed balance is truth whatever the status: the next
             // matches' buys are planned against it.
             self.gold_balance = gold;
         }
         // Like gold, a buy is truth whatever the status: the slot is spent
-        // for the rest of the roll. The id-0 sentinel never names an item —
-        // asked of `shop::catalog_id`, the single interpreter, rather than
-        // re-derived as `item != 0` here.
+        // for the rest of the roll. There is no sentinel test left to re-derive
+        // (this line used to read `item != 0`, in contradiction of
+        // `shop::catalog_id`'s "do not re-derive" contract): an echo with no id
+        // arrives as `None` and this `if let` is the only reader.
         // The `bought` guard also dedups a replayed echo, so a buy is counted
         // at most once per roll (a genuine re-buy in a fresh roll clears
         // `bought` and counts again — two items obtained).
-        if let Some(item) = catalog_id(item)
+        if let Some(item) = item
             && !self.bought.contains(&item)
         {
             self.bought.push(item);
@@ -620,8 +627,9 @@ impl Controller {
             return Vec::new();
         }
         // Not on the checklist: an unmatched buy, a replayed echo of a
-        // consumed purchase, or the id-0 sentinel.
-        let Some(position) = self.checklist.iter().position(|&id| id == item) else {
+        // consumed purchase, or an echo the server gave no id.
+        let Some(position) = item.and_then(|item| self.checklist.iter().position(|&id| id == item))
+        else {
             return Vec::new();
         };
         self.checklist.swap_remove(position);

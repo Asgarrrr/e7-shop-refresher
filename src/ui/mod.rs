@@ -169,7 +169,7 @@ impl eframe::App for ShopApp {
         let latest = if open {
             None
         } else {
-            self.journal_cache.last().map(|line| line.text.as_str())
+            self.journal_cache.last().map(|line| &*line.text)
         };
         let mut panel = egui::Panel::bottom("journal")
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
@@ -259,6 +259,12 @@ impl eframe::App for ShopApp {
                 sections = %labels,
                 "config.toml not saved"
             );
+            // `push`, not `emit_at(WARN, …)`, deliberately: the file half is the
+            // structured `warn!` immediately above, with `error`, `path` and
+            // `sections` as fields. Routing this through `emit_at` would mirror
+            // the prose a second time and *replace* those three fields with it.
+            // `push` is the forgetful one, and here that is correct — the line it
+            // would forget is already recorded, better, one statement up.
             self.handles.journal.push(&[format!(
                 "config.toml not saved ({labels}): {}",
                 err.report()
@@ -288,6 +294,10 @@ fn deliver_command(handles: &SessionHandles, command: Command) -> bool {
         // window closes, and "the button did nothing" is only diagnosable after
         // the fact from the file.
         tracing::debug!("a player command was dropped: the session queue is full or closed");
+        // `push` for the same reason as `persist_sections`' line above: the file
+        // half is the `debug!` on the line before, at the level this belongs at
+        // (a full queue is not a failure of the app), which `emit_at` cannot
+        // express — it offers INFO, WARN and ERROR only.
         handles
             .journal
             .push(&[">> command dropped — the session is busy, try again".to_owned()]);
