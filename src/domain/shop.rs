@@ -4,6 +4,9 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// One shop roll as the analysis server trimmed it: the merchant, the slots on
+/// offer, and the refresh-session facts. Every field is optional on the wire —
+/// a degraded message still reaches the view rather than failing the link.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShopSnapshot {
     #[serde(default)]
@@ -16,6 +19,17 @@ pub struct ShopSnapshot {
     /// lost.
     #[serde(default, deserialize_with = "object_or_none")]
     pub refresh: Option<RefreshMeta>,
+}
+
+/// Interprets a wire item id: `0` means the server omitted it, anything else is
+/// a global catalog id.
+///
+/// **The only place the `0` sentinel is interpreted.** [`ShopItem::catalog_id`]
+/// is the usual way in; this free form exists for the ids that arrive without a
+/// slot around them (a purchase echo's `item`), which is exactly where the
+/// comparison used to be re-derived.
+pub fn catalog_id(id: u32) -> Option<u32> {
+    (id != 0).then_some(id)
 }
 
 impl ShopSnapshot {
@@ -40,28 +54,63 @@ pub struct RefreshMeta {
 /// `null`, or mistyped value degrades to `None` rather than failing the whole
 /// snapshot. The value is consumed wholesale first — a bare `?` on the typed
 /// parse would abort the surrounding message mid-stream.
+///
+/// The degradation is *logged*, because both of these fields change what the app
+/// does and not just what it shows: a dropped `limit` makes a sold-out slot read
+/// buyable (the actuator then clicks Buy, no echo arrives, and the watchdog halts
+/// `Unresponsive` blaming the game), and a dropped `refresh` silently disables
+/// out-of-funds detection. `debug!` and not `warn!`: the default filter keeps it
+/// in the log file, and it is not the player's problem to read.
 fn object_or_none<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: serde::de::DeserializeOwned,
 {
     let value = serde_json::Value::deserialize(de)?;
-    Ok(serde_json::from_value::<T>(value).ok())
+    match serde_json::from_value::<T>(value) {
+        Ok(parsed) => Ok(Some(parsed)),
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                field = std::any::type_name::<T>(),
+                "tolerated an undecodable side-channel object — degraded to absent"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Tolerant wire collection (`substats`): an undecodable element is dropped,
 /// a non-array value degrades to empty — the containing message survives.
+///
+/// Logged for the same reason as [`object_or_none`]: a silently shortened
+/// substat list quietly fails `min_substats` and every `required_substats`
+/// threshold, so the loop refreshes past an item the player wanted.
 fn lenient_elements<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: serde::de::DeserializeOwned,
 {
     let serde_json::Value::Array(values) = serde_json::Value::deserialize(de)? else {
+        tracing::debug!(
+            field = std::any::type_name::<T>(),
+            "tolerated a non-array wire collection — degraded to empty"
+        );
         return Ok(Vec::new());
     };
     Ok(values
         .into_iter()
-        .filter_map(|value| serde_json::from_value(value).ok())
+        .filter_map(|value| match serde_json::from_value(value) {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    field = std::any::type_name::<T>(),
+                    "dropped an undecodable wire collection element"
+                );
+                None
+            }
+        })
         .collect())
 }
 
@@ -92,7 +141,7 @@ pub struct ShopItem {
     /// mistyped entry is dropped, not fatal: it could never match a name-keyed
     /// criterion anyway.
     #[serde(default, deserialize_with = "lenient_elements")]
-    pub substats: Vec<SubStat>,
+    pub substats: Vec<Substat>,
     /// Fail-open like an absent field: a partial or mistyped limit degrades
     /// to `None` (buyable), matching the server's own omission semantics.
     #[serde(default, deserialize_with = "object_or_none")]
@@ -106,10 +155,10 @@ impl ShopItem {
     }
 
     /// The global catalog id, or `None` when the server omitted it
-    /// (`id == 0`). The only place the 0 sentinel is interpreted — do not
-    /// re-derive the comparison.
+    /// (`id == 0`). Delegates to [`catalog_id`] so the sentinel comparison
+    /// exists once — do not re-derive it.
     pub fn catalog_id(&self) -> Option<u32> {
-        (self.id != 0).then_some(self.id)
+        catalog_id(self.id)
     }
 
     /// Player-facing slot number: the wire slot, or the 1-based position when
@@ -119,6 +168,28 @@ impl ShopItem {
     /// Not injective on malformed shops: a fallback number can collide with
     /// another item's wire slot, so callers matching items by this number may
     /// over-select there.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use arkyve_refresh_shop::domain::shop::ShopItem;
+    ///
+    /// // Slot omitted (`0`): the 1-based position stands in.
+    /// let omitted = ShopItem::default();
+    /// assert_eq!(omitted.effective_slot(0), 1);
+    /// assert_eq!(omitted.effective_slot(5), 6);
+    ///
+    /// // A wire slot always wins, whatever the position.
+    /// let numbered = ShopItem {
+    ///     slot: 4,
+    ///     ..ShopItem::default()
+    /// };
+    /// assert_eq!(numbered.effective_slot(0), 4);
+    ///
+    /// // Clamped, never wrapped: an oversized shop must not fall back onto
+    /// // the `0` sentinel it is standing in for.
+    /// assert_eq!(omitted.effective_slot(300), u8::MAX);
+    /// ```
     pub fn effective_slot(&self, index: usize) -> u8 {
         if self.slot == 0 {
             u8::try_from(index + 1).unwrap_or(u8::MAX)
@@ -139,8 +210,10 @@ pub enum ItemKind {
     Unknown,
 }
 
+/// One rolled substat of a gear item, by internal stat name. The value is
+/// optional: the wire lists blank entries, which no threshold can satisfy.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct SubStat {
+pub struct Substat {
     pub name: String,
     #[serde(default)]
     pub value: Option<f64>,
@@ -217,6 +290,19 @@ mod tests {
         let substats = &snapshot.slots[0].substats;
         assert_eq!(substats.len(), 1);
         assert_eq!(substats[0].name, "speed");
+    }
+
+    #[test]
+    fn slot_by_id_finds_the_slot_and_never_matches_the_zero_sentinel() {
+        // The haul-recording lookup. `0` means "the server omitted the id", so
+        // it must never resolve to the slot that happens to carry it.
+        let snapshot = parse(r#"{"slots":[{"id":0,"slot":1},{"id":102,"slot":2}]}"#);
+        assert_eq!(
+            snapshot.slot_by_id(102).and_then(ShopItem::catalog_id),
+            Some(102)
+        );
+        assert!(snapshot.slot_by_id(0).is_none());
+        assert!(snapshot.slot_by_id(999).is_none());
     }
 
     #[test]

@@ -1,3 +1,16 @@
+//! Behavioural specification for the refresh-loop controller: what each
+//! [`Event`] does to the state machine, and which [`Action`]s come back.
+//!
+//! Ordered roughly as the loop runs, and grouped so a reader can find the rule
+//! they doubt: shared fixtures, then arming and refusal, snapshot evaluation
+//! (pause, auto-resume, purchase echoes), the dedup and re-buy guards that make
+//! a re-opened shop cheap, gold-aware buy planning, lifecycle no-ops and honest
+//! halt labels, the stop limits and their priority order, buy-target geometry,
+//! the recovery watchdog ladder, and finally the haul tally.
+//!
+//! Time is a plain `now_ms` argument, so every deadline here is exact and
+//! nothing sleeps.
+
 use super::*;
 use crate::domain::shop::ItemKind::{self, Equipment, Token};
 use crate::domain::shop::{PurchaseLimit, ShopItem};
@@ -1005,8 +1018,12 @@ fn out_of_funds_when_balance_below_cost() {
     let mut ctrl = started(Limits::default());
     let actions = ctrl.handle(snap(dud_shop(Some(meta(2, 3))), 1));
     assert_eq!(actions, vec![Action::Halt(StopReason::OutOfFunds)]);
+}
 
-    // Boundary: balance == cost still affords one refresh.
+#[test]
+fn balance_equal_to_cost_still_affords_one_refresh() {
+    // Boundary of out_of_funds_when_balance_below_cost: the gate is `<`, not
+    // `<=`, so the last affordable refresh still goes out.
     let mut ctrl = started(Limits::default());
     assert_eq!(
         ctrl.handle(snap(dud_shop(Some(meta(3, 3))), 1)),
@@ -1016,40 +1033,57 @@ fn out_of_funds_when_balance_below_cost() {
 
 #[test]
 fn stop_reason_priority_order() {
+    // Table-driven so a failure names the pair that broke: this pins the
+    // *ordering* of `stop_reason`'s clauses, which is exactly the kind of thing
+    // that gets reordered by accident.
     let all_limits = Limits {
         max_refreshes: Some(0),
         max_spend: Some(0),
         max_matches: None,
         max_duration_ms: Some(0),
     };
-
-    // Everything triggered at once: OutOfFunds wins.
-    let mut ctrl = started(all_limits.clone());
-    let actions = ctrl.handle(snap(dud_shop(Some(meta(2, 3))), 100));
-    assert_eq!(actions, vec![Action::Halt(StopReason::OutOfFunds)]);
-
-    // No funds info: MaxRefreshes beats MaxSpend and Timeout.
-    let mut ctrl = started(all_limits);
-    let actions = ctrl.handle(snap(dud_shop(None), 100));
-    assert_eq!(actions, vec![Action::Halt(StopReason::MaxRefreshes)]);
-
-    // MaxSpend beats Timeout.
-    let mut ctrl = started(Limits {
-        max_spend: Some(0),
-        max_duration_ms: Some(0),
-        ..Limits::default()
-    });
-    let actions = ctrl.handle(snap(dud_shop(None), 100));
-    assert_eq!(actions, vec![Action::Halt(StopReason::MaxSpend)]);
-
-    // MaxMatches beats Timeout.
-    let mut ctrl = started(Limits {
-        max_matches: Some(0),
-        max_duration_ms: Some(0),
-        ..Limits::default()
-    });
-    let actions = ctrl.handle(snap(dud_shop(None), 100));
-    assert_eq!(actions, vec![Action::Halt(StopReason::MaxMatches)]);
+    let cases = [
+        (
+            all_limits.clone(),
+            Some(meta(2, 3)),
+            StopReason::OutOfFunds,
+            "everything triggered at once: OutOfFunds wins",
+        ),
+        (
+            all_limits,
+            None,
+            StopReason::MaxRefreshes,
+            "no funds info: MaxRefreshes beats MaxSpend and Timeout",
+        ),
+        (
+            Limits {
+                max_spend: Some(0),
+                max_duration_ms: Some(0),
+                ..Limits::default()
+            },
+            None,
+            StopReason::MaxSpend,
+            "MaxSpend beats Timeout",
+        ),
+        (
+            Limits {
+                max_matches: Some(0),
+                max_duration_ms: Some(0),
+                ..Limits::default()
+            },
+            None,
+            StopReason::MaxMatches,
+            "MaxMatches beats Timeout",
+        ),
+    ];
+    for (limits, refresh, expected, label) in cases {
+        let mut ctrl = started(limits);
+        assert_eq!(
+            ctrl.handle(snap(dud_shop(refresh), 100)),
+            vec![Action::Halt(expected)],
+            "{label}"
+        );
+    }
 }
 
 #[test]

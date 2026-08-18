@@ -16,9 +16,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::filter::Filter;
-use crate::domain::shop::{RefreshMeta, ShopSnapshot};
+use crate::domain::shop::{RefreshMeta, ShopSnapshot, catalog_id};
 
-use dedup::{SlotIdentity, fingerprint};
+use dedup::{Fingerprint, fingerprint};
 use watchdog::Expectation;
 
 /// A refresh always costs 3 crystals (game fact); a wire-sent cost overrides.
@@ -61,6 +61,9 @@ pub struct Limits {
     pub max_duration_ms: Option<u64>,
 }
 
+/// Why a hunt stopped. Every variant is player-facing (rendered by
+/// `render::describe`), so the label must stay honest about *who* stopped it:
+/// the player, a machine fault, or a limit the player set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     PlayerStopped,
@@ -79,6 +82,9 @@ pub enum StopReason {
     Timeout,
 }
 
+/// Where the refresh loop is. Only `Watching` and `Paused` are *armed*: every
+/// gate in this module tests for that pair, and events arriving outside it are
+/// stored for the view but never acted on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Idle,
@@ -90,6 +96,9 @@ pub enum Status {
     Stopped(StopReason),
 }
 
+/// Everything that can move the loop: player commands, decoded wire arrivals,
+/// link transitions, and the clock. The only input to [`Controller::handle`], and
+/// the only way time enters the state machine (`now_ms`, assumed monotonic).
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Arms the watch. The caller must deliver a snapshot *after* this:
@@ -257,7 +266,7 @@ pub struct Controller {
     /// but never re-evaluated, so it cannot double-bill a refresh. Cleared
     /// on `Start` only — surviving the post-buy auto-resume is what mutes a
     /// re-open right after a buy.
-    acted_fingerprint: Option<Vec<SlotIdentity>>,
+    acted_fingerprint: Option<Fingerprint>,
     /// Catalog ids bought in the current roll. The wire never says sold-out
     /// and ids are stable per item type, so this is the only guard against
     /// re-buying an already-bought slot. Both fields survive `Start`: a
@@ -265,8 +274,10 @@ pub struct Controller {
     /// alone would let a same-roll re-open wrongly forget the buys.
     bought: Vec<u32>,
     /// The roll `bought` is scoped to; a snapshot with a different identity
-    /// is fresh stock and empties the set.
-    bought_fingerprint: Option<Vec<SlotIdentity>>,
+    /// is fresh stock and empties the set. Shares the `Arc` with
+    /// `acted_fingerprint` rather than deep-copying every slot's strings — the
+    /// two hold the same value whenever both are set.
+    bought_fingerprint: Option<Fingerprint>,
     /// Watchdog armed. Only ever true for live actuation: Off is
     /// player-paced advice and DryRun never yields wire feedback — deadlines
     /// would self-halt both.
@@ -467,6 +478,7 @@ impl Controller {
             self.acted_fingerprint = fingerprint;
             if self.acted_fingerprint != self.bought_fingerprint {
                 self.bought.clear(); // new roll = fresh stock
+                // A refcount bump, not a second deep copy of the roll.
                 self.bought_fingerprint = self.acted_fingerprint.clone();
             }
         }
@@ -535,7 +547,12 @@ impl Controller {
                 .is_some_and(|id| self.bought.contains(&id));
             let in_reach = !item.is_sold_out() && affordable && !already_bought;
             if in_reach && let (Some(balance), Some(price)) = (gold, item.price) {
-                gold = Some(balance - price);
+                // `saturating_sub`, not `-`: both operands are wire-supplied, and
+                // `price <= balance` only holds here through `affordable` above —
+                // a non-local invariant an added `in_reach` term could break. At
+                // zero the next item simply reads unaffordable, which is the
+                // intended semantics.
+                gold = Some(balance.saturating_sub(price));
             }
             buyable |= in_reach;
             targets.push(BuyTarget {
@@ -561,11 +578,15 @@ impl Controller {
             self.gold_balance = gold;
         }
         // Like gold, a buy is truth whatever the status: the slot is spent
-        // for the rest of the roll. The id-0 sentinel never names an item.
+        // for the rest of the roll. The id-0 sentinel never names an item —
+        // asked of `shop::catalog_id`, the single interpreter, rather than
+        // re-derived as `item != 0` here.
         // The `bought` guard also dedups a replayed echo, so a buy is counted
         // at most once per roll (a genuine re-buy in a fresh roll clears
         // `bought` and counts again — two items obtained).
-        if item != 0 && !self.bought.contains(&item) {
+        if let Some(item) = catalog_id(item)
+            && !self.bought.contains(&item)
+        {
             self.bought.push(item);
             // `bought` takes every buy as roll truth (dedup, re-open guard);
             // the haul is narrower — the *run's* take. Record only while a
@@ -618,11 +639,14 @@ impl Controller {
                 Some(reason) => self.halt(reason),
                 None => Vec::new(),
             },
-            Status::Watching | Status::Paused if self.duration_elapsed(now_ms) => {
+            Status::Watching | Status::Paused if self.has_duration_elapsed(now_ms) => {
                 self.halt(StopReason::Timeout)
             }
             Status::Watching | Status::Paused => self.watchdog(now_ms),
-            _ => Vec::new(),
+            // Named, not `_`: the tick is the only time-driven check-point, so a
+            // new `Status` falling in here would get no limit enforcement and no
+            // watchdog for as long as it lasted. Make it a compile error.
+            Status::Idle | Status::Stopped(_) => Vec::new(),
         }
     }
 
@@ -701,7 +725,7 @@ impl Controller {
         {
             return Some(StopReason::MaxMatches);
         }
-        if self.duration_elapsed(now_ms) {
+        if self.has_duration_elapsed(now_ms) {
             return Some(StopReason::Timeout);
         }
         None
@@ -709,7 +733,7 @@ impl Controller {
 
     /// `saturating_sub`: a `now_ms` reported earlier than the start counts as
     /// zero elapsed rather than underflowing.
-    fn duration_elapsed(&self, now_ms: u64) -> bool {
+    fn has_duration_elapsed(&self, now_ms: u64) -> bool {
         self.limits.max_duration_ms.is_some_and(|max| {
             self.started_at
                 .is_some_and(|started| now_ms.saturating_sub(started) >= max)

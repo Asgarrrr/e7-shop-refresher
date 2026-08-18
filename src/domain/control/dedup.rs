@@ -1,7 +1,9 @@
 //! Snapshot identity for duplicate suppression: an identical re-arrival of
 //! an already-acted-on shop must never double-bill a refresh or re-buy.
 
-use crate::domain::shop::{ShopSnapshot, SubStat};
+use std::sync::Arc;
+
+use crate::domain::shop::{ShopSnapshot, Substat};
 
 /// One slot's contribution to a snapshot's identity: the catalog id plus the
 /// per-roll fields the filter can match on — a re-roll redrawing the same
@@ -15,13 +17,22 @@ pub(super) struct SlotIdentity {
     price: Option<u32>,
     grade: Option<u8>,
     set: Option<String>,
-    substats: Vec<SubStat>,
+    substats: Vec<Substat>,
 }
+
+/// A snapshot's dedup identity: the ordered [`SlotIdentity`]s, behind an `Arc`.
+///
+/// Shared rather than owned because `Controller` holds two of these at once (the
+/// last roll evaluated and the roll `bought` is scoped to) and they are the same
+/// value whenever both are set. The contents are never mutated in place — only
+/// compared and replaced wholesale — so the second holder wants a refcount, not
+/// a second deep copy of every slot's `set` and `substats` strings.
+pub(super) type Fingerprint = Arc<Vec<SlotIdentity>>;
 
 /// Snapshot identity for dedup: the ordered [`SlotIdentity`]s. `None` when
 /// any id is the 0 sentinel — omitted ids make shops indistinguishable.
-pub(super) fn fingerprint(snapshot: &ShopSnapshot) -> Option<Vec<SlotIdentity>> {
-    snapshot
+pub(super) fn fingerprint(snapshot: &ShopSnapshot) -> Option<Fingerprint> {
+    let slots: Option<Vec<SlotIdentity>> = snapshot
         .slots
         .iter()
         .map(|item| {
@@ -33,5 +44,6 @@ pub(super) fn fingerprint(snapshot: &ShopSnapshot) -> Option<Vec<SlotIdentity>> 
                 substats: item.substats.clone(),
             })
         })
-        .collect()
+        .collect();
+    slots.map(Arc::new)
 }

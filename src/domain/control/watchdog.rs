@@ -19,7 +19,7 @@ enum Proof {
 }
 
 impl Proof {
-    fn window_ms(self) -> u64 {
+    const fn window_ms(self) -> u64 {
         match self {
             Proof::Snapshot => EXPECT_SNAPSHOT_MS,
             Proof::Purchase => EXPECT_PURCHASE_MS,
@@ -63,10 +63,13 @@ impl Expectation {
         }
     }
 
-    /// One rung higher, fresh full deadline.
+    /// One rung higher, fresh full deadline. Saturating rather than bare `+`:
+    /// the cap is the ladder's `match` arms in [`Controller::watchdog`] (rung ≥ 2
+    /// halts and clears the expectation), which is non-local reasoning the
+    /// operator should not depend on.
     fn escalate(self, now_ms: u64) -> Self {
         Self {
-            attempt: self.attempt + 1,
+            attempt: self.attempt.saturating_add(1),
             ..self.regrant(now_ms)
         }
     }
@@ -98,6 +101,10 @@ impl Controller {
                 let actions: Vec<Action> = self
                     .refresh_or_halt(now_ms)
                     .into_iter()
+                    // Pass-through by design: only `Refresh` is relabelled, and
+                    // leaving every other action alone stays right for any
+                    // variant `Action` gains. Not a swallowed case — do not
+                    // expand this arm into a variant list.
                     .map(|action| match action {
                         Action::Refresh => Action::Recover(Recovery::Refresh),
                         other => other,
@@ -120,7 +127,11 @@ impl Controller {
                     targets: self.recovery_buy_targets(),
                 })]
             }
-            _ => self.halt(StopReason::Unresponsive),
+            // The wildcard is for the *rung* dimension only (rung ≥ 2 is the
+            // halt); the proof dimension is spelled out so a new `Proof` variant
+            // is a compile error here instead of an immediate halt that blames
+            // the game. Clippy cannot see this — the scrutinee is a tuple.
+            (Proof::Snapshot | Proof::Purchase, _) => self.halt(StopReason::Unresponsive),
         }
     }
 

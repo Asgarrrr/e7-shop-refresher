@@ -2,9 +2,19 @@
 //! worth stopping the refresh loop to buy. Kept on the client so they can be
 //! tuned live from the UI.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::domain::shop::{ItemKind, ShopItem};
+
+/// The gear grades the game ships (`config.example.toml` documents the same
+/// closed domain). A floor outside it is a typo, and a costly one: `matches` is
+/// fail-closed on grade, so every item is dropped, while `is_unrestricted`
+/// counts any floor as a real criterion — the loop arms and then refreshes
+/// forever, debiting crystals, without ever matching. Rejected while
+/// deserializing so the invalid value never exists, the way `Config::validate`
+/// rejects an unrecognized `[filter] kinds` entry.
+const GRADE_MIN: u8 = 2;
+const GRADE_MAX: u8 = 4;
 
 /// Player criteria, all ANDed; an empty `Vec` or `None` field does not
 /// constrain, so a default `Filter` matches every available item.
@@ -16,26 +26,57 @@ use crate::domain::shop::{ItemKind, ShopItem};
 /// Deserialized from the config file's `[filter]` section. Unlike the wire
 /// models, unknown keys are rejected: a typo here silently loosens the
 /// criteria the refresh loop spends crystals against.
+///
+/// The four never-`None` fields are skipped when empty, like `Timings`' eight
+/// ranges: `config/persist.rs` replaces the whole `[filter]` section on Apply,
+/// and without the skips the first edit of one criterion writes four inert lines
+/// into a file that module exists to leave as the player wrote it. The container
+/// `#[serde(default)]` makes every omission round-trip.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Filter {
     /// Kept item kinds (any-of); empty keeps all, including `Unknown`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<ItemKind>,
     /// Kept items (any-of), by exact internal name (`ticketrare_name`, ...);
     /// empty keeps all.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<String>,
     /// Kept sets (any-of), by exact internal id; empty keeps all.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sets: Vec<String>,
     /// Minimum substat count (raw list length).
     pub min_substats: Option<u8>,
     /// Substats that must all be present, each above its optional threshold.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub required_substats: Vec<SubstatReq>,
     /// Inclusive gold cap; an unknown price fails it.
     pub max_price: Option<u32>,
     /// Inclusive minimum gear grade (2, 3, or 4); an unknown grade fails it.
+    /// A floor outside that domain is refused at parse time — see `GRADE_MIN`.
+    #[serde(deserialize_with = "grade_floor")]
     pub min_grade: Option<u8>,
     /// Keep sold-out items (default drops them).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub include_sold_out: bool,
+}
+
+/// Parses `min_grade`, refusing a floor the game has no grade for. Absence and
+/// `None` pass through; anything else is an error naming the offending value, so
+/// `toml` can point at the line.
+fn grade_floor<'de, D>(de: D) -> Result<Option<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(grade) = Option::<u8>::deserialize(de)? else {
+        return Ok(None);
+    };
+    if !(GRADE_MIN..=GRADE_MAX).contains(&grade) {
+        return Err(serde::de::Error::custom(format!(
+            "gear grade {grade} does not exist (expected {GRADE_MIN}, 3 or {GRADE_MAX})"
+        )));
+    }
+    Ok(Some(grade))
 }
 
 /// One required substat, by exact internal name (`speed`, `cri`, ...). `min` is
@@ -137,10 +178,10 @@ impl SubstatReq {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::shop::{PurchaseLimit, SubStat};
+    use crate::domain::shop::{PurchaseLimit, Substat};
 
-    fn substat(name: &str, value: Option<f64>) -> SubStat {
-        SubStat {
+    fn substat(name: &str, value: Option<f64>) -> Substat {
+        Substat {
             name: name.to_owned(),
             value,
         }
@@ -482,6 +523,58 @@ mod tests {
             substat("speed", Some(3.0)),
         ];
         assert!(filter.matches(&item));
+    }
+
+    #[test]
+    fn min_grade_outside_the_game_domain_is_refused() {
+        // A typo'd floor is fail-closed in `matches` yet counts as a real
+        // criterion in `is_unrestricted`, so it arms a loop that refreshes
+        // forever and never matches. Refused at parse time instead.
+        for grade in ["0", "1", "5", "44"] {
+            let err = toml::from_str::<Filter>(&format!("min_grade = {grade}"))
+                .expect_err("out-of-domain grade should be refused");
+            assert!(
+                err.to_string().contains("does not exist"),
+                "error should name the offending grade: {err}"
+            );
+        }
+        for grade in [2, 3, 4] {
+            let filter: Filter =
+                toml::from_str(&format!("min_grade = {grade}")).expect("real grade parses");
+            assert_eq!(filter.min_grade, Some(grade));
+        }
+        // Absent stays absent — the container default, not the check.
+        assert_eq!(
+            toml::from_str::<Filter>("")
+                .expect("empty parses")
+                .min_grade,
+            None
+        );
+    }
+
+    #[test]
+    fn inert_filter_keys_are_not_serialized() {
+        // `config::persist` replaces the whole `[filter]` section on Apply, so
+        // without the skips the first edit of one criterion writes four no-op
+        // lines into a file that module exists to leave alone.
+        let filter = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            ..Filter::default()
+        };
+        let text = toml::to_string(&filter).expect("serialize");
+        assert!(text.contains("ticketrare_name"));
+        for inert in ["kinds", "sets", "required_substats", "include_sold_out"] {
+            assert!(!text.contains(inert), "{inert} written into {text:?}");
+        }
+        // And a set value still round-trips, so the skips are not a data loss.
+        let filter = Filter {
+            include_sold_out: true,
+            kinds: vec![ItemKind::Equipment],
+            ..Filter::default()
+        };
+        let text = toml::to_string(&filter).expect("serialize");
+        let back: Filter = toml::from_str(&text).expect("deserialize");
+        assert_eq!(filter, back);
     }
 
     #[test]
