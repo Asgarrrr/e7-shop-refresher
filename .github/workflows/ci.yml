@@ -27,18 +27,34 @@ jobs:
         run: cargo fmt --all --check
       - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
       - run: cargo clippy --locked --no-default-features --features gui,actuator --all-targets -- -D warnings
-      # Both combinations build_source must survive: no backend (above) and the
-      # WinDivert backend alone.
+      # Every arm build_source must survive: no backend (above), each backend
+      # alone, and — the one no single-feature lane reaches — both at once,
+      # which is what exercises the `not(feature = "pcap-backend")` precedence
+      # gates in `capture::mod`.
+      - name: Check passive Npcap backend
+        run: cargo clippy --locked --no-default-features --features pcap-backend --all-targets -- -D warnings
       - name: Check passive WinDivert backend
         run: cargo clippy --locked --no-default-features --features windivert-backend --all-targets -- -D warnings
-      # The combination actually shipped (windivert-backend + gui + actuator).
+      - name: Check the WinDivert product combination
+        run: cargo clippy --locked --no-default-features --features windivert-backend,gui,actuator --all-targets -- -D warnings
+      # The combination actually shipped (pcap-backend + gui + actuator).
       # Checking the pieces separately misses a cfg interaction that only the
       # product build has.
       - name: Check shipped default features
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Check both backends compiled together
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - name: Build shipped release (default features)
         if: matrix.toolchain == 'stable'
         run: cargo build --locked --release
+      # The delay-load assertion below needs an exe that imports WinDivert at
+      # all, and the shipped default no longer does: `pcap-backend` is the
+      # default backend now. So build the WinDivert combination over it (same
+      # output path) purely to have something to assert on, until the removal
+      # pass drops the DLL and the assertion with it.
+      - name: Build release with the WinDivert backend
+        if: matrix.toolchain == 'stable'
+        run: cargo build --locked --release --features windivert-backend
       # The release exe must not merely link: the WinDivert import has to be a
       # *delay* import. A plain static import means the loader demands the DLL
       # before the exe can extract it, and every launch dies with
@@ -61,10 +77,16 @@ jobs:
           "WinDivert.dll is delay-loaded"
       - run: cargo test --locked --no-default-features
       - run: cargo test --locked --no-default-features --features gui,actuator
+      - name: Test passive Npcap backend (non-elevated tests)
+        run: cargo test --locked --no-default-features --features pcap-backend
       - name: Test passive WinDivert backend (non-elevated tests)
         run: cargo test --locked --no-default-features --features windivert-backend
+      - name: Test the WinDivert product combination (non-elevated tests)
+        run: cargo test --locked --no-default-features --features windivert-backend,gui,actuator
       - name: Test shipped default features (non-elevated tests)
         run: cargo test --locked
+      - name: Test both backends compiled together (non-elevated tests)
+        run: cargo test --locked --all-features
 
   dependency-policy:
     name: Dependency policy

@@ -256,6 +256,10 @@ fn main() -> ExitCode {
         version = env!("CARGO_PKG_VERSION"),
         os = %std::env::consts::OS,
         gui = cfg!(feature = "gui"),
+        // Both backends, not just WinDivert: `pcap-backend` is the shipped
+        // default now, so logging only the other one would put "no capture
+        // backend" in every bug report we receive.
+        pcap = cfg!(feature = "pcap-backend"),
         windivert = cfg!(feature = "windivert-backend"),
         actuator = cfg!(feature = "actuator"),
         config_path = %config_path.display(),

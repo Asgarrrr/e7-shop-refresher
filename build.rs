@@ -1,16 +1,41 @@
-//! Linker setup for the native capture backend.
+//! Linker setup for the shipped executable.
 //!
 //! Two things are arranged here, and only on MSVC (both are MSVC linker
 //! features):
 //!
-//! 1. **Non-elevation.** The exe used to carry a `requireAdministrator`
-//!    manifest, which put the TOML parser, egui, the TLS uplink and the TCP
-//!    reassembly of hostile network bytes in an administrator process for the
-//!    whole session. Only opening the WinDivert handle ever needed the
-//!    privilege, and that step now lives in a separate broker process the app
-//!    launches with `runas` (`src/capture/elevate.rs`). So the image declares
-//!    `asInvoker`: the window opens with no prompt, and the consent prompt
-//!    appears when capture starts, for the one process that needs it.
+//! 1. **Elevation — for the actuator, not for the capture backend.** This is
+//!    the part that reads backwards, so it is written down in full.
+//!
+//!    The capture backend needs no privilege at all. The shipped default is
+//!    Npcap (`src/capture/pcap.rs`): it taps every adapter through `wpcap.dll`
+//!    from an ordinary process, and the whole pipeline — capture, reassembly,
+//!    uplink, decoded snapshot, refresh job — was measured working end to end
+//!    from an unelevated run. Nothing below is for it.
+//!
+//!    The *actuator* is what needs the token, because of UIPI: Windows refuses
+//!    input aimed at a window whose integrity level is higher than the sending
+//!    process's, and it refuses it silently for `SendInput` (see
+//!    `actuator::win::probe_window_reachable`). Epic Seven is launched through
+//!    `C:\ProgramData\Smilegate\STOVE\STOVE.exe`, whose manifest declares
+//!    `requestedExecutionLevel level='requireAdministrator'`, so the game
+//!    inherits **high** integrity from its launcher. Measured live on a real
+//!    install: `EpicSeven.exe` high, this app (then `asInvoker`) medium — every
+//!    click was refused, and the journal said so
+//!    ("the game window runs at a higher integrity level than this app …
+//!    — stopping the loop"). A player cannot fix that from the game's side:
+//!    STOVE is the launcher Epic Seven ships with, and it always elevates.
+//!
+//!    So the exe declares `requireAdministrator`. That is the *product*
+//!    talking: driving another window's input is the feature, and the feature
+//!    requires the privilege. A second, smaller consequence of the medium
+//!    integrity run: `install_logging` could not even open its log file under
+//!    `%LOCALAPPDATA%`, and fell back to an inert stdout.
+//!
+//!    An earlier design split the app into an unelevated UI plus an elevated
+//!    WinDivert broker so that only the driver handle ran with the token. It
+//!    was abandoned on the measurement above, not on taste: it solved a problem
+//!    the actuator has anyway, and the Npcap tap removed the only reason the
+//!    split existed.
 //!
 //! 2. **Delay-loading `WinDivert.dll`**, so the exe
 //!    can ship as a single file. `WinDivert.dll` and `WinDivert64.sys` are
@@ -36,26 +61,30 @@ fn main() {
         return;
     }
 
-    // Declare `asInvoker` explicitly, and keep the manifest embedded. Deleting
+    // Ask for the administrator token, and keep the manifest embedded. Deleting
     // these two lines is NOT the same thing: `/MANIFEST` is on by default in
     // `link.exe`, so dropping `/MANIFEST:EMBED` does not produce "no manifest",
     // it produces an external `arkyve-refresh-shop.exe.manifest` sidecar that
     // Windows honours during dev runs from `target\` and that silently vanishes
     // when the lone exe ships. Dev and shipped builds would then differ in
-    // exactly the property this whole design turns on, for no reason anyone
-    // could find later. Stating the level is also documentation: a reader of
-    // this file learns that running unelevated is a decision, not an omission.
+    // exactly the property this whole design turns on — the run from `target\`
+    // would drive the game and the shipped exe would be refused every click —
+    // for no reason anyone could find later.
     //
-    // `uiAccess='false'` is the default, spelled out because the alternative
-    // (a signed, `Program Files`-resident image driving higher-integrity UI) is
-    // the one thing someone might reach for when the actuator hits UIPI, and it
-    // is not what we do.
+    // `uiAccess='false'` is the default, spelled out because it is the *other*
+    // answer to UIPI and we deliberately do not take it: `uiAccess='true'` would
+    // let a medium-integrity process drive higher-integrity UI, but only for an
+    // Authenticode-signed image installed under a secure location such as
+    // `Program Files`. Neither holds for a single exe a player downloads, so
+    // elevation is the only door left.
     //
     // Outside the backend guard on purpose: a `--no-default-features --features
     // gui,actuator` build used to get no manifest at all, so the two builds made
     // different declarations about the same exe.
     println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-    println!("cargo:rustc-link-arg-bins=/MANIFESTUAC:level='asInvoker' uiAccess='false'");
+    println!(
+        "cargo:rustc-link-arg-bins=/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
+    );
 
     if std::env::var_os("CARGO_FEATURE_WINDIVERT_BACKEND").is_none() {
         return;

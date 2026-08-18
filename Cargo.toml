@@ -8,24 +8,28 @@ license = "MIT"
 publish = false
 
 [features]
-default = ["windivert-backend", "gui", "actuator"]
-# Native Windows capture backend (WinDivert), the shipped default. Delivers
-# IP-layer copies of the game's TCP packets, so it is indifferent to the link
-# layer underneath — the reason it works on WiFi where a NIC-level tap hands
-# out 802.11 frames. Links *dynamically* against the vendored prebuilt
-# `WinDivert.lib`/`WinDivert.dll` (`WINDIVERT_PATH` in `.cargo/config.toml`);
-# never `WINDIVERT_STATIC`, see that file for why. Pulls windows-sys for
-# `LoadLibraryW` (the delay-loaded WinDivert.dll is preloaded by full path from
-# its extracted app-data location) and for the runtime-dir DACL hardening.
+default = ["pcap-backend", "gui", "actuator"]
+# Native Windows capture backend (WinDivert), no longer the default — kept
+# compiling only until the removal pass lands. Delivers IP-layer copies of the
+# game's TCP packets through a kernel driver, which needs administrator rights
+# *and* a third-party signed driver on the player's machine; `pcap-backend`
+# gets the same IP-layer copies with neither. Links *dynamically* against the
+# vendored prebuilt `WinDivert.lib`/`WinDivert.dll` (`WINDIVERT_PATH` in
+# `.cargo/config.toml`); never `WINDIVERT_STATIC`, see that file for why. Pulls
+# windows-sys for `LoadLibraryW` (the delay-loaded WinDivert.dll is preloaded by
+# full path from its extracted app-data location) and for the runtime-dir DACL
+# hardening.
 windivert-backend = ["dep:windivert", "dep:windows-sys"]
-# Experimental Npcap capture backend, deliberately NOT in `default`. Taps every
-# adapter through `wpcap.dll` from an ordinary, *unelevated* process — no driver
-# load, no broker, no UAC prompt — which is the whole question it exists to
-# answer. Pulls `libloading` because the DLL is resolved at runtime rather than
-# linked (a static link would need the Npcap SDK to build and would kill the exe
-# in the Windows loader on a machine without Npcap), and windows-sys for the one
-# registry read that tells "Npcap is admins-only" apart from "no adapters".
-# Wins over `windivert-backend` in `app::build_source` when both are compiled.
+# Npcap capture backend, the shipped default. Taps every adapter through
+# `wpcap.dll` and needs no privilege of its own: it was proven end to end from
+# an ordinary *unelevated* process (capture → reassembly → uplink → decoded
+# snapshot → refresh job). The exe is still manifested `requireAdministrator`,
+# but for the actuator and not for this — see `build.rs`. Pulls `libloading`
+# because the DLL is resolved at runtime rather than linked (a static link would
+# need the Npcap SDK to build and would kill the exe in the Windows loader on a
+# machine without Npcap), and windows-sys for the one registry read that tells
+# "Npcap is admins-only" apart from "no adapters". Wins over
+# `windivert-backend` in `app::build_source` when both are compiled.
 pcap-backend = ["dep:libloading", "dep:windows-sys"]
 # egui window over the session (dashboard + player commands). Disable for the
 # console-only build.

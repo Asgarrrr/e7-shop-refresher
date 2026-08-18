@@ -104,7 +104,8 @@ pub(super) fn raise(game: HWND, rect: ClientRect) -> Result<bool, String> {
 /// indistinguishable without it" — the error code — and then not use the
 /// distinction. It is used now, because the two want opposite things from the
 /// player: a dead window is nothing to do, an integrity-level mismatch is
-/// "relaunch Epic Seven without administrator rights".
+/// "restart this app as administrator" (the game cannot go the other way: Epic
+/// Seven inherits high integrity from STOVE's `requireAdministrator` launcher).
 ///
 /// That fix deliberately does **not** appear here. `MessageSurface::acquire`
 /// probes the window once per job and stops the loop with the full explanation
@@ -299,10 +300,11 @@ mod tests {
 
     #[test]
     fn an_access_denied_placement_leaves_the_fix_to_the_preflight() {
-        // The preflight stops the loop with the "relaunch Epic Seven without
-        // administrator rights" line before any click is planned. Repeating it
-        // per click would bury the one line that matters.
+        // The preflight stops the loop with the "restart it as administrator"
+        // line before any click is planned. Repeating it per click would bury
+        // the one line that matters.
         let message = placement_refusal("slot the game under the input shield", &uipi_refusal());
+        assert!(!message.contains("restart"), "{message}");
         assert!(!message.contains("relaunch"), "{message}");
     }
 

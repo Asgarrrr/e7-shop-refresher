@@ -259,10 +259,13 @@ impl<S: Surface> Drop for SurfaceJobGuard<'_, S> {
 /// nothing respawns it. Returning would drop the job receiver, and every later
 /// submit would then fail against a channel nobody reads — while `Start` from
 /// `Status::Stopped` happily re-arms the gate and the whole session goes on
-/// *looking* alive. Staying in the loop makes the advice the halt prints
-/// ("relaunch Epic Seven without administrator rights") actually work: the
-/// player fixes the cause, presses Start, the next job re-runs `acquire`, the
-/// preflight re-probes, and the actuator recovers with no process restart.
+/// *looking* alive. Staying in the loop is what lets the player act on the halt
+/// at all: they fix the cause the message names — bring the game back, restore
+/// the window — press Start, the next job re-runs `acquire`, the preflight
+/// re-probes, and the actuator recovers with no process restart. (The UIPI
+/// halt is the one exception whose fix *is* a restart of this app, since the
+/// integrity level is fixed at process start; the recovery path still has to
+/// exist for every other cause.)
 pub async fn run_executor(
     mut surface: impl Surface,
     mut jobs: mpsc::Receiver<Job>,
@@ -770,9 +773,11 @@ mod tests {
             "{}",
             line.text
         );
+        // The cause the player reads must be the real one (STOVE elevates the
+        // game) and the action must be one they can perform on their side.
+        assert!(line.text.contains("STOVE launcher"), "{}", line.text);
         assert!(
-            line.text
-                .contains("relaunch Epic Seven without administrator rights"),
+            line.text.contains("restart it as administrator"),
             "{}",
             line.text
         );
@@ -887,11 +892,10 @@ mod tests {
     async fn a_re_armed_watch_acts_again_after_a_fatal_without_a_process_restart() {
         // The whole reason the fatal paths stopped returning.
         //
-        // The player is told to relaunch Epic Seven without administrator
-        // rights and press Start again. That advice is only true if the
-        // executor task outlived the halt: it is spawned once per session, so
-        // a `return` here would leave the re-armed session submitting into a
-        // channel nobody reads.
+        // The player is told to fix the cause and press Start again. That
+        // advice is only true if the executor task outlived the halt: it is
+        // spawned once per session, so a `return` here would leave the re-armed
+        // session submitting into a channel nobody reads.
         let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         // One-shot, like the shield refusing to raise against an elevated

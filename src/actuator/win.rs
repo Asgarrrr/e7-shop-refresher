@@ -336,10 +336,12 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
 ///
 /// # Why this exists
 ///
-/// Since the capture backend moved into its own elevated broker, the window
-/// this process owns runs at *medium* integrity. If the player starts Epic
-/// Seven as administrator, UIPI puts its window out of reach and every backend
-/// fails — but neither fails in a way that names the cause:
+/// Epic Seven always runs at *high* integrity: players launch it through
+/// `STOVE.exe`, whose manifest declares `requireAdministrator`, and the game
+/// inherits the level from its launcher (measured on a real install:
+/// `EpicSeven.exe` high). UIPI then refuses input from any process below that
+/// level, so if this app is not itself elevated its window is out of reach and
+/// every backend fails — but neither fails in a way that names the cause:
 ///
 /// - The default `Message` backend gets `ERROR_ACCESS_DENIED` from the shield's
 ///   `SetWindowPos`, which used to be reported as "the window is gone or its
@@ -350,6 +352,15 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
 ///   reports success, and nothing whatsoever moves in the game. No per-call
 ///   error classification anywhere can see that, which is why the diagnosis has
 ///   to be a preflight rather than a better error message.
+///
+/// The exe is manifested `requireAdministrator` (see `build.rs`) precisely so
+/// that the normal run is *not* the failing one, which makes this probe a safety
+/// net rather than the everyday path. It stays because the net still catches
+/// real cases — an elevation the player declined on a build whose manifest did
+/// not force it, a `-gnu` or hand-linked binary carrying no manifest, a
+/// debugger launching this process at medium integrity, or STOVE changing what
+/// it does — and because in every one of them the alternative is not an error
+/// but a silence: clicks reported as delivered, nothing moving on screen.
 ///
 /// # Why a no-op `SetWindowPos`, and emphatically *not* `PostMessageW(WM_NULL)`
 ///
@@ -407,14 +418,26 @@ fn probe_window_reachable(hwnd: HWND) -> std::io::Result<()> {
 /// [`probe_window_reachable`]) but Microsoft does not document it, so a future
 /// Windows answering something else must still stop the loop and still point at
 /// the likely cause rather than fall through to a raw Win32 dump.
+///
+/// # The advice has to be one the player can actually carry out
+///
+/// This line used to end in "relaunch Epic Seven without administrator rights",
+/// and that is impossible: Epic Seven is started by `STOVE.exe`, which declares
+/// `requireAdministrator` in its own manifest, so a player using the normal
+/// launcher has no unelevated way to run the game. The side that can change is
+/// *this* app — it ships manifested `requireAdministrator` for exactly this
+/// reason — so the fix names restarting it as administrator, which is a thing a
+/// player can do, and the acceptable UAC prompt they may have dismissed.
 pub(super) fn preflight_refusal(error: &std::io::Error) -> SurfaceError {
     let cause = if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
         "the game window runs at a higher integrity level than this app, so Windows refuses every \
-         click aimed at it — relaunch Epic Seven without administrator rights"
+         click aimed at it — Epic Seven runs as administrator because the STOVE launcher requires \
+         it, so close this app and restart it as administrator, accepting the Windows permission \
+         prompt"
     } else {
         "the game window refused a harmless preflight, so no click aimed at it would arrive \
-         either — if Epic Seven was started as administrator, relaunch it without administrator \
-         rights"
+         either — close this app and restart it as administrator, accepting the Windows \
+         permission prompt"
     };
     SurfaceError::Fatal(format!("{cause} ({error})"))
 }
@@ -511,9 +534,10 @@ fn sendinput_result(inserted: u32) -> Result<(), SurfaceError> {
 /// is for.
 ///
 /// In practice the preflight at acquire catches this first and this branch is
-/// the backstop for a game *relaunched as administrator mid-session* — so it
-/// names the cause in one clause and leaves the full explanation and the fix to
-/// [`preflight_refusal`], rather than repeating a paragraph on every click.
+/// the backstop for a window whose integrity level changed *mid-job*, after the
+/// probe passed — so it names the cause in one clause and leaves the full
+/// explanation and the fix to [`preflight_refusal`], rather than repeating a
+/// paragraph on every click.
 ///
 /// Everything else keeps the old verdict, minus the invented certainty: a queue
 /// that is genuinely full, or a window that closed between the shield going up
@@ -1358,10 +1382,14 @@ mod tests {
             panic!("a window this process cannot drive is not something to retry");
         };
         assert!(reason.contains("higher integrity level"), "{reason}");
-        assert!(
-            reason.contains("relaunch Epic Seven without administrator rights"),
-            "{reason}"
-        );
+        // The cause is named, and named correctly: the game is elevated because
+        // its launcher demands it.
+        assert!(reason.contains("STOVE launcher"), "{reason}");
+        assert!(reason.contains("restart it as administrator"), "{reason}");
+        // The advice the measurement disproved: STOVE is manifested
+        // `requireAdministrator`, so no player can start Epic Seven unelevated
+        // through it. Telling them to try is worse than saying nothing.
+        assert!(!reason.contains("without administrator rights"), "{reason}");
     }
 
     /// The verdict hangs on the call failing, not on the code being 5 — the
@@ -1372,7 +1400,8 @@ mod tests {
         let SurfaceError::Fatal(reason) = preflight_refusal(&dead_handle()) else {
             panic!("any refused preflight must stop the loop");
         };
-        assert!(reason.contains("administrator rights"), "{reason}");
+        assert!(reason.contains("restart it as administrator"), "{reason}");
+        assert!(!reason.contains("without administrator rights"), "{reason}");
     }
 
     #[test]

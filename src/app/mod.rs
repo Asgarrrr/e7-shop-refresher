@@ -1097,33 +1097,33 @@ fn parse_command(line: &str) -> Option<Command> {
 /// Three arms, so every feature combination builds and exactly one of them
 /// applies:
 ///
-/// - **Npcap**, when `pcap-backend` is on, and it wins over WinDivert when both
-///   are compiled in. That precedence is the point of the feature: it exists to
-///   run the whole pipeline on an unelevated tap and compare, so a build that
-///   asks for it must get it rather than silently keeping the broker. Nothing is
-///   launched, nothing is elevated, and no UAC prompt appears.
-/// - **WinDivert, through the elevated broker**, when its feature is on. This
-///   process never touches the driver: it launches a second copy of this exe
-///   with an administrator token and reads raw IP packets back off a named pipe,
-///   so the parser, the reassembler, the TLS client and the UI all stay at
-///   medium integrity. The packets are IP-layer copies, so the pipeline is
-///   indifferent to the link layer beneath — the reason it keeps working on a
-///   WiFi adapter, where a NIC-level tap delivers 802.11 frames this crate does
-///   not decode.
+/// - **Npcap**, when `pcap-backend` is on — the shipped default — and it wins
+///   over WinDivert when both are compiled in. It taps every adapter through
+///   `wpcap.dll` in this very process: no driver to load, no second process, no
+///   UAC prompt of its own. The process *is* elevated (the exe is manifested
+///   `requireAdministrator`), but for the actuator, not for this — see
+///   `build.rs`, and do not read this arm as needing the token.
+/// - **WinDivert, through the elevated broker**, when its feature is on and
+///   Npcap is not. Kept compiling until the removal pass; this process never
+///   touches the driver, it launches a second copy of this exe with an
+///   administrator token and reads raw IP packets back off a named pipe. Both
+///   backends hand up IP-layer copies, so the pipeline is indifferent to the
+///   link layer beneath — the reason either keeps working on a WiFi adapter,
+///   where a NIC-level tap delivers 802.11 frames this crate does not decode.
 /// - **No backend** — an error the caller can show, never a panic. This is the
 ///   `--no-default-features` build, where the rest of the pipeline still
 ///   compiles and tests.
 ///
-/// Blocking on purpose, and called from `Session::run` on a runtime worker: a
-/// UAC prompt sits in the middle of it. `spawn_elevated_broker` keeps that off
-/// the runtime's back (see its `blocking` helper), which is why this stays a
-/// plain synchronous call.
+/// Blocking on purpose, and called from `Session::run` on a runtime worker:
+/// under the WinDivert arm a UAC prompt sits in the middle of it.
+/// `spawn_elevated_broker` keeps that off the runtime's back (see its
+/// `blocking` helper), which is why this stays a plain synchronous call.
 #[cfg(all(windows, feature = "pcap-backend"))]
 fn build_source(config: &Config) -> Result<CaptureSource> {
     use crate::capture::PcapSource;
     info!(
         port = config.game_port,
-        "opening the Npcap tap on every adapter (no elevation, no prompt)"
+        "opening the Npcap tap on every adapter (the tap itself needs no privilege)"
     );
     let (source, stop) = PcapSource::open(config.game_port)?;
     Ok(CaptureSource::new(source, stop))
@@ -1146,7 +1146,7 @@ fn build_source(config: &Config) -> Result<CaptureSource> {
 #[cfg(not(all(windows, any(feature = "windivert-backend", feature = "pcap-backend"))))]
 fn build_source(_config: &Config) -> Result<CaptureSource> {
     Err(crate::Error::Capture(
-        "no capture backend compiled — enable `windivert-backend` (default) or `pcap-backend` \
+        "no capture backend compiled — enable `pcap-backend` (default) or `windivert-backend` \
          on Windows"
             .to_owned(),
     ))
