@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 use windivert::prelude::*;
 
-use super::{CaptureSource, CaptureStop, Direction, PacketSource, Segment, parse_segment};
+use super::{
+    CaptureSource, CaptureStop, Direction, MAX_PACKET_BYTES, PacketSource, Segment, parse_segment,
+};
 use crate::error::{Error, Result};
 
 /// User-mode WinDivert library, embedded in the executable and extracted into
@@ -42,11 +44,6 @@ const DRIVER_FILE: &str = "WinDivert64.sys";
 /// otherwise carry the library with no license at all.
 const LICENSE_TEXT: &[u8] = include_bytes!("../../vendor/windivert/LICENSE");
 const LICENSE_FILE: &str = "WinDivert-LICENSE.txt";
-
-/// Largest packet WinDivert can deliver (`WINDIVERT_MTU_MAX`). Coalesced
-/// receives (RSC/LSO) routinely exceed the wire MTU, so anything smaller as a
-/// buffer makes `recv` fail on the first bulk transfer.
-const MAX_PACKET_BYTES: usize = 65_575;
 
 /// How many delivered packets between two funnel lines. Every captured packet
 /// passes through here, so this is emitted periodically rather than per packet

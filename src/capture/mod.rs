@@ -2,6 +2,12 @@
 
 mod ip;
 
+// Unconditional on purpose. The broker protocol is pure `std::io` with no Win32
+// in it, and gating it on `windivert-backend` would keep its tests out of both
+// portable lanes of `just verify` — the only lanes that ever exercise it, since
+// the elevated side is untestable by construction.
+mod pipe;
+
 #[cfg(all(windows, feature = "windivert-backend"))]
 mod windivert;
 
@@ -10,9 +16,27 @@ use std::net::SocketAddr;
 use crate::error::Result;
 
 pub use ip::parse_segment;
+// Re-exported rather than left `pub` inside a private module: this crate is a
+// lib plus a bin, so only an item reachable from the crate root escapes
+// `dead_code`, and every lane builds with `-D warnings`. The broker (the sole
+// caller of `write_frame`) does not exist yet.
+pub use pipe::{
+    FRAME_FLAG_CAPTURE_LOSS, FRAME_KIND_DIAGNOSTIC, FRAME_KIND_FATAL, FRAME_KIND_PACKET,
+    PipeSource, write_frame,
+};
 
 #[cfg(all(windows, feature = "windivert-backend"))]
 pub use windivert::WinDivertSource;
+
+/// Largest packet the capture driver can deliver (`WINDIVERT_MTU_MAX`), and by
+/// extension the largest frame payload the broker may put on the pipe.
+/// Coalesced receives (RSC/LSO) routinely exceed the wire MTU, so anything
+/// smaller as a buffer makes `recv` fail on the first bulk transfer.
+///
+/// Lives here rather than in the backend because both ends of the pipe have to
+/// agree on it: the elevated side sizes its receive buffer from it, the
+/// unelevated side refuses any frame claiming more.
+pub const MAX_PACKET_BYTES: usize = 65_575;
 
 /// A blocking capture source paired with the capability that wakes it during
 /// session teardown. Keeping the pair together makes it impossible for the
