@@ -1094,8 +1094,14 @@ fn parse_command(line: &str) -> Option<Command> {
 
 /// Opens the compiled capture backend.
 ///
-/// Two arms, so both feature combinations build:
+/// Three arms, so every feature combination builds and exactly one of them
+/// applies:
 ///
+/// - **Npcap**, when `pcap-backend` is on, and it wins over WinDivert when both
+///   are compiled in. That precedence is the point of the feature: it exists to
+///   run the whole pipeline on an unelevated tap and compare, so a build that
+///   asks for it must get it rather than silently keeping the broker. Nothing is
+///   launched, nothing is elevated, and no UAC prompt appears.
 /// - **WinDivert, through the elevated broker**, when its feature is on. This
 ///   process never touches the driver: it launches a second copy of this exe
 ///   with an administrator token and reads raw IP packets back off a named pipe,
@@ -1112,7 +1118,18 @@ fn parse_command(line: &str) -> Option<Command> {
 /// UAC prompt sits in the middle of it. `spawn_elevated_broker` keeps that off
 /// the runtime's back (see its `blocking` helper), which is why this stays a
 /// plain synchronous call.
-#[cfg(all(windows, feature = "windivert-backend"))]
+#[cfg(all(windows, feature = "pcap-backend"))]
+fn build_source(config: &Config) -> Result<CaptureSource> {
+    use crate::capture::PcapSource;
+    info!(
+        port = config.game_port,
+        "opening the Npcap tap on every adapter (no elevation, no prompt)"
+    );
+    let (source, stop) = PcapSource::open(config.game_port)?;
+    Ok(CaptureSource::new(source, stop))
+}
+
+#[cfg(all(windows, feature = "windivert-backend", not(feature = "pcap-backend")))]
 fn build_source(config: &Config) -> Result<CaptureSource> {
     use crate::capture::{PipeSource, spawn_elevated_broker};
     info!(
@@ -1126,10 +1143,12 @@ fn build_source(config: &Config) -> Result<CaptureSource> {
     ))
 }
 
-#[cfg(not(all(windows, feature = "windivert-backend")))]
+#[cfg(not(all(windows, any(feature = "windivert-backend", feature = "pcap-backend"))))]
 fn build_source(_config: &Config) -> Result<CaptureSource> {
     Err(crate::Error::Capture(
-        "no capture backend compiled — enable `windivert-backend` (default) on Windows".to_owned(),
+        "no capture backend compiled — enable `windivert-backend` (default) or `pcap-backend` \
+         on Windows"
+            .to_owned(),
     ))
 }
 

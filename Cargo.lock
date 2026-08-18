@@ -122,6 +122,7 @@ dependencies = [
  "egui_kittest",
  "etherparse 0.20.3",
  "futures-util",
+ "libloading",
  "rustls",
  "serde",
  "serde_json",

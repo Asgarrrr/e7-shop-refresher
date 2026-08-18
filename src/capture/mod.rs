@@ -6,7 +6,12 @@ mod ip;
 // Gated with the backend rather than with `windows` alone, because without the
 // backend there is no broker to launch — and `windows-sys` itself is an optional
 // dependency this feature turns on.
-#[cfg(all(windows, feature = "windivert-backend"))]
+//
+// Also gated *off* by `pcap-backend`, which outranks WinDivert in
+// `app::build_source` when both are compiled: nothing would then ever launch a
+// broker, and every item in here would be dead code in a lane that builds with
+// `-D warnings`. The two cfgs must stay in step with that precedence.
+#[cfg(all(windows, feature = "windivert-backend", not(feature = "pcap-backend")))]
 mod elevate;
 
 // Unconditional on purpose. The broker protocol is pure `std::io` with no Win32
@@ -14,6 +19,13 @@ mod elevate;
 // portable lanes of `just verify` — the only lanes that ever exercise it, since
 // the elevated side is untestable by construction.
 mod pipe;
+
+// Experimental Npcap backend. Coexists with WinDivert rather than replacing it:
+// it captures from an *unelevated* process, so if it holds up it retires the
+// broker, the pipe and the UAC prompt — which is a decision to take on evidence,
+// not one to pre-empt by deleting the shipped path.
+#[cfg(all(windows, feature = "pcap-backend"))]
+mod pcap;
 
 #[cfg(all(windows, feature = "windivert-backend"))]
 mod windivert;
@@ -32,8 +44,10 @@ pub use pipe::{
     PipeSource, write_frame,
 };
 
-#[cfg(all(windows, feature = "windivert-backend"))]
+#[cfg(all(windows, feature = "windivert-backend", not(feature = "pcap-backend")))]
 pub(crate) use elevate::spawn_elevated_broker;
+#[cfg(all(windows, feature = "pcap-backend"))]
+pub use pcap::PcapSource;
 #[cfg(all(windows, feature = "windivert-backend"))]
 pub use windivert::WinDivertSource;
 
@@ -55,7 +69,10 @@ pub(crate) struct CaptureSource {
     pub(crate) stop: Box<dyn CaptureStop>,
 }
 
-#[cfg(any(test, all(windows, feature = "windivert-backend")))]
+#[cfg(any(
+    test,
+    all(windows, any(feature = "windivert-backend", feature = "pcap-backend"))
+))]
 impl CaptureSource {
     pub(crate) fn new(
         packets: impl PacketSource + 'static,

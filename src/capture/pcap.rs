@@ -1,0 +1,1220 @@
+//! Npcap capture backend: an unelevated, adapter-agnostic tap.
+//!
+//! # Why this exists
+//!
+//! The shipped WinDivert backend needs a kernel driver load, which needs
+//! administrator rights, which is why this product carries an elevated broker,
+//! a named pipe, a UAC prompt and everything under `capture::elevate`. Npcap's
+//! installer offers to leave its driver open to ordinary users (the `AdminOnly`
+//! option, off by default), and a measured probe on the development machine
+//! confirmed a **non-elevated** process capturing the game's traffic: 82 packets
+//! matched, 82 parsed, 0 unparsed, on the Wi-Fi adapter, `DLT_EN10MB`. This
+//! module is that probe turned into a real backend so the question "can the
+//! elevated architecture be retired?" can be answered against the whole
+//! pipeline rather than against a toy.
+//!
+//! It coexists with WinDivert on purpose: nothing here deletes or weakens the
+//! shipped path, and the feature is not in `default`.
+//!
+//! # Why `wpcap.dll` is loaded by hand
+//!
+//! The `pcap` crate links `wpcap.lib` statically. That would make the build
+//! require the Npcap SDK, and — worse — would make the shipped exe die *in the
+//! Windows loader, before `main`* on any machine without Npcap installed, with
+//! no message the player could act on. Loading the DLL through `libloading`
+//! keeps the binary startable everywhere and turns "Npcap is not installed"
+//! into an ordinary [`Error::Capture`] naming the download page.
+//!
+//! # Why every adapter is opened, and none is selected
+//!
+//! [`PcapSource::open`] enumerates the machine's devices and opens *all* of
+//! them, one thread and one handle each, each with its own kernel-side BPF
+//! filter. The filter is compiled into the driver per handle, so an adapter
+//! that carries no game traffic costs a parked thread and about a megabyte of
+//! kernel ring — nothing per packet, because the packets it does not match
+//! never leave the driver.
+//!
+//! That price buys the removal of every adapter heuristic. The machine this was
+//! measured on has an Ethernet interface holding an APIPA address while Wi-Fi
+//! carries the traffic, so "pick the adapter with a default route" or "pick the
+//! one with a real IP" would both have guessed wrong at least once; opening all
+//! of them also survives a mid-session Wi-Fi/Ethernet switch, a VPN coming up,
+//! or a docking station appearing, with no code at all. The cost of seeing the
+//! same packet on two adapters is likewise already paid: [`crate::stream`]
+//! dedupes by TCP sequence number, because it must already tolerate ordinary
+//! retransmissions.
+
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread::JoinHandle;
+
+use tracing::{debug, info, warn};
+
+use super::{CaptureStop, Direction, PacketSource, Segment, parse_segment};
+use crate::error::{Error, Result};
+
+/// Size libpcap requires of every error buffer it is handed. Not negotiable:
+/// the library writes up to this many bytes without asking.
+const PCAP_ERRBUF_SIZE: usize = 256;
+
+/// Bytes captured per packet.
+///
+/// Deliberately **not** [`super::MAX_PACKET_BYTES`] (65 575, the WinDivert
+/// driver's own maximum). Receive-side coalescing (RSC/LRO) hands the stack a
+/// single "packet" made of many wire frames, and the probe measured one of
+/// **48 870 bytes** on this machine — 32 times the MTU. 65 575 happened to be
+/// above that here; there is no reason it is above it everywhere, and a
+/// too-small snaplen does not fail, it silently truncates, which reaches
+/// `parse_segment` as a malformed packet and reads as a parser bug. 262 144 is
+/// libpcap's own documented ceiling, so this is simply "as much as it will
+/// give".
+const SNAPLEN: c_int = 262_144;
+
+/// Read timeout, in milliseconds. Bounds how long a capture thread can sit
+/// inside `pcap_next_ex` without looking at the stop flag, and therefore how
+/// long session teardown waits. Also how often each thread polls `pcap_stats`.
+const READ_TIMEOUT_MS: c_int = 200;
+
+/// Promiscuous mode off: only traffic addressed to this host is wanted, and
+/// asking the NIC for everything else would multiply the volume the kernel
+/// filter has to chew through for no gain.
+const PROMISCUOUS: c_int = 0;
+
+/// `pcap_compile`'s optimizer flag. On: the filter is evaluated per packet in
+/// the driver, so it is worth optimizing once at open time.
+const OPTIMIZE_FILTER: c_int = 1;
+
+/// Netmask handed to `pcap_compile`. The filter below uses no broadcast-relative
+/// primitive (`ip broadcast` and friends), which is the only thing the netmask
+/// feeds, so zero is correct rather than merely tolerated.
+const FILTER_NETMASK: c_uint = 0;
+
+// Link types this module knows how to strip. Anything else is skipped with a
+// named log line rather than guessed at: a wrong strip length does not fail, it
+// hands `parse_segment` bytes that are off by a few and produces a silent,
+// total parse failure that looks like a bug in the parser.
+const DLT_NULL: c_int = 0;
+const DLT_EN10MB: c_int = 1;
+const DLT_RAW: c_int = 12;
+/// Some libpcap builds number "raw IP, no link layer" differently.
+const DLT_RAW_ALT: c_int = 101;
+
+/// `pcap_next_ex` return codes. Only these four are defined for a live handle.
+const NEXT_EX_OK: c_int = 1;
+const NEXT_EX_TIMEOUT: c_int = 0;
+
+/// How many packet frames between two funnel lines on this side. Every captured
+/// packet passes through the funnel, so the line is periodic — plus once on the
+/// very first packet, so a capture that is about to reject everything says so
+/// immediately instead of after five hundred packets.
+const FUNNEL_LOG_EVERY: u64 = 500;
+
+/// How many packets a capture thread delivers between two `pcap_stats` polls.
+/// Stats are also polled on every read timeout, which covers an idle adapter;
+/// this covers a busy one, where timeouts may never happen.
+const STATS_EVERY_PACKETS: u64 = 512;
+
+// --- FFI -------------------------------------------------------------------
+//
+// Transcribed from `pcap.h` and, more importantly, **verified against a real
+// run** of the feasibility probe against Npcap 1.75. Only the fields this
+// module reads are named; the rest of each struct is present because the
+// library writes through the pointer and the layout has to match.
+
+#[repr(C)]
+struct PcapIf {
+    next: *mut PcapIf,
+    name: *mut c_char,
+    description: *mut c_char,
+    addresses: *mut c_void,
+    flags: c_uint,
+}
+
+/// libpcap's per-packet header.
+///
+/// The timestamp is a Windows `struct timeval`: two **32-bit** longs, so this
+/// struct is 16 bytes, not the 24 a 64-bit `time_t` would give. Getting it
+/// wrong is not a crash — `caplen` would read the tail of the timestamp and
+/// yield absurd lengths — which is why [`plausible_caplen`] guards every read.
+#[repr(C)]
+struct PcapPktHdr {
+    tv_sec: i32,
+    tv_usec: i32,
+    caplen: c_uint,
+    len: c_uint,
+}
+
+#[repr(C)]
+struct BpfProgram {
+    bf_len: c_uint,
+    bf_insns: *mut c_void,
+}
+
+/// `struct pcap_stat`.
+///
+/// libpcap defines three counters, and adds three Windows-only ones
+/// (`ps_capt`, `ps_sent`, `ps_netdrop`) that only `pcap_stats_ex` ever fills.
+/// All six are declared so the library can never write past this struct
+/// whichever build answers; only the first two are read.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct PcapStat {
+    ps_recv: c_uint,
+    ps_drop: c_uint,
+    ps_ifdrop: c_uint,
+    ps_capt: c_uint,
+    ps_sent: c_uint,
+    ps_netdrop: c_uint,
+}
+
+/// Opaque `pcap_t`.
+type PcapT = c_void;
+
+/// The subset of `wpcap.dll` this backend uses, resolved once at open time.
+///
+/// Every entry point is a stable libpcap export whose signature has not changed
+/// across the library's lifetime, so resolving them by name is safe in the sense
+/// that matters: a missing symbol is caught here, at load, not at the call.
+struct Wpcap {
+    /// Kept solely to pin the library in memory: the function pointers below
+    /// are only valid while it stays loaded.
+    _lib: libloading::Library,
+    findalldevs: unsafe extern "C" fn(*mut *mut PcapIf, *mut c_char) -> c_int,
+    freealldevs: unsafe extern "C" fn(*mut PcapIf),
+    open_live: unsafe extern "C" fn(*const c_char, c_int, c_int, c_int, *mut c_char) -> *mut PcapT,
+    close: unsafe extern "C" fn(*mut PcapT),
+    datalink: unsafe extern "C" fn(*mut PcapT) -> c_int,
+    datalink_val_to_name: unsafe extern "C" fn(c_int) -> *const c_char,
+    compile:
+        unsafe extern "C" fn(*mut PcapT, *mut BpfProgram, *const c_char, c_int, c_uint) -> c_int,
+    setfilter: unsafe extern "C" fn(*mut PcapT, *mut BpfProgram) -> c_int,
+    freecode: unsafe extern "C" fn(*mut BpfProgram),
+    next_ex: unsafe extern "C" fn(*mut PcapT, *mut *mut PcapPktHdr, *mut *const u8) -> c_int,
+    stats: unsafe extern "C" fn(*mut PcapT, *mut PcapStat) -> c_int,
+    geterr: unsafe extern "C" fn(*mut PcapT) -> *mut c_char,
+    lib_version: unsafe extern "C" fn() -> *const c_char,
+}
+
+/// Where `wpcap.dll` is looked for, in order.
+///
+/// The plain name resolves only when Npcap was installed in WinPcap-compatible
+/// mode (the installer default, but the player may have unchecked it); the
+/// second path is the private directory Npcap always writes to and is not on
+/// any DLL search path. Which one answered is logged, because "the plain name
+/// did not resolve" is the difference between a working and a broken install on
+/// a machine we cannot inspect.
+const DLL_CANDIDATES: [&str; 2] = ["wpcap.dll", r"C:\Windows\System32\Npcap\wpcap.dll"];
+
+/// What to tell a player who has no Npcap at all.
+const INSTALL_HINT: &str = "install Npcap from https://npcap.com/#download and leave \
+     \"Restrict Npcap driver's access to Administrators\" UNCHECKED";
+
+impl Wpcap {
+    fn load() -> Result<(Self, &'static str)> {
+        let mut failures = Vec::new();
+        for path in DLL_CANDIDATES {
+            // SAFETY: `Library::new` runs the DLL's entry point, which for
+            // `wpcap.dll` only initializes the library's own state. The symbols
+            // resolved just below are copied out as plain function pointers;
+            // they stay valid exactly as long as `_lib` — stored in the same
+            // struct, never separated from them — keeps the module loaded.
+            // Failure mode: the DLL is absent or is not a valid image, which
+            // surfaces as an `Err` here and is collected rather than fatal, so
+            // the second candidate still gets its turn.
+            let lib = match unsafe { libloading::Library::new(path) } {
+                Ok(lib) => lib,
+                Err(err) => {
+                    failures.push(format!("{path}: {err}"));
+                    continue;
+                }
+            };
+            // SAFETY: each `get` resolves one exported symbol and the
+            // transcribed signature is checked against `pcap.h` above; a name
+            // that does not exist returns `Err` and is reported rather than
+            // called. The returned `Symbol` borrows `lib`, but dereferencing it
+            // copies out a bare function pointer whose validity is tied to the
+            // module staying loaded, which `_lib` guarantees below.
+            let resolved = unsafe {
+                macro_rules! sym {
+                    ($name:literal) => {
+                        match lib.get($name) {
+                            Ok(symbol) => *symbol,
+                            Err(err) => {
+                                failures.push(format!(
+                                    "{path}: {} is missing ({err})",
+                                    String::from_utf8_lossy($name).trim_end_matches('\0')
+                                ));
+                                continue;
+                            }
+                        }
+                    };
+                }
+                Wpcap {
+                    findalldevs: sym!(b"pcap_findalldevs\0"),
+                    freealldevs: sym!(b"pcap_freealldevs\0"),
+                    open_live: sym!(b"pcap_open_live\0"),
+                    close: sym!(b"pcap_close\0"),
+                    datalink: sym!(b"pcap_datalink\0"),
+                    datalink_val_to_name: sym!(b"pcap_datalink_val_to_name\0"),
+                    compile: sym!(b"pcap_compile\0"),
+                    setfilter: sym!(b"pcap_setfilter\0"),
+                    freecode: sym!(b"pcap_freecode\0"),
+                    next_ex: sym!(b"pcap_next_ex\0"),
+                    stats: sym!(b"pcap_stats\0"),
+                    geterr: sym!(b"pcap_geterr\0"),
+                    lib_version: sym!(b"pcap_lib_version\0"),
+                    _lib: lib,
+                }
+            };
+            return Ok((resolved, path));
+        }
+        Err(Error::Capture(format!(
+            "could not load wpcap.dll ({}) — {INSTALL_HINT}",
+            failures.join("; ")
+        )))
+    }
+
+    fn version(&self) -> String {
+        // SAFETY: `pcap_lib_version` returns a pointer to a string constant
+        // owned by the library, valid for as long as the module is loaded and
+        // never freed by the caller.
+        cstr(unsafe { (self.lib_version)() })
+    }
+
+    /// The library's account of the last failure on `handle`.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a live `pcap_t` opened by this library.
+    unsafe fn error_text(&self, handle: *mut PcapT) -> String {
+        // SAFETY: delegated to the caller's contract; `pcap_geterr` returns a
+        // pointer into the handle's own error buffer, valid until the next call
+        // on that handle, and this copies it out immediately.
+        cstr(unsafe { (self.geterr)(handle) })
+    }
+}
+
+/// Copies a NUL-terminated C string, treating null as empty.
+fn cstr(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    // SAFETY: callers pass either a library-owned string constant or a pointer
+    // into a buffer that outlives this call; both are NUL-terminated, which is
+    // the only thing `from_ptr` requires. The result is copied before returning
+    // so nothing borrows the source.
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+// --- Link-layer stripping --------------------------------------------------
+
+/// How to get from a captured frame to the IP packet inside it.
+///
+/// Chosen per device from `pcap_datalink()`, never hardcoded: the same machine
+/// hands out Ethernet framing on a NIC, a four-byte pseudo-header on the
+/// loopback adapter, and bare IP on some VPN interfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkStrip {
+    /// `DLT_EN10MB`: 14 bytes, plus 4 for each VLAN tag.
+    Ethernet,
+    /// A header of fixed size with no optional parts — `DLT_NULL` (4) or
+    /// `DLT_RAW` (0).
+    Fixed(usize),
+}
+
+/// 802.1Q tag protocol identifier.
+const TPID_8021Q: u16 = 0x8100;
+/// 802.1ad ("QinQ") service tag protocol identifier.
+const TPID_8021AD: u16 = 0x88A8;
+/// Bytes of Ethernet header before the EtherType field.
+const ETHERTYPE_OFFSET: usize = 12;
+/// How many stacked VLAN tags are tolerated before a frame is given up on. Two
+/// covers 802.1ad's outer tag plus an inner 802.1Q one, which is as deep as
+/// anything a consumer machine will produce.
+const MAX_VLAN_TAGS: usize = 2;
+
+impl LinkStrip {
+    /// `None` for a link type this module cannot decode — the caller must skip
+    /// the device rather than guess a length.
+    fn for_datalink(datalink: c_int) -> Option<Self> {
+        match datalink {
+            DLT_EN10MB => Some(Self::Ethernet),
+            DLT_NULL => Some(Self::Fixed(4)),
+            DLT_RAW | DLT_RAW_ALT => Some(Self::Fixed(0)),
+            _ => None,
+        }
+    }
+
+    /// The IP packet inside `frame`, or `None` if the frame is too short or
+    /// carries a link header this cannot see past.
+    fn ip_bytes<'a>(&self, frame: &'a [u8]) -> Option<&'a [u8]> {
+        match self {
+            Self::Fixed(len) => frame.get(*len..),
+            Self::Ethernet => frame.get(ethernet_payload_offset(frame)?..),
+        }
+    }
+}
+
+/// Where the IP packet starts inside an Ethernet frame, accounting for VLAN
+/// tags.
+///
+/// A tagged frame pushes the EtherType four bytes further along for each tag,
+/// so a fixed 14-byte strip would hand `parse_segment` the last four bytes of
+/// the tag stack followed by the IP header — garbage that parses as nothing and
+/// looks exactly like a broken capture.
+///
+/// ⚠ **Untested.** The machine this backend was measured on has `VlanSupport=0`
+/// on its adapters, so no tagged frame was ever observed; this path exists
+/// because a player who *does* run tagged VLANs would otherwise see a silent,
+/// total parse failure with no clue as to why. If it ever needs debugging, the
+/// symptom is `unparsed` climbing in lockstep with `delivered`.
+fn ethernet_payload_offset(frame: &[u8]) -> Option<usize> {
+    let mut at = ETHERTYPE_OFFSET;
+    // `<=` so that `MAX_VLAN_TAGS` tags are accepted and the (MAX+1)-th is what
+    // falls through to `None`.
+    for _ in 0..=MAX_VLAN_TAGS {
+        let field = frame.get(at..at + 2)?;
+        let ethertype = u16::from_be_bytes([field[0], field[1]]);
+        if ethertype != TPID_8021Q && ethertype != TPID_8021AD {
+            return Some(at + 2);
+        }
+        at += 4;
+    }
+    None
+}
+
+/// Rejects a `caplen` that cannot have come from a correctly-laid-out
+/// [`PcapPktHdr`].
+///
+/// This is the canary for the one FFI mistake in this module that would not
+/// crash: a `timeval` declared with 64-bit members would shift `caplen` onto the
+/// low half of `tv_usec`, so every "length" would be a microsecond count instead
+/// — nonsense, but nonsense that reads and slices without faulting. The bound is
+/// the snaplen, because libpcap never reports more than it was asked to capture.
+///
+/// It is a canary, not a proof: a microsecond count happens to land inside
+/// `0..=SNAPLEN` about a quarter of the time, so a wrong layout would be caught
+/// within the first few packets rather than on the first one. That is enough —
+/// the failure is systematic, and one caught packet ends the session with a
+/// message naming the layout.
+fn plausible_caplen(caplen: c_uint) -> bool {
+    caplen != 0 && caplen <= SNAPLEN as c_uint
+}
+
+// --- Handles ---------------------------------------------------------------
+
+/// One opened, filtered adapter, owned by exactly one capture thread.
+///
+/// A `pcap_t` is not thread-safe, and this type is what makes that safe by
+/// construction: it is created on the opening thread, moved wholesale into its
+/// capture thread, and closed by [`Drop`] on whichever thread ends up owning it
+/// last. No two threads ever hold the same one.
+struct Handle {
+    wpcap: Arc<Wpcap>,
+    handle: *mut PcapT,
+    /// The `\Device\NPF_{...}` name, kept for log lines.
+    device: String,
+    strip: LinkStrip,
+}
+
+// SAFETY: `*mut PcapT` is not `Send` by default because libpcap makes no
+// thread-safety promise about concurrent use of one handle. This wrapper does
+// not make concurrent use possible: a `Handle` is an owning, non-`Clone`,
+// non-`Sync` value, so at most one thread can name it at any instant, and the
+// only transfer that happens is the single move into the capture thread at
+// spawn time. Nothing else in this module retains the raw pointer.
+unsafe impl Send for Handle {}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` was returned non-null by `pcap_open_live`, has
+        // not been closed (this is the only close, and `Handle` is not `Clone`),
+        // and no receive can be in flight because the thread that would issue it
+        // is the thread running this drop.
+        unsafe { (self.wpcap.close)(self.handle) };
+    }
+}
+
+/// Why one adapter did not make it into the capture set. Collected so that a
+/// zero-usable-device failure can say what actually happened on each one.
+struct Refusal {
+    device: String,
+    reason: String,
+}
+
+// --- Public source ---------------------------------------------------------
+
+/// Where packets that reach this process go to die.
+///
+/// The same instrument [`super::PipeSource`] carries, and deliberately a
+/// separate copy of it: its `delivered` counts frames read off a pipe, this one
+/// counts frames pulled off *n* adapters and stripped of their link header, and
+/// merging the two would mean touching the broker path this experiment must
+/// leave alone. Two things can drop a packet between the driver and the
+/// reassembler — the parser refusing it, and a segment travelling the wrong way
+/// — and each is individually plausible as the reason a healthy-looking session
+/// yields nothing. `delivered` staying at zero is itself the headline result:
+/// the adapters are open but the kernel filter matches no traffic.
+#[derive(Default)]
+struct Funnel {
+    delivered: u64,
+    unparsed: u64,
+    admitted: u64,
+    server_to_client: u64,
+}
+
+impl Funnel {
+    fn report(&self) {
+        if self.delivered != 1 && !self.delivered.is_multiple_of(FUNNEL_LOG_EVERY) {
+            return;
+        }
+        debug!(
+            delivered = self.delivered,
+            admitted = self.admitted,
+            server_to_client = self.server_to_client,
+            unparsed = self.unparsed,
+            "capture funnel"
+        );
+    }
+}
+
+/// A [`PacketSource`] fed by one capture thread per adapter.
+pub struct PcapSource {
+    /// Stripped IP packets, funnelled from every capture thread.
+    ///
+    /// Unbounded on purpose. A bounded channel would park a capture thread
+    /// outside the driver whenever the reassembler lagged, and the driver's ring
+    /// would overflow behind it — turning a transient consumer stall into real,
+    /// unrecoverable capture loss. Unbounded lets the consumer catch up; the
+    /// producers are already rate-limited by the kernel filter, which admits
+    /// only one TCP port's server-to-client traffic.
+    packets: Receiver<Vec<u8>>,
+    game_port: u16,
+    /// Set by any capture thread whose `pcap_stats` drop counter moved, and left
+    /// set until the capture loop asks for it.
+    capture_loss: Arc<AtomicBool>,
+    /// Shared with [`PcapStop`], and with every capture thread.
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+    funnel: Funnel,
+}
+
+/// Remote wake for a [`PcapSource`] parked on its channel.
+///
+/// A flag, not a handle operation, and that is the whole design. `pcap_close`
+/// from another thread while a receive is in flight is a use-after-free waiting
+/// to happen — the [`CaptureStop`] contract in [`super`] forbids exactly that,
+/// after it burned this codebase once. So teardown only stores `true`; each
+/// capture thread notices within one [`READ_TIMEOUT_MS`] window, closes its own
+/// handle, and drops its sender. When the last sender goes, the receiver in
+/// [`PacketSource::next_segment`] wakes with a disconnect, which is how the
+/// blocking call ends.
+///
+/// Idempotent by construction: storing `true` twice is storing `true`.
+pub(crate) struct PcapStop {
+    stop: Arc<AtomicBool>,
+}
+
+impl CaptureStop for PcapStop {
+    fn stop(&mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl PcapSource {
+    /// Opens every usable adapter and starts capturing.
+    ///
+    /// Blocking, and quick: enumeration plus one `pcap_open_live` and one filter
+    /// compile per device. Unlike the WinDivert path there is no UAC prompt in
+    /// the middle of it — that absence is the entire point of this backend.
+    ///
+    /// A device that fails to open, or reports a link type [`LinkStrip`] cannot
+    /// see past, is logged and skipped: a machine with a dozen virtual adapters
+    /// should not be blocked by whichever one of them refuses. Only *zero*
+    /// usable devices is fatal.
+    pub(crate) fn open(game_port: u16) -> Result<(Self, PcapStop)> {
+        let (wpcap, loaded_from) = Wpcap::load()?;
+        info!(
+            path = loaded_from,
+            version = %wpcap.version(),
+            plain_name_resolved = loaded_from == DLL_CANDIDATES[0],
+            "wpcap.dll loaded"
+        );
+        let wpcap = Arc::new(wpcap);
+
+        let devices = enumerate(&wpcap)?;
+        // Only the game server's own source port: the shop response is the only
+        // traffic this product decodes, and everything else is discarded in the
+        // driver rather than copied to user space and thrown away here.
+        let filter = format!("tcp and src port {game_port}");
+
+        let mut handles = Vec::new();
+        let mut refused = Vec::new();
+        for device in &devices {
+            match open_device(&wpcap, device, &filter) {
+                Ok(handle) => handles.push(handle),
+                Err(reason) => {
+                    warn!(device = %device, reason = %reason, "skipping adapter");
+                    refused.push(Refusal {
+                        device: device.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+
+        if handles.is_empty() {
+            return Err(no_usable_device_error(&devices, &refused));
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture_loss = Arc::new(AtomicBool::new(false));
+        let (sender, packets) = channel();
+        let mut threads = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let device = handle.device.clone();
+            let sender = sender.clone();
+            let stop = stop.clone();
+            let capture_loss = capture_loss.clone();
+            let thread = std::thread::Builder::new()
+                .name(format!("pcap-{}", short_device_name(&device)))
+                .spawn(move || capture_loop(handle, &sender, &stop, &capture_loss))
+                .map_err(|err| Error::Capture(format!("spawning a capture thread: {err}")))?;
+            threads.push(thread);
+        }
+        // The original sender must go, or the receiver could never observe a
+        // disconnect and `next_segment` would block forever after teardown.
+        drop(sender);
+
+        info!(
+            adapters = threads.len(),
+            skipped = refused.len(),
+            filter = %filter,
+            snaplen = SNAPLEN,
+            "Npcap capture open (passive copy; originals untouched)"
+        );
+
+        Ok((
+            Self {
+                packets,
+                game_port,
+                capture_loss,
+                stop: stop.clone(),
+                threads,
+                funnel: Funnel::default(),
+            },
+            PcapStop { stop },
+        ))
+    }
+}
+
+impl Drop for PcapSource {
+    /// Stops and joins the capture threads.
+    ///
+    /// Teardown normally goes through [`PcapStop`] first, so this is usually a
+    /// no-op join of already-finished threads. It exists for the paths that do
+    /// not — a dropped source with its stop handle still alive would otherwise
+    /// leave *n* threads capturing into a channel nobody reads.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        for thread in self.threads.drain(..) {
+            if thread.join().is_err() {
+                warn!("a capture thread panicked");
+            }
+        }
+    }
+}
+
+impl PacketSource for PcapSource {
+    fn next_segment(&mut self) -> Result<Segment> {
+        loop {
+            // A disconnect means every capture thread has exited: either the
+            // stop flag was set (teardown, and the caller is already shutting
+            // down) or every adapter errored out. Either way there will never be
+            // another packet, so this is the end of the source.
+            let packet = self.packets.recv().map_err(|_| {
+                Error::Capture("every Npcap capture thread exited — the tap is closed".to_owned())
+            })?;
+
+            self.funnel.delivered += 1;
+            // The link header is already gone: each capture thread strips its
+            // own adapter's framing, because the strip length is a property of
+            // the adapter and nothing down here knows which one a packet came
+            // from. What arrives is a raw IP packet, exactly the shape the
+            // broker forwards, so the parser is shared verbatim.
+            let Some(segment) = parse_segment(&packet, self.game_port) else {
+                self.funnel.unparsed += 1;
+                self.funnel.report();
+                continue;
+            };
+
+            self.funnel.admitted += 1;
+            if segment.direction == Direction::ServerToClient {
+                self.funnel.server_to_client += 1;
+                if self.funnel.server_to_client == 1 {
+                    // The shop response travels in this direction only, so this
+                    // line is the proof that the filter, the port, the adapter
+                    // choice and the link-layer strip all agree. Its *absence*
+                    // in a session log means capture is open but sees nothing
+                    // from the game server.
+                    info!(
+                        payload = segment.payload.len(),
+                        syn = segment.syn,
+                        server = %segment.flow.server,
+                        client = %segment.flow.client,
+                        "first server-to-client segment admitted"
+                    );
+                }
+            }
+            self.funnel.report();
+            return Ok(segment);
+        }
+    }
+
+    fn take_capture_loss(&mut self) -> bool {
+        self.capture_loss.swap(false, Ordering::AcqRel)
+    }
+}
+
+// --- Device enumeration and opening ----------------------------------------
+
+/// Every capture device the driver will admit to, by name.
+///
+/// An empty list is not an error here — [`no_usable_device_error`] is what turns
+/// it into one, because it is also the signature of `AdminOnly=1` and deserves a
+/// message that says so.
+fn enumerate(wpcap: &Wpcap) -> Result<Vec<String>> {
+    let mut errbuf = [0 as c_char; PCAP_ERRBUF_SIZE];
+    let mut alldevs: *mut PcapIf = std::ptr::null_mut();
+    // SAFETY: `alldevs` is a live out-parameter that receives a list owned by
+    // the library; `errbuf` is exactly `PCAP_ERRBUF_SIZE` bytes as the API
+    // requires and outlives the call. On failure nothing is allocated and
+    // `alldevs` is untouched, so the early return below leaks nothing.
+    let rc = unsafe { (wpcap.findalldevs)(&mut alldevs, errbuf.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(Error::Capture(format!(
+            "pcap_findalldevs: {}",
+            cstr(errbuf.as_ptr())
+        )));
+    }
+
+    let mut names = Vec::new();
+    let mut cursor = alldevs;
+    while !cursor.is_null() {
+        // SAFETY: `cursor` walks the library-owned list returned above, which
+        // stays valid until the `pcap_freealldevs` below; every `next` is either
+        // null or the next node, and `name` is a NUL-terminated string owned by
+        // that same list. Nothing read here outlives the copy `cstr` makes.
+        unsafe {
+            let device = &*cursor;
+            let name = cstr(device.name);
+            let description = cstr(device.description);
+            if !name.is_empty() {
+                debug!(device = %name, description = %description, "adapter enumerated");
+                names.push(name);
+            }
+            cursor = device.next;
+        }
+    }
+    // SAFETY: `alldevs` is the list `pcap_findalldevs` allocated above, freed
+    // exactly once, and no pointer into it is retained — every string was copied.
+    unsafe { (wpcap.freealldevs)(alldevs) };
+    Ok(names)
+}
+
+/// Opens `device`, checks its link type and installs the kernel-side filter.
+///
+/// The `Err` is the human-readable reason this adapter is unusable, not a fatal
+/// error: the caller logs it and moves on to the next one.
+fn open_device(
+    wpcap: &Arc<Wpcap>,
+    device: &str,
+    filter: &str,
+) -> std::result::Result<Handle, String> {
+    let device_c = CString::new(device).map_err(|_| "device name contains a NUL".to_owned())?;
+    let filter_c = CString::new(filter).map_err(|_| "filter contains a NUL".to_owned())?;
+    let mut errbuf = [0 as c_char; PCAP_ERRBUF_SIZE];
+
+    // SAFETY: `device_c` and `errbuf` outlive the call and are, respectively, a
+    // NUL-terminated name and a `PCAP_ERRBUF_SIZE` buffer. A null return means
+    // failure, with the reason in `errbuf`, and is handled without ever
+    // dereferencing the returned pointer.
+    let raw = unsafe {
+        (wpcap.open_live)(
+            device_c.as_ptr(),
+            SNAPLEN,
+            PROMISCUOUS,
+            READ_TIMEOUT_MS,
+            errbuf.as_mut_ptr(),
+        )
+    };
+    if raw.is_null() {
+        return Err(format!("pcap_open_live: {}", cstr(errbuf.as_ptr())));
+    }
+    // Owning wrapper first, so every failure below closes the handle by drop
+    // rather than by a `pcap_close` that has to be repeated on each path. The
+    // strip is provisional until `pcap_datalink` has answered — it cannot be
+    // asked before the handle exists, and the handle must not exist unowned.
+    let mut handle = Handle {
+        wpcap: wpcap.clone(),
+        handle: raw,
+        device: device.to_owned(),
+        strip: LinkStrip::Fixed(0),
+    };
+
+    // SAFETY: `handle.handle` is the live, non-null `pcap_t` just opened, and
+    // this thread is its only user until it is moved into a capture thread.
+    // `datalink_val_to_name` returns a library-owned string constant (or null,
+    // which `cstr` tolerates).
+    let (datalink, datalink_name) = unsafe {
+        let datalink = (wpcap.datalink)(handle.handle);
+        (datalink, cstr((wpcap.datalink_val_to_name)(datalink)))
+    };
+    let Some(strip) = LinkStrip::for_datalink(datalink) else {
+        return Err(format!(
+            "link type {datalink_name} (DLT {datalink}) cannot be stripped to an IP packet"
+        ));
+    };
+    handle.strip = strip;
+
+    let mut program = BpfProgram {
+        bf_len: 0,
+        bf_insns: std::ptr::null_mut(),
+    };
+    // SAFETY: `program` is a live, zeroed out-parameter that `pcap_compile`
+    // fills on success and leaves alone on failure; `filter_c` is a
+    // NUL-terminated expression alive for the call. On success the compiled
+    // program owns a heap allocation, released by `pcap_freecode` on every path
+    // below before this scope ends. `pcap_setfilter` copies the program into the
+    // driver, so freeing it immediately afterwards is correct.
+    unsafe {
+        if (wpcap.compile)(
+            handle.handle,
+            &mut program,
+            filter_c.as_ptr(),
+            OPTIMIZE_FILTER,
+            FILTER_NETMASK,
+        ) != 0
+        {
+            return Err(format!(
+                "pcap_compile({filter}): {}",
+                wpcap.error_text(handle.handle)
+            ));
+        }
+        let installed = (wpcap.setfilter)(handle.handle, &mut program);
+        let failure = (installed != 0).then(|| wpcap.error_text(handle.handle));
+        (wpcap.freecode)(&mut program);
+        if let Some(failure) = failure {
+            return Err(format!("pcap_setfilter: {failure}"));
+        }
+    }
+
+    debug!(
+        device = %device,
+        link = %datalink_name,
+        datalink,
+        ?strip,
+        "adapter opened and filtered"
+    );
+    Ok(handle)
+}
+
+/// Turns "no adapter survived" into a message that names a cause.
+///
+/// The two failures worth telling apart are indistinguishable from the return
+/// codes alone: Npcap present but restricted to administrators hands back an
+/// empty device list (or access-denied opens) from an unelevated process, which
+/// looks identical to a machine that simply has no adapters. `AdminOnly` in the
+/// registry is what settles it — on the machine this backend was measured on it
+/// reads 0.
+fn no_usable_device_error(devices: &[String], refused: &[Refusal]) -> Error {
+    if npcap_admin_only().is_some_and(|value| value != 0) {
+        return Error::Capture(
+            "Npcap is installed but its driver is restricted to administrators \
+             (HKLM\\SYSTEM\\CurrentControlSet\\Services\\npcap\\Parameters\\AdminOnly is set): \
+             reinstall it with \"Restrict Npcap driver's access to Administrators\" unchecked, \
+             or run this app elevated"
+                .to_owned(),
+        );
+    }
+    if devices.is_empty() {
+        return Error::Capture(format!(
+            "Npcap enumerated no capture device at all — if this machine has a working \
+             network adapter, the driver is probably not running: {INSTALL_HINT}"
+        ));
+    }
+    let reasons = refused
+        .iter()
+        .map(|refusal| format!("{}: {}", short_device_name(&refusal.device), refusal.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Error::Capture(format!(
+        "none of the {} adapter(s) Npcap enumerated could be captured on — {reasons}",
+        devices.len()
+    ))
+}
+
+/// The `AdminOnly` value of the Npcap service, or `None` when it is unset or
+/// unreadable (which Npcap treats as permissive).
+fn npcap_admin_only() -> Option<u32> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW,
+    };
+
+    let subkey = wide(r"SYSTEM\CurrentControlSet\Services\npcap\Parameters");
+    let value = wide("AdminOnly");
+    let mut data: u32 = 0;
+    let mut size = size_of::<u32>() as u32;
+    // SAFETY: `subkey` and `value` are NUL-terminated UTF-16 buffers owned by
+    // this frame and alive across the call. `data` and `size` are stack slots;
+    // `size` is initialized to exactly `data`'s size and `RRF_RT_REG_DWORD`
+    // restricts the call to writing a `DWORD` into it, so no over-write is
+    // possible. `HKEY_LOCAL_MACHINE` is a predefined key that needs no close.
+    // Failure mode: a `WIN32_ERROR` return, with `data` untouched — hence the
+    // status check before it is read.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&raw mut data).cast(),
+            &mut size,
+        )
+    };
+    (status == ERROR_SUCCESS).then_some(data)
+}
+
+/// NUL-terminated UTF-16, as every `...W` entry point wants it.
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// `\Device\NPF_{GUID}` is unreadable in a log line; the GUID alone is enough to
+/// tell two adapters apart.
+fn short_device_name(device: &str) -> &str {
+    device.rsplit('\\').next().unwrap_or(device)
+}
+
+// --- Capture thread --------------------------------------------------------
+
+/// One adapter's receive loop: strip, forward, and watch the driver's drop
+/// counter. Parses nothing — [`PcapSource::next_segment`] does that, once, for
+/// every adapter.
+///
+/// Returns when the stop flag is set, when the receiver has gone away, or when
+/// the handle reports an error. An error kills only this adapter: the others
+/// keep capturing, which matters precisely because this backend opens adapters
+/// it has no reason to believe in.
+fn capture_loop(
+    handle: Handle,
+    packets: &Sender<Vec<u8>>,
+    stop: &AtomicBool,
+    capture_loss: &AtomicBool,
+) {
+    let wpcap: &Wpcap = &handle.wpcap;
+    let mut delivered: u64 = 0;
+    let mut unstrippable: u64 = 0;
+    let mut dropped: c_uint = 0;
+    let mut error: Option<String> = None;
+
+    while !stop.load(Ordering::Acquire) {
+        let mut header: *mut PcapPktHdr = std::ptr::null_mut();
+        let mut data: *const u8 = std::ptr::null();
+        // SAFETY: `handle.handle` is this thread's exclusive live `pcap_t`.
+        // `header` and `data` are out-parameters the library points at its own
+        // buffers; on return code 1 both are non-null and the bytes they
+        // describe stay valid until the next call on this handle, which is why
+        // the copy below happens before looping. Any other return code leaves
+        // them unspecified and is handled without dereferencing.
+        let rc = unsafe { (wpcap.next_ex)(handle.handle, &mut header, &mut data) };
+        match rc {
+            NEXT_EX_OK => {
+                if header.is_null() || data.is_null() {
+                    continue;
+                }
+                // SAFETY: return code 1 guarantees `header` points at a
+                // fully-written `PcapPktHdr` owned by the library.
+                let caplen = unsafe { (*header).caplen };
+                if !plausible_caplen(caplen) {
+                    error = Some(format!(
+                        "pcap reported a {caplen}-byte capture, which is impossible at a \
+                         snaplen of {SNAPLEN} — the pcap_pkthdr layout is wrong, so this \
+                         adapter's data cannot be trusted"
+                    ));
+                    break;
+                }
+                // SAFETY: return code 1 guarantees `data` points at `caplen`
+                // readable bytes (checked plausible just above, and bounded by
+                // the snaplen the handle was opened with). The slice is consumed
+                // — copied into an owned `Vec` — before the next `pcap_next_ex`
+                // on this handle invalidates it.
+                let frame = unsafe { std::slice::from_raw_parts(data, caplen as usize) };
+                delivered += 1;
+                let Some(ip) = handle.strip.ip_bytes(frame) else {
+                    // A frame too short to hold its own link header, or with a
+                    // VLAN stack deeper than this strips. Counted separately so
+                    // that "the adapter delivers, but nothing survives the
+                    // strip" is legible in this thread's closing line.
+                    unstrippable += 1;
+                    continue;
+                };
+                if packets.send(ip.to_vec()).is_err() {
+                    break; // The source is gone; nothing left to feed.
+                }
+                if delivered.is_multiple_of(STATS_EVERY_PACKETS) {
+                    poll_drops(wpcap, &handle, &mut dropped, capture_loss);
+                }
+            }
+            // Read timeout. Normal, and the only moment an idle adapter gets to
+            // look at the stop flag or at its drop counter.
+            NEXT_EX_TIMEOUT => poll_drops(wpcap, &handle, &mut dropped, capture_loss),
+            _ => {
+                // SAFETY: the handle is still live and exclusively this thread's;
+                // `pcap_geterr` reads its internal error buffer.
+                error = Some(unsafe { wpcap.error_text(handle.handle) });
+                break;
+            }
+        }
+    }
+
+    match error {
+        Some(error) => warn!(
+            device = %short_device_name(&handle.device),
+            delivered,
+            unstrippable,
+            dropped,
+            error = %error,
+            "adapter capture ended on an error"
+        ),
+        None => debug!(
+            device = %short_device_name(&handle.device),
+            delivered,
+            unstrippable,
+            dropped,
+            "adapter capture ended"
+        ),
+    }
+    // `handle` drops here, on the thread that owned it, closing the `pcap_t`.
+}
+
+/// Reads the driver's counters and reports any *new* drop as capture loss.
+///
+/// `ps_drop` is packets the kernel had to throw away because the capture ring
+/// was full. A passive tap never sees already-ACKed bytes again, so a hole left
+/// this way can never be filled by a retransmission — which is exactly the
+/// condition [`PacketSource::take_capture_loss`] exists to report, and the
+/// capture loop turns into a resync instead of a permanent stall.
+fn poll_drops(wpcap: &Wpcap, handle: &Handle, previous: &mut c_uint, capture_loss: &AtomicBool) {
+    let mut stats = PcapStat::default();
+    // SAFETY: `stats` is a live, fully-initialized `pcap_stat` of the layout the
+    // library expects (with room for the Windows-only tail it may or may not
+    // write), and `handle.handle` is this thread's exclusive live `pcap_t`. A
+    // non-zero return means the counters were not written, so they are only read
+    // on success.
+    if unsafe { (wpcap.stats)(handle.handle, &mut stats) } != 0 {
+        return;
+    }
+    // Wrapping: these are 32-bit counters that will roll over on a long-lived
+    // handle, and a rollover must read as "some loss", never as a huge negative.
+    let delta = stats.ps_drop.wrapping_sub(*previous);
+    if delta == 0 {
+        return;
+    }
+    *previous = stats.ps_drop;
+    capture_loss.store(true, Ordering::Release);
+    warn!(
+        device = %short_device_name(&handle.device),
+        lost = delta,
+        total = stats.ps_drop,
+        received = stats.ps_recv,
+        "the capture driver dropped packets — the byte stream has a hole in it"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds an Ethernet frame with `tags` VLAN tags in front of an IPv4
+    /// EtherType, followed by `payload`.
+    fn ethernet_frame(tags: &[u16], payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0xAAu8; ETHERTYPE_OFFSET];
+        for tag in tags {
+            frame.extend_from_slice(&tag.to_be_bytes());
+            frame.extend_from_slice(&[0x00, 0x64]); // priority/VID, unread
+        }
+        frame.extend_from_slice(&0x0800u16.to_be_bytes()); // IPv4
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn every_link_type_this_backend_accepts_maps_to_its_own_strip_length() {
+        assert_eq!(
+            LinkStrip::for_datalink(DLT_EN10MB),
+            Some(LinkStrip::Ethernet)
+        );
+        assert_eq!(LinkStrip::for_datalink(DLT_NULL), Some(LinkStrip::Fixed(4)));
+        assert_eq!(LinkStrip::for_datalink(DLT_RAW), Some(LinkStrip::Fixed(0)));
+        assert_eq!(
+            LinkStrip::for_datalink(DLT_RAW_ALT),
+            Some(LinkStrip::Fixed(0))
+        );
+    }
+
+    #[test]
+    fn an_unknown_link_type_yields_no_strip_so_the_device_is_skipped_rather_than_guessed_at() {
+        // 105 is DLT_IEEE802_11 — real 802.11 framing, which is precisely the
+        // case the ADR rejected NIC capture over and which must not be guessed.
+        for datalink in [105, 127, 143, -1, 1000] {
+            assert_eq!(LinkStrip::for_datalink(datalink), None, "DLT {datalink}");
+        }
+    }
+
+    #[test]
+    fn a_fixed_strip_removes_exactly_its_header_and_refuses_a_frame_shorter_than_it() {
+        assert_eq!(
+            LinkStrip::Fixed(0).ip_bytes(b"\x45raw ip"),
+            Some(b"\x45raw ip".as_slice())
+        );
+        assert_eq!(
+            LinkStrip::Fixed(4).ip_bytes(b"\x02\x00\x00\x00ip"),
+            Some(b"ip".as_slice())
+        );
+        // A four-byte loopback header with nothing behind it is an empty packet,
+        // not a failure; one byte short of the header is a failure.
+        assert_eq!(
+            LinkStrip::Fixed(4).ip_bytes(b"\x02\x00\x00\x00"),
+            Some(b"".as_slice())
+        );
+        assert_eq!(LinkStrip::Fixed(4).ip_bytes(b"\x02\x00\x00"), None);
+    }
+
+    #[test]
+    fn an_untagged_ethernet_frame_loses_exactly_fourteen_bytes() {
+        let frame = ethernet_frame(&[], b"ip packet");
+        assert_eq!(ethernet_payload_offset(&frame), Some(14));
+        assert_eq!(
+            LinkStrip::Ethernet.ip_bytes(&frame),
+            Some(b"ip packet".as_slice())
+        );
+    }
+
+    #[test]
+    fn a_vlan_tag_pushes_the_ip_packet_four_bytes_further_along() {
+        for tpid in [TPID_8021Q, TPID_8021AD] {
+            let frame = ethernet_frame(&[tpid], b"ip packet");
+            assert_eq!(ethernet_payload_offset(&frame), Some(18), "tpid {tpid:#x}");
+            assert_eq!(
+                LinkStrip::Ethernet.ip_bytes(&frame),
+                Some(b"ip packet".as_slice()),
+                "tpid {tpid:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_double_tagged_qinq_frame_loses_both_tags() {
+        let frame = ethernet_frame(&[TPID_8021AD, TPID_8021Q], b"ip packet");
+        assert_eq!(ethernet_payload_offset(&frame), Some(22));
+        assert_eq!(
+            LinkStrip::Ethernet.ip_bytes(&frame),
+            Some(b"ip packet".as_slice())
+        );
+    }
+
+    #[test]
+    fn a_vlan_stack_deeper_than_this_strips_is_refused_rather_than_mis_stripped() {
+        let frame = ethernet_frame(&[TPID_8021AD, TPID_8021Q, TPID_8021Q], b"ip packet");
+        assert_eq!(ethernet_payload_offset(&frame), None);
+        assert_eq!(LinkStrip::Ethernet.ip_bytes(&frame), None);
+    }
+
+    #[test]
+    fn an_ethernet_frame_too_short_to_hold_its_ethertype_is_refused() {
+        assert_eq!(ethernet_payload_offset(&[0xAA; 13]), None);
+        assert_eq!(LinkStrip::Ethernet.ip_bytes(&[0xAA; 13]), None);
+        // Exactly fourteen bytes: a header and an empty packet, which is legal.
+        assert_eq!(
+            LinkStrip::Ethernet.ip_bytes(&ethernet_frame(&[], b"")),
+            Some(b"".as_slice())
+        );
+    }
+
+    #[test]
+    fn the_stripped_bytes_of_a_real_ethernet_frame_parse_as_a_segment() {
+        // The end-to-end shape of this backend in one assertion: an Ethernet
+        // frame in, the app's own `parse_segment` out. Anything wrong with the
+        // strip length shows up here as a `None`.
+        use etherparse::PacketBuilder;
+
+        const GAME_PORT: u16 = 3333;
+        let builder = PacketBuilder::ipv4([104, 116, 20, 111], [192, 168, 1, 10], 64)
+            .tcp(GAME_PORT, 51_000, 1000, 64_240);
+        let mut packet = Vec::with_capacity(builder.size(2));
+        builder.write(&mut packet, b"AB").expect("write packet");
+
+        let frame = ethernet_frame(&[], &packet);
+        let ip = LinkStrip::Ethernet.ip_bytes(&frame).expect("strip");
+        let segment = parse_segment(ip, GAME_PORT).expect("parse");
+        assert_eq!(segment.direction, Direction::ServerToClient);
+        assert_eq!(segment.seq, 1000);
+        assert_eq!(segment.payload, b"AB");
+    }
+
+    #[test]
+    fn a_caplen_outside_the_snaplen_is_rejected_as_a_pkthdr_layout_error() {
+        assert!(plausible_caplen(1));
+        assert!(plausible_caplen(SNAPLEN as c_uint));
+        assert!(!plausible_caplen(0));
+        assert!(!plausible_caplen(SNAPLEN as c_uint + 1));
+        // What a 64-bit `timeval` would produce: a microsecond count read as a
+        // length. Most of that range is out of bounds and caught here; the part
+        // below the snaplen is not, which is why this is a canary rather than a
+        // proof (see `plausible_caplen`).
+        assert!(!plausible_caplen(999_999));
+        assert!(!plausible_caplen(0)); // a zero-length "packet" cannot exist
+    }
+
+    #[test]
+    fn the_windows_pcap_pkthdr_is_sixteen_bytes_because_its_timeval_is_two_longs() {
+        // The single most dangerous constant in this file: a 24-byte header
+        // would put `caplen` where `tv_usec` is and report nonsense lengths
+        // instead of crashing.
+        assert_eq!(size_of::<PcapPktHdr>(), 16);
+        assert_eq!(size_of::<PcapStat>(), 24);
+    }
+
+    /// Live smoke check, never run by CI (`#[ignore]`, and CI has neither an
+    /// adapter nor Npcap). Run it by hand on a machine with Npcap to confirm the
+    /// dynamic load, the enumeration and the per-adapter open all still work:
+    ///
+    /// ```text
+    /// cargo test --no-default-features --features pcap-backend -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs Npcap and a real adapter"]
+    fn the_tap_opens_on_this_machine_without_elevation() {
+        let (source, mut stop) = PcapSource::open(3333).expect("open the Npcap tap");
+        assert!(!source.threads.is_empty(), "at least one adapter must open");
+        println!("adapters capturing: {}", source.threads.len());
+        stop.stop().expect("stop is infallible");
+    }
+
+    #[test]
+    fn a_device_path_is_logged_by_its_trailing_component() {
+        assert_eq!(
+            short_device_name(r"\Device\NPF_{A1B2-C3D4}"),
+            "NPF_{A1B2-C3D4}"
+        );
+        assert_eq!(short_device_name("lo0"), "lo0");
+    }
+}

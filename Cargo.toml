@@ -18,6 +18,15 @@ default = ["windivert-backend", "gui", "actuator"]
 # `LoadLibraryW` (the delay-loaded WinDivert.dll is preloaded by full path from
 # its extracted app-data location) and for the runtime-dir DACL hardening.
 windivert-backend = ["dep:windivert", "dep:windows-sys"]
+# Experimental Npcap capture backend, deliberately NOT in `default`. Taps every
+# adapter through `wpcap.dll` from an ordinary, *unelevated* process — no driver
+# load, no broker, no UAC prompt — which is the whole question it exists to
+# answer. Pulls `libloading` because the DLL is resolved at runtime rather than
+# linked (a static link would need the Npcap SDK to build and would kill the exe
+# in the Windows loader on a machine without Npcap), and windows-sys for the one
+# registry read that tells "Npcap is admins-only" apart from "no adapters".
+# Wins over `windivert-backend` in `app::build_source` when both are compiled.
+pcap-backend = ["dep:libloading", "dep:windows-sys"]
 # egui window over the session (dashboard + player commands). Disable for the
 # console-only build.
 gui = ["dep:eframe"]
@@ -66,6 +75,9 @@ eframe = { version = "0.35", optional = true, default-features = false, features
 # `.cargo/config.toml` — `WINDIVERT_STATIC` compiles the vendor C in-tree and
 # the resulting object breaks the release build's stack-guard probing.
 windivert = { version = "0.7.0-beta.4", optional = true }
+# Runtime resolution of `wpcap.dll` for the Npcap backend. Never a link-time
+# dependency: see the `pcap-backend` feature comment above.
+libloading = { version = "0.8", optional = true }
 windows-sys = { version = "0.61", optional = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
