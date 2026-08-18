@@ -1335,7 +1335,7 @@ mod tests {
     #[test]
     fn an_error_buffer_is_read_up_to_its_terminator_and_no_further() {
         let mut errbuf = [0 as c_char; PCAP_ERRBUF_SIZE];
-        for (slot, byte) in errbuf.iter_mut().zip(b"pcap_open_live failed junk") {
+        for (slot, byte) in errbuf.iter_mut().zip(b"pcap_open_live failed\0junk") {
             *slot = byte.cast_signed();
         }
         assert_eq!(errbuf_text(&errbuf), "pcap_open_live failed");
