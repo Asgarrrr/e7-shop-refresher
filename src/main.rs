@@ -1,103 +1,30 @@
 //! Entry point for the Secret Shop relay.
+//!
+//! Dispatch only. The startup *policy* — where the config and the log live, how
+//! logging degrades when its directory is unwritable, what a player is told
+//! about retired config keys, and the exit-code contract — lives in `lib.rs`,
+//! where `cargo test` can reach it (see `proj-003`). What has to stay here is
+//! the crate-level `windows_subsystem` attribute, which is an attribute on the
+//! *binary*, and the two `run_mode` arms, which own the OS main thread.
 
 // The windowed build is a real windowed app: no console opens beside the
 // window. Everything player-facing flows through the journal/banner; stdout
 // and stdin become inert sinks there (the console build keeps them).
 #![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
+// Shipped code has none of these today (measured: 0 sites in --lib --bins).
+// `not(test)` keeps the ratchet off the test harness, where `unwrap` in a
+// fixture is the correct spelling — 257 sites and rising. The rest of the
+// lint policy lives in Cargo.toml's `[lints]`; these two cannot, because a
+// `[lints]` table applies to every target including the tests.
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::panic))]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::writer::BoxMakeWriter;
-
-use arkyve_refresh_shop::{Config, app, crash, migrate};
-
-/// Location of the config file. The app owns this file (the GUI's Setup/Apply
-/// writes it); the player isn't expected to hand-edit it, so it lives out of
-/// the way in per-user roaming app-data on Windows —
-/// `%APPDATA%\arkyve-refresh-shop\config.toml` — rather than beside the exe.
-/// If `APPDATA` is somehow unset, or on non-Windows dev machines (mac), it
-/// falls back to a `config.toml` in the working directory.
-fn config_path() -> PathBuf {
-    #[cfg(windows)]
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        return PathBuf::from(appdata)
-            .join(arkyve_refresh_shop::APP_DIR)
-            .join("config.toml");
-    }
-    PathBuf::from("config.toml")
-}
-
-/// On first run no config file exists yet. Write the bundled example (compiled
-/// into the exe) to the resolved path so the player finds a real, commented
-/// file at the standard location — and a valid one: the example carries the
-/// default hunt `[filter]`, which the relay requires to start. Best-effort:
-/// any failure is ignored and `Config::load` falls back to the in-memory
-/// defaults, exactly as before.
-fn seed_config_if_missing(path: &std::path::Path) {
-    if path.exists() {
-        return;
-    }
-    const EXAMPLE: &str = include_str!("../config.example.toml");
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, EXAMPLE);
-}
-
-/// Where the rotated log files live: next to `crash.log`, in per-user *local*
-/// app-data (logs are machine-local, they must not roam). Falls back to the
-/// temp dir when `LOCALAPPDATA` is unset (non-Windows dev machines).
-fn log_dir() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(arkyve_refresh_shop::APP_DIR)
-        .join("logs")
-}
-
-/// Installs the tracing subscriber over a daily-rotated file.
-///
-/// The windowed build has no console — stdout and stderr are inert sinks —
-/// so a stdout subscriber loses every event the moment the app ships. The
-/// returned guard flushes the non-blocking writer on drop: it MUST live until
-/// the end of `main`, or the last (most interesting) lines never hit disk.
-#[must_use = "the worker guard flushes the log on drop; keep it alive"]
-fn install_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    let (writer, guard) = match tracing_appender::rolling::Builder::new()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix(arkyve_refresh_shop::APP_DIR)
-        .filename_suffix("log")
-        // A player leaves this running for days: cap the disk footprint.
-        .max_log_files(5)
-        .build(log_dir())
-    {
-        Ok(appender) => {
-            let (writer, guard) = tracing_appender::non_blocking(appender);
-            (BoxMakeWriter::new(writer), Some(guard))
-        }
-        // Unwritable log dir: fall back to stdout rather than to no
-        // subscriber at all — inert in the windowed build, real in the
-        // console one.
-        Err(_) => (BoxMakeWriter::new(std::io::stdout), None),
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            // `try_from_default_env`, not `from_default_env`: a malformed
-            // RUST_LOG must not kill the app. `journal=info` keeps the
-            // player-facing lines (emitted on that target) in the file — the
-            // crate-level directive does not cover them.
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("arkyve_refresh_shop=debug,journal=info,warn")),
-        )
-        .with_writer(writer)
-        // A file is not a terminal: escape codes would only make it unreadable.
-        .with_ansi(false)
-        .with_target(false)
-        .init();
-    guard
-}
+use arkyve_refresh_shop::{
+    Config, app, config_path, crash, exit_code, fatal, install_logging, migrate,
+    seed_config_if_missing, strip_and_report_retired_keys,
+};
 
 fn main() -> ExitCode {
     // Ahead of `install_logging`, and that ordering is the point: an install
@@ -111,19 +38,39 @@ fn main() -> ExitCode {
     // Before anything can panic: capture panics to a file. In the windowed
     // build stdout/stderr are inert, and a panic on a worker task or the
     // capture thread would otherwise vanish (surfacing only as a bare
-    // "session ended").
+    // "session ended"). The hook also emits a `tracing` line, which is a no-op
+    // until the subscriber below exists — deliberately, the file is the primary
+    // record.
     crash::install();
+
+    // Held to the end of `main`: dropping it flushes the log writer. The
+    // `LogSetup` beside it carries what could not be said before the subscriber
+    // existed — including "there is no log file", the one failure in this crate
+    // that would otherwise conceal itself completely.
+    let (_log_guard, log_setup) = install_logging();
+    // Cause before effect: a failed DACL reset is *why* the log directory may
+    // have refused, so the migrate findings come first.
+    leftovers.report();
+    log_setup.report();
 
     // rustls 0.23 needs a process-level CryptoProvider installed before the
     // first TLS handshake, or connect_async panics on any wss:// URL. Install
     // it explicitly (the enabled feature set alone doesn't auto-select one).
-    rustls::crypto::ring::default_provider()
+    // Placed after `install_logging` so the failure below can be *reported*:
+    // this used to `.expect()`, which in the windowed build meant a
+    // double-clicked exe that did nothing at all, unlike its two neighbouring
+    // startup failures which both route through `fatal`. `install_default`
+    // fails only if a provider is already installed, so this is a programming
+    // invariant — it just does not need to be a silent one.
+    if rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("install the rustls ring CryptoProvider");
-
-    // Held to the end of `main`: dropping it flushes the log writer.
-    let _log_guard = install_logging();
-    leftovers.report();
+        .is_err()
+    {
+        tracing::error!("a rustls CryptoProvider was already installed");
+        return fatal(
+            "Failed to initialise TLS: a crypto provider was already installed.".to_owned(),
+        );
+    }
 
     let config_path = config_path();
     // Emitted before the config is even read: a run that dies on an invalid
@@ -141,61 +88,21 @@ fn main() -> ExitCode {
     let config = match Config::load(&config_path) {
         Ok(config) => config,
         Err(err) => {
+            // Structured for the file, prose for the player: the two audiences
+            // want different things, and the prose carries embedded newlines
+            // that would break one-event-per-line in the log.
+            tracing::error!(
+                error = ?err,
+                config_path = %config_path.display(),
+                "invalid configuration"
+            );
             return fatal(format!(
                 "Invalid configuration: {err}\n\nFix {} and restart.",
                 config_path.display()
             ));
         }
     };
-    // Said out loud, once, at the one moment the player might correlate it with
-    // something: these keys still parse but no longer do anything. The capture
-    // filter is a BPF expression built from `game_port` inside the Npcap
-    // backend, the receive buffer is the snaplen that backend picks, and the
-    // forward directions stopped being a choice when the pipeline dropped the
-    // client -> server half it never decoded. They are still *accepted* because
-    // deleting the fields would make `Config::load` fail on every config file
-    // written by an earlier release, which is every config file that exists.
-    //
-    // "Once" used to be a lie: nothing removed the keys, and `persist::save`
-    // rewrites only the GUI-editable sections, so the warning came back every
-    // launch with no cure but hand-editing a file the app owns. So strip them
-    // here, and say which of the two things happened.
-    //
-    // Placed after `Config::load` on purpose. We only ever rewrite a file the
-    // app has just parsed *and* validated — a run that is about to die on an
-    // invalid config touches nothing — and the loaded `Config` is what tells us
-    // whether there is anything to strip at all, so the normal case (no retired
-    // key, every install from here on) costs no second read and no log line.
-    let retired: Vec<String> = [config.capture.retired_keys(), config.forward.retired_keys()]
-        .into_iter()
-        .flatten()
-        .collect();
-    if !retired.is_empty() {
-        let still_set = retired.join(", ");
-        // Best-effort throughout: the keys are inert, so failing to delete them
-        // costs a log line, never a startup.
-        match arkyve_refresh_shop::config::persist::strip_retired_keys(&config_path) {
-            Ok(Some(removed)) => tracing::warn!(
-                keys = %removed,
-                "these config keys were already being ignored and have now been removed from config.toml; no setting of yours was changed"
-            ),
-            // The rewrite failed: the keys really are still on disk, so this
-            // stays a "you may want to act" warning rather than a past-tense
-            // one — it will repeat on the next launch.
-            Err(err) => tracing::warn!(
-                keys = %still_set,
-                error = %err,
-                "these config keys are accepted but ignored, and will be refused in a later release; config.toml could not be rewritten to drop them"
-            ),
-            // Loaded from the file, absent from the file: something rewrote it
-            // underneath us between the two reads. Nothing to do, and worth a
-            // line, because the warning will come back next launch.
-            Ok(None) => tracing::warn!(
-                keys = %still_set,
-                "these config keys are accepted but ignored, and will be refused in a later release; they were already gone from config.toml when it was re-read, so nothing was written"
-            ),
-        }
-    }
+    strip_and_report_retired_keys(&config, &config_path);
     // No `server_url` here: it can carry a credential (see
     // `app::redacted_server_url`), and this file is what the player is asked
     // to send us.
@@ -208,29 +115,30 @@ fn main() -> ExitCode {
     // The runtime is built by hand instead of #[tokio::main]: in the GUI
     // build, eframe/winit must own the OS main thread.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        // Five long-lived tasks (uplink, reassembly, actuator, stdin, session
+        // loop), all IO-bound or offloaded through `actuator::blocking` /
+        // `spawn_blocking`. Two workers is the floor `app/mod.rs:515-517`'s
+        // "with a single worker, that is a deadlock" assumes; four is the
+        // ceiling this workload can use, and the default (one per
+        // `available_parallelism`) would reserve 16-24 idle worker stacks on a
+        // player's gaming CPU, beside the game it is driving.
+        .worker_threads(4)
+        // Only the capture teardown join uses the blocking pool.
+        .max_blocking_threads(4)
+        // Named for the same reason every other thread here is (`capture`,
+        // `shield`, `pcap-<adapter>`): `crash.rs` is the only post-mortem
+        // channel, and it records the thread name.
+        .thread_name("relay-worker")
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
-        Err(err) => return fatal(format!("Failed to start the async runtime: {err}")),
+        Err(err) => {
+            tracing::error!(error = ?err, "the async runtime could not be started");
+            return fatal(format!("Failed to start the async runtime: {err}"));
+        }
     };
     run_mode(runtime, config, config_path)
-}
-
-/// Every fatal error before the main window opens lands here: the log file
-/// always (stderr is inert in the windowed build, and these two failures —
-/// invalid config, runtime that won't build — are the likeliest of all),
-/// stderr, then an error window in the windowed build.
-fn fatal(message: String) -> ExitCode {
-    // Field named `reason`, not `message`: `message` is the field tracing
-    // itself fills from the format string, and two would collide in the file.
-    tracing::error!(reason = %message, "startup failed");
-    eprintln!("{message}");
-    #[cfg(feature = "gui")]
-    if let Err(err) = arkyve_refresh_shop::ui::show_fatal(message) {
-        eprintln!("error window failed: {err}");
-    }
-    ExitCode::FAILURE
 }
 
 /// Console-only build: the session blocks the main thread, as before.
@@ -240,11 +148,15 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config, _config_path: Path
     // Not a plain drop: tokio::io::stdin parks an uncancelable blocking read,
     // and dropping the runtime would hang exit until the player presses Enter.
     runtime.shutdown_background();
+    // Same contract as the windowed lane, through the same function. There is no
+    // window here, so its half is vacuously satisfied and only the session
+    // decides.
     match outcome {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => exit_code(true, false),
         Err(err) => {
+            tracing::error!(error = ?err, "the session ended with a fatal error");
             eprintln!("Fatal error: {err}");
-            ExitCode::FAILURE
+            exit_code(true, true)
         }
     }
 }
@@ -271,11 +183,13 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config, config_path: PathB
     let (session, handles, shutdown) = app::setup(config);
     let error = ui::SessionErrorSlot::default();
     let failed = Arc::new(AtomicBool::new(false));
-    let (slot, flag) = (error.clone(), failed.clone());
+    // Spelled `Arc::clone`, not `.clone()`: refcount bumps, not deep copies —
+    // the convention every other shared handle in this crate follows.
+    let (slot, flag) = (Arc::clone(&error), Arc::clone(&failed));
     let gate = handles.gate.clone();
     // The handle is kept, not discarded: it is both the join point for the
     // teardown below and the reason a panic in this wrapper cannot vanish.
-    let session_task = runtime.spawn(async move {
+    let mut session_task = runtime.spawn(async move {
         // app::supervise catches a session panic (it must land in the banner,
         // not vanish with a discarded JoinHandle) and forces the gate off.
         let (outcome, session_failed) = app::supervise(session.run(), gate).await;
@@ -304,7 +218,9 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config, config_path: PathB
                 handles,
                 error,
                 seed_timings,
-                config_path.clone(),
+                // Moved, not cloned: `AppCreator` is `FnOnce` and nothing reads
+                // `config_path` after `run_native`.
+                config_path,
             )))
         }),
     );
@@ -314,12 +230,27 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config, config_path: PathB
     // skip the whole teardown — leaving an orphaned live capture session in
     // the driver on every launch/close cycle.
     shutdown.request();
-    let joined =
-        runtime.block_on(async { tokio::time::timeout(TEARDOWN_GRACE, session_task).await });
+    let joined = runtime.block_on(async {
+        // `&mut session_task`, not `session_task`: `timeout` takes its future by
+        // value, so handing the `JoinHandle` over would *detach* the task on the
+        // timeout arm rather than cancel it — and the next line
+        // (`shutdown_background`) leaks blocking threads, which is exactly the
+        // "a capture session may outlive the process" outcome the warning below
+        // describes. `JoinHandle` is `Unpin + Future`, so a borrow is a valid
+        // branch; aborting turns that accident into the intended path.
+        let outcome = tokio::time::timeout(TEARDOWN_GRACE, &mut session_task).await;
+        if outcome.is_err() {
+            session_task.abort();
+            // Drain the cancellation so the task is really gone before the
+            // runtime is dropped.
+            let _ = session_task.await;
+        }
+        outcome
+    });
     if joined.is_err() {
         tracing::warn!(
             grace_s = TEARDOWN_GRACE.as_secs(),
-            "session teardown timed out; a capture session may outlive the process"
+            "session teardown timed out; the task was aborted, and a capture session may briefly outlive the process"
         );
     }
     // Still not a plain drop, and still last: tokio::io::stdin parks a
@@ -328,13 +259,16 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config, config_path: PathB
     // never the cooperative teardown above.
     runtime.shutdown_background();
     match result {
-        // A dead session is a failure even when the window closed cleanly:
-        // scripts and smoke checks read the exit code.
-        Ok(()) if !failed.load(Ordering::Relaxed) => ExitCode::SUCCESS,
-        Ok(()) => ExitCode::FAILURE,
+        Ok(()) => exit_code(true, failed.load(Ordering::Relaxed)),
         Err(err) => {
+            // `eframe::run_native` fails for real, common reasons — no GL
+            // context, a stale display driver, an RDP session, a headless
+            // service account — and stderr is inert in exactly this build, so
+            // without this line the log stops after "actuator configured" and
+            // the player sees a double-clicked exe do nothing.
+            tracing::error!(error = %err, "the application window could not be created");
             eprintln!("GUI error: {err}");
-            ExitCode::FAILURE
+            exit_code(false, failed.load(Ordering::Relaxed))
         }
     }
 }
