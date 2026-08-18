@@ -57,11 +57,17 @@ trivial_casts = "warn"                               # 0
 unused_qualifications = "warn" # 0
 # A `pub` item that no path outside the crate can reach is a claim the module
 # graph contradicts. Enabled *instead of* `clippy::redundant_pub_crate`, not
-# beside it: for the 15 `pub(crate)` items inside the private `mod render` and
+# beside it: for the `pub(crate)` items inside the private `mod render` and
 # `mod pcap`, `redundant_pub_crate`'s only suggestion is `pub` — and taking it
-# makes all 15 fire here instead (verified by applying it). The two lints have no
-# common fixed point for a private module, and of the pair this is the one that
-# catches a real error rather than a spelling.
+# makes every one of them fire here instead (verified by applying it). The two
+# lints have no common fixed point for a private module, and of the pair this is
+# the one that catches a real error rather than a spelling.
+#
+# The count is lane-dependent, so it is stated per lane rather than as one
+# number: `--all-targets` measures **15** on the default features and **12** on
+# `--no-default-features`, the difference being `mod pcap`, which is gated on
+# `windows` + `pcap-backend`. An earlier commit message and the audit synthesis
+# both said "13", which matches neither lane — re-measured and corrected.
 unreachable_pub = "warn" # 0
 
 [lints.clippy]
@@ -93,6 +99,15 @@ format_push_string = "warn"  # 0
 # logical AND" because backticking English would have been the wrong fix.
 doc_markdown = "warn"        # 0
 # Zero in the test harness too, unlike `unwrap_used`/`panic` above.
+# The one panic macro the ratchet used to miss. `unwrap_used` and `panic` live in
+# a crate-root `cfg_attr(not(test), …)` because the test harness needs them, but
+# `unreachable!` measures **0** here on all six lanes for `--lib --bins` *and*
+# for `--all-targets` — there is not one token of it left under `src/`,
+# `examples/`, `tests/` or `build.rs` — so it belongs in the table with no gate.
+# It got in once: a per-packet `Resync::from_u8` fallback, three doors from
+# `stream.rs`'s reporters, which argue at length that this pipeline must
+# saturate-and-log rather than abort a player's session.
+unreachable = "warn"    # 0
 todo = "warn"           # 0
 unimplemented = "warn"  # 0
 dbg_macro = "warn"      # 0

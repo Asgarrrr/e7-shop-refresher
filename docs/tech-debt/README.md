@@ -40,6 +40,31 @@ so the `stable` arm was a second MSRV arm and **nothing had ever been built on c
 stable**. That is fixed, which means the other 13 commits are the first work in this repo
 verified on both toolchains.
 
+### Corrections to commit messages already written
+
+Two commit messages in this run assert things that are not true. They were
+reconstructed by reading diffs — three implementing agents were interrupted and never
+reported — and the reconstruction over-read what the code did. The commits are left
+as written and corrected here, because rewriting eighteen messages costs more than it
+buys; this section is the record.
+
+- **`5452f6b` (app)** claims *"The console run mode now fails fast with a real reason
+  when `[filter]` names no criteria."* **Untrue.** `src/app/mod.rs:364-373` is
+  byte-identical to `97e8807` — same condition, same `Error::Config`, same string. The
+  commit added only a `# Errors` doc section. (The sentence immediately before it, about
+  five mutex-poisoning panics, *is* true.)
+- **`ba2f72c` (ui)** claims *"the generation-gated cache pattern the journal already
+  used in this same file now covers the snapshot too."* **Untrue at the time.** What
+  landed was removing `detail` from `SlotRow`, which closed `mem-006` and `perf-002`;
+  `view_state` still ran every frame under the controller lock with a clone per slot,
+  and there was no row cache. `own-002` was closed afterwards by `SlotRows`, and with a
+  *field comparison* gate, not a generation counter — pointer identity would have
+  missed every re-roll, because `Controller` stores the snapshot inline.
+- **`2213299`** and this file's own Declined section said `redundant_pub_crate` fires on
+  **13** items. Re-measured: **15** on the default features, **12** on
+  `--no-default-features`. Neither is 13. `Cargo.toml` now states both and names the
+  lane; the argument for the decline is unaffected.
+
 ### Where the audit was wrong
 
 Recorded because the audit's own numbers were the reason several findings looked cheap, and
@@ -67,7 +92,8 @@ because a reviewer should know which of its claims were tested:
   `Controller` would carry both a draft and an armed filter and every reader would pick a side.
   The rule is not duplicated; only the reaction differs by build, deliberately.
 - **`lint-008`** — resolved by measurement: `redundant_pub_crate`'s only suggestion is `pub`,
-  and applying it makes all 13 items fire under `unreachable_pub` instead. For an item in a
+  and applying it makes every one of them fire under `unreachable_pub` instead (15 items on
+  the default features, 12 on `--no-default-features` — see Corrections). For an item in a
   private module the two lints have no common fixed point.
 - **`type-003`'s domain half** — `src/domain/` and `src/actuator/` have zero dependency on each
   other today; a shared `Slot` forces a new architectural edge in one direction or the other.
