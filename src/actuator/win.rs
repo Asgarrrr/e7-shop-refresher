@@ -46,8 +46,8 @@ const ABSOLUTE_COORD_MAX: i64 = 65_535;
 
 /// A window handle, carried as the `isize` this module has always carried it as.
 ///
-/// The integer representation is load-bearing and documented on
-/// [`MessageSurface::target`]: `HWND` is a raw pointer, so a bare `HWND` in a
+/// The integer representation is load-bearing and documented on [`Target`]:
+/// `HWND` is a raw pointer, so a bare `HWND` in a
 /// struct would make the executor's future `!Send`. What was missing was the
 /// *type*. The handle used to be a bare `isize` travelling beside other `isize`s
 /// — most sharply in [`post`], where the LPARAM parameter has the same width and
@@ -114,12 +114,6 @@ impl fmt::Debug for Hwnd {
     }
 }
 
-/// An input attempted without a live `acquire()`. Both backends answer this,
-/// with this exact text: it is a contract violation, not a fault of the world,
-/// and it must never be a panic — that would kill the actuator task and take the
-/// whole session with it, where `Fatal` stops the loop with a real reason.
-const NO_TARGET: &str = "input attempted without an acquired game window";
-
 /// The verdict when the window is no longer where the job planned it.
 ///
 /// One definition for both backends: a window with no client area is minimized,
@@ -185,10 +179,14 @@ fn release_twice(
 /// Sized up front rather than `collect()`ed: `EncodeUtf16::size_hint` reports a
 /// *lower* bound of `ceil(len / 3)`, which is what `Vec::from_iter` reserves, so
 /// the ASCII titles this is called with allocated small and then grew.
-/// `WinSurface::validate_target` runs `find_game_window` — hence this — before
-/// every single injected event, so a two-slot buy job took ~60 of those.
 /// `text.len() + 1` is exact for ASCII and never short: one UTF-16 unit per byte
 /// at most, plus the terminator.
+///
+/// The one *hot* caller is gone rather than made cheaper: `find_game_window` ran
+/// before every injected event and now reads the compile-time
+/// `GAME_WINDOW_TITLE_W` instead. Everything still calling this does so once per
+/// process (the shield's class name), where one exact allocation is the right
+/// shape and a `static` would only add a second spelling of the same encoding.
 #[must_use]
 pub(super) fn wide(text: &str) -> Vec<u16> {
     let mut buffer = Vec::with_capacity(text.len() + 1);
@@ -270,6 +268,15 @@ fn ensure_dpi_awareness() -> Result<(), SurfaceError> {
         // inferred from this return.
         let set =
             unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        // Read before the two getters below, per the rule this file states at
+        // three other Win32 call sites: `GetLastError` is per-thread and *any*
+        // later call may overwrite it. Neither getter is documented to set it,
+        // which is exactly why reading it after them was not safe to rely on —
+        // "not documented to write the slot" is not "documented not to". On the
+        // shipped GUI build winit has already set the awareness, so this branch
+        // fires on every launch and this value is the difference between a
+        // reproducible bug report and "the clicks miss sometimes".
+        let set_error = (set == 0).then(std::io::Error::last_os_error);
         // One Win32 call per block, so each `// SAFETY:` answers for exactly the
         // call above it.
         //
@@ -282,14 +289,16 @@ fn ensure_dpi_awareness() -> Result<(), SurfaceError> {
         // recognize.
         let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(context) };
         let verdict = awareness_verdict(awareness);
-        if set == 0 {
+        // `Some` exactly when the setter refused, so this is the same branch the
+        // bare `set == 0` used to spell — with the error it names captured back
+        // when it still belonged to that call.
+        if let Some(error) = set_error {
             // Whoever set it first won: winit in the GUI build, or a shim.
-            // Recorded either way — this one line is the difference between a
-            // reproducible bug report and "the clicks miss sometimes".
+            // Recorded either way.
             tracing::info!(
                 awareness = awareness_name(awareness),
                 accepted = verdict.is_ok(),
-                error = %std::io::Error::last_os_error(),
+                error = %error,
                 "process DPI awareness was already set before the actuator asked"
             );
         }
@@ -387,14 +396,12 @@ impl InputDriver for SystemInputDriver {
 /// error. Measured, not assumed. The allocation is one per session.
 pub struct WinSurface {
     driver: Box<dyn InputDriver>,
-    target: Option<Target>,
 }
 
 impl Default for WinSurface {
     fn default() -> Self {
         Self {
             driver: Box::new(SystemInputDriver),
-            target: None,
         }
     }
 }
@@ -404,13 +411,7 @@ impl WinSurface {
     fn with_driver(driver: impl InputDriver + 'static) -> Self {
         Self {
             driver: Box::new(driver),
-            target: None,
         }
-    }
-
-    fn target(&self) -> Result<Target, SurfaceError> {
-        self.target
-            .ok_or_else(|| SurfaceError::Fatal(NO_TARGET.to_owned()))
     }
 
     fn ensure_foreground(&mut self, hwnd: Hwnd) -> Result<(), SurfaceError> {
@@ -430,8 +431,12 @@ impl WinSurface {
     /// Re-establishes that the acquired title still names this exact HWND,
     /// that its planned screen rectangle is unchanged and usable, and that it
     /// owns the foreground. The ordering is part of the safety contract.
-    fn validate_target(&mut self) -> Result<(), SurfaceError> {
-        let target = self.target()?;
+    ///
+    /// `target` arrives from the caller — the executor's guard, holding what
+    /// `acquire` produced — rather than out of a field this type kept: everything
+    /// checked below is about the *world* having moved, which is the only failure
+    /// left once "was there an acquire at all" is carried by the type.
+    fn validate_target(&mut self, target: Target) -> Result<(), SurfaceError> {
         let titled = self.driver.find_game_window()?;
         if titled != target.hwnd {
             return Err(SurfaceError::Fatal(
@@ -447,8 +452,8 @@ impl WinSurface {
         self.ensure_foreground(target.hwnd)
     }
 
-    fn send_guarded(&mut self, event: InputEvent) -> Result<(), SurfaceError> {
-        self.validate_target()?;
+    fn send_guarded(&mut self, target: Target, event: InputEvent) -> Result<(), SurfaceError> {
+        self.validate_target(target)?;
         self.driver.send(event)
     }
 
@@ -457,16 +462,17 @@ impl WinSurface {
     /// The borrow has to be split by hand because both closures want
     /// `&mut self` — hence the raw pointer-free dance of validating first into a
     /// `Result` and handing `release_twice` a closure that only needs the driver.
-    fn release_after_down(&mut self) -> Result<(), SurfaceError> {
-        let validated = self.validate_target();
+    fn release_after_down(&mut self, target: Target) -> Result<(), SurfaceError> {
+        let validated = self.validate_target(target);
         let driver = &mut self.driver;
         release_twice(|| validated, || driver.send(InputEvent::LeftUp), "LEFTUP")
     }
 }
 
 impl Surface for WinSurface {
-    fn acquire(&mut self) -> Result<ClientRect, SurfaceError> {
-        self.target = None;
+    type Window = Target;
+
+    fn acquire(&mut self) -> Result<(Target, ClientRect), SurfaceError> {
         let hwnd = self.driver.find_game_window()?;
         // Before the foreground is stolen and before any coordinate is planned:
         // a window this process may not drive is not worth pulling forward, and
@@ -477,37 +483,77 @@ impl Surface for WinSurface {
             .map_err(|error| preflight_refusal(&error))?;
         self.ensure_foreground(hwnd)?;
         let rect = self.driver.client_rect(hwnd)?;
-        self.target = Some(Target { hwnd, rect });
-        Ok(rect)
+        Ok((Target { hwnd, rect }, rect))
     }
 
-    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError> {
-        self.send_guarded(InputEvent::Move(at))?;
+    fn click(
+        &mut self,
+        target: &Target,
+        at: (i32, i32),
+        press_ms: u64,
+    ) -> Result<(), SurfaceError> {
+        let target = *target;
+        self.send_guarded(target, InputEvent::Move(at))?;
         self.driver.sleep(Duration::from_millis(MOVE_SETTLE_MS));
-        self.send_guarded(InputEvent::LeftDown)?;
+        self.send_guarded(target, InputEvent::LeftDown)?;
         self.driver.sleep(Duration::from_millis(press_ms));
-        self.release_after_down()
+        self.release_after_down(target)
     }
 
-    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError> {
-        self.send_guarded(InputEvent::Move(at))?;
+    fn scroll(
+        &mut self,
+        target: &Target,
+        at: (i32, i32),
+        notches: i32,
+    ) -> Result<(), SurfaceError> {
+        let target = *target;
+        self.send_guarded(target, InputEvent::Move(at))?;
         self.driver.sleep(Duration::from_millis(MOVE_SETTLE_MS));
-        self.send_guarded(InputEvent::Wheel(notches))
+        self.send_guarded(target, InputEvent::Wheel(notches))
     }
 
-    fn release(&mut self) {
-        self.target = None;
-    }
+    // No `release`: this backend engaged nothing outside the events it already
+    // sent, and the `Option<Target>` its `release` used to clear does not exist
+    // any more — the window is the executor guard's, and it drops with the job.
 }
+
+/// [`GAME_WINDOW_TITLE`] as the NUL-terminated UTF-16 `FindWindowW` wants,
+/// encoded once at compile time.
+///
+/// `find_game_window` runs before *every* injected event —
+/// `WinSurface::validate_target` calls it, which this module's own
+/// `validation_calls()` pins at three times inside a single `click` — so a
+/// two-slot buy job used to re-encode these same ten bytes ~60 times, each time
+/// through a `Vec` that allocated short and then grew. There is nothing left to
+/// encode at run time and nothing left to allocate.
+///
+/// The title is ASCII, hence one UTF-16 unit per byte; the `assert!` is what
+/// keeps that true. A non-ASCII character added here needs a real encoder, and
+/// this stops the build instead of silently truncating one. The last unit stays
+/// the `0` the array is initialized with — the terminator the W-suffixed call
+/// reads.
+static GAME_WINDOW_TITLE_W: [u16; GAME_WINDOW_TITLE.len() + 1] = {
+    let bytes = GAME_WINDOW_TITLE.as_bytes();
+    let mut units = [0u16; GAME_WINDOW_TITLE.len() + 1];
+    let mut index = 0;
+    while index < bytes.len() {
+        assert!(
+            bytes[index].is_ascii(),
+            "the game window title must be ASCII for this encoder"
+        );
+        units[index] = bytes[index] as u16;
+        index += 1;
+    }
+    units
+};
 
 /// No window at all: nothing to retry against — fatal.
 fn find_game_window() -> Result<HWND, SurfaceError> {
-    let title = wide(GAME_WINDOW_TITLE);
-    // SAFETY: `title` is a NUL-terminated UTF-16 buffer that outlives the
-    // call (`wide` appends the terminator), and a null class filter means
-    // "any class". The returned handle is borrowed, not owned: nothing to
-    // free, and NULL is the documented not-found answer.
-    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    // SAFETY: `GAME_WINDOW_TITLE_W` is a `static` NUL-terminated UTF-16 buffer,
+    // so it outlives the call outright, and a null class filter means "any
+    // class". The returned handle is borrowed, not owned: nothing to free, and
+    // NULL is the documented not-found answer.
+    let hwnd = unsafe { FindWindowW(std::ptr::null(), GAME_WINDOW_TITLE_W.as_ptr()) };
     if hwnd.is_null() {
         // Captured before any other Win32 call, which would overwrite the
         // thread's last-error slot: "not found" and "denied" look identical
@@ -787,40 +833,39 @@ fn post_refusal(error: &std::io::Error) -> SurfaceError {
 /// the game window — no focus stolen, the player keeps the mouse. The engine
 /// tracks its cursor through move messages, so every input re-asserts the
 /// [`shield`] over the game until [`release`](Surface::release).
+/// Fieldless on purpose: the only thing this backend owns beyond one job is the
+/// process-global [`shield`], which its `Drop` lowers. The job-scoped
+/// `Option<Target>` it used to carry — and the `target()` guard that read it —
+/// are gone: the window is a [`Target`] the executor's guard holds and hands back
+/// to every call (`api-004`).
+///
+/// Braced-empty rather than a unit struct so that `MessageSurface::default()` —
+/// how `src/app/mod.rs` spawns it, and the shape every other backend in the crate
+/// is built with — does not become a `clippy::default_constructed_unit_structs`
+/// diagnostic in a file this type does not own.
 #[derive(Default)]
-pub struct MessageSurface {
-    /// Job-scoped; the handle is stored as an integer — see [`Hwnd`], which is
-    /// that integer with a type on it — so the executor's future stays `Send`
-    /// across awaits.
-    target: Option<Target>,
-}
+pub struct MessageSurface {}
 
-impl MessageSurface {
-    /// The job-scoped target. An input attempted without a prior `acquire()`
-    /// is a contract violation, not a fault of the world: it answers with the
-    /// same [`NO_TARGET`] fatal `WinSurface::target` raises — literally the same
-    /// constant now — rather than panicking, since a panic here would kill the
-    /// actuator task and take the whole session down, where `Fatal` stops the
-    /// loop with a real reason.
-    fn target(&self) -> Result<Target, SurfaceError> {
-        self.target
-            .ok_or_else(|| SurfaceError::Fatal(NO_TARGET.to_owned()))
-    }
-
-    fn cleanup(&mut self) {
-        self.target = None;
+impl Drop for MessageSurface {
+    fn drop(&mut self) {
         shield::hide();
     }
 }
 
-impl Drop for MessageSurface {
-    fn drop(&mut self) {
-        self.cleanup();
-    }
-}
-
+/// One acquired game window: the handle, and the client area that was measured on
+/// it. This is [`Surface::Window`] for both Windows backends — the value
+/// `acquire` hands out and every later call hands back, which is what makes
+/// "input without an acquire" unrepresentable rather than merely refused.
+///
+/// The handle rides as an integer inside [`Hwnd`] rather than as a bare `HWND`
+/// because `HWND` is a raw pointer, and a raw pointer in here would make the
+/// executor's future `!Send` and unspawnable.
+///
+/// `pub` only so the two `impl Surface` blocks below do not name a private type
+/// in a public associated type (`private_interfaces`). Opaque either way: every
+/// field and every method is private to this module.
 #[derive(Clone, Copy)]
-struct Target {
+pub struct Target {
     hwnd: Hwnd,
     /// Client area in screen pixels.
     rect: ClientRect,
@@ -855,7 +900,9 @@ impl Target {
 }
 
 impl Surface for MessageSurface {
-    fn acquire(&mut self) -> Result<ClientRect, SurfaceError> {
+    type Window = Target;
+
+    fn acquire(&mut self) -> Result<(Target, ClientRect), SurfaceError> {
         ensure_dpi_awareness()?;
         let hwnd = find_game_window()?;
         // One probe per job, at the only moment a clear answer is still useful:
@@ -863,15 +910,20 @@ impl Surface for MessageSurface {
         // job with a message that names the wrong cause.
         probe_window_reachable(hwnd).map_err(|error| preflight_refusal(&error))?;
         let rect = client_rect(hwnd)?;
-        self.target = Some(Target {
+        let target = Target {
             hwnd: Hwnd::new(hwnd),
             rect,
-        });
-        Ok(rect)
+        };
+        Ok((target, rect))
     }
 
-    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError> {
-        let target = self.target()?;
+    fn click(
+        &mut self,
+        target: &Target,
+        at: (i32, i32),
+        press_ms: u64,
+    ) -> Result<(), SurfaceError> {
+        let target = *target;
         target.engage()?;
         let lparam = pack_point(target.to_client(at))?;
         post(target.hwnd, WM_MOUSEMOVE, 0, lparam)?;
@@ -889,8 +941,13 @@ impl Surface for MessageSurface {
         )
     }
 
-    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError> {
-        let target = self.target()?;
+    fn scroll(
+        &mut self,
+        target: &Target,
+        at: (i32, i32),
+        notches: i32,
+    ) -> Result<(), SurfaceError> {
+        let target = *target;
         target.engage()?;
         post(
             target.hwnd,
@@ -909,25 +966,14 @@ impl Surface for MessageSurface {
         Ok(())
     }
 
-    fn release(&mut self) {
-        self.cleanup();
+    /// Lowers the shield the inputs raised. Idempotent — `shield::hide` tolerates
+    /// there being nothing up — because it runs both from the executor's guard and
+    /// from this type's `Drop`.
+    fn release(&mut self, _target: &Target) {
+        shield::hide();
     }
 }
 
-/// `MAKELPARAM`: x in the low word, y in the high word, both signed 16-bit.
-///
-/// A coordinate that does not fit is refused instead of being masked back
-/// inside the window: `& 0xFFFF` would fold it silently onto some other pixel
-/// and the click would still be posted, landing somewhere nobody planned.
-/// `Recoverable` because the only way to get here is an absurd client rect,
-/// and the next `acquire()` reads a fresh one — exactly the self-healing case
-/// [`SurfaceError::Recoverable`] describes.
-///
-/// The word assembly goes through `u32`, not `i32`: shifting a high word past
-/// bit 31 in a signed integer sets the sign bit, and the `as isize` widening
-/// would then sign-extend into the upper half of a 64-bit LPARAM. Windows
-/// only reads the low 32 bits, so the old form worked by accident; this one
-/// builds the value the doc comment promises.
 /// `WM_MOUSEWHEEL`'s wParam: the wheel delta in the high word, *signed 16-bit*.
 ///
 /// Validated exactly like the coordinate sibling below, and for the same reason.
@@ -946,6 +992,20 @@ fn wheel_wparam(notches: i32) -> Result<usize, SurfaceError> {
     Ok(usize::from(delta.cast_unsigned()) << 16)
 }
 
+/// `MAKELPARAM`: x in the low word, y in the high word, both signed 16-bit.
+///
+/// A coordinate that does not fit is refused instead of being masked back
+/// inside the window: `& 0xFFFF` would fold it silently onto some other pixel
+/// and the click would still be posted, landing somewhere nobody planned.
+/// `Recoverable` because the only way to get here is an absurd client rect,
+/// and the next `acquire()` reads a fresh one — exactly the self-healing case
+/// [`SurfaceError::Recoverable`] describes.
+///
+/// The word assembly goes through `u32`, not `i32`: shifting a high word past
+/// bit 31 in a signed integer sets the sign bit, and the `as isize` widening
+/// would then sign-extend into the upper half of a 64-bit LPARAM. Windows
+/// only reads the low 32 bits, so the old form works by accident; this one
+/// builds the value the doc comment promises.
 fn pack_point((x, y): (i32, i32)) -> Result<isize, SurfaceError> {
     let x = i16::try_from(x)
         .map_err(|_| SurfaceError::Recoverable(format!("x {x} out of LPARAM range")))?;
@@ -979,14 +1039,26 @@ mod tests {
     const GAME_HWND: Hwnd = Hwnd(101);
     const OTHER_HWND: Hwnd = Hwnd(202);
 
+    /// `release` runs from the executor's guard *and* from this type's `Drop`, so
+    /// it can be reached two or three times over one job with no shield ever
+    /// raised (an `acquire` that succeeded and a first `engage` that did not).
+    /// `shield::hide` has to tolerate all of it.
+    ///
+    /// This used to also assert `surface.target.is_none()` after the calls. That
+    /// state is gone — `api-004` moved the window out of the backend — so what is
+    /// left to pin is the idempotence, which is the part that runs from a
+    /// destructor.
     #[test]
-    fn message_surface_cleanup_is_idempotent_without_a_window() {
+    fn message_surface_cleanup_is_idempotent_without_a_shield() {
         let mut surface = MessageSurface::default();
+        let target = Target {
+            hwnd: GAME_HWND,
+            rect: game_rect(),
+        };
 
-        surface.release();
-        surface.release();
+        surface.release(&target);
+        surface.release(&target);
 
-        assert!(surface.target.is_none());
         drop(surface);
     }
 
@@ -1128,9 +1200,14 @@ mod tests {
         (surface, state)
     }
 
-    fn acquire_and_clear(surface: &mut WinSurface, state: &Arc<Mutex<FakeState>>) {
-        assert_eq!(surface.acquire(), Ok(game_rect()));
+    /// Acquires, checks the rect, and hands back the window every later call in
+    /// the test has to present — which is the whole shape of `api-004`: the test
+    /// cannot reach an input without holding the proof of an acquire either.
+    fn acquire_and_clear(surface: &mut WinSurface, state: &Arc<Mutex<FakeState>>) -> Target {
+        let (target, rect) = surface.acquire().expect("the fake acquires");
+        assert_eq!(rect, game_rect());
         state.lock().unwrap().calls.clear();
+        target
     }
 
     fn calls(state: &Arc<Mutex<FakeState>>) -> Vec<DriverCall> {
@@ -1156,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn acquire_stores_the_exact_target_and_focuses_it() {
+    fn acquire_hands_back_the_exact_target_and_focuses_it() {
         let (mut surface, state) = fake_surface();
         state
             .lock()
@@ -1164,8 +1241,11 @@ mod tests {
             .foreground_results
             .extend([OTHER_HWND, GAME_HWND]);
 
-        assert_eq!(surface.acquire(), Ok(game_rect()));
-        let target = surface.target.expect("target stored");
+        // The target is *returned* rather than stashed in the surface: the rect
+        // the executor plans against and the window the inputs are aimed at come
+        // out of the same call, so they cannot disagree.
+        let (target, rect) = surface.acquire().expect("the fake acquires");
+        assert_eq!(rect, game_rect());
         assert_eq!(target.hwnd, GAME_HWND);
         assert_eq!(target.rect, game_rect());
         assert_eq!(
@@ -1188,9 +1268,9 @@ mod tests {
     #[test]
     fn click_validates_before_every_normal_event() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
 
-        assert_eq!(surface.click((400, 500), 25), Ok(()));
+        assert_eq!(surface.click(&target, (400, 500), 25), Ok(()));
         let mut expected = validation_calls();
         expected.push(DriverCall::Send(InputEvent::Move((400, 500))));
         expected.push(DriverCall::Sleep(MOVE_SETTLE_MS));
@@ -1205,9 +1285,9 @@ mod tests {
     #[test]
     fn scroll_validates_before_move_and_again_before_wheel() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
 
-        assert_eq!(surface.scroll((300, 600), -2), Ok(()));
+        assert_eq!(surface.scroll(&target, (300, 600), -2), Ok(()));
         let mut expected = validation_calls();
         expected.push(DriverCall::Send(InputEvent::Move((300, 600))));
         expected.push(DriverCall::Sleep(MOVE_SETTLE_MS));
@@ -1219,11 +1299,11 @@ mod tests {
     #[test]
     fn different_title_matched_window_is_fatal_before_input() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state.lock().unwrap().window = OTHER_HWND;
 
         assert!(matches!(
-            surface.click((1, 2), 3),
+            surface.click(&target, (1, 2), 3),
             Err(SurfaceError::Fatal(reason)) if reason.contains("different window")
         ));
         assert_eq!(calls(&state), vec![DriverCall::FindWindow]);
@@ -1232,7 +1312,7 @@ mod tests {
     #[test]
     fn missing_title_matched_window_is_fatal_before_input() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state
             .lock()
             .unwrap()
@@ -1240,7 +1320,7 @@ mod tests {
             .push_back(Err(SurfaceError::Fatal("game window missing".to_owned())));
 
         assert!(matches!(
-            surface.scroll((1, 2), 1),
+            surface.scroll(&target, (1, 2), 1),
             Err(SurfaceError::Fatal(reason)) if reason.contains("missing")
         ));
         assert_eq!(calls(&state), vec![DriverCall::FindWindow]);
@@ -1249,11 +1329,11 @@ mod tests {
     #[test]
     fn moved_rect_is_recoverable_before_input() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state.lock().unwrap().rect = moved_rect();
 
         assert!(matches!(
-            surface.click((1, 2), 3),
+            surface.click(&target, (1, 2), 3),
             Err(SurfaceError::Recoverable(reason)) if reason.contains("moved or resized")
         ));
         assert_eq!(
@@ -1265,11 +1345,11 @@ mod tests {
     #[test]
     fn minimized_rect_is_recoverable_before_input() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state.lock().unwrap().rect.width = 0;
 
         assert!(matches!(
-            surface.scroll((1, 2), 1),
+            surface.scroll(&target, (1, 2), 1),
             Err(SurfaceError::Recoverable(reason)) if reason.contains("minimized")
         ));
         assert!(sent_events(&state).is_empty());
@@ -1278,7 +1358,7 @@ mod tests {
     #[test]
     fn dead_stored_window_is_fatal_before_input() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state
             .lock()
             .unwrap()
@@ -1286,7 +1366,7 @@ mod tests {
             .push_back(Err(dead_window()));
 
         assert!(matches!(
-            surface.click((1, 2), 3),
+            surface.click(&target, (1, 2), 3),
             Err(SurfaceError::Fatal(reason)) if reason.contains("client area")
         ));
         assert!(sent_events(&state).is_empty());
@@ -1295,14 +1375,14 @@ mod tests {
     #[test]
     fn lost_focus_is_restored_and_verified_before_input() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state
             .lock()
             .unwrap()
             .foreground_results
             .extend([OTHER_HWND, GAME_HWND]);
 
-        assert_eq!(surface.scroll((30, 40), 1), Ok(()));
+        assert_eq!(surface.scroll(&target, (30, 40), 1), Ok(()));
         let actual = calls(&state);
         assert_eq!(
             &actual[..7],
@@ -1321,7 +1401,7 @@ mod tests {
     #[test]
     fn refused_focus_restoration_is_fatal_before_input() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state
             .lock()
             .unwrap()
@@ -1329,7 +1409,7 @@ mod tests {
             .extend([OTHER_HWND, OTHER_HWND]);
 
         assert!(matches!(
-            surface.scroll((30, 40), 1),
+            surface.scroll(&target, (30, 40), 1),
             Err(SurfaceError::Fatal(reason)) if reason.contains("could not focus")
         ));
         assert!(sent_events(&state).is_empty());
@@ -1349,7 +1429,7 @@ mod tests {
     #[test]
     fn focus_loss_during_move_settle_blocks_left_down() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state
             .lock()
             .unwrap()
@@ -1357,33 +1437,28 @@ mod tests {
             .extend([GAME_HWND, OTHER_HWND, OTHER_HWND]);
 
         assert!(matches!(
-            surface.click((30, 40), 5),
+            surface.click(&target, (30, 40), 5),
             Err(SurfaceError::Fatal(_))
         ));
         assert_eq!(sent_events(&state), vec![InputEvent::Move((30, 40))]);
     }
 
-    #[test]
-    fn release_clears_target_and_actions_fail_closed() {
-        let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
-        surface.release();
-
-        assert!(matches!(
-            surface.click((1, 2), 3),
-            Err(SurfaceError::Fatal(reason)) if reason.contains("without an acquired")
-        ));
-        assert!(matches!(
-            surface.scroll((1, 2), 1),
-            Err(SurfaceError::Fatal(reason)) if reason.contains("without an acquired")
-        ));
-        assert!(calls(&state).is_empty());
-    }
+    // `release_clears_target_and_actions_fail_closed` used to sit here, and its
+    // twin `message_surface_input_without_acquire_is_fatal_not_a_panic` further
+    // down. Both asserted that an input attempted after `release` — or with no
+    // `acquire` at all — answered `SurfaceError::Fatal` rather than panicking.
+    // Neither is a state either backend can be in any more: there is no
+    // `Option<Target>` to be `None`, so the call cannot be written without a
+    // `Target` to present (`api-004`). Deleted rather than weakened — a test for
+    // an unrepresentable state is a test of nothing — and what it was really
+    // guarding, that the executor never routes a window a job did not acquire, is
+    // now pinned in `actuator::mod`'s
+    // `every_input_and_the_release_see_the_window_that_job_acquired`.
 
     #[test]
     fn send_refusal_before_left_down_never_synthesizes_left_up() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state
             .lock()
             .unwrap()
@@ -1391,7 +1466,7 @@ mod tests {
             .extend([Ok(()), Err(blocked_input())]);
 
         assert!(matches!(
-            surface.click((30, 40), 5),
+            surface.click(&target, (30, 40), 5),
             Err(SurfaceError::Recoverable(_))
         ));
         assert_eq!(
@@ -1403,14 +1478,14 @@ mod tests {
     #[test]
     fn focus_is_restored_before_guarded_left_up() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state
             .lock()
             .unwrap()
             .foreground_results
             .extend([GAME_HWND, GAME_HWND, OTHER_HWND, GAME_HWND]);
 
-        assert_eq!(surface.click((30, 40), 5), Ok(()));
+        assert_eq!(surface.click(&target, (30, 40), 5), Ok(()));
         let actual = calls(&state);
         let request = actual
             .iter()
@@ -1427,7 +1502,7 @@ mod tests {
     #[test]
     fn refused_focus_after_left_down_still_sends_unguarded_left_up() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state
             .lock()
             .unwrap()
@@ -1435,7 +1510,7 @@ mod tests {
             .extend([GAME_HWND, GAME_HWND, OTHER_HWND, OTHER_HWND]);
 
         assert!(matches!(
-            surface.click((30, 40), 5),
+            surface.click(&target, (30, 40), 5),
             Err(SurfaceError::Fatal(reason)) if reason.contains("could not focus")
         ));
         assert_eq!(
@@ -1451,7 +1526,7 @@ mod tests {
     #[test]
     fn moved_rect_after_left_down_still_sends_unguarded_left_up() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state.lock().unwrap().rect_results.extend([
             Ok(game_rect()),
             Ok(game_rect()),
@@ -1459,7 +1534,7 @@ mod tests {
         ]);
 
         assert!(matches!(
-            surface.click((30, 40), 5),
+            surface.click(&target, (30, 40), 5),
             Err(SurfaceError::Recoverable(reason)) if reason.contains("moved or resized")
         ));
         assert_eq!(sent_events(&state).last(), Some(&InputEvent::LeftUp));
@@ -1468,7 +1543,7 @@ mod tests {
     #[test]
     fn minimized_rect_after_left_down_still_sends_unguarded_left_up() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         let mut minimized = game_rect();
         minimized.height = 0;
         state.lock().unwrap().rect_results.extend([
@@ -1478,7 +1553,7 @@ mod tests {
         ]);
 
         assert!(matches!(
-            surface.click((30, 40), 5),
+            surface.click(&target, (30, 40), 5),
             Err(SurfaceError::Recoverable(reason)) if reason.contains("minimized")
         ));
         assert_eq!(sent_events(&state).last(), Some(&InputEvent::LeftUp));
@@ -1487,7 +1562,7 @@ mod tests {
     #[test]
     fn refused_cleanup_left_up_is_retried_once() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         {
             let mut fake = state.lock().unwrap();
             fake.foreground_results
@@ -1497,7 +1572,7 @@ mod tests {
         }
 
         assert!(matches!(
-            surface.click((30, 40), 5),
+            surface.click(&target, (30, 40), 5),
             Err(SurfaceError::Fatal(reason)) if reason.contains("could not focus")
         ));
         assert_eq!(
@@ -1512,7 +1587,7 @@ mod tests {
     #[test]
     fn two_failed_cleanup_left_ups_are_fatal() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         {
             let mut fake = state.lock().unwrap();
             fake.foreground_results
@@ -1522,7 +1597,7 @@ mod tests {
         }
 
         assert!(matches!(
-            surface.click((30, 40), 5),
+            surface.click(&target, (30, 40), 5),
             Err(SurfaceError::Fatal(reason)) if reason.contains("could not be proven released")
         ));
         assert_eq!(
@@ -1537,7 +1612,7 @@ mod tests {
     #[test]
     fn refused_guarded_left_up_is_retried_and_returns_original_error() {
         let (mut surface, state) = fake_surface();
-        acquire_and_clear(&mut surface, &state);
+        let target = acquire_and_clear(&mut surface, &state);
         state
             .lock()
             .unwrap()
@@ -1545,7 +1620,7 @@ mod tests {
             .extend([Ok(()), Ok(()), Err(blocked_input()), Ok(())]);
 
         assert!(matches!(
-            surface.click((30, 40), 5),
+            surface.click(&target, (30, 40), 5),
             Err(SurfaceError::Recoverable(reason)) if reason.contains("input blocked")
         ));
         assert_eq!(
@@ -1647,13 +1722,14 @@ mod tests {
             surface.acquire(),
             Err(SurfaceError::Fatal(reason)) if reason.contains("higher integrity level")
         ));
-        // Nothing was focused, nothing was measured, no target was stored: the
-        // job never becomes clickable.
+        // Nothing was focused and nothing was measured, so the job never becomes
+        // clickable — and now for a stronger reason than an unset field: the `Err`
+        // carries no `Target`, so there is no window for a later input to be
+        // aimed at.
         assert_eq!(
             calls(&state),
             vec![DriverCall::FindWindow, DriverCall::Probe(GAME_HWND)]
         );
-        assert!(surface.target.is_none());
     }
 
     /// The whole reason the probe is a preflight rather than a better error
@@ -1674,21 +1750,10 @@ mod tests {
         assert!(sent_events(&state).is_empty());
     }
 
-    /// The default backend must fail closed exactly like `WinSurface`: a
-    /// panic here would kill the actuator task and end the session.
-    #[test]
-    fn message_surface_input_without_acquire_is_fatal_not_a_panic() {
-        let mut surface = MessageSurface::default();
-
-        assert!(matches!(
-            surface.click((1, 2), 3),
-            Err(SurfaceError::Fatal(reason)) if reason.contains("without an acquired")
-        ));
-        assert!(matches!(
-            surface.scroll((1, 2), 1),
-            Err(SurfaceError::Fatal(reason)) if reason.contains("without an acquired")
-        ));
-    }
+    // `message_surface_input_without_acquire_is_fatal_not_a_panic` stood here —
+    // see the note where its `WinSurface` twin was, further up. Same reason: the
+    // state it described cannot be constructed now that the window is a
+    // parameter.
 
     /// The low word is x, the high word is y, and the whole thing stays
     /// inside the low 32 bits Win32 reads back.

@@ -127,6 +127,22 @@ impl Slot {
 
     /// The clickable 0-based row of this display slot; `None` for anything
     /// a degraded shop put outside the six rows — never a click.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use arkyve_refresh_shop::actuator::plan::{Row, Slot};
+    ///
+    /// // The six display slots the shop numbers 1..=6 are rows 0..=5.
+    /// assert_eq!(Slot::new(1).row(), Row::new(0));
+    /// assert_eq!(Slot::new(6).row(), Row::new(5));
+    ///
+    /// // What a degraded shop can report: the `0` sentinel, a seventh slot,
+    /// // and the clamped `effective_slot` fallback. None of them is a click.
+    /// assert_eq!(Slot::new(0).row(), None);
+    /// assert_eq!(Slot::new(7).row(), None);
+    /// assert_eq!(Slot::new(u8::MAX).row(), None);
+    /// ```
     #[must_use]
     pub const fn row(self) -> Option<Row> {
         match self.0.checked_sub(1) {
@@ -183,6 +199,20 @@ const SCROLL_BOTTOM_SHIFT: f32 = 217.0;
 /// The Buy button of a 0-based row. Rows `0..=LAST_TOP_ROW` are clickable at
 /// scroll-top; the rest only at scroll-bottom, where the whole list sits
 /// `SCROLL_BOTTOM_SHIFT` design px higher.
+///
+/// # Examples
+///
+/// ```
+/// use arkyve_refresh_shop::actuator::plan::{Row, buy_zone};
+/// # fn row(index: u8) -> Row { Row::new(index).expect("0..=5 is a real row") }
+///
+/// // Row 0's Buy button is on the 720 px-tall screen at scroll-top…
+/// assert_eq!(buy_zone(row(0), false).cy, 166.5);
+/// // …while row 4's is not: it only exists once the list has been scrolled
+/// // to the bottom, which lifts the whole list by the same 217 px.
+/// assert_eq!(buy_zone(row(4), false).cy, 746.5);
+/// assert_eq!(buy_zone(row(4), true).cy, 529.5);
+/// ```
 pub fn buy_zone(row: Row, at_bottom: bool) -> Zone {
     let mut cy = BUY_ROW_TOP_CY + BUY_ROW_PITCH * f32::from(row.get());
     if at_bottom {
@@ -270,6 +300,34 @@ impl std::fmt::Display for ScreenError {
 /// just-closed window), and [`ScreenError::TooNarrow`] when the window is
 /// narrower than the 16:9 design aspect. The distinction is the whole point of
 /// the type: the first is transient, the second is not.
+///
+/// # Examples
+///
+/// ```
+/// use arkyve_refresh_shop::actuator::plan::{
+///     Anchor, ClientRect, DesignPoint, ScreenError, to_screen,
+/// };
+///
+/// let left = DesignPoint { x: 100.0, y: 100.0, anchor: Anchor::Left };
+///
+/// // At the 1280×720 design resolution the transform is the identity, and the
+/// // three anchors coincide.
+/// let design = ClientRect { left: 0, top: 0, width: 1280, height: 720 };
+/// assert_eq!(to_screen(design, left)?, (100, 100));
+///
+/// // 1920×1080 at screen (100, 50): scale 1.5, no pillarbox.
+/// let scaled = ClientRect { left: 100, top: 50, width: 1920, height: 1080 };
+/// assert_eq!(to_screen(scaled, left)?, (250, 200));
+///
+/// // Narrower than 16:9 has no design-space mapping at all: the game caps the
+/// // view vertically instead, so the point is refused rather than guessed.
+/// let narrow = ClientRect { left: 0, top: 0, width: 1280, height: 800 };
+/// assert!(matches!(
+///     to_screen(narrow, left),
+///     Err(ScreenError::TooNarrow { .. })
+/// ));
+/// # Ok::<(), ScreenError>(())
+/// ```
 pub fn to_screen(rect: ClientRect, point: DesignPoint) -> Result<(i32, i32), ScreenError> {
     if rect.is_degenerate() {
         return Err(ScreenError::DegenerateRect {
@@ -290,6 +348,15 @@ pub fn to_screen(rect: ClientRect, point: DesignPoint) -> Result<(i32, i32), Scr
         Anchor::Right => view_w - (DESIGN_W - point.x),
         Anchor::Center => view_w / 2.0 + (point.x - DESIGN_W / 2.0),
     };
+    // `as` from float to int saturates at the bounds but maps `NaN` to 0 — which
+    // here would be a click at the top-left corner of the *screen*, outside the
+    // game window, silently. It cannot happen: `is_degenerate` above rejects
+    // `height <= 0`, so `ch >= 1.0` and neither `s` nor `aspect` can be a `0.0 /
+    // 0.0`, and every other term is a finite design constant or a rect field. The
+    // saturation itself is the wanted behaviour for the remaining extreme — an
+    // absurd rect clamps to `i32` bounds, and `pack_point` then refuses the
+    // coordinate rather than masking it back inside the window. The same
+    // reasoning is written out at `win::move_cursor`'s clamp.
     let px = (rect.left as f32 + off_x + x * s).round() as i32;
     let py = (rect.top as f32 + point.y * s).round() as i32;
     Ok((px, py))
@@ -795,6 +862,7 @@ fn scroll(jitter: &mut Jitter, notches: i32) -> Input {
 /// after a confirm click that missed its modal. Safe on the shop screen —
 /// nothing clickable sits under either confirm zone when no modal is open
 /// (player-confirmed game fact).
+#[must_use = "a planned job that is never submitted is a lost click"]
 pub fn confirm_retry_job(zone: Zone, timings: Timings, epoch: Epoch, seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
     let mut delay = Jitter::new(seed ^ DELAY_SEED_SALT);
@@ -808,6 +876,7 @@ pub fn confirm_retry_job(zone: Zone, timings: Timings, epoch: Epoch, seed: u64) 
 }
 
 /// Refresh = click Refresh, wait out the confirm modal, click its yes.
+#[must_use = "a planned job that is never submitted is a lost click"]
 pub fn refresh_job(trigger: Trigger, timings: Timings, epoch: Epoch, seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
     let mut delay = Jitter::new(seed ^ DELAY_SEED_SALT);
@@ -831,6 +900,7 @@ pub fn refresh_job(trigger: Trigger, timings: Timings, epoch: Epoch, seed: u64) 
 /// clamp makes it a no-op when already there), buy the top-group rows, one
 /// scroll to the bottom, buy the bottom-group rows. Each buy is click +
 /// confirm.
+#[must_use = "a planned job that is never submitted is a lost click"]
 pub fn buy_job(trigger: Trigger, timings: Timings, epoch: Epoch, rows: &[Row], seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
     let mut delay = Jitter::new(seed ^ DELAY_SEED_SALT);
@@ -1167,47 +1237,67 @@ mod tests {
     fn the_row_count_and_the_scroll_split_stay_one_fact() {
         // The guard that was missing: `MAX_ROW` and `LAST_TOP_ROW` used to be
         // bare `<= 5` / `> 3` literals at three sites, and editing one alone
-        // planned a scroll-to-bottom for a row still at the top. Every clause
-        // below is derived from the constants, so a change to either that leaves
-        // the other behind fails here rather than in the shop.
-        assert_eq!(Slot::new(MAX_ROW + 1).row(), Row::new(MAX_ROW));
-        assert_eq!(Slot::new(MAX_ROW + 2).row(), None);
-        assert_eq!(Row::new(MAX_ROW + 1), None);
+        // planned a scroll-to-bottom for a row still at the top — a click on the
+        // wrong item's Buy button with real gold behind it.
+        //
+        // Every clause below is a *literal*, deliberately. The first version of
+        // this test derived all six of its assertions from the two constants,
+        // which made every one of them a tautology: `Slot::new(MAX_ROW + 1).row()
+        // == Row::new(MAX_ROW)` holds for any `MAX_ROW < 255` by `Slot::row`'s own
+        // definition, and the two `buy_job` clauses restated `row.get() >
+        // LAST_TOP_ROW`. `LAST_TOP_ROW = 2` or `= 4` passed the whole suite —
+        // i.e. the guard reintroduced exactly the hazard it was filed against.
+        assert_eq!(MAX_ROW, 5, "the Secret Shop shows six display slots");
+        assert_eq!(LAST_TOP_ROW, 3, "four of them are reachable at scroll-top");
+        assert_eq!(Slot::new(6).row(), Row::new(5));
+        assert_eq!(Slot::new(7).row(), None);
+        assert_eq!(Row::new(6), None);
+
+        // The clause that actually couples the row count to the geometry, which
+        // is the coupling the two constants exist to state: a top-group row is
+        // one whose Buy button is on screen *without* scrolling, and a
+        // bottom-group row is one whose Buy button is on screen only *with* it.
+        // Read straight off `buy_zone`, so a row count changed without moving the
+        // split — or a pitch or shift changed without moving either — fails here
+        // and not in the shop.
+        let on_screen = |cy: f32| (0.0..=DESIGN_H).contains(&cy);
+        for index in 0..=LAST_TOP_ROW {
+            assert!(
+                on_screen(buy_zone(row(index), false).cy),
+                "row {index} is in the top group but its Buy button is off screen at scroll-top"
+            );
+        }
+        for index in LAST_TOP_ROW + 1..=MAX_ROW {
+            assert!(
+                on_screen(buy_zone(row(index), true).cy),
+                "row {index} is in the bottom group but its Buy button is off screen at scroll-bottom"
+            );
+            assert!(
+                !on_screen(buy_zone(row(index), false).cy),
+                "row {index} is reachable at scroll-top, so it does not belong to the bottom group"
+            );
+        }
 
         // The last top-group row is bought without a second scroll; the first
         // bottom-group row is reached by one, and only one.
-        let top = buy_job(
-            Trigger::ShopOpened,
-            Timings::default(),
-            Epoch(0),
-            &[row(LAST_TOP_ROW)],
-            42,
-        );
-        assert_eq!(
-            top.steps
-                .iter()
-                .filter(|step| matches!(step.input, Input::Scroll { .. }))
-                .count(),
-            1
-        );
-        let bottom = buy_job(
-            Trigger::ShopOpened,
-            Timings::default(),
-            Epoch(0),
-            &[row(LAST_TOP_ROW + 1)],
-            42,
-        );
-        assert_eq!(
-            bottom
-                .steps
-                .iter()
-                .filter(|step| matches!(step.input, Input::Scroll { .. }))
-                .count(),
-            2
-        );
+        let scrolls = |index: u8| {
+            buy_job(
+                Trigger::ShopOpened,
+                Timings::default(),
+                Epoch(0),
+                &[row(index)],
+                42,
+            )
+            .steps
+            .iter()
+            .filter(|step| matches!(step.input, Input::Scroll { .. }))
+            .count()
+        };
+        assert_eq!(scrolls(3), 1);
+        assert_eq!(scrolls(4), 2);
         // And the row the extra scroll exists for really does move by the shift.
         assert_eq!(
-            buy_zone(row(LAST_TOP_ROW + 1), false).cy - buy_zone(row(LAST_TOP_ROW + 1), true).cy,
+            buy_zone(row(4), false).cy - buy_zone(row(4), true).cy,
             SCROLL_BOTTOM_SHIFT
         );
     }

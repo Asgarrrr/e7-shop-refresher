@@ -190,26 +190,88 @@ pub enum SurfaceError {
 /// Every method may park its thread for the length of an input (Win32
 /// syscalls plus the deliberate settle and hold beats), so the executor only
 /// ever calls them through `blocking`.
+///
+/// # Why the window is a parameter rather than a field
+///
+/// "Clicking needs a successful [`acquire`](Surface::acquire) first" used to be
+/// prose, enforced at run time in *three* separate places: an
+/// `Option<Target>` field and a `target()` guard inside each of the two Windows
+/// backends, each answering the same hand-written fatal, plus an
+/// `.expect("active surface job guard")` in the executor's own guard. Three
+/// defensive checks for one invariant is three places to get the next backend
+/// wrong — and the backends' copies were a *second*, unsynchronized copy of state
+/// the executor already owns, since it takes the [`plan::ClientRect`] out of
+/// `acquire` and carries it through the whole job anyway.
+///
+/// So `acquire` hands back a [`Window`](Surface::Window) — opaque, backend-owned,
+/// whatever the backend needs to act (the Win32 backends put the `HWND` and the
+/// measured client rect in it) — and every input method takes one. There is no
+/// state to forget to set, no guard to forget to write, and "input without an
+/// acquire" is not a value that can be built. What stays fail-closed is
+/// everything the *world* can break: the window died, moved, or refuses input.
+/// That is what [`SurfaceError`] is for, and the backends still re-verify on
+/// every single event.
 pub trait Surface {
+    /// A backend's proof that it acquired the game window, and everything it
+    /// needs to act on it.
+    ///
+    /// Opaque on purpose: the executor only routes it from `acquire` to the
+    /// input calls and finally to `release`, and never looks inside. A backend
+    /// with nothing to carry uses `()`.
+    type Window;
+
     /// Locates the game window, returning its client area — whether it is
     /// brought to the foreground is backend-specific.
-    fn acquire(&mut self) -> Result<plan::ClientRect, SurfaceError>;
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Recoverable`] when the window is alive but not usable
+    /// right now, so the *next* `acquire` may well succeed: [`run_executor`]
+    /// drops this one job and the watchdog's retry heals it.
+    /// [`SurfaceError::Fatal`] when acting would be blind — no window carrying
+    /// the game's title, a client rect Windows refuses to read at all, a process
+    /// DPI awareness that would place every click at the wrong scale, or a window
+    /// at a higher integrity level than this process. There the executor halts
+    /// the watch and the payload is the line the player reads.
+    ///
+    /// Either way nothing was engaged, so a failed `acquire` leaves no
+    /// [`release`](Surface::release) owing — which is why the executor only
+    /// builds its cleanup guard on the `Ok` path.
+    fn acquire(&mut self) -> Result<(Self::Window, plan::ClientRect), SurfaceError>;
     /// One left click at a screen point, held `press_ms`.
     ///
-    /// Preconditioned on a successful [`acquire`](Surface::acquire) since the
-    /// last [`release`](Surface::release): the point is meaningless without
-    /// the client rect that produced it. Implementations must answer a
-    /// violation with [`SurfaceError::Fatal`], never a panic — the executor
-    /// runs inside a supervised task, so a panic ends the whole session while
-    /// `Fatal` halts the watch with a reason the player can read.
-    fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError>;
-    /// Wheel notches at a screen point. Same precondition and same
-    /// fail-closed rule as [`click`](Surface::click).
-    fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError>;
-    /// Job over, completed or aborted: undo whatever the inputs set up.
-    /// Implementations must make this idempotent and non-panicking because
-    /// it runs from a destructor.
-    fn release(&mut self) {}
+    /// `window` is what [`acquire`](Surface::acquire) handed back, so the
+    /// precondition the point depends on — that a client rect was measured and
+    /// this is the window it was measured on — is carried by the argument rather
+    /// than asserted. Implementations must still answer everything the world can
+    /// break with a [`SurfaceError`], never a panic: the executor runs inside a
+    /// supervised task, so a panic ends the whole session while `Fatal` halts the
+    /// watch with a reason the player can read.
+    fn click(
+        &mut self,
+        window: &Self::Window,
+        at: (i32, i32),
+        press_ms: u64,
+    ) -> Result<(), SurfaceError>;
+    /// Wheel notches at a screen point. Same contract and same fail-closed rule
+    /// as [`click`](Surface::click).
+    fn scroll(
+        &mut self,
+        window: &Self::Window,
+        at: (i32, i32),
+        notches: i32,
+    ) -> Result<(), SurfaceError>;
+    /// Job over, completed or aborted: undo whatever the inputs set up for
+    /// `window`. Implementations must make this idempotent and non-panicking
+    /// because it runs from a destructor.
+    ///
+    /// The window is borrowed rather than consumed so the executor's guard can
+    /// own it outright instead of behind an `Option` — an `Option` there is what
+    /// made the guard's own `expect` necessary, and this trait is meant to delete
+    /// that kind of check, not relocate it.
+    fn release(&mut self, window: &Self::Window) {
+        let _ = window;
+    }
 }
 
 /// Runs one blocking [`Surface`] call without starving the runtime.
@@ -237,40 +299,56 @@ fn blocking<T>(call: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Owns cleanup for one successfully acquired job.
+/// Owns cleanup for one successfully acquired job, and the window that job
+/// acquired.
+///
+/// Both fields are plain values rather than `Option`s: the guard is built only on
+/// `acquire`'s `Ok` path, so an inactive guard is not a state it has. That is
+/// what removes the `.expect("active surface job guard")` the two input methods
+/// used to open with — a third runtime check of the same "acquired first"
+/// invariant the backends each checked once (`api-004`). Idempotence of the
+/// release is a `bool`, which is the only thing the `Option` was actually
+/// tracking.
 struct SurfaceJobGuard<'a, S: Surface> {
-    surface: Option<&'a mut S>,
+    surface: &'a mut S,
+    window: S::Window,
+    released: bool,
 }
 
 impl<'a, S: Surface> SurfaceJobGuard<'a, S> {
-    fn new(surface: &'a mut S) -> Self {
+    fn new(surface: &'a mut S, window: S::Window) -> Self {
         Self {
-            surface: Some(surface),
+            surface,
+            window,
+            released: false,
         }
     }
 
     fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError> {
-        let surface = self
-            .surface
-            .as_deref_mut()
-            .expect("active surface job guard");
-        blocking(|| surface.click(at, press_ms))
+        let Self {
+            surface, window, ..
+        } = self;
+        blocking(|| surface.click(window, at, press_ms))
     }
 
     fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError> {
-        let surface = self
-            .surface
-            .as_deref_mut()
-            .expect("active surface job guard");
-        blocking(|| surface.scroll(at, notches))
+        let Self {
+            surface, window, ..
+        } = self;
+        blocking(|| surface.scroll(window, at, notches))
     }
 
     fn release_once(&mut self) {
-        if let Some(surface) = self.surface.take() {
-            // Cleanup posts and hides too: blocking all the same, and this
-            // also runs from `Drop` on the runtime worker.
-            blocking(|| surface.release());
+        if self.released {
+            return;
         }
+        self.released = true;
+        let Self {
+            surface, window, ..
+        } = self;
+        // Cleanup posts and hides too: blocking all the same, and this
+        // also runs from `Drop` on the runtime worker.
+        blocking(|| surface.release(window));
     }
 }
 
@@ -326,8 +404,8 @@ pub async fn run_executor(
         }
         // `acquire` finds the window, may steal the foreground and sleeps out
         // the focus settle: blocking like every other surface call.
-        let rect = match blocking(|| surface.acquire()) {
-            Ok(rect) => rect,
+        let (window, rect) = match blocking(|| surface.acquire()) {
+            Ok(acquired) => acquired,
             Err(SurfaceError::Recoverable(reason)) => {
                 // Nothing engaged, nothing landed: drop the job and let the
                 // watchdog turn the silence into a retry.
@@ -342,7 +420,7 @@ pub async fn run_executor(
                 continue;
             }
         };
-        let mut surface = SurfaceJobGuard::new(&mut surface);
+        let mut surface = SurfaceJobGuard::new(&mut surface, window);
         for step in &job.steps {
             tokio::time::sleep(Duration::from_millis(step.wait_ms)).await;
             if let Some(reason) = drop_reason(&job, &epoch, &gate) {
@@ -537,6 +615,12 @@ mod tests {
         Scroll((i32, i32), i32),
     }
 
+    /// A distinguishable stand-in for a real backend's window handle: one is
+    /// minted per `acquire`, so a test can prove that every input and the release
+    /// were handed *this job's* window and not a stale one.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FakeWindow(u32);
+
     /// Records every input; `on_input` runs after each; `deny_after` fails
     /// the next input once `n` have landed (one-shot, so a later job can
     /// succeed).
@@ -546,6 +630,11 @@ mod tests {
         on_input: Box<dyn FnMut() + Send>,
         deny_after: Option<(usize, SurfaceError)>,
         releases: Arc<Mutex<usize>>,
+        /// Handed out by `acquire`, incrementing, so two jobs never share one.
+        acquires: u32,
+        /// Every window this surface was *given* back, in call order: one entry
+        /// per `click`/`scroll`/`release`.
+        windows: Arc<Mutex<Vec<FakeWindow>>>,
     }
 
     impl FakeSurface {
@@ -557,6 +646,8 @@ mod tests {
                 on_input: Box::new(|| {}),
                 deny_after: None,
                 releases: Arc::new(Mutex::new(0)),
+                acquires: 0,
+                windows: Arc::new(Mutex::new(Vec::new())),
             };
             (surface, events)
         }
@@ -571,14 +662,30 @@ mod tests {
             }
             Ok(())
         }
+
+        /// Records which window the caller handed back. Deliberately *before*
+        /// `deny`, so a refused input still proves it was aimed at the right one.
+        fn saw(&mut self, window: &FakeWindow) {
+            self.windows.lock().unwrap().push(*window);
+        }
     }
 
     impl Surface for FakeSurface {
-        fn acquire(&mut self) -> Result<ClientRect, SurfaceError> {
-            self.rect.clone()
+        type Window = FakeWindow;
+
+        fn acquire(&mut self) -> Result<(FakeWindow, ClientRect), SurfaceError> {
+            let rect = self.rect.clone()?;
+            self.acquires += 1;
+            Ok((FakeWindow(self.acquires), rect))
         }
 
-        fn click(&mut self, at: (i32, i32), press_ms: u64) -> Result<(), SurfaceError> {
+        fn click(
+            &mut self,
+            window: &FakeWindow,
+            at: (i32, i32),
+            press_ms: u64,
+        ) -> Result<(), SurfaceError> {
+            self.saw(window);
             self.deny()?;
             self.events
                 .lock()
@@ -588,7 +695,13 @@ mod tests {
             Ok(())
         }
 
-        fn scroll(&mut self, at: (i32, i32), notches: i32) -> Result<(), SurfaceError> {
+        fn scroll(
+            &mut self,
+            window: &FakeWindow,
+            at: (i32, i32),
+            notches: i32,
+        ) -> Result<(), SurfaceError> {
+            self.saw(window);
             self.deny()?;
             self.events
                 .lock()
@@ -598,7 +711,8 @@ mod tests {
             Ok(())
         }
 
-        fn release(&mut self) {
+        fn release(&mut self, window: &FakeWindow) {
+            self.saw(window);
             *self.releases.lock().unwrap() += 1;
         }
     }
@@ -609,7 +723,7 @@ mod tests {
         let releases = surface.releases.clone();
 
         {
-            let _guard = SurfaceJobGuard::new(&mut surface);
+            let _guard = SurfaceJobGuard::new(&mut surface, FakeWindow(1));
         }
 
         assert_eq!(*releases.lock().unwrap(), 1);
@@ -621,7 +735,7 @@ mod tests {
         let releases = surface.releases.clone();
 
         {
-            let mut guard = SurfaceJobGuard::new(&mut surface);
+            let mut guard = SurfaceJobGuard::new(&mut surface, FakeWindow(1));
             guard.release_once();
             guard.release_once();
         }
@@ -635,12 +749,65 @@ mod tests {
         let releases = surface.releases.clone();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = SurfaceJobGuard::new(&mut surface);
+            let _guard = SurfaceJobGuard::new(&mut surface, FakeWindow(1));
             panic!("test unwind");
         }));
 
         assert!(result.is_err());
         assert_eq!(*releases.lock().unwrap(), 1);
+    }
+
+    /// What replaced the three runtime "did you acquire first?" checks
+    /// (`api-004`): the window travels from `acquire` through every input to the
+    /// release, and the executor cannot route a stale one because it does not keep
+    /// one.
+    ///
+    /// Two jobs run back to back against one surface, each minting its own
+    /// window. Job 1 is aborted by a recoverable refusal on its second input, so
+    /// it is also the case where the old shape had a half-cleared
+    /// `Option<Target>` to get wrong.
+    #[tokio::test(start_paused = true)]
+    async fn every_input_and_the_release_see_the_window_that_job_acquired() {
+        let rig = rig();
+        let (mut surface, events) = FakeSurface::new(design_rect());
+        let windows = surface.windows.clone();
+        let releases = surface.releases.clone();
+        surface.deny_after = Some((
+            1,
+            SurfaceError::Recoverable("the game window moved or resized mid-job".to_owned()),
+        ));
+        for seed in [1, 2] {
+            rig.job_tx
+                .send(plan::refresh_job(
+                    Trigger::Refreshed,
+                    Timings::default(),
+                    Epoch(0),
+                    seed,
+                ))
+                .await
+                .unwrap();
+        }
+        drop(rig.job_tx);
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+
+        // Job 1: one click lands, the second is refused, then the abort's
+        // release. Job 2: both clicks and its own release.
+        assert_eq!(events.lock().unwrap().len(), 3);
+        assert_eq!(*releases.lock().unwrap(), 2);
+        // Every call was handed *that* job's window, in order. A stale one would
+        // show up here as a `1` after the first `2` — which is exactly what a
+        // surface-held `Option<Target>` could produce and nothing checked.
+        assert_eq!(
+            *windows.lock().unwrap(),
+            vec![
+                FakeWindow(1),
+                FakeWindow(1),
+                FakeWindow(1),
+                FakeWindow(2),
+                FakeWindow(2),
+                FakeWindow(2),
+            ]
+        );
     }
 
     fn design_rect() -> Result<ClientRect, SurfaceError> {
