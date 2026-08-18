@@ -1,7 +1,8 @@
 //! The session loop and its handlers: own the controller, apply its
 //! decisions to the capture gate, and echo every outcome to the player.
 
-use std::sync::Mutex;
+use std::fmt::Write as _;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
@@ -17,20 +18,59 @@ use crate::watch::{HaltSource, WatchGate};
 
 use super::Command;
 
+/// The session tick period; the wall clock the domain's time limits are read
+/// against. [`HEARTBEAT_EVERY_TICKS`] counts these, so the two are one
+/// arithmetic relation rather than two unrelated literals.
+const TICK_PERIOD: Duration = Duration::from_secs(1);
+
 /// One heartbeat every 30 ticks (30 s). A healthy pipeline at rest and a dead
 /// one are otherwise indistinguishable in the logs: both are silent.
 const HEARTBEAT_EVERY_TICKS: u64 = 30;
+
+/// How long the loop waits, after the uplink channel closed with no fatal
+/// captured, for a racing supervisor report. A panicking worker drops its
+/// sender a scheduling hop before its supervisor sends the fatal, so without
+/// this window a crash is reported as a clean "session ended".
+const FATAL_REPORT_GRACE: Duration = Duration::from_millis(150);
+
+/// The controller's poison-tolerant lock, matching the policy the journal, the
+/// view, the actuator and the stream budget already state: a panic on some
+/// other thread must not turn every later dispatch into a second panic.
+///
+/// This mutex is the one the GUI already reads through
+/// `ui::lock_ignoring_poison`, so the two owners of it have to agree. The
+/// alternative — `.expect("controller mutex poisoned")` — turned a recoverable
+/// frame fault into `supervise` reporting "session crashed" and the whole relay
+/// stopping. `Controller::handle` is pure and saturating, so a guard released by
+/// an unwinding thread never leaves the state machine half-written.
+fn lock(controller: &Mutex<Controller>) -> MutexGuard<'_, Controller> {
+    controller.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Why the loop stopped. Exactly one of these holds when the loop breaks; the
+/// teardown event and the fatal-report grace window are both read off it, so a
+/// `break` added later cannot silently default to "shutdown".
+enum Exit {
+    /// Ctrl+C or the window closing — the player's own stop.
+    PlayerStopped,
+    /// The uplink's message channel closed; a racing fatal may still arrive.
+    UplinkClosed,
+    /// A pipeline death, already journaled.
+    Fatal(String),
+}
 
 /// Owns the controller for the session: multiplexes player commands, server
 /// messages, a 1 s tick (time limits), capture failures, the cooperative
 /// shutdown signal, and Ctrl+C.
 ///
 /// The mutex guard is only ever held across synchronous calls, never an
-/// `.await`. The wall clock is read here so the domain stays pure.
+/// `.await`. The wall clock is read here so the domain stays pure. The guard is
+/// taken through [`lock`], so a controller poisoned by a panic elsewhere
+/// degrades instead of ending the session with a second panic.
 ///
 /// Returns the fatal failure, if one ended the session: the caller turns it
 /// into an error outcome (banner + exit code), the loop only reports it. The
-/// message is self-describing (`capture: …`, `uplink task panicked`).
+/// message is self-describing (`network capture: …`, `uplink task panicked`).
 #[expect(
     clippy::too_many_arguments,
     reason = "four borrowed session handles plus the four channels this loop multiplexes; \
@@ -47,7 +87,7 @@ pub(super) async fn session_loop(
     mut shutdown: watch::Receiver<bool>,
 ) -> Option<String> {
     let now_ms = || journal.now_ms();
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let mut ticker = tokio::time::interval(TICK_PERIOD);
     // Burst would replay every tick missed during a CPU stall back to back,
     // all carrying near-identical `now_ms` — N pointless dispatches (each
     // taking and releasing the controller mutex) right after a hiccup.
@@ -60,12 +100,14 @@ pub(super) async fn session_loop(
     let mut commands_open = true;
     let mut fatal_open = true;
     let mut shutdown_open = true;
-    let mut fatal_failure = None;
-    let mut player_exit = false;
-    let mut uplink_closed = false;
     let mut ticks: u64 = 0;
     let mut last_shop_ms: Option<u64> = None;
-    loop {
+    // A tag this build does not know is the fourth way "it stopped refreshing"
+    // happens, and it presents exactly like a mute server. The decode boundary
+    // warns once per connection; the heartbeat carries the running count so the
+    // periodic line can be told apart too.
+    let mut unknown_messages: u64 = 0;
+    let exit = loop {
         // Read here rather than in the branch: the signal may already be set
         // when the loop starts (a window closed during startup), in which case
         // `changed()` would never fire.
@@ -73,8 +115,7 @@ pub(super) async fn session_loop(
             journal.emit(&[">> shutting down".to_owned()]);
             // The window closing is the player's own stop, exactly like
             // Ctrl+C — not a pipeline death.
-            player_exit = true;
-            break;
+            break Exit::PlayerStopped;
         }
         tokio::select! {
             biased;
@@ -109,6 +150,9 @@ pub(super) async fn session_loop(
                     if matches!(message, ServerMessage::Shop(_)) {
                         last_shop_ms = Some(now);
                     }
+                    if matches!(message, ServerMessage::Unknown) {
+                        unknown_messages = unknown_messages.wrapping_add(1);
+                    }
                     on_message(controller, gate, journal, actuator, message, now);
                 }
                 // An armed watch with a dead link looks exactly like a closed
@@ -116,7 +160,10 @@ pub(super) async fn session_loop(
                 // The controller is told too: the watchdog must not escalate
                 // over a dead wire.
                 Some(UplinkEvent::LinkDown(reason)) => {
-                    journal.emit(
+                    // `warn`, not `info`: a dead wire is the reason no shop can
+                    // arrive, and a log narrowed past it explains nothing.
+                    journal.emit_at(
+                        tracing::Level::WARN,
                         &[format!(">> server link down: {reason} — retrying, no shop can arrive")],
                     );
                     dispatch(controller, gate, journal, actuator, Event::LinkDown, now_ms());
@@ -126,19 +173,22 @@ pub(super) async fn session_loop(
                     let now = now_ms();
                     dispatch(controller, gate, journal, actuator, Event::LinkUp { now_ms: now }, now);
                 }
-                None => {
-                    uplink_closed = true;
-                    break; // uplink channel closed.
-                }
+                None => break Exit::UplinkClosed,
             },
             error = fatal_errors.recv(), if fatal_open => match error {
                 Some(error) => {
                     // Break immediately: the channel cascade can take tens of
                     // seconds to reach this loop, during which the window
                     // would keep claiming a healthy watch.
-                    journal.emit(&[format!(">> session aborted — {error}")]);
-                    fatal_failure = Some(error);
-                    break;
+                    //
+                    // `error`, not `info`: this is the line README's
+                    // troubleshooting tells the player to look for, and at
+                    // `info` any narrowing of `RUST_LOG` deletes it.
+                    journal.emit_at(
+                        tracing::Level::ERROR,
+                        &[format!(">> session aborted — {error}")],
+                    );
+                    break Exit::Fatal(error);
                 }
                 None => fatal_open = false,
             },
@@ -147,57 +197,64 @@ pub(super) async fn session_loop(
                 dispatch(controller, gate, journal, actuator, Event::Tick { now_ms: now }, now);
                 ticks = ticks.wrapping_add(1);
                 if ticks.is_multiple_of(HEARTBEAT_EVERY_TICKS) {
-                    heartbeat(controller, gate, now, last_shop_ms);
+                    heartbeat(controller, gate, now, last_shop_ms, unknown_messages);
                 }
             }
             _ = &mut ctrl_c => {
                 journal.emit(&[">> Ctrl+C, stopping".to_owned()]);
-                player_exit = true;
-                break;
+                break Exit::PlayerStopped;
             }
         }
-    }
+    };
     // A worker panic can close the uplink's message channel — the panicking
     // task drops its sender as it unwinds — a scheduling hop *before* its
     // supervisor delivers the fatal on `fatal_errors`. If the loop ended that
     // way with no fatal captured yet, wait briefly for the racing report so a
     // crash is not misreported as a clean "session ended".
-    if uplink_closed
-        && fatal_failure.is_none()
+    let mut raced_failure = None;
+    if matches!(exit, Exit::UplinkClosed)
         && fatal_open
-        && let Ok(Some(error)) =
-            tokio::time::timeout(Duration::from_millis(150), fatal_errors.recv()).await
+        && let Ok(Some(error)) = tokio::time::timeout(FATAL_REPORT_GRACE, fatal_errors.recv()).await
     {
-        journal.emit(&[format!(">> session aborted — {error}")]);
-        fatal_failure = Some(error);
+        journal.emit_at(
+            tracing::Level::ERROR,
+            &[format!(">> session aborted — {error}")],
+        );
+        raced_failure = Some(error);
     }
     // The window (GUI build) outlives the loop: leave an honest state behind
     // — controller stopped, gate (and thus capture) off, a journal line
     // saying why. Only Ctrl+C and closing the window are the player's own
     // stop; a pipeline death is a shutdown. The domain ignores both for a
     // never-armed controller.
-    let teardown = if player_exit {
-        Event::Stop
-    } else {
-        Event::Shutdown
+    let teardown = match exit {
+        Exit::PlayerStopped => Event::Stop,
+        Exit::UplinkClosed | Exit::Fatal(_) => Event::Shutdown,
     };
     dispatch(controller, gate, journal, actuator, teardown, now_ms());
-    fatal_failure
+    match exit {
+        Exit::Fatal(error) => Some(error),
+        Exit::PlayerStopped | Exit::UplinkClosed => raced_failure,
+    }
 }
 
 /// One periodic line saying the loop is alive and what it is waiting on.
 ///
-/// The three ways "it stopped refreshing" happens — capture blind, server
-/// mute, actuator stuck — are indistinguishable in a silent log; this makes
-/// them tell apart. `since_last_shop_s` is `None` until the first shop.
+/// The four ways "it stopped refreshing" happens — capture blind, server mute,
+/// actuator stuck, or a server dialect this build does not parse — are
+/// indistinguishable in a silent log; this makes them tell apart.
+/// `since_last_shop_s` is `None` until the first shop, and `unknown_messages`
+/// separates "server mute" from "server talking, client not understanding":
+/// both present as no shop arriving.
 /// Nothing is awaited here, so the controller guard never crosses an await.
 fn heartbeat(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
     now_ms: u64,
     last_shop_ms: Option<u64>,
+    unknown_messages: u64,
 ) {
-    let ctrl = controller.lock().expect("controller mutex poisoned");
+    let ctrl = lock(controller);
     let status = status_label(&ctrl);
     let refreshes = ctrl.progress().refreshes;
     drop(ctrl);
@@ -207,6 +264,7 @@ fn heartbeat(
         refreshes,
         gate_armed = gate.is_enabled(),
         since_last_shop_s = ?since_last_shop_s,
+        unknown_messages,
         "session heartbeat"
     );
 }
@@ -234,7 +292,7 @@ fn handle_command(
     command: Command,
     now_ms: u64,
 ) -> Vec<String> {
-    let mut ctrl = controller.lock().expect("controller mutex poisoned");
+    let mut ctrl = lock(controller);
     let event = match command {
         Command::Start => Event::Start { now_ms },
         Command::Stop => Event::Stop,
@@ -314,6 +372,9 @@ fn on_message(
     now_ms: u64,
 ) {
     match message {
+        // Neither is silent overall: the decode boundary warns once per
+        // connection on an unknown tag and `session_loop` counts them into the
+        // heartbeat. Nothing player-facing to say here.
         ServerMessage::Ack | ServerMessage::Unknown => {}
         ServerMessage::Shop(snapshot) => {
             // The full item dump stays console-only: the GUI table shows the
@@ -323,7 +384,7 @@ fn on_message(
             // the player touched the game, so aborting in-flight clicks is
             // the safe reading.
             actuator.epoch.bump();
-            let mut ctrl = controller.lock().expect("controller mutex poisoned");
+            let mut ctrl = lock(controller);
             // Read before handling: an advised refresh counts itself into
             // `refreshes`, so after `handle` the very first shop would
             // already look refreshed.
@@ -354,7 +415,7 @@ fn handle_purchase(
     notice: &PurchaseNotice,
     now_ms: u64,
 ) -> Vec<String> {
-    let mut ctrl = controller.lock().expect("controller mutex poisoned");
+    let mut ctrl = lock(controller);
     let mut lines = vec![purchase_line(&ctrl, notice)];
     let actions = ctrl.handle(Event::Purchase {
         item: notice.item,
@@ -403,7 +464,7 @@ fn dispatch(
     event: Event,
     now_ms: u64,
 ) {
-    let mut ctrl = controller.lock().expect("controller mutex poisoned");
+    let mut ctrl = lock(controller);
     let actions = ctrl.handle(event);
     let lines = apply(&actions, &ctrl, gate, actuator, None, now_ms);
     drop(ctrl);
@@ -631,10 +692,6 @@ fn submit_buys(
 /// Details of the matched targets, straight from the snapshot that raised
 /// them (the controller stored it before emitting).
 fn render_match(lines: &mut Vec<String>, targets: &[BuyTarget], controller: &Controller) {
-    let list: Vec<String> = targets
-        .iter()
-        .map(|target| target.slot.to_string())
-        .collect();
     let clickable = targets.iter().filter(|target| target.id.is_some()).count();
     // Matched + still Paused means the loop waits on purchases; a Buy with
     // the loop not Paused is dead stock (nothing on it is buyable) and any
@@ -652,7 +709,17 @@ fn render_match(lines: &mut Vec<String>, targets: &[BuyTarget], controller: &Con
     } else {
         ": buy in game — resumes automatically"
     };
-    lines.push(format!(">> MATCH — slot(s) {}{hint}", list.join(", ")));
+    // Written straight into the line: a `Vec<String>` of slot numbers only to
+    // `join(", ")` allocated once per target and once more for the join.
+    let mut line = String::from(">> MATCH — slot(s) ");
+    for (position, target) in targets.iter().enumerate() {
+        if position > 0 {
+            line.push_str(", ");
+        }
+        let _ = write!(line, "{}", target.slot);
+    }
+    line.push_str(hint);
+    lines.push(line);
     let Some(snapshot) = controller.last_snapshot() else {
         return;
     };

@@ -1,3 +1,23 @@
+//! Tests for the session loop and its handlers, in the order the module
+//! declares them.
+//!
+//! 1. **The loop itself** — how each `break` path leaves the controller and the
+//!    gate, the safety-halt latch against a saturated command queue, the
+//!    post-loop grace drain that keeps a worker panic from reading as a clean
+//!    end, and the cooperative shutdown signal.
+//! 2. **Commands** (`handle_command`) — every `Command` variant, including the
+//!    `Toggle` resolution and the retune confirmations.
+//! 3. **Server messages** (`on_message`, `handle_purchase`) — shop snapshots,
+//!    purchase echoes and the lines each renders.
+//! 4. **`apply`** — the gate transitions, the advice wording, and the job
+//!    submissions (refresh, buy, confirm re-click) per actuator mode.
+//! 5. **Watchdog recovery** — each `Recovery` rung and what it queues.
+//!
+//! The shared fixtures (`never_shutdown`, `timings`, `off`, `recording`,
+//! `dud_shop`) open the file; the narrower ones (`one_item_shop`,
+//! `controller_with_named_item`, `armed`, `armed_recovering`) sit immediately
+//! above the group that uses them.
+
 use std::sync::Arc;
 
 use super::*;
@@ -88,7 +108,7 @@ async fn session_loop_exit_stops_controller_and_gate() {
     assert!(!gate.is_enabled());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_worker_panic_is_reported_when_the_uplink_channel_closes() {
     let gate = WatchGate::new(false);
     let journal = EventLog::default();
@@ -106,7 +126,7 @@ async fn a_worker_panic_is_reported_when_the_uplink_channel_closes() {
     // grace-drain can surface it. Without that drain the loop returns None.
     drop(message_tx);
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let _ = error_tx.send("uplink task panicked".to_owned()).await;
     });
 
@@ -373,7 +393,7 @@ async fn session_loop_exit_leaves_never_armed_controller_idle() {
 /// Closing the window must unwind the pipeline: without this branch the loop
 /// keeps running on a detached task and the process dies with a live capture
 /// session still open in the driver.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn shutdown_signal_ends_the_loop_and_stops_the_watch() {
     let gate = WatchGate::new(false);
     let journal = EventLog::default();
@@ -390,7 +410,7 @@ async fn shutdown_signal_ends_the_loop_and_stops_the_watch() {
     let (_error_tx, error_rx) = mpsc::channel::<String>(1);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let signal = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         shutdown_tx.send_replace(true);
         shutdown_tx
     });
@@ -578,7 +598,7 @@ fn gate_follows_controller_status() {
     apply(&[], &ctrl, &gate, &off(), None, 0);
     assert!(!gate.is_enabled()); // Idle
 
-    ctrl.handle(Event::Start { now_ms: 0 });
+    let _ = ctrl.handle(Event::Start { now_ms: 0 });
     apply(&[], &ctrl, &gate, &off(), None, 0);
     assert!(gate.is_enabled()); // Watching
 
@@ -695,7 +715,7 @@ fn controller_with_named_item() -> Controller {
     let mut snapshot = one_item_shop();
     snapshot.slots[0].id = 42;
     snapshot.slots[0].name = Some("Reforged Sword".to_owned());
-    controller.handle(Event::Snapshot {
+    let _ = controller.handle(Event::Snapshot {
         snapshot,
         now_ms: 0,
     });
@@ -743,7 +763,7 @@ fn purchase_line_omits_missing_gold() {
 fn match_hint_warns_when_some_matches_untracked() {
     let gate = WatchGate::new(false);
     let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
-    ctrl.handle(Event::Start { now_ms: 0 });
+    let _ = ctrl.handle(Event::Start { now_ms: 0 });
     // Two matches, only one trackable: the first slot keeps the id-0
     // sentinel, so auto-resume would refresh over it.
     let snapshot = ShopSnapshot {
@@ -857,7 +877,7 @@ fn armed() -> Mutex<Controller> {
         Filter::matching_default_items(),
         Limits::default(),
     ));
-    controller
+    let _ = controller
         .lock()
         .unwrap()
         .handle(Event::Start { now_ms: 0 });
@@ -1054,7 +1074,7 @@ fn dead_stock_match_keeps_refreshing_without_clicks() {
         ..Filter::matching_default_items()
     };
     let controller = Mutex::new(Controller::new(filter, Limits::default()));
-    controller
+    let _ = controller
         .lock()
         .unwrap()
         .handle(Event::Start { now_ms: 0 });
@@ -1158,7 +1178,7 @@ fn a_gone_executor_is_journaled_as_gone_not_as_a_full_queue() {
 fn armed_recovering() -> Mutex<Controller> {
     let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
     ctrl.enable_recovery();
-    ctrl.handle(Event::Start { now_ms: 0 });
+    let _ = ctrl.handle(Event::Start { now_ms: 0 });
     Mutex::new(ctrl)
 }
 

@@ -12,7 +12,7 @@ use futures_util::FutureExt;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument as _, debug, error, info, warn};
 
 use crate::actuator::{ActuatorHandle, Mode, SnapshotEpoch, plan};
 #[cfg(test)]
@@ -40,6 +40,30 @@ const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 /// reporting nothing on the configured port.
 const CAPTURE_PROGRESS_EVERY: u64 = 1000;
 
+/// Metadata queue depth between the capture thread and reassembly. `stream.rs`
+/// reasons about "a 512-slot channel" when it justifies its size canaries, so
+/// this number and those canaries move together — see the `CaptureEvent` assert
+/// below.
+const CAPTURE_EVENT_QUEUE: usize = 512;
+
+/// Reassembled chunks awaiting the uplink, and inbound server messages awaiting
+/// the session loop. Both stages are byte-capped by [`PipelineBudget`]; the slot
+/// count only bounds how far ahead a producer may run.
+const PIPELINE_QUEUE: usize = 256;
+
+/// Fatal-failure reports. Several producers, one consumer, and only the first
+/// message is ever used — the depth exists so a racing second report cannot
+/// block the task that is already unwinding.
+const FATAL_QUEUE: usize = 4;
+
+/// Player commands awaiting the session loop. Safety stops do not ride this
+/// queue (see [`Command`]), so saturation costs latency, never a missed stop.
+const COMMAND_QUEUE: usize = 16;
+
+/// Click jobs awaiting the actuator. Deliberately shallow: a deep queue would
+/// let clicks planned against a dead shop pile up behind the epoch check.
+const JOB_QUEUE: usize = 8;
+
 /// Conservative one-shot allowance for reordered predecessors immediately
 /// after capture resumes. Ten milliseconds is the documented hard cap: it
 /// bounds latency even though no server-side timing evidence is available.
@@ -60,12 +84,61 @@ enum CaptureEvent {
     PressureResync,
 }
 
-const RESYNC_ACK: u8 = 0;
-const RESYNC_PENDING: u8 = 1;
-const RESYNC_ENQUEUED: u8 = 2;
+/// `CaptureEvent` is stored **by value** in a [`CAPTURE_EVENT_QUEUE`]-slot
+/// channel, so its size is that queue's footprint: one extra field on the
+/// largest variant silently inflates tens of KiB of always-resident memory.
+/// `stream.rs`'s canaries pin the *fields* (`BudgetedSegment`, `Segment`); this
+/// one pins the enum that is actually queued.
+///
+/// If this fires, re-measure and update the number deliberately — never work
+/// around it by boxing a variant without saying why here.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    size_of::<CaptureEvent>() == 120,
+    "CaptureEvent grew: it is queued by value, so this is per-slot queue memory"
+);
+
+/// The three states of the pressure-marker protocol, in the order they cycle:
+/// `Ack -> Pending -> Enqueued -> Ack`. Stored in an `AtomicU8` with explicit
+/// discriminants, the way [`crate::watch::HaltSource`] already does it — the two
+/// named atomics sit in the same pipeline and both deserve a `match` rather than
+/// a chain of `!=`.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Resync {
+    /// Nothing outstanding: segments flow.
+    Ack = 0,
+    /// A re-anchor is owed but the marker has not reached the queue yet.
+    Pending = 1,
+    /// The marker is in the queue; the consumer will acknowledge it.
+    Enqueued = 2,
+}
+
+impl Resync {
+    /// Decodes a value this type itself wrote. [`PressureResync`] is the only
+    /// writer and every store goes through `Self as u8`, so the fallback is
+    /// unreachable rather than lenient — spelled out loudly instead of silently
+    /// defaulting to `Ack`, which would drop a resync marker.
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Ack,
+            1 => Self::Pending,
+            2 => Self::Enqueued,
+            other => unreachable!("PressureResync holds only its own discriminants, saw {other}"),
+        }
+    }
+}
 
 /// Lossless single-producer pressure marker protocol. A full metadata queue
 /// leaves the request Pending; capture retries before admitting later bytes.
+///
+/// `Relaxed` throughout, deliberately: this atomic is a state machine, not a
+/// publication channel. The only thing that crosses the thread boundary is the
+/// [`CaptureEvent::PressureResync`] marker, and it rides the `mpsc` channel,
+/// which supplies the happens-before edge. What must hold here — the marker is
+/// never enqueued twice, and never lost when `try_send` reports `Full` — rests
+/// on RMW atomicity and on the modification order over a single location, both
+/// of which `Relaxed` already gives. Do not "strengthen" these back.
 #[derive(Clone, Default)]
 struct PressureResync(Arc<AtomicU8>);
 
@@ -74,10 +147,10 @@ impl PressureResync {
         if self
             .0
             .compare_exchange(
-                RESYNC_ACK,
-                RESYNC_PENDING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Resync::Ack as u8,
+                Resync::Pending as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             )
             .is_ok()
         {
@@ -92,41 +165,48 @@ impl PressureResync {
         if self
             .0
             .compare_exchange(
-                RESYNC_PENDING,
-                RESYNC_ENQUEUED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Resync::Pending as u8,
+                Resync::Enqueued as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             )
             .is_err()
         {
-            return self.0.load(Ordering::Acquire) == RESYNC_ENQUEUED;
+            return self.state() == Resync::Enqueued;
         }
         match tx.try_send(CaptureEvent::PressureResync) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 let changed = self.0.compare_exchange(
-                    RESYNC_ENQUEUED,
-                    RESYNC_PENDING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
+                    Resync::Enqueued as u8,
+                    Resync::Pending as u8,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
                 );
                 debug_assert!(changed.is_ok());
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.0.store(RESYNC_ACK, Ordering::Release);
+                self.0.store(Resync::Ack as u8, Ordering::Relaxed);
                 false
             }
         }
     }
 
-    fn blocks_segments(&self) -> bool {
-        self.0.load(Ordering::Acquire) != RESYNC_ACK
+    fn state(&self) -> Resync {
+        Resync::from_u8(self.0.load(Ordering::Relaxed))
+    }
+
+    fn is_blocking_segments(&self) -> bool {
+        match self.state() {
+            Resync::Ack => false,
+            Resync::Pending | Resync::Enqueued => true,
+        }
     }
 
     fn acknowledge(&self) {
-        let previous = self.0.swap(RESYNC_ACK, Ordering::AcqRel);
-        debug_assert_eq!(previous, RESYNC_ENQUEUED);
+        let previous = Resync::from_u8(self.0.swap(Resync::Ack as u8, Ordering::Relaxed));
+        debug_assert_eq!(previous, Resync::Enqueued);
     }
 }
 
@@ -220,7 +300,7 @@ pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
     // with `start`.
     let gate = WatchGate::new(false);
     let journal = EventLog::default();
-    let (command_tx, command_rx) = mpsc::channel::<Command>(16);
+    let (command_tx, command_rx) = mpsc::channel::<Command>(COMMAND_QUEUE);
     let mut controller = Controller::new(config.filter.clone(), config.limits.clone());
     if actuator_mode(&config) == Mode::Live {
         // Only real clicking gets watchdog deadlines: Off is player-paced
@@ -235,7 +315,7 @@ pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
         gate,
         journal,
     };
-    let (job_tx, job_rx) = mpsc::channel::<plan::Job>(8);
+    let (job_tx, job_rx) = mpsc::channel::<plan::Job>(JOB_QUEUE);
     let timings = Arc::new(Mutex::new(config.actuator.timings));
     let actuator = ActuatorHandle::new(
         actuator_mode(&config),
@@ -285,6 +365,13 @@ fn actuator_mode(_config: &Config) -> Mode {
 
 /// Console-only entry point: [`setup`] + [`Session::run`], discarding the
 /// view handles.
+///
+/// # Errors
+///
+/// [`crate::Error::Config`] when `[filter]` names no criteria — the console has
+/// no editor, so an unrestricted filter can only be fixed in `config.toml` and
+/// failing fast beats booting a watch that can never arm. Otherwise whatever
+/// [`Session::run`] returns.
 pub async fn run(config: Config) -> Result<()> {
     // The console has no filter editor: an unrestricted filter can only be
     // fixed in config.toml, so fail fast. The GUI path (setup +
@@ -301,6 +388,15 @@ pub async fn run(config: Config) -> Result<()> {
 
 impl Session {
     /// Runs the relay and blocks until shutdown (Ctrl+C or end of stream).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Capture`] when no capture backend can be opened (see
+    /// `build_source`) or when the capture thread cannot be started, and
+    /// [`crate::Error::Fatal`] carrying the session's own fatal — the first
+    /// message the session loop froze off the fatal channel, already journaled
+    /// and already self-describing. A clean teardown, including a player stop,
+    /// is `Ok(())`.
     pub async fn run(self) -> Result<()> {
         let Self {
             config,
@@ -318,12 +414,12 @@ impl Session {
         } = handles;
         let budget = PipelineBudget::new();
         let pressure_resync = PressureResync::default();
-        let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(512);
-        let (raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(256);
-        let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(256);
+        let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(CAPTURE_EVENT_QUEUE);
+        let (raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(PIPELINE_QUEUE);
+        let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(PIPELINE_QUEUE);
         // One fatal-failure channel, several producers. The session loop
         // freezes the first message before teardown starts.
-        let (fatal_tx, fatal_rx) = mpsc::channel::<String>(4);
+        let (fatal_tx, fatal_rx) = mpsc::channel::<String>(FATAL_QUEUE);
         // Every receiver is taken before the signal moves into the worker set;
         // a window close reaches the session loop and the workers alike.
         let shutdown_rx = shutdown.subscribe();
@@ -403,7 +499,11 @@ impl Session {
         drop(job_rx);
 
         // Keyboard input, decoupled from the session loop through the channel.
-        workers.spawn("stdin", &fatal_tx, stdin_loop(commands, shutdown_rx));
+        workers.spawn(
+            "stdin",
+            &fatal_tx,
+            stdin_loop(commands, shutdown_rx, journal.clone()),
+        );
         // Only the capture thread and owned task wrappers remain fatal
         // producers; channel closure can therefore still be observed.
         drop(fatal_tx);
@@ -452,7 +552,7 @@ impl CaptureWorker {
     /// detach an unabortable thread, so shutdown capability is the finite join.
     fn stop_and_join(&mut self) {
         if let Err(err) = self.stop.stop() {
-            error!(error = %err, "capture stop failed during teardown");
+            error!(error = ?err, "capture stop failed during teardown");
         }
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
@@ -485,6 +585,10 @@ impl SessionWorkers {
 
     /// The panic catcher is the owned worker itself: there is no detached
     /// supervisor holding a second child handle.
+    ///
+    /// The span is entered here rather than inside each worker: four tasks
+    /// interleave into one log file, and `name` is the correlation field they all
+    /// need. One `.instrument()` covers every event any of them emits.
     fn spawn(
         &mut self,
         name: &'static str,
@@ -492,11 +596,14 @@ impl SessionWorkers {
         future: impl Future<Output = ()> + Send + 'static,
     ) {
         let fatal = fatal.clone();
-        let handle = tokio::spawn(async move {
-            if AssertUnwindSafe(future).catch_unwind().await.is_err() {
-                let _ = fatal.send(format!("{name} task panicked")).await;
+        let handle = tokio::spawn(
+            async move {
+                if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+                    let _ = fatal.send(format!("{name} task panicked")).await;
+                }
             }
-        });
+            .instrument(tracing::info_span!("worker", name)),
+        );
         self.tasks.push(TokioWorker {
             name,
             handle: Some(handle),
@@ -563,7 +670,7 @@ fn report_join(
     if let Err(err) = result
         && !(aborted && err.is_cancelled())
     {
-        error!(worker = name, error = %err, "worker join failed during teardown");
+        error!(worker = name, error = ?err, "worker join failed during teardown");
     }
 }
 
@@ -587,6 +694,13 @@ fn spawn_capture_with_budget(
             if std::panic::catch_unwind(run).is_err() {
                 let _ = panic_fatal.blocking_send("capture thread panicked".to_owned());
             }
+        })
+        // Not `?`: the blanket `From<io::Error>` would surface an exhausted
+        // thread limit as a bare "i/o: <os error>" with nothing saying what
+        // failed. This is the earliest thing that can break after the config
+        // loads, and the one failure the player can act on.
+        .map_err(|source| {
+            crate::Error::Capture(format!("starting the capture thread: {source}"))
         })?;
     Ok(CaptureWorker {
         stop,
@@ -619,19 +733,34 @@ fn spawn_capture(
 /// The gate is forced off on every path: a panicking session never reaches
 /// the loop's own teardown, and capture must not keep streaming game traffic
 /// under a crash banner. Idempotent after a clean teardown.
+///
+/// The task lives in a single-element [`tokio::task::JoinSet`] rather than a
+/// bare `JoinHandle`: dropping a handle *detaches*, so a cancelled `supervise`
+/// used to leave the session running with nobody holding it and `gate.set(false)`
+/// never reached — capture still forwarding, the actuator still clicking, under a
+/// session that is officially gone. `JoinSet` aborts on drop instead.
 pub async fn supervise(
     session: impl Future<Output = Result<()>> + Send + 'static,
     gate: WatchGate,
 ) -> (String, bool) {
-    let outcome = tokio::spawn(session).await;
+    let mut set = tokio::task::JoinSet::new();
+    set.spawn(session);
+    let outcome = set.join_next().await;
     gate.set(false);
     match outcome {
-        Ok(Ok(())) => (
+        Some(Ok(Ok(()))) => (
             "session ended — restart the app to reconnect".to_owned(),
             false,
         ),
-        Ok(Err(err)) => (format!("session error: {err}"), true),
-        Err(panic) => (format!("session crashed: {panic}"), true),
+        Some(Ok(Err(err))) => (format!("session error: {err}"), true),
+        Some(Err(panic)) => (format!("session crashed: {panic}"), true),
+        // Unreachable: the set holds exactly the task spawned above. Reported as
+        // a failure rather than panicked on — this is the function whose whole
+        // job is to turn a dead session into a line the player can read.
+        None => (
+            "session crashed: the session task vanished".to_owned(),
+            true,
+        ),
     }
 }
 
@@ -698,38 +827,34 @@ async fn reassemble_loop_with_pressure(
                 .expect("test segment fits capture quota"),
         };
 
-        // Plan 008 remains authoritative: never hold a SYN behind the anchor
-        // deadline. Commit any older burst first, then let `Reassembler`
-        // classify/reset the connection incarnation immediately.
+        // A SYN is never held behind the anchor deadline: it re-anchors the
+        // sequence space, so buffering it would make the burst's own ordering
+        // meaningless. Commit any older burst first, then let `Reassembler`
+        // classify/reset the connection incarnation immediately
+        // (`Reassembler::syn_starts_new_incarnation`).
         if segment.syn {
             if !flush_anchor(&mut anchor, &mut reassembler, &raw_tx).await {
                 break;
             }
             anchor = AnchorState::Steady;
-            match forward_segment(&mut reassembler, segment, &raw_tx).await {
-                ForwardStatus::Open => {}
-                ForwardStatus::Pressure => anchor = AnchorState::AwaitingFirst,
-                ForwardStatus::Closed => break,
+            if !forward_or_rearm(&mut reassembler, segment, &raw_tx, &mut anchor).await {
+                break;
             }
             continue;
         }
 
         match &mut anchor {
             AnchorState::Steady => {
-                match forward_segment(&mut reassembler, segment, &raw_tx).await {
-                    ForwardStatus::Open => {}
-                    ForwardStatus::Pressure => anchor = AnchorState::AwaitingFirst,
-                    ForwardStatus::Closed => break,
+                if !forward_or_rearm(&mut reassembler, segment, &raw_tx, &mut anchor).await {
+                    break;
                 }
             }
             AnchorState::AwaitingFirst => {
                 let mut burst = InitialBurst::new();
                 if burst.would_exceed(&segment) {
                     anchor = AnchorState::Steady;
-                    match forward_segment(&mut reassembler, segment, &raw_tx).await {
-                        ForwardStatus::Open => {}
-                        ForwardStatus::Pressure => anchor = AnchorState::AwaitingFirst,
-                        ForwardStatus::Closed => break,
+                    if !forward_or_rearm(&mut reassembler, segment, &raw_tx, &mut anchor).await {
+                        break;
                     }
                     continue;
                 }
@@ -754,10 +879,8 @@ async fn reassemble_loop_with_pressure(
                     if !flush_anchor(&mut anchor, &mut reassembler, &raw_tx).await {
                         break;
                     }
-                    match forward_segment(&mut reassembler, segment, &raw_tx).await {
-                        ForwardStatus::Open => {}
-                        ForwardStatus::Pressure => anchor = AnchorState::AwaitingFirst,
-                        ForwardStatus::Closed => break,
+                    if !forward_or_rearm(&mut reassembler, segment, &raw_tx, &mut anchor).await {
+                        break;
                     }
                 } else {
                     burst.push(segment);
@@ -798,6 +921,33 @@ async fn flush_anchor(
         }
     }
     true
+}
+
+/// Forwards `segment`, re-arming the anchor if either form of byte pressure
+/// invalidated the origin those bytes belonged to. `false` means the downstream
+/// closed and the caller must `break`.
+///
+/// A plain function rather than a macro on purpose: the four call sites in
+/// `reassemble_loop_with_pressure` are the crate's most correctness-critical
+/// transitions (a wrong `anchor` here stalls reassembly forever), and a
+/// `macro_rules!` would hide them from rust-analyzer, the debugger and the error
+/// messages while buying nothing but the same line count. Only the *post*-forward
+/// transition lives here — two call sites set `AnchorState::Steady` immediately
+/// before calling, and that ordering is theirs to keep.
+async fn forward_or_rearm(
+    reassembler: &mut Reassembler,
+    segment: BudgetedSegment,
+    raw_tx: &mpsc::Sender<BudgetedChunk>,
+    anchor: &mut AnchorState,
+) -> bool {
+    match forward_segment(reassembler, segment, raw_tx).await {
+        ForwardStatus::Open => true,
+        ForwardStatus::Pressure => {
+            *anchor = AnchorState::AwaitingFirst;
+            true
+        }
+        ForwardStatus::Closed => false,
+    }
 }
 
 async fn forward_segment(
@@ -858,6 +1008,62 @@ async fn forward_chunks(
     ForwardStatus::Open
 }
 
+/// The three rare reports of the per-packet loop, out of line.
+///
+/// `#[cold]` + `#[inline(never)]` keeps only the branch test in
+/// [`capture_loop_budgeted`]'s body: with `codegen-units = 1` LLVM would happily
+/// inline the tracing callsite machinery *and* the `PipelineStats` construction
+/// (which takes the budget mutex) into the one function that runs per captured
+/// packet, for branches that fire once a session or never. The honest scale is
+/// small — the kernel filter is one port and the feasibility probe saw 82 matched
+/// packets end to end — so the return here is hot-body layout and readability,
+/// not throughput.
+#[cold]
+#[inline(never)]
+fn report_backend_loss(budget: &PipelineBudget) {
+    let stats = budget.snapshot();
+    warn!(
+        dropped_segments = stats.dropped_segments,
+        dropped_bytes = stats.dropped_bytes,
+        resyncs = stats.resyncs,
+        "capture backend lost packets; dropping until resync acknowledgement"
+    );
+}
+
+/// See [`report_backend_loss`] for why this is out of line. Reports every stage
+/// because a byte-pressure event is diagnosed by *which* stage is holding bytes.
+#[cold]
+#[inline(never)]
+fn report_byte_pressure(budget: &PipelineBudget) {
+    let stats = budget.snapshot();
+    warn!(
+        current_total = stats.current_total,
+        capture_bytes = stats.current_capture,
+        pending_bytes = stats.current_reassembly,
+        outbound_bytes = stats.current_outbound,
+        dropped_segments = stats.dropped_segments,
+        dropped_bytes = stats.dropped_bytes,
+        resyncs = stats.resyncs,
+        "capture pipeline byte pressure; dropping until resync acknowledgement"
+    );
+}
+
+/// See [`report_backend_loss`] for why this is out of line. Slots, not bytes, ran
+/// out here, so only the capture stage's own numbers are relevant.
+#[cold]
+#[inline(never)]
+fn report_metadata_queue_full(budget: &PipelineBudget) {
+    let stats = budget.snapshot();
+    warn!(
+        current_total = stats.current_total,
+        capture_bytes = stats.current_capture,
+        dropped_segments = stats.dropped_segments,
+        dropped_bytes = stats.dropped_bytes,
+        resyncs = stats.resyncs,
+        "capture metadata queue full; dropping until resync acknowledgement"
+    );
+}
+
 /// Capture loop (synchronous context). Stops when the pipeline closes.
 ///
 /// A recv error ends the loop AND is reported through `fatal`: tracing is
@@ -880,8 +1086,11 @@ fn capture_loop_budgeted(
             Ok(segment) => segment,
             Err(err) => {
                 if !*shutdown.borrow() {
-                    error!(error = %err, "capture interrupted");
-                    let _ = fatal.blocking_send(format!("capture: {err}"));
+                    // `Error::Capture`'s own `Display` opens with "network
+                    // capture: ", so a call-site prefix here doubled the kind in
+                    // the one line the player is asked to send us.
+                    error!(error = ?err, "capture interrupted");
+                    let _ = fatal.blocking_send(err.to_string());
                 }
                 break;
             }
@@ -930,15 +1139,9 @@ fn capture_loop_budgeted(
         // does, so it reuses the counted, lossless resync protocol rather than
         // leaving reassembly to stall on a gap no retransmission can fill.
         if source.take_capture_loss() && pressure_resync.request(&budget) {
-            let stats = budget.snapshot();
-            warn!(
-                dropped_segments = stats.dropped_segments,
-                dropped_bytes = stats.dropped_bytes,
-                resyncs = stats.resyncs,
-                "capture backend lost packets; dropping until resync acknowledgement"
-            );
+            report_backend_loss(&budget);
         }
-        if pressure_resync.blocks_segments() {
+        if pressure_resync.is_blocking_segments() {
             budget.record_drop(capacity);
             pressure_resync.try_enqueue(&tx);
             continue;
@@ -949,17 +1152,7 @@ fn capture_loop_budgeted(
             Err(segment) => {
                 budget.record_drop(segment.payload.capacity());
                 if pressure_resync.request(&budget) {
-                    let stats = budget.snapshot();
-                    warn!(
-                        current_total = stats.current_total,
-                        capture_bytes = stats.current_capture,
-                        pending_bytes = stats.current_reassembly,
-                        outbound_bytes = stats.current_outbound,
-                        dropped_segments = stats.dropped_segments,
-                        dropped_bytes = stats.dropped_bytes,
-                        resyncs = stats.resyncs,
-                        "capture pipeline byte pressure; dropping until resync acknowledgement"
-                    );
+                    report_byte_pressure(&budget);
                 }
                 pressure_resync.try_enqueue(&tx);
                 continue;
@@ -982,15 +1175,7 @@ fn capture_loop_budgeted(
             Err(mpsc::error::TrySendError::Full(CaptureEvent::Budgeted(segment))) => {
                 budget.record_drop(segment.capacity());
                 if pressure_resync.request(&budget) {
-                    let stats = budget.snapshot();
-                    warn!(
-                        current_total = stats.current_total,
-                        capture_bytes = stats.current_capture,
-                        dropped_segments = stats.dropped_segments,
-                        dropped_bytes = stats.dropped_bytes,
-                        resyncs = stats.resyncs,
-                        "capture metadata queue full; dropping until resync acknowledgement"
-                    );
+                    report_metadata_queue_full(&budget);
                 }
                 drop(segment);
                 pressure_resync.try_enqueue(&tx);
@@ -1024,16 +1209,32 @@ fn capture_loop(
 
 /// Reads stdin lines and forwards them as [`Command`]s; the session loop never
 /// touches stdin.
-async fn stdin_loop(commands: mpsc::Sender<Command>, shutdown: watch::Receiver<bool>) {
-    input_loop(BufReader::new(tokio::io::stdin()), commands, shutdown).await;
+async fn stdin_loop(
+    commands: mpsc::Sender<Command>,
+    shutdown: watch::Receiver<bool>,
+    journal: EventLog,
+) {
+    input_loop(
+        BufReader::new(tokio::io::stdin()),
+        commands,
+        shutdown,
+        &journal,
+    )
+    .await;
 }
 
 /// Input-independent select core, injectable in tests so a pending read can be
 /// cancelled without touching process stdin.
+///
+/// Unknown input goes through `journal`, not `println!`: it is player feedback,
+/// and `journal.rs` owns the single sink for those. Printed straight to stdout it
+/// reached the player in the console lane and nobody at all in the windowed one,
+/// where stdout is inert and the log file is what we are sent.
 async fn input_loop(
     input: impl AsyncBufRead + Unpin,
     commands: mpsc::Sender<Command>,
     mut shutdown: watch::Receiver<bool>,
+    journal: &EventLog,
 ) {
     let mut lines = input.lines();
     loop {
@@ -1054,10 +1255,10 @@ async fn input_loop(
                             break; // session loop gone.
                         }
                     }
-                    None => println!(
+                    None => journal.emit(&[format!(
                         ">> unknown command: {:?} (start, stop, enter = toggle)",
                         line.trim()
-                    ),
+                    )]),
                 },
                 Ok(None) | Err(_) => break,
             },
@@ -1332,14 +1533,13 @@ mod tests {
             tx.try_send(CaptureEvent::Resync).unwrap();
         }
 
-        let rejected = match budget.admit_capture(segment_with_capacity(1000, 1, 16)) {
-            Ok(_) => panic!("oversized segment unexpectedly admitted"),
-            Err(segment) => segment,
+        let Err(rejected) = budget.admit_capture(segment_with_capacity(1000, 1, 16)) else {
+            panic!("oversized segment unexpectedly admitted")
         };
         budget.record_drop(rejected.payload.capacity());
         assert!(pressure.request(&budget));
         assert!(!pressure.try_enqueue(&tx));
-        assert!(pressure.blocks_segments());
+        assert!(pressure.is_blocking_segments());
         assert_eq!(budget.snapshot().dropped_segments, 1);
         assert_eq!(budget.snapshot().dropped_bytes, 16);
         assert_eq!(budget.snapshot().resyncs, 1);
@@ -1352,7 +1552,7 @@ mod tests {
         }
         assert!(matches!(rx.try_recv(), Ok(CaptureEvent::PressureResync)));
         pressure.acknowledge();
-        assert!(!pressure.blocks_segments());
+        assert!(!pressure.is_blocking_segments());
         assert_eq!(budget.snapshot().resyncs, 1);
     }
 
@@ -1551,7 +1751,7 @@ mod tests {
         // The only fatal is the source running out of characterization data.
         assert_eq!(
             fatal_rx.try_recv().unwrap(),
-            "capture: network capture: characterization complete"
+            "network capture: characterization complete"
         );
     }
 
@@ -1720,9 +1920,20 @@ mod tests {
             .await
             .unwrap();
         tokio::task::yield_now().await;
-        drop(raw_rx);
 
+        // The paused clock advances whenever nothing is runnable, so
+        // `task.await` resolves with or without the `raw_tx.closed()` branch:
+        // the deadline arm would reach the same `break` 10 ms later. The elapsed
+        // time is the only thing that tells the two apart.
+        let before = Instant::now();
+        drop(raw_rx);
         task.await.unwrap();
+
+        assert_eq!(
+            Instant::now().duration_since(before),
+            Duration::ZERO,
+            "a closed downstream must not wait out the anchor window"
+        );
         drop(event_tx);
     }
 
@@ -1941,7 +2152,7 @@ mod tests {
 
         assert_eq!(
             fatal_rx.try_recv().unwrap(),
-            "capture: network capture: receive failed"
+            "network capture: receive failed"
         );
     }
 
@@ -2100,7 +2311,7 @@ mod tests {
 
         workers.shutdown(&WatchGate::new(false), actuator).await;
 
-        assert_eq!(primary, "capture: network capture: first");
+        assert_eq!(primary, "network capture: first");
         assert_eq!(
             fatal_rx.try_recv().unwrap(),
             "uplink task panicked",
@@ -2113,7 +2324,10 @@ mod tests {
         let (reader, _writer) = tokio::io::duplex(64);
         let (commands, mut command_rx) = mpsc::channel(1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let task = tokio::spawn(input_loop(BufReader::new(reader), commands, shutdown_rx));
+        let journal = EventLog::default();
+        let task = tokio::spawn(async move {
+            input_loop(BufReader::new(reader), commands, shutdown_rx, &journal).await;
+        });
         tokio::task::yield_now().await;
 
         shutdown_tx.send_replace(true);
