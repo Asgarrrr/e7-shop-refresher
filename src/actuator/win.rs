@@ -3,6 +3,7 @@
 //! (`SendInput`, real cursor, foreground — the fallback). No window is ever
 //! resized: `to_screen` covers any aspect from 16:9 up, refuses narrower.
 
+use std::fmt;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -42,6 +43,76 @@ const SHIELD_DRAIN_MS: u64 = 50;
 /// Full range of a `MOUSEEVENTF_ABSOLUTE` coordinate — a Win32 protocol
 /// constant, like `WHEEL_DELTA` above it.
 const ABSOLUTE_COORD_MAX: i64 = 65_535;
+
+/// A window handle, carried as the `isize` this module has always carried it as.
+///
+/// The integer representation is load-bearing and documented on
+/// [`MessageSurface::target`]: `HWND` is a raw pointer, so a bare `HWND` in a
+/// struct would make the executor's future `!Send`. What was missing was the
+/// *type*. The handle used to be a bare `isize` travelling beside other `isize`s
+/// — most sharply in [`post`], where the LPARAM parameter has the same width and
+/// [`pack_point`], whose result feeds it, returned exactly the handle's type, so
+/// `post(lparam, WM_LBUTTONDOWN, MK_LBUTTON as usize, target.hwnd)` compiled. It
+/// would have handed a coordinate pair to `PostMessageW` as a window handle:
+/// `FALSE` + `ERROR_INVALID_WINDOW_HANDLE`, classified `Recoverable` by
+/// [`post_refusal`], after which the watchdog retries a click that can never
+/// land.
+///
+/// `#[repr(transparent)]` states the layout the `as HWND` casts throughout this
+/// module already relied on implicitly; it adds no assumption, it writes the
+/// existing one down. Every Win32 call still receives the exact ABI type,
+/// obtained through [`Hwnd::raw`] at the call itself — the FFI boundary is
+/// unchanged.
+///
+/// `Send` needs no `unsafe impl`: the inner value is an `isize`, which is what
+/// keeping it an integer was for.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Hwnd(isize);
+
+impl Hwnd {
+    /// Wraps what Win32 just handed back. A null handle is *not* refused here —
+    /// `FindWindowW`'s null is checked by [`find_game_window`], and
+    /// `GetForegroundWindow`'s null is a legitimate "nobody has focus" that
+    /// `ensure_foreground` compares like any other handle.
+    pub(super) fn new(handle: HWND) -> Self {
+        Self(handle as isize)
+    }
+
+    /// Back to the ABI type, at the Win32 call site and nowhere else.
+    pub(super) fn raw(self) -> HWND {
+        self.0 as HWND
+    }
+}
+
+/// What `repr(transparent)` promises, stated where a change to the wrapper would
+/// break it: [`Hwnd::raw`] hands the inner integer straight to Win32 as a
+/// pointer, so the wrapper must be exactly the ABI type's width. In the style of
+/// `Timings`' and `capture`'s canaries — adding a second field is then a decision
+/// rather than a surprise.
+const _: () = assert!(size_of::<Hwnd>() == size_of::<HWND>());
+
+/// Handles are conventionally read in hex, and wrapping the integer would
+/// otherwise have taken `{:#x}` away.
+impl fmt::LowerHex for Hwnd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl fmt::UpperHex for Hwnd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, f)
+    }
+}
+
+/// Hex, for the same reason: a decimal handle is unrecognizable next to the
+/// value any Win32 tool would show for it.
+impl fmt::Debug for Hwnd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Hwnd({self:#x})")
+    }
+}
 
 /// An input attempted without a live `acquire()`. Both backends answer this,
 /// with this exact text: it is a contract violation, not a fault of the world,
@@ -234,7 +305,7 @@ enum InputEvent {
 /// boundary behind this trait lets the event-order tests prove that validation
 /// happens before injection without ever touching the real cursor or focus.
 trait InputDriver: Send {
-    fn find_game_window(&mut self) -> Result<isize, SurfaceError>;
+    fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError>;
     /// The preflight probe of [`probe_window_reachable`], raw.
     ///
     /// Hands back the thread's last-error untouched instead of a
@@ -242,10 +313,10 @@ trait InputDriver: Send {
     /// reads, and whether the loop stops — stays in one pure function
     /// ([`preflight_refusal`]) that the tests can drive with a synthetic
     /// `ERROR_ACCESS_DENIED` and no Win32 anywhere.
-    fn probe_reachable(&mut self, hwnd: isize) -> std::io::Result<()>;
-    fn foreground_window(&mut self) -> isize;
-    fn request_foreground(&mut self, hwnd: isize);
-    fn client_rect(&mut self, hwnd: isize) -> Result<ClientRect, SurfaceError>;
+    fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()>;
+    fn foreground_window(&mut self) -> Hwnd;
+    fn request_foreground(&mut self, hwnd: Hwnd);
+    fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError>;
     fn send(&mut self, event: InputEvent) -> Result<(), SurfaceError>;
     fn sleep(&mut self, duration: Duration);
 }
@@ -253,22 +324,22 @@ trait InputDriver: Send {
 struct SystemInputDriver;
 
 impl InputDriver for SystemInputDriver {
-    fn find_game_window(&mut self) -> Result<isize, SurfaceError> {
+    fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError> {
         ensure_dpi_awareness()?;
-        find_game_window().map(|hwnd| hwnd as isize)
+        find_game_window().map(Hwnd::new)
     }
 
-    fn probe_reachable(&mut self, hwnd: isize) -> std::io::Result<()> {
-        probe_window_reachable(hwnd as HWND)
+    fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()> {
+        probe_window_reachable(hwnd.raw())
     }
 
-    fn foreground_window(&mut self) -> isize {
+    fn foreground_window(&mut self) -> Hwnd {
         // SAFETY: no arguments, no ownership — the returned HWND (possibly
         // NULL) is only ever compared here, never dereferenced.
-        (unsafe { GetForegroundWindow() }) as isize
+        Hwnd::new(unsafe { GetForegroundWindow() })
     }
 
-    fn request_foreground(&mut self, hwnd: isize) {
+    fn request_foreground(&mut self, hwnd: Hwnd) {
         // The refusal is dropped on purpose: `SetForegroundWindow` reports
         // FALSE both when the switch is denied and when it merely has not
         // happened yet, so its verdict is worthless. `ensure_foreground`
@@ -276,11 +347,11 @@ impl InputDriver for SystemInputDriver {
         // is the authority, and it is the one that produces the error.
         // SAFETY: `hwnd` is the handle `acquire` found; the call validates it
         // itself and answers FALSE for a window that died in between.
-        let _ = unsafe { SetForegroundWindow(hwnd as HWND) };
+        let _ = unsafe { SetForegroundWindow(hwnd.raw()) };
     }
 
-    fn client_rect(&mut self, hwnd: isize) -> Result<ClientRect, SurfaceError> {
-        client_rect(hwnd as HWND)
+    fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError> {
+        client_rect(hwnd.raw())
     }
 
     fn send(&mut self, event: InputEvent) -> Result<(), SurfaceError> {
@@ -337,7 +408,7 @@ impl WinSurface {
             .ok_or_else(|| SurfaceError::Fatal(NO_TARGET.to_owned()))
     }
 
-    fn ensure_foreground(&mut self, hwnd: isize) -> Result<(), SurfaceError> {
+    fn ensure_foreground(&mut self, hwnd: Hwnd) -> Result<(), SurfaceError> {
         if self.driver.foreground_window() == hwnd {
             return Ok(());
         }
@@ -713,8 +784,9 @@ fn post_refusal(error: &std::io::Error) -> SurfaceError {
 /// [`shield`] over the game until [`release`](Surface::release).
 #[derive(Default)]
 pub struct MessageSurface {
-    /// Job-scoped; the handle is stored as an integer so the executor's
-    /// future stays `Send` across awaits.
+    /// Job-scoped; the handle is stored as an integer — see [`Hwnd`], which is
+    /// that integer with a type on it — so the executor's future stays `Send`
+    /// across awaits.
     target: Option<Target>,
 }
 
@@ -744,7 +816,7 @@ impl Drop for MessageSurface {
 
 #[derive(Clone, Copy)]
 struct Target {
-    hwnd: isize,
+    hwnd: Hwnd,
     /// Client area in screen pixels.
     rect: ClientRect,
 }
@@ -762,14 +834,14 @@ impl Target {
     /// A shield failure is fatal — never click shieldless.
     fn engage(self) -> Result<(), SurfaceError> {
         self.verify()?;
-        if shield::raise(self.hwnd as HWND, self.rect).map_err(SurfaceError::Fatal)? {
+        if shield::raise(self.hwnd, self.rect).map_err(SurfaceError::Fatal)? {
             std::thread::sleep(Duration::from_millis(SHIELD_DRAIN_MS));
         }
         Ok(())
     }
 
     fn verify(self) -> Result<(), SurfaceError> {
-        let rect = client_rect(self.hwnd as HWND)?;
+        let rect = client_rect(self.hwnd.raw())?;
         if rect == self.rect {
             return Ok(());
         }
@@ -787,7 +859,7 @@ impl Surface for MessageSurface {
         probe_window_reachable(hwnd).map_err(|error| preflight_refusal(&error))?;
         let rect = client_rect(hwnd)?;
         self.target = Some(Target {
-            hwnd: hwnd as isize,
+            hwnd: Hwnd::new(hwnd),
             rect,
         });
         Ok(rect)
@@ -878,12 +950,12 @@ fn pack_point((x, y): (i32, i32)) -> Result<isize, SurfaceError> {
     Ok(packed as i32 as isize)
 }
 
-fn post(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> Result<(), SurfaceError> {
+fn post(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> Result<(), SurfaceError> {
     // SAFETY: `hwnd` may already be dead — `PostMessageW` reports that with
     // FALSE instead of faulting. Delivery is asynchronous, so nothing may be
     // borrowed by the queue: `wparam`/`lparam` carry packed coordinates and
     // button flags only, never a pointer into this process.
-    let ok = unsafe { PostMessageW(hwnd as HWND, msg, wparam, lparam) } != 0;
+    let ok = unsafe { PostMessageW(hwnd.raw(), msg, wparam, lparam) } != 0;
     if ok {
         return Ok(());
     }
@@ -899,8 +971,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    const GAME_HWND: isize = 101;
-    const OTHER_HWND: isize = 202;
+    const GAME_HWND: Hwnd = Hwnd(101);
+    const OTHER_HWND: Hwnd = Hwnd(202);
 
     #[test]
     fn message_surface_cleanup_is_idempotent_without_a_window() {
@@ -916,25 +988,25 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum DriverCall {
         FindWindow,
-        Probe(isize),
+        Probe(Hwnd),
         Foreground,
-        RequestForeground(isize),
-        ClientRect(isize),
+        RequestForeground(Hwnd),
+        ClientRect(Hwnd),
         Send(InputEvent),
         Sleep(u64),
     }
 
     struct FakeState {
         calls: Vec<DriverCall>,
-        window: isize,
-        foreground: isize,
+        window: Hwnd,
+        foreground: Hwnd,
         rect: ClientRect,
-        find_results: VecDeque<Result<isize, SurfaceError>>,
+        find_results: VecDeque<Result<Hwnd, SurfaceError>>,
         /// Scripted preflight outcomes, raw: an `Err` here is the thread's
         /// last-error as Win32 would have left it, so the tests exercise the
         /// real classification instead of a pre-classified verdict.
         probe_results: VecDeque<std::io::Result<()>>,
-        foreground_results: VecDeque<isize>,
+        foreground_results: VecDeque<Hwnd>,
         rect_results: VecDeque<Result<ClientRect, SurfaceError>>,
         send_results: VecDeque<Result<(), SurfaceError>>,
     }
@@ -960,7 +1032,7 @@ mod tests {
     }
 
     impl InputDriver for FakeInputDriver {
-        fn find_game_window(&mut self) -> Result<isize, SurfaceError> {
+        fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(DriverCall::FindWindow);
             if let Some(result) = state.find_results.pop_front() {
@@ -970,13 +1042,13 @@ mod tests {
             }
         }
 
-        fn probe_reachable(&mut self, hwnd: isize) -> std::io::Result<()> {
+        fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(DriverCall::Probe(hwnd));
             state.probe_results.pop_front().unwrap_or(Ok(()))
         }
 
-        fn foreground_window(&mut self) -> isize {
+        fn foreground_window(&mut self) -> Hwnd {
             let mut state = self.state.lock().unwrap();
             state.calls.push(DriverCall::Foreground);
             if let Some(hwnd) = state.foreground_results.pop_front() {
@@ -986,7 +1058,7 @@ mod tests {
             }
         }
 
-        fn request_foreground(&mut self, hwnd: isize) {
+        fn request_foreground(&mut self, hwnd: Hwnd) {
             self.state
                 .lock()
                 .unwrap()
@@ -994,7 +1066,7 @@ mod tests {
                 .push(DriverCall::RequestForeground(hwnd));
         }
 
-        fn client_rect(&mut self, hwnd: isize) -> Result<ClientRect, SurfaceError> {
+        fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(DriverCall::ClientRect(hwnd));
             if let Some(result) = state.rect_results.pop_front() {
@@ -1716,6 +1788,33 @@ mod tests {
         assert_eq!(wheel_wparam(0).unwrap(), 0);
         // The low word is wParam's button-state field and must stay clear.
         assert_eq!(wheel_wparam(10).unwrap() & 0xFFFF, 0);
+    }
+
+    /// The swap the newtype exists to stop, and the round trip the FFI boundary
+    /// depends on. The transposition itself cannot be written here — that is the
+    /// point, and a `#[test]` cannot assert a compile error — so what is pinned
+    /// is that a handle and a packed point are no longer the same type: the
+    /// packed point stays the `isize` LPARAM Win32 reads, while the handle only
+    /// becomes an `HWND` through `raw`.
+    #[test]
+    fn a_handle_survives_the_round_trip_to_the_abi_type_and_back() {
+        let packed: isize = pack_point((0x1234, 0x5678)).unwrap();
+        let hwnd = Hwnd::new(packed as HWND);
+        assert_eq!(hwnd.raw() as isize, packed);
+        assert_eq!(Hwnd::new(std::ptr::null_mut()), Hwnd(0));
+        assert_ne!(GAME_HWND, OTHER_HWND);
+    }
+
+    /// Handles are read in hex everywhere else (Spy++, WinDbg, a bug report), so
+    /// wrapping the integer must not cost `{:#x}` — and `Debug`, which is what a
+    /// failing assertion prints, uses it.
+    #[test]
+    fn a_handle_formats_as_hex_in_every_form() {
+        let hwnd = Hwnd(0x00AB_CDEF);
+        assert_eq!(format!("{hwnd:x}"), "abcdef");
+        assert_eq!(format!("{hwnd:#x}"), "0xabcdef");
+        assert_eq!(format!("{hwnd:X}"), "ABCDEF");
+        assert_eq!(format!("{hwnd:?}"), "Hwnd(0xabcdef)");
     }
 
     #[test]

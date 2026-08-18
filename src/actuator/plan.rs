@@ -98,10 +98,79 @@ const SCROLL_ZONE: Zone = Zone {
     anchor: Anchor::Right,
 };
 
-/// The clickable 0-based row of a 1-based display slot; `None` for anything
-/// a degraded shop put outside the six rows — never a click.
-pub fn row_for_slot(slot: u8) -> Option<u8> {
-    slot.checked_sub(1).filter(|&row| row <= MAX_ROW)
+/// A 1-based display slot, exactly as the shop numbers its items — the shape
+/// the domain's `BuyTarget::slot` and `ShopItem::effective_slot` speak.
+///
+/// Distinct from [`Row`] because the two differ by one and used to be the same
+/// `u8`: `buy_job(trigger, timings, epoch, &slots, now_ms)` type-checked, and an
+/// off-by-one row clicks the *wrong item's* Buy button, spends the player's gold
+/// on an item the filter rejected, and then wedges the pause — the purchase echo
+/// for the unexpected id is not on the checklist, so nothing ever clears it.
+/// [`Slot::row`] is the one place the two representations meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Slot(u8);
+
+impl Slot {
+    /// Wraps a display slot number as the shop reported it. Any value is
+    /// accepted — a degraded shop can report 0 or a clamped `u8::MAX`, and
+    /// [`Slot::row`] is what refuses those.
+    #[must_use]
+    pub const fn new(slot: u8) -> Self {
+        Self(slot)
+    }
+
+    /// The display number, for the player-facing line.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    /// The clickable 0-based row of this display slot; `None` for anything
+    /// a degraded shop put outside the six rows — never a click.
+    #[must_use]
+    pub const fn row(self) -> Option<Row> {
+        match self.0.checked_sub(1) {
+            Some(row) if row <= MAX_ROW => Some(Row(row)),
+            _ => None,
+        }
+    }
+}
+
+/// A 0-based clickable row, `0..=MAX_ROW` **by construction**: the only thing
+/// [`buy_zone`] and [`buy_job`] accept.
+///
+/// `buy_job` used to filter `row <= MAX_ROW` itself and silently lose anything
+/// above it, so a slot-numbered `&[1, …, 6]` dropped row 6 rather than erring.
+/// There is nothing left to filter: an out-of-range row cannot be built, and the
+/// refusal happens once, at [`Slot::row`], where the caller still has a slot to
+/// name in the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Row(u8);
+
+impl Row {
+    /// A row from a raw 0-based index, or `None` past [`MAX_ROW`].
+    #[must_use]
+    pub const fn new(row: u8) -> Option<Self> {
+        if row <= MAX_ROW {
+            Some(Self(row))
+        } else {
+            None
+        }
+    }
+
+    /// The 0-based index, for the coordinate arithmetic.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    /// The display slot this row is: the one definition of the `row + 1` the
+    /// journal line used to spell by hand. Cannot overflow — a `Row` is at most
+    /// `MAX_ROW`.
+    #[must_use]
+    pub const fn slot(self) -> Slot {
+        Slot(self.0 + 1)
+    }
 }
 
 /// Row 0's Buy-button centre at scroll-top, design px.
@@ -114,8 +183,8 @@ const SCROLL_BOTTOM_SHIFT: f32 = 217.0;
 /// The Buy button of a 0-based row. Rows `0..=LAST_TOP_ROW` are clickable at
 /// scroll-top; the rest only at scroll-bottom, where the whole list sits
 /// `SCROLL_BOTTOM_SHIFT` design px higher.
-pub fn buy_zone(row: u8, at_bottom: bool) -> Zone {
-    let mut cy = BUY_ROW_TOP_CY + BUY_ROW_PITCH * f32::from(row);
+pub fn buy_zone(row: Row, at_bottom: bool) -> Zone {
+    let mut cy = BUY_ROW_TOP_CY + BUY_ROW_PITCH * f32::from(row.get());
     if at_bottom {
         cy -= SCROLL_BOTTOM_SHIFT;
     }
@@ -491,12 +560,25 @@ pub struct TimedStep {
     pub input: Input,
 }
 
+/// The shop-generation number a plan was built against, read from
+/// [`SnapshotEpoch::current`](crate::actuator::SnapshotEpoch::current).
+///
+/// A newtype because every job builder below takes it *immediately before* a
+/// `seed: u64` drawn from `now_ms`, so the two used to be adjacent bare `u64`s
+/// and a transposition compiled. It would not have produced a wrong click, which
+/// is worse: the executor's first act on every job is `job.epoch !=
+/// epoch.current()`, so a swapped pair drops *every* click forever while the
+/// journal blames the shop for changing. Only ever compared for equality —
+/// nothing here does arithmetic on a generation number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Epoch(pub u64);
+
 /// A full input sequence, valid for one shop state: `epoch` is the snapshot
 /// generation the plan was built against — the executor drops the job once a
 /// newer shop has arrived.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Job {
-    pub epoch: u64,
+    pub epoch: Epoch,
     pub steps: Vec<TimedStep>,
 }
 
@@ -563,7 +645,7 @@ fn scroll(jitter: &mut Jitter, notches: i32) -> Input {
 /// after a confirm click that missed its modal. Safe on the shop screen —
 /// nothing clickable sits under either confirm zone when no modal is open
 /// (player-confirmed game fact).
-pub fn confirm_retry_job(zone: Zone, timings: Timings, epoch: u64, seed: u64) -> Job {
+pub fn confirm_retry_job(zone: Zone, timings: Timings, epoch: Epoch, seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
     let mut delay = Jitter::new(seed ^ DELAY_SEED_SALT);
     Job {
@@ -576,7 +658,7 @@ pub fn confirm_retry_job(zone: Zone, timings: Timings, epoch: u64, seed: u64) ->
 }
 
 /// Refresh = click Refresh, wait out the confirm modal, click its yes.
-pub fn refresh_job(trigger: Trigger, timings: Timings, epoch: u64, seed: u64) -> Job {
+pub fn refresh_job(trigger: Trigger, timings: Timings, epoch: Epoch, seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
     let mut delay = Jitter::new(seed ^ DELAY_SEED_SALT);
     let steps = vec![
@@ -592,15 +674,17 @@ pub fn refresh_job(trigger: Trigger, timings: Timings, epoch: u64, seed: u64) ->
     Job { epoch, steps }
 }
 
-/// Buy every row in `rows` (0-based; out-of-range rows are dropped, never
-/// clicked). Stateless about the list: always scroll to the top first (the
+/// Buy every row in `rows`. A [`Row`] is in range by construction, so there is
+/// nothing to drop here any more — a slot outside the six rows was already
+/// refused by [`Slot::row`], where the caller still had a slot number to put in
+/// the journal. Stateless about the list: always scroll to the top first (the
 /// clamp makes it a no-op when already there), buy the top-group rows, one
 /// scroll to the bottom, buy the bottom-group rows. Each buy is click +
 /// confirm.
-pub fn buy_job(trigger: Trigger, timings: Timings, epoch: u64, rows: &[u8], seed: u64) -> Job {
+pub fn buy_job(trigger: Trigger, timings: Timings, epoch: Epoch, rows: &[Row], seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
     let mut delay = Jitter::new(seed ^ DELAY_SEED_SALT);
-    let mut rows: Vec<u8> = rows.iter().copied().filter(|&row| row <= MAX_ROW).collect();
+    let mut rows: Vec<Row> = rows.to_vec();
     rows.sort_unstable();
     rows.dedup();
     if rows.is_empty() {
@@ -618,7 +702,7 @@ pub fn buy_job(trigger: Trigger, timings: Timings, epoch: u64, rows: &[u8], seed
     let mut wait_ms = timings.scroll_settle_ms(&mut delay);
     let mut at_bottom = false;
     for row in rows {
-        if row > LAST_TOP_ROW && !at_bottom {
+        if row.get() > LAST_TOP_ROW && !at_bottom {
             steps.push(TimedStep {
                 wait_ms,
                 input: scroll(&mut jitter, -SCROLL_TO_EXTREME_NOTCHES),
@@ -694,6 +778,13 @@ mod tests {
 
     fn point(x: f32, y: f32, anchor: Anchor) -> DesignPoint {
         DesignPoint { x, y, anchor }
+    }
+
+    /// A row the type system accepts, for the tests that plan clicks. Panics on
+    /// an out-of-range index, which is the whole point of [`Row`]: the fixture
+    /// cannot smuggle in a row `buy_job` used to drop silently.
+    fn row(index: u8) -> Row {
+        Row::new(index).expect("the fixture must name a real row")
     }
 
     fn click_at(step: &TimedStep) -> DesignPoint {
@@ -837,16 +928,17 @@ mod tests {
         // planned a scroll-to-bottom for a row still at the top. Every clause
         // below is derived from the constants, so a change to either that leaves
         // the other behind fails here rather than in the shop.
-        assert_eq!(row_for_slot(MAX_ROW + 1), Some(MAX_ROW));
-        assert_eq!(row_for_slot(MAX_ROW + 2), None);
+        assert_eq!(Slot::new(MAX_ROW + 1).row(), Row::new(MAX_ROW));
+        assert_eq!(Slot::new(MAX_ROW + 2).row(), None);
+        assert_eq!(Row::new(MAX_ROW + 1), None);
 
         // The last top-group row is bought without a second scroll; the first
         // bottom-group row is reached by one, and only one.
         let top = buy_job(
             Trigger::ShopOpened,
             Timings::default(),
-            0,
-            &[LAST_TOP_ROW],
+            Epoch(0),
+            &[row(LAST_TOP_ROW)],
             42,
         );
         assert_eq!(
@@ -859,8 +951,8 @@ mod tests {
         let bottom = buy_job(
             Trigger::ShopOpened,
             Timings::default(),
-            0,
-            &[LAST_TOP_ROW + 1],
+            Epoch(0),
+            &[row(LAST_TOP_ROW + 1)],
             42,
         );
         assert_eq!(
@@ -873,7 +965,7 @@ mod tests {
         );
         // And the row the extra scroll exists for really does move by the shift.
         assert_eq!(
-            buy_zone(LAST_TOP_ROW + 1, false).cy - buy_zone(LAST_TOP_ROW + 1, true).cy,
+            buy_zone(row(LAST_TOP_ROW + 1), false).cy - buy_zone(row(LAST_TOP_ROW + 1), true).cy,
             SCROLL_BOTTOM_SHIFT
         );
     }
@@ -913,17 +1005,28 @@ mod tests {
     }
 
     #[test]
-    fn row_for_slot_maps_the_six_slots_and_rejects_the_rest() {
-        assert_eq!(row_for_slot(1), Some(0));
-        assert_eq!(row_for_slot(6), Some(5));
-        assert_eq!(row_for_slot(0), None);
-        assert_eq!(row_for_slot(7), None);
+    fn slot_row_maps_the_six_slots_and_rejects_the_rest() {
+        assert_eq!(Slot::new(1).row(), Row::new(0));
+        assert_eq!(Slot::new(6).row(), Row::new(5));
+        assert_eq!(Slot::new(0).row(), None);
+        assert_eq!(Slot::new(7).row(), None);
+    }
+
+    /// The two representations round-trip, in the one place each direction
+    /// lives: the journal line reads `Row::slot`, the planner reads `Slot::row`.
+    #[test]
+    fn every_row_names_the_slot_it_came_from() {
+        for index in 0..=MAX_ROW {
+            let row = row(index);
+            assert_eq!(row.slot().row(), Some(row));
+            assert_eq!(row.slot().get(), index + 1);
+        }
     }
 
     #[test]
     fn buy_zone_positions_top_and_bottom_rows() {
         assert_eq!(
-            buy_zone(0, false),
+            buy_zone(row(0), false),
             Zone {
                 cx: 1154.0,
                 cy: 166.5,
@@ -932,8 +1035,8 @@ mod tests {
                 anchor: Anchor::Right,
             }
         );
-        assert_eq!(buy_zone(4, true).cy, 529.5);
-        assert_eq!(buy_zone(5, true).cy, 674.5);
+        assert_eq!(buy_zone(row(4), true).cy, 529.5);
+        assert_eq!(buy_zone(row(5), true).cy, 674.5);
     }
 
     #[test]
@@ -947,8 +1050,8 @@ mod tests {
 
     #[test]
     fn confirm_retry_job_single_click_in_zone() {
-        let job = confirm_retry_job(CONFIRM_BUY, Timings::default(), 5, 42);
-        assert_eq!(job.epoch, 5);
+        let job = confirm_retry_job(CONFIRM_BUY, Timings::default(), Epoch(5), 42);
+        assert_eq!(job.epoch, Epoch(5));
         assert_eq!(job.steps.len(), 1);
         assert_eq!(job.steps[0].wait_ms, 400);
         assert_within(click_at(&job.steps[0]), CONFIRM_BUY);
@@ -956,8 +1059,8 @@ mod tests {
 
     #[test]
     fn refresh_job_clicks_refresh_then_confirm() {
-        let job = refresh_job(Trigger::Refreshed, Timings::default(), 3, 42);
-        assert_eq!(job.epoch, 3);
+        let job = refresh_job(Trigger::Refreshed, Timings::default(), Epoch(3), 42);
+        assert_eq!(job.epoch, Epoch(3));
         assert_eq!(job.steps.len(), 2);
         assert_eq!(job.steps[0].wait_ms, 780);
         assert_within(click_at(&job.steps[0]), REFRESH);
@@ -967,22 +1070,24 @@ mod tests {
 
     #[test]
     fn buy_job_orders_top_group_then_one_scroll_then_bottom_group() {
-        // Unsorted with a duplicate and an out-of-range row.
+        // Unsorted, with a duplicate. (The out-of-range row this case used to
+        // carry cannot be spelled any more — see
+        // `a_slot_outside_the_six_rows_never_becomes_a_click`.)
         let job = buy_job(
             Trigger::ShopOpened,
             Timings::default(),
-            9,
-            &[5, 0, 4, 0, 6],
+            Epoch(9),
+            &[row(5), row(0), row(4), row(0)],
             42,
         );
-        assert_eq!(job.epoch, 9);
+        assert_eq!(job.epoch, Epoch(9));
         assert_eq!(job.steps.len(), 8);
         // Scroll to the top first, whatever the current position.
         assert_eq!(job.steps[0].wait_ms, 1_180);
         assert!(scroll_notches(&job.steps[0]) > 0);
         // Row 0 at scroll-top.
         assert_eq!(job.steps[1].wait_ms, 100);
-        assert_within(click_at(&job.steps[1]), buy_zone(0, false));
+        assert_within(click_at(&job.steps[1]), buy_zone(row(0), false));
         assert_eq!(job.steps[2].wait_ms, 150);
         assert_within(click_at(&job.steps[2]), CONFIRM_BUY);
         // One scroll to the bottom between the groups.
@@ -990,38 +1095,49 @@ mod tests {
         assert!(scroll_notches(&job.steps[3]) < 0);
         // Rows 4 and 5 at scroll-bottom.
         assert_eq!(job.steps[4].wait_ms, 100);
-        assert_within(click_at(&job.steps[4]), buy_zone(4, true));
+        assert_within(click_at(&job.steps[4]), buy_zone(row(4), true));
         assert_eq!(job.steps[5].wait_ms, 150);
         assert_within(click_at(&job.steps[5]), CONFIRM_BUY);
         assert_eq!(job.steps[6].wait_ms, 600);
-        assert_within(click_at(&job.steps[6]), buy_zone(5, true));
+        assert_within(click_at(&job.steps[6]), buy_zone(row(5), true));
         assert_eq!(job.steps[7].wait_ms, 150);
         assert_within(click_at(&job.steps[7]), CONFIRM_BUY);
     }
 
     #[test]
     fn buy_job_scrolls_top_then_bottom_for_a_bottom_only_row() {
-        let job = buy_job(Trigger::PurchaseResumed, Timings::default(), 1, &[4], 42);
+        let job = buy_job(
+            Trigger::PurchaseResumed,
+            Timings::default(),
+            Epoch(1),
+            &[row(4)],
+            42,
+        );
         assert_eq!(job.steps.len(), 4);
         assert_eq!(job.steps[0].wait_ms, 400);
         assert!(scroll_notches(&job.steps[0]) > 0);
         assert_eq!(job.steps[1].wait_ms, 100);
         assert!(scroll_notches(&job.steps[1]) < 0);
         assert_eq!(job.steps[2].wait_ms, 100);
-        assert_within(click_at(&job.steps[2]), buy_zone(4, true));
+        assert_within(click_at(&job.steps[2]), buy_zone(row(4), true));
     }
 
     #[test]
-    fn buy_job_drops_out_of_range_rows_entirely() {
-        // A clamped fallback slot must never become a click.
-        let job = buy_job(
-            Trigger::ShopOpened,
-            Timings::default(),
-            7,
-            &[6, u8::MAX],
-            42,
-        );
-        assert_eq!(job.epoch, 7);
+    fn a_slot_outside_the_six_rows_never_becomes_a_click() {
+        // `buy_job` used to take `&[u8]` and filter the out-of-range rows out
+        // itself, which meant a caller that passed *slot* numbers lost row 6
+        // instead of being refused. The refusal now happens one step earlier and
+        // exactly once, so there is no row left for `buy_job` to drop: slot 7 and
+        // a clamped `effective_slot` fallback (`u8::MAX`) have no row at all, and
+        // the resulting empty plan clicks nothing.
+        assert_eq!(Slot::new(7).row(), None);
+        assert_eq!(Slot::new(u8::MAX).row(), None);
+        let rows: Vec<Row> = [7, u8::MAX]
+            .into_iter()
+            .filter_map(|slot| Slot::new(slot).row())
+            .collect();
+        let job = buy_job(Trigger::ShopOpened, Timings::default(), Epoch(7), &rows, 42);
+        assert_eq!(job.epoch, Epoch(7));
         assert!(job.steps.is_empty());
     }
 
@@ -1039,10 +1155,10 @@ mod tests {
             confirm_refresh_modal: range(50, 150),
             ..Timings::default()
         };
-        let job = refresh_job(Trigger::Refreshed, timings, 3, 42);
+        let job = refresh_job(Trigger::Refreshed, timings, Epoch(3), 42);
         assert!((780 + 200..=780 + 800).contains(&job.steps[0].wait_ms));
         assert!((270 + 50..=270 + 150).contains(&job.steps[1].wait_ms));
-        let baseline = refresh_job(Trigger::Refreshed, Timings::default(), 3, 42);
+        let baseline = refresh_job(Trigger::Refreshed, Timings::default(), Epoch(3), 42);
         assert_eq!(click_at(&job.steps[0]), click_at(&baseline.steps[0]));
         assert_eq!(click_at(&job.steps[1]), click_at(&baseline.steps[1]));
     }
@@ -1054,7 +1170,7 @@ mod tests {
             refreshed: range(500, 500),
             ..Timings::default()
         };
-        let job = refresh_job(Trigger::Refreshed, timings, 3, 42);
+        let job = refresh_job(Trigger::Refreshed, timings, Epoch(3), 42);
         assert_eq!(job.steps[0].wait_ms, 780 + 500);
     }
 
@@ -1064,13 +1180,14 @@ mod tests {
             refreshed: range(0, 1_000),
             ..Timings::default()
         };
-        let a = refresh_job(Trigger::Refreshed, timings, 3, 42);
-        let b = refresh_job(Trigger::Refreshed, timings, 3, 42);
+        let a = refresh_job(Trigger::Refreshed, timings, Epoch(3), 42);
+        let b = refresh_job(Trigger::Refreshed, timings, Epoch(3), 42);
         assert_eq!(a.steps[0].wait_ms, b.steps[0].wait_ms); // same seed
         // A different seed almost surely lands on a different draw over a wide
         // range; scan a few so the test never flakes on one unlucky collision.
         let differs = (100..110).any(|seed| {
-            refresh_job(Trigger::Refreshed, timings, 3, seed).steps[0].wait_ms != a.steps[0].wait_ms
+            refresh_job(Trigger::Refreshed, timings, Epoch(3), seed).steps[0].wait_ms
+                != a.steps[0].wait_ms
         });
         assert!(differs, "a wide range should vary across seeds");
     }
@@ -1086,7 +1203,13 @@ mod tests {
         };
         // Point ranges keep the assertions exact while still exercising the
         // draw path on every buy step.
-        let job = buy_job(Trigger::ShopOpened, timings, 9, &[0, 1], 42);
+        let job = buy_job(
+            Trigger::ShopOpened,
+            timings,
+            Epoch(9),
+            &[row(0), row(1)],
+            42,
+        );
         assert_eq!(job.steps[0].wait_ms, 1_180 + 200); // pre-wait on the scroll
         assert_eq!(job.steps[1].wait_ms, 100 + 50); // scroll settle before buy 0
         assert_eq!(job.steps[2].wait_ms, 150 + 30); // confirm buy 0
@@ -1100,7 +1223,7 @@ mod tests {
             recovery: range(250, 250),
             ..Timings::default()
         };
-        let job = confirm_retry_job(CONFIRM_REFRESH, timings, 5, 42);
+        let job = confirm_retry_job(CONFIRM_REFRESH, timings, Epoch(5), 42);
         assert_eq!(job.steps[0].wait_ms, 400 + 250);
     }
 
@@ -1117,7 +1240,7 @@ mod tests {
             refreshed: range(600, 100),
             ..Timings::default()
         };
-        let job = refresh_job(Trigger::Refreshed, timings, 3, 42);
+        let job = refresh_job(Trigger::Refreshed, timings, Epoch(3), 42);
         assert_eq!(job.steps[0].wait_ms, 780 + 600);
     }
 
@@ -1173,7 +1296,7 @@ mod tests {
             ..Timings::default()
         };
         // No panic, and the baseline still saturates the result.
-        let job = refresh_job(Trigger::Refreshed, timings, 3, 42);
+        let job = refresh_job(Trigger::Refreshed, timings, Epoch(3), 42);
         assert!(job.steps[0].wait_ms >= 780);
     }
 }

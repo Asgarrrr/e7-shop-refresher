@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::journal::EventLog;
 use crate::watch::{HaltSource, WatchGate};
 
-use plan::{Input, Job, ScreenError, Timings};
+use plan::{Epoch, Input, Job, ScreenError, Timings};
 
 /// The actuator's poison-tolerant lock, matching the policy the journal, the
 /// view and the stream budget already state: a panic on some other thread must
@@ -52,9 +52,12 @@ impl SnapshotEpoch {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The generation to plan against, as an [`Epoch`] rather than a bare `u64`:
+    /// every job builder takes it beside a millisecond seed, and the two are not
+    /// interchangeable.
     #[must_use]
-    pub fn current(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+    pub fn current(&self) -> Epoch {
+        Epoch(self.0.load(Ordering::Relaxed))
     }
 }
 
@@ -688,7 +691,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -714,7 +717,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -745,7 +748,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -771,7 +774,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -820,7 +823,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -873,7 +876,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -917,8 +920,8 @@ mod tests {
             .send(plan::buy_job(
                 Trigger::ShopOpened,
                 Timings::default(),
-                0,
-                &[0, 4],
+                Epoch(0),
+                &[plan::Row::new(0).unwrap(), plan::Row::new(4).unwrap()],
                 42,
             ))
             .await
@@ -927,7 +930,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -998,7 +1001,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -1023,7 +1026,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 2,
             ))
             .await
@@ -1070,8 +1073,8 @@ mod tests {
             .send(plan::buy_job(
                 Trigger::ShopOpened,
                 Timings::default(),
-                0,
-                &[0, 4],
+                Epoch(0),
+                &[plan::Row::new(0).unwrap(), plan::Row::new(4).unwrap()],
                 42,
             ))
             .await
@@ -1103,7 +1106,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -1112,7 +1115,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 2,
             ))
             .await
@@ -1149,7 +1152,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -1180,7 +1183,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -1189,7 +1192,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 2,
             ))
             .await
@@ -1217,7 +1220,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -1252,7 +1255,7 @@ mod tests {
             .send(plan::refresh_job(
                 Trigger::Refreshed,
                 Timings::default(),
-                0,
+                Epoch(0),
                 1,
             ))
             .await
@@ -1283,7 +1286,13 @@ mod tests {
         };
         let (surface, events) = FakeSurface::new(Ok(rect));
         let releases = surface.releases.clone();
-        let job = plan::buy_job(Trigger::ShopOpened, Timings::default(), 0, &[1], 42);
+        let job = plan::buy_job(
+            Trigger::ShopOpened,
+            Timings::default(),
+            Epoch(0),
+            &[plan::Row::new(1).unwrap()],
+            42,
+        );
         let expected: Vec<Recorded> = job
             .steps
             .iter()

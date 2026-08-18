@@ -901,7 +901,7 @@ fn shop_jobs_carry_open_then_refresh_pre_waits_and_epochs() {
     );
     let first = jobs.try_recv().expect("first refresh job");
     assert_eq!(first.steps[0].wait_ms, 1_180); // shop-open animation
-    assert_eq!(first.epoch, 1);
+    assert_eq!(first.epoch, plan::Epoch(1));
 
     on_message(
         &controller,
@@ -913,7 +913,7 @@ fn shop_jobs_carry_open_then_refresh_pre_waits_and_epochs() {
     );
     let second = jobs.try_recv().expect("second refresh job");
     assert_eq!(second.steps[0].wait_ms, 780); // refresh animation
-    assert_eq!(second.epoch, 2);
+    assert_eq!(second.epoch, plan::Epoch(2));
     assert!(
         journal
             .entries()
@@ -956,7 +956,7 @@ fn purchase_resume_job_waits_for_the_post_buy_animation() {
     assert_eq!(resume.steps[0].wait_ms, 400);
     // A purchase never bumps the epoch: the shop is unchanged and the
     // job must not be treated as stale.
-    assert_eq!(resume.epoch, 1);
+    assert_eq!(resume.epoch, plan::Epoch(1));
 }
 
 #[test]
@@ -1116,7 +1116,7 @@ fn full_job_queue_journals_the_drop() {
         .try_send(plan::refresh_job(
             Trigger::Refreshed,
             plan::Timings::default(),
-            0,
+            plan::Epoch(0),
             0,
         ))
         .expect("fills the queue");
@@ -1209,7 +1209,7 @@ fn watchdog_confirm_retry_submits_one_click_at_current_epoch() {
     );
     let retry = jobs.try_recv().expect("confirm retry job");
     assert_eq!(retry.steps.len(), 1);
-    assert_eq!(retry.epoch, 1);
+    assert_eq!(retry.epoch, plan::Epoch(1));
     assert!(journal.entries().iter().any(|line| {
         line.text
             .contains("no shop after refresh — re-clicking confirm")
@@ -1252,7 +1252,7 @@ fn watchdog_refresh_reissue_uses_recovery_pre_wait() {
     // Full refresh sequence, but into an idle game: dispatch margin only.
     assert_eq!(reissue.steps.len(), 2);
     assert_eq!(reissue.steps[0].wait_ms, 400);
-    assert_eq!(reissue.epoch, 1);
+    assert_eq!(reissue.epoch, plan::Epoch(1));
     assert!(
         journal
             .entries()

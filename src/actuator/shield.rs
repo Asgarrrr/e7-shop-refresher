@@ -19,13 +19,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::lock;
 use super::plan::ClientRect;
-use super::win::wide;
+use super::win::{Hwnd, wide};
 
 const CLASS_NAME: &str = "arkyve-refresh-shop-shield";
 
 /// Never caches a failure: a transient setup error must not brick the
 /// backend for the process lifetime.
-static WINDOW: Mutex<Option<isize>> = Mutex::new(None);
+static WINDOW: Mutex<Option<Hwnd>> = Mutex::new(None);
 
 // Poisoning carries no meaning here: the guarded state is a plain handle, and a
 // panic elsewhere must not turn every later click into a fatal — the promise
@@ -43,20 +43,20 @@ static WINDOW: Mutex<Option<isize>> = Mutex::new(None);
 /// else as the plain action that failed plus the OS error. Also carries the
 /// reason the shield window could not be created or its pump thread started.
 /// Every one of them is fatal to the caller: never click shieldless.
-pub(super) fn raise(game: HWND, rect: ClientRect) -> Result<bool, String> {
-    let shield = handle()? as HWND;
+pub(super) fn raise(game: Hwnd, rect: ClientRect) -> Result<bool, String> {
+    let shield = handle()?;
     // SAFETY: `game` is the handle the caller revalidated through
     // `Target::verify` just before this call, and `GetWindow` is defined over
     // any HWND — a window that died in between returns NULL, which reads as
     // "the shield is not directly above it" instead of faulting. Nothing is
     // borrowed past the call: the result is only compared.
-    let directly_above = unsafe { GetWindow(game, GW_HWNDPREV) } == shield;
+    let directly_above = unsafe { GetWindow(game.raw(), GW_HWNDPREV) } == shield.raw();
     // SAFETY: `IsWindowVisible` is defined over any HWND — it validates the
     // handle itself, only reports, and answers 0 for one it does not know. The
     // shield's aliveness is deliberately *not* claimed here: it dies with its
     // pump thread, which can exit at any moment after `handle()` returns, so no
     // caller of `raise` could hold that precondition.
-    let visible = unsafe { IsWindowVisible(shield) } != 0;
+    let visible = unsafe { IsWindowVisible(shield.raw()) } != 0;
     if directly_above && visible {
         return Ok(false);
     }
@@ -69,8 +69,8 @@ pub(super) fn raise(game: HWND, rect: ClientRect) -> Result<bool, String> {
     // is checked right below, and that tolerance is the whole justification.
     let placed = unsafe {
         SetWindowPos(
-            shield,
-            game,
+            shield.raw(),
+            game.raw(),
             rect.left,
             rect.top,
             rect.width,
@@ -89,8 +89,8 @@ pub(super) fn raise(game: HWND, rect: ClientRect) -> Result<bool, String> {
     // `SWP_NOMOVE | SWP_NOSIZE` makes the zeroed geometry inert.
     let swapped = unsafe {
         SetWindowPos(
-            game,
-            shield,
+            game.raw(),
+            shield.raw(),
             0,
             0,
             0,
@@ -143,19 +143,19 @@ pub(super) fn hide() {
         // thread; `ShowWindow` is defined over arbitrary HWND values and
         // answers FALSE, which is exactly the best-effort semantics a
         // lowering wants. Nothing is dereferenced on this side.
-        unsafe { ShowWindow(shield as HWND, SW_HIDE) };
+        unsafe { ShowWindow(shield.raw(), SW_HIDE) };
     }
 }
 
 /// Current window, recreated when missing or dead (a window dies with its
 /// pump thread).
-fn handle() -> Result<isize, String> {
+fn handle() -> Result<Hwnd, String> {
     let mut window = lock(&WINDOW);
     if let Some(hwnd) = *window {
         // SAFETY: asking whether a possibly-dead handle is still a window is
         // precisely what `IsWindow` is for — it validates the handle itself
         // and only reports.
-        if unsafe { IsWindow(hwnd as HWND) } != 0 {
+        if unsafe { IsWindow(hwnd.raw()) } != 0 {
             return Ok(hwnd);
         }
         *window = None;
@@ -167,7 +167,7 @@ fn handle() -> Result<isize, String> {
 
 /// The window lives on its own pumping thread: unpumped, it would count as
 /// hung precisely while it absorbs the player's input.
-fn spawn_window() -> Result<isize, String> {
+fn spawn_window() -> Result<Hwnd, String> {
     // The channel carries the verdict itself, not a bare readiness signal: a
     // successful `recv` *is* the detailed `create_window` answer, and a
     // `RecvError` — the sender dropped without sending — is exactly "the thread
@@ -176,7 +176,7 @@ fn spawn_window() -> Result<isize, String> {
     // window for that was between filling the slot and sending, two adjacent
     // statements that cannot panic. One fewer lock in a module the actuator
     // touches on every job.
-    let (tx, rx) = std::sync::mpsc::channel::<Result<isize, String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Hwnd, String>>();
     let spawned = std::thread::Builder::new()
         .name("shield".to_owned())
         .spawn(move || {
@@ -231,7 +231,7 @@ fn register_class(class: &[u16]) -> Result<(), String> {
     Ok(())
 }
 
-fn create_window() -> Result<isize, String> {
+fn create_window() -> Result<Hwnd, String> {
     let class = wide(CLASS_NAME);
     register_class(&class)?;
     // SAFETY: as in `register_class` — the process's own module handle, no
@@ -268,7 +268,7 @@ fn create_window() -> Result<isize, String> {
         let error = std::io::Error::last_os_error();
         return Err(format!("could not set the shield transparency ({error})"));
     }
-    Ok(hwnd as isize)
+    Ok(Hwnd::new(hwnd))
 }
 
 extern "system" fn shield_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

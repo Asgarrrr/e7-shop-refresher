@@ -658,10 +658,16 @@ fn submit_buys(
     let Some(trigger) = active_trigger(actuator, trigger) else {
         return;
     };
-    let rows: Vec<u8> = targets
+    // The one crossing between the shop's 1-based display slot and the
+    // actuator's 0-based click row, and it is the type system's now: a `Row`
+    // exists only on the far side of `Slot::row`, so the `&rows` handed to
+    // `buy_job` below cannot be a list of slot numbers — that used to compile,
+    // and it clicked the wrong item's Buy button with the player's gold behind
+    // it. A slot outside the six rows is refused here, still named.
+    let rows: Vec<plan::Row> = targets
         .iter()
         .filter(|target| target.id.is_some())
-        .filter_map(|target| plan::row_for_slot(target.slot))
+        .filter_map(|target| plan::Slot::new(target.slot).row())
         .collect();
     if rows.is_empty() {
         // Normal buys go quiet here (untrackable matches are advice-only),
@@ -673,10 +679,13 @@ fn submit_buys(
         return;
     }
     for row in &rows {
+        // `Row::slot` rather than a hand-written `row + 1`: the reverse of the
+        // conversion above, in the one place that owns it.
+        let slot = row.slot().get();
         lines.push(if actuator.mode == Mode::Live {
-            format!(">> → buying slot {}", row + 1)
+            format!(">> → buying slot {slot}")
         } else {
-            format!(">> → buy slot {} planned (dry-run)", row + 1)
+            format!(">> → buy slot {slot} planned (dry-run)")
         });
     }
     let job = plan::buy_job(
