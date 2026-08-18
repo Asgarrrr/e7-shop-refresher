@@ -1,5 +1,20 @@
 # Initial stream anchor evidence
 
+> **Amendment, 2026-08-18 (`f6b3ce6`).** This is a frozen evidence record: everything
+> below was true at the revision it names, and the body is deliberately left as
+> written. Three claims no longer describe the code, because the unused
+> client-to-server direction was removed and the pipeline now carries a single
+> half-stream per flow:
+>
+> - anchors are keyed on `FlowKey` alone, not on `(FlowKey, Direction)`;
+> - there is no direction filter in the anchor loop, so nothing is "filtered
+>   before starting the timer" — a packet that is not the game server talking is
+>   rejected earlier, by `parse_segment` returning `None`;
+> - ordering is likewise per-flow, not per-`(flow, direction)`.
+>
+> The decision this document records — ADD_BOUNDED_WINDOW — is unaffected: it
+> concerns *when* a stream is anchored, not how many half-streams exist.
+
 Repository revision examined: `24fd7fd38883faf70d6559e967b23b296a9c0fbf`.
 
 Decision: ADD_BOUNDED_WINDOW
