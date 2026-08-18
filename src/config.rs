@@ -116,14 +116,38 @@ pub enum ActuatorBackend {
     Message,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Vestigial. Both keys are parsed and both are ignored.
+///
+/// They stopped meaning anything when capture moved behind a privilege
+/// boundary: the WinDivert filter is now a constant compiled into the elevated
+/// broker (`tcp and tcp.SrcPort == {game_port}`) with a validated `u16` in it,
+/// and the receive buffer is pinned to the driver's own maximum. The filter in
+/// particular *had* to stop being configurable — this file lives in per-user
+/// roaming app-data, where any medium-integrity process on the machine can
+/// rewrite it, and its contents used to be handed to a kernel driver's filter
+/// compiler inside an administrator process.
+///
+/// **They are still parsed on purpose, and removing them is not a cleanup.**
+/// This struct and [`Config`] are both `deny_unknown_fields`, and
+/// `config.example.toml` shipped `buffer_size` *uncommented* — a file
+/// `main::seed_config_if_missing` writes to `%APPDATA%` on every first run. So
+/// the key is on disk for every player who has ever launched this app, and
+/// deleting the field turns their next launch into `Config::load` failing, an
+/// "Invalid configuration" window, and an app that no longer starts. Editing
+/// `config.example.toml` does nothing for files already written.
+///
+/// Plan: keep them accepted-and-ignored for this release, with the startup
+/// warning `main` emits from [`CaptureConfig::retired_keys`], then delete both
+/// fields (and this struct with them) in a later one, once a player upgrading
+/// across two releases is no longer plausible.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
-    /// Receive buffer size for one WinDivert packet (bytes). Raised to the
-    /// driver's own maximum when set lower.
-    pub buffer_size: usize,
-    /// Explicit WinDivert filter; otherwise derived from `game_port` +
-    /// `forward`.
+    /// Accepted and ignored: the broker's receive buffer is fixed at the
+    /// driver's maximum packet size.
+    pub buffer_size: Option<usize>,
+    /// Accepted and ignored: the capture filter is a constant on the elevated
+    /// side and no longer crosses the privilege boundary as a string.
     pub filter: Option<String>,
 }
 
@@ -161,12 +185,24 @@ impl Default for ReconnectConfig {
     }
 }
 
-impl Default for CaptureConfig {
-    fn default() -> Self {
-        Self {
-            buffer_size: 65_535,
-            filter: None,
+impl CaptureConfig {
+    /// The retired keys this file actually sets, as a readable list, or `None`
+    /// when it sets neither.
+    ///
+    /// A key that silently does nothing is worse than one that is refused: the
+    /// player who set `capture.filter` to widen their capture would otherwise
+    /// spend an evening wondering why. `main` turns this into one warning line
+    /// at startup, so the log a player sends us names it too.
+    #[must_use]
+    pub fn retired_keys(&self) -> Option<String> {
+        let mut keys = Vec::new();
+        if self.buffer_size.is_some() {
+            keys.push("capture.buffer_size");
         }
+        if self.filter.is_some() {
+            keys.push("capture.filter");
+        }
+        (!keys.is_empty()).then(|| keys.join(", "))
     }
 }
 
@@ -237,9 +273,6 @@ impl Config {
     ///     captured game stream, session tokens included, in cleartext);
     ///   - an unrecognized value in `[filter] kinds`, which the wire-tolerant
     ///     `ItemKind` would otherwise fold into `Unknown` and match nothing;
-    ///   - a `capture.filter` that never mentions `game_port`: the direction of
-    ///     a segment is inferred from that port, so such a filter would deliver
-    ///     packets nothing can classify — zero segments and no error;
     ///   - an `[actuator.timings]` range that is reversed (`min_ms > max_ms`)
     ///     or whose `max_ms` exceeds the 60 000 ms ceiling.
     ///
@@ -305,17 +338,16 @@ impl Config {
                 "unrecognized kind in [filter] kinds (expected: equipment, hero, token)".into(),
             ));
         }
-        // A segment's direction is inferred by comparing its ports to
-        // `game_port`: a custom filter capturing a different port delivers
-        // traffic nothing can classify — zero segments, no error.
-        if let Some(filter) = &self.capture.filter
-            && !filter.contains(&self.game_port.to_string())
-        {
-            return Err(crate::Error::Config(format!(
-                "capture.filter does not reference game_port ({}): no packet would be classified",
-                self.game_port
-            )));
-        }
+        // `capture.filter` used to be checked here for naming `game_port`,
+        // because a filter on another port delivered traffic nothing could
+        // classify. That check went away with the thing it guarded: the filter
+        // is a constant on the elevated side now, built from `game_port`
+        // itself, so the mismatch it caught can no longer be expressed. Note
+        // that this rejection must NOT come back in another form — a config
+        // written before the change may well carry a filter naming a different
+        // port, and refusing it would lock that player out of the app on
+        // upgrade for a setting that no longer has any effect.
+        //
         // `[actuator.timings]` reaches both the refresh loop and the Setup
         // meter unchecked otherwise. Two shapes have to be refused here, at the
         // root, rather than absorbed downstream:
@@ -345,26 +377,6 @@ impl Config {
         Ok(())
     }
 
-    /// Effective WinDivert filter: only the directions to forward.
-    ///
-    /// The shop response travels server -> client (`tcp.SrcPort == game_port`).
-    /// A `capture.filter` in the config replaces the derived expression
-    /// wholesale — `validate` has already checked it names `game_port`, without
-    /// which nothing downstream could classify a segment's direction.
-    pub fn capture_filter(&self) -> String {
-        if let Some(filter) = &self.capture.filter {
-            return filter.clone();
-        }
-        let mut clauses = Vec::new();
-        if self.forward.server_to_client {
-            clauses.push(format!("tcp.SrcPort == {}", self.game_port));
-        }
-        if self.forward.client_to_server {
-            clauses.push(format!("tcp.DstPort == {}", self.game_port));
-        }
-        format!("tcp and ({})", clauses.join(" or "))
-    }
-
     pub fn reconnect_initial(&self) -> Duration {
         Duration::from_millis(self.reconnect.initial_ms).max(RECONNECT_FLOOR)
     }
@@ -384,54 +396,70 @@ mod tests {
         Ok(config)
     }
 
+    /// **The regression this whole compatibility shim exists to prevent.**
+    ///
+    /// `config.example.toml` shipped `buffer_size = 65575` uncommented, and
+    /// `main::seed_config_if_missing` writes that file to `%APPDATA%` on every
+    /// first run — so this exact text is on disk for every player who has ever
+    /// launched the app, and some of them uncommented `filter` too. With
+    /// `deny_unknown_fields` on both structs, retiring the keys by deleting
+    /// them turns the next launch into an "Invalid configuration" window and an
+    /// app that will not start. Updating the example does nothing for files
+    /// already written; only still parsing the keys does.
     #[test]
-    fn capture_buffer_zero_is_accepted() {
-        let config = parse_and_validate("[capture]\nbuffer_size = 0").expect("zero is compatible");
-        assert_eq!(config.capture.buffer_size, 0);
-    }
-
-    #[test]
-    fn capture_buffer_legacy_lower_value_is_accepted() {
-        let config =
-            parse_and_validate("[capture]\nbuffer_size = 65535").expect("legacy value is valid");
-        assert_eq!(config.capture.buffer_size, 65_535);
-    }
-
-    #[test]
-    fn capture_buffer_larger_than_the_driver_maximum_is_accepted() {
-        let config =
-            parse_and_validate("[capture]\nbuffer_size = 999999").expect("an oversized buffer");
-        assert_eq!(config.capture.buffer_size, 999_999);
-    }
-
-    /// A custom filter replaces the derived one wholesale, so it is accepted —
-    /// but only if it still names `game_port`, the port every direction check
-    /// downstream is made against.
-    #[test]
-    fn custom_capture_filter_is_accepted_and_must_name_the_game_port() {
-        let config = parse_and_validate("[capture]\nfilter = \"tcp and tcp.SrcPort == 3333\"")
-            .expect("a filter naming game_port");
-        assert_eq!(config.capture_filter(), "tcp and tcp.SrcPort == 3333");
-
-        let error = parse_and_validate("[capture]\nfilter = \"tcp and tcp.SrcPort == 4444\"")
-            .expect_err("a filter on another port classifies nothing");
-        assert!(error.to_string().contains("capture.filter"));
-    }
-
-    #[test]
-    fn derived_capture_filter_follows_the_forwarded_directions() {
-        let mut config = Config::default();
-        assert_eq!(config.capture_filter(), "tcp and (tcp.SrcPort == 3333)");
-
-        config.forward.client_to_server = true;
+    fn a_config_written_before_the_capture_keys_were_retired_still_loads() {
+        let config = parse_and_validate(
+            "[capture]\nbuffer_size = 65575\nfilter = \"tcp and tcp.SrcPort == 3333\"",
+        )
+        .expect("an upgrading player's existing config must still load");
+        assert_eq!(config.capture.buffer_size, Some(65_575));
         assert_eq!(
-            config.capture_filter(),
-            "tcp and (tcp.SrcPort == 3333 or tcp.DstPort == 3333)"
+            config.capture.filter.as_deref(),
+            Some("tcp and tcp.SrcPort == 3333")
         );
+    }
 
-        config.forward.server_to_client = false;
-        config.game_port = 4444;
-        assert_eq!(config.capture_filter(), "tcp and (tcp.DstPort == 4444)");
+    #[test]
+    fn a_retired_filter_naming_another_port_is_no_longer_a_startup_failure() {
+        // It used to be refused, because a filter on another port delivered
+        // traffic nothing could classify. The filter is a constant on the
+        // elevated side now, so the value is inert — and refusing it would
+        // lock an upgrading player out of the app over a setting that has no
+        // effect at all.
+        let config = parse_and_validate("[capture]\nfilter = \"tcp and tcp.SrcPort == 4444\"")
+            .expect("an inert setting must not stop the app from starting");
+        assert!(config.capture.filter.is_some());
+    }
+
+    #[test]
+    fn the_retired_capture_keys_are_named_only_when_they_are_actually_set() {
+        // This list is what the startup warning prints; an empty file must not
+        // produce a warning about keys the player never wrote.
+        assert_eq!(Config::default().capture.retired_keys(), None);
+        assert_eq!(
+            parse_and_validate("[capture]\nbuffer_size = 65575")
+                .expect("still accepted")
+                .capture
+                .retired_keys()
+                .as_deref(),
+            Some("capture.buffer_size")
+        );
+        assert_eq!(
+            parse_and_validate("[capture]\nfilter = \"tcp\"")
+                .expect("still accepted")
+                .capture
+                .retired_keys()
+                .as_deref(),
+            Some("capture.filter")
+        );
+        assert_eq!(
+            parse_and_validate("[capture]\nbuffer_size = 0\nfilter = \"tcp\"")
+                .expect("still accepted")
+                .capture
+                .retired_keys()
+                .as_deref(),
+            Some("capture.buffer_size, capture.filter")
+        );
     }
 
     #[test]
@@ -453,15 +481,19 @@ mod tests {
     }
 
     #[test]
-    fn capture_buffer_overflow_is_rejected_during_deserialization() {
+    fn capture_buffer_overflow_is_still_rejected_during_deserialization() {
+        // The key is ignored, not untyped: a value that cannot be a `usize` is
+        // still a malformed file, and reporting it as a parse error is more
+        // useful than silently reading it as "unset".
         let error = parse_and_validate("[capture]\nbuffer_size = 18446744073709551616")
             .expect_err("integer overflow must fail deserialization");
         assert!(matches!(error, crate::Error::ConfigParse(_)));
     }
 
     #[test]
-    fn capture_buffer_default_is_the_documented_value() {
-        assert_eq!(Config::default().capture.buffer_size, 65_535);
+    fn an_absent_capture_section_leaves_both_retired_keys_unset() {
+        assert_eq!(Config::default().capture.buffer_size, None);
+        assert_eq!(Config::default().capture.filter, None);
     }
 
     #[test]

@@ -47,7 +47,8 @@ the session, **Stop** when done.
 
 Capture needs to see packets before Windows hands them to the game, and the
 only supported way to do that is a kernel-mode driver. **WinDivert** is that
-driver. Being upfront about it:
+driver, and loading a driver needs administrator rights. Being upfront about
+all of it:
 
 - **A signed kernel driver is registered as a Windows service.** On the first
   capture, `WinDivert.dll` registers `WinDivert64.sys` (WinDivert 2.2.2, signed
@@ -63,14 +64,38 @@ driver. Being upfront about it:
 
   The driver can stay resident for a while after the tool exits, until Windows
   drops the last kernel reference; it is gone after a reboot in any case.
-- **Administrator rights are required**, for that reason alone. The exe carries
-  a `requireAdministrator` manifest, so Windows shows the UAC prompt on launch
-  rather than letting the first capture fail with a puzzling error.
+- **Administrator rights are required for that one step, and only that one
+  step.** The app itself runs as you, with no special rights: its manifest says
+  `asInvoker`, so double-clicking the exe opens the window with no prompt at
+  all. When capture starts, it launches a *second* process of the same exe with
+  the `runas` verb — that is the UAC prompt you see — and that second process is
+  the only thing that ever holds administrator rights.
+
+  What that elevated process does is deliberately almost nothing: it opens the
+  WinDivert handle, receives packets, and writes them down a private pipe to the
+  app. It parses no packet, reads no configuration file, opens no network
+  connection, and has no window. Everything that used to make elevation
+  uncomfortable — the TOML parser, the window, the TLS uplink, and above all the
+  TCP reassembly that chews on unauthenticated bytes off the wire — now runs as
+  you, at ordinary integrity, where a bug in it is a bug in a normal program.
+  Earlier versions ran that entire list as administrator for the whole session.
+
+  Two consequences worth knowing:
+
+  - Task Manager shows **two** `arkyve-refresh-shop` processes while capture is
+    running, and its *Elevated* column marks only one of them. Closing the
+    window ends both, within a second, whether or not any traffic is flowing.
+  - Do **not** right-click → *Run as administrator* (older versions of this file
+    told you to). It still works, but then the app is already elevated, no
+    prompt appears, and the separation above quietly evaporates — the log says
+    so in as many words when it happens.
 - **The mode is `SNIFF` + `RECV_ONLY`.** The driver gives the tool a *copy* of
   matching packets and the originals travel on untouched; the handle cannot
-  send, so nothing is injected, dropped or rewritten. The filter is narrow by
-  default — TCP with source port `game_port` (3333) — so no other traffic on
-  the machine is even copied.
+  send, so nothing is injected, dropped or rewritten. The filter is fixed — TCP
+  with source port `game_port` (3333), and nothing else — so no other traffic on
+  the machine is even copied. It is no longer configurable, on purpose: it is
+  the one string the unprivileged side would otherwise hand to a kernel driver
+  to compile.
 - **Some antivirus products flag WinDivert as *riskware* / *hacktool***
   (`HackTool:Win32/WinDivert`, `RiskWare.WinDivert`, and similar). This is a
   category judgement, not a detection of malicious behaviour: WinDivert is a
@@ -119,6 +144,17 @@ administrator rights. Versions that extracted into the root are migrated
 automatically on the first elevated launch (permissions restored, stale files
 removed); that one run's log file is lost, and the next run's log says so.
 
+> **If you type someone else's administrator credentials at the prompt** — a
+> standard Windows account approving UAC with an admin account's password,
+> rather than clicking Yes as an admin yourself — the two processes then run as
+> two different users, and `%LOCALAPPDATA%` means two different folders. The
+> extracted `runtime\` (and the broker's own `crash.log`) land under the
+> **administrator's** profile, while the window's config, logs and crash log
+> stay under **yours**. For the config that is an improvement: `config.toml` is
+> now read from the profile of the person actually editing it, which the old
+> fully-elevated build did not do. It is worth knowing before you go looking for
+> a file that is not where you expect.
+
 > **Delay-load needs a proper import lib.** The official release ships a "long"
 > `WinDivert.lib` that `/DELAYLOAD` silently ignores (`LNK4199`). We regenerated
 > it as an MSVC **short-import** lib from `vendor/windivert/WinDivert.def`
@@ -140,11 +176,12 @@ removed); that one run's log file is lost, and the next run's log says so.
 
 ## Requirements
 
-- **End user**: Windows x64. Just the exe — double-click it. It carries a UAC
-  manifest (`requireAdministrator`), so Windows shows the consent prompt on
-  launch automatically (WinDivert loads a kernel driver, which needs admin); no
-  "Run as administrator" needed. It self-extracts its runtime to `%LOCALAPPDATA%`
-  on first run.
+- **End user**: Windows x64. Just the exe — double-click it. It carries an
+  `asInvoker` manifest and runs as you: **no prompt at launch**. The UAC prompt
+  appears when capture starts, for the separate helper process that opens the
+  driver (see *What gets installed on your machine*). Never "Run as
+  administrator" — that removes the separation rather than helping. It
+  self-extracts its runtime to `%LOCALAPPDATA%` on first run.
 - **Build machine**: Rust >= 1.92 and the MSVC toolchain (`link.exe`). No C
   compiler needed — the DLL is prebuilt.
 
@@ -189,11 +226,6 @@ capture fails with a clear message instead of panicking:
 cargo test --no-default-features
 ```
 
-> **Dev note:** the native backend embeds a `requireAdministrator` manifest,
-> so `cargo run` from a non-elevated shell fails with "requires elevation". Run
-> it from an elevated terminal, launch the built exe directly (it prompts UAC),
-> or use `--no-default-features` for pipeline work.
-
 ## Configuration
 
 The app reads and writes its config at a per-user location, not beside the exe:
@@ -213,8 +245,8 @@ leave it untouched. Delete it to regenerate the example on the next launch.
 | `server_url` | `wss://ingest.arkyve.dev/refresh-shop` | Analysis server |
 | `forward.server_to_client` | `true` | Forward responses (shop contents) |
 | `forward.client_to_server` | `false` | Forward requests (context) |
-| `capture.buffer_size` | `65535` | Receive buffer per packet; raised to 65575 (the WinDivert maximum) |
-| `capture.filter` | derived | Manual WinDivert filter override; must mention `game_port` |
+| `capture.buffer_size` | — | **Retired.** Still parsed so older files keep loading; ignored (the buffer is fixed at the driver's maximum) |
+| `capture.filter` | — | **Retired.** Still parsed so older files keep loading; ignored (the filter is a constant in the elevated helper) |
 | `[filter]` | matches everything | Item interest criteria (kinds, sets, substats, price) |
 | `[limits]` | no limits | Session stop limits (refreshes, crystals, matches, duration) |
 | `[actuator]` | live | `dry_run = true` journals planned clicks without sending input |
@@ -222,8 +254,11 @@ leave it untouched. Delete it to regenerate the example on the next launch.
 ## Running
 
 ```sh
-cargo run --release   # as administrator; opens the window (default features)
+cargo run --release   # plain shell, no elevation; opens the window (default features)
 ```
+
+The window opens straight away; Windows asks for consent once, when the capture
+helper is launched.
 
 Control from the window: one contextual Start/Stop button in the status bar,
 filter & limits editors under the Setup tab. Close the window to quit.
@@ -255,13 +290,17 @@ system temp directory.
 
 Reading it yourself:
 
-- `arkyve-refresh-shop starting` missing → the app never got to run; check the
-  UAC prompt was accepted, and that no antivirus quarantined the exe or the
-  extracted `WinDivert.dll` / `WinDivert64.sys`.
-- No `WinDivert capture open` line → the driver never loaded. Either the process
-  is not elevated, or the extraction into
-  `%LOCALAPPDATA%\arkyve-refresh-shop\runtime\` failed — the error that follows
-  names the file.
+- `arkyve-refresh-shop starting` missing → the app never got to run; check that
+  no antivirus quarantined the exe or the extracted `WinDivert.dll` /
+  `WinDivert64.sys`. (The app no longer needs a UAC prompt to reach this line —
+  the prompt comes later, for the capture helper.)
+- No `WinDivert capture open` line → the driver never loaded. Either the UAC
+  prompt for the capture helper was dismissed (the banner says so), or the
+  extraction into `%LOCALAPPDATA%\arkyve-refresh-shop\runtime\` failed — the
+  error that follows names the file. The helper has no log file of its own: what
+  it knows travels back over the pipe and lands in the lines above. If it died
+  before that, look for its `crash.log`, which is under the profile of the
+  account that approved the prompt.
 - `WinDivert capture open` but no `first server-to-client segment admitted` →
   the tap is running and the game server's traffic never matched. Check the
   `filter=` value on that same line against the port the game actually uses.

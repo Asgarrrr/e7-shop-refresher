@@ -24,12 +24,18 @@ initial_ms = 1000
 max_ms = 30000
 
 [capture]
-# Receive buffer per packet; values below 65575 (the WinDivert maximum, reached
-# by coalesced receives) are raised to it.
-buffer_size = 65575
-# Manual WinDivert filter override. Replaces the expression derived from
-# game_port + [forward]; it must still mention game_port, since that is the port
-# every direction check is made against. WinDivert filter syntax.
+# Both keys below are retired: still accepted so that config files written by
+# earlier versions keep loading, but ignored, and a later release will refuse
+# them outright. If yours sets either, the log says so once at startup — delete
+# the line, nothing depends on it.
+#
+# Capture now runs in a separate administrator process that does one thing (open
+# the driver handle and copy packets to the app over a pipe). Its filter is a
+# constant built from game_port, and its receive buffer is pinned to the
+# driver's maximum. That is deliberate: this file is writable by any ordinary
+# program on the machine, and a filter string from it used to be handed to a
+# kernel driver to compile.
+# buffer_size = 65575
 # filter = "tcp and tcp.SrcPort == 3333"
 
 [filter]
