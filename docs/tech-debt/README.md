@@ -20,13 +20,55 @@ Date: 2026-08-18 · Branch: `rewrite/network-capture` · Reviewed at `97e8807`.
 
 | | |
 |---|---|
-| Commits | 17, on `rewrite/network-capture`, from `def899b` to `320c20d` |
-| Tests | **516 → 589 passing**, 0 failed (+73, none weakened or removed) |
-| Test lanes | 589 / 465 / 532 / 478 across the four feature combinations, all 0 failed |
-| Gates | clippy **0 diagnostics on all six CI lanes** · `cargo fmt --check` clean · `cargo doc --document-private-items` **0 warnings** · `cargo deny check bans` ok |
+| Commits | 29, on `rewrite/network-capture`, from `def899b` to `HEAD` |
+| Tests | **516 → 593 passing**, 0 failed (+77, none weakened or removed), plus 4 doctests where there were none |
+| Test lanes | 593 / 468 / 538 / 580 / 510 / 481 across all six CI lanes, 0 failed on each |
+| Gates | clippy **0 diagnostics on all six lanes** · `cargo fmt --check` clean · `cargo doc --document-private-items` **0 warnings** · `cargo deny check bans` ok |
 | P0 | **fixed and now unrepresentable** — `uplink::run` takes `ServerUrl`, whose `Display` redacts |
 | P1 | **26 of 27 fixed.** `api-005` declined on a design argument — see below |
-| Ledger | [`_HANDOFF.md`](_HANDOFF.md): **59 resolved, 13 open** — the file splits, two design decisions needing their own review, and one newly filed follow-up |
+| Structure | **All seven module splits done.** `app/mod.rs` 2266 → 621 |
+| Ledger | [`_HANDOFF.md`](_HANDOFF.md): **67 resolved, 28 lines open** — declines with measurements, two design decisions wanting their own review, and follow-ups filed during the work |
+
+A post-implementation review and a completeness audit both ran after the fixes; their
+results are folded in below. **The review found no behavioural regression** in anything
+that clicks, spends or halts, and confirmed the four highest-risk changes
+(`watch.rs`'s single-atomic gate and all five transitions, the capture trim with every
+budget lease, `Hwnd` at all ~14 Win32 call sites with zero ABI signature lines touched,
+and `Slot`/`Row` totality). Its nine findings are all fixed, in `5f49af5` … `4b0e42e`.
+
+The one that matters most: the test guarding `const-003` **could not fail** — all six of
+its assertions were tautologies over the constants they were meant to pin, so the
+invariant whose failure clicks the wrong Buy button was unguarded. It now pins the
+literals *and* couples row count to geometry, mutation-proved red in three directions and
+re-proved after the split.
+
+### The splits
+
+Held back deliberately until every behavioural fix had landed, so each diff reads as a
+move. Every lane's test count came out **identical**, which is the property that makes a
+move reviewable.
+
+| Was | Now |
+|---|---|
+| `app/mod.rs` 2266 | `mod.rs` 621 + `pressure`/`ingest`/`reassembly`/`workers`/`console`/`fixtures` |
+| `actuator/win.rs` 1901 | `win/` — `mod`, `dpi`, `send_input`, `post_message` |
+| `actuator/plan.rs` 1680 | `plan/` — `geometry`, `timings`, `jobs`, `jitter`, `mod` |
+| `stream.rs` 1740 | `stream/` — `mod`, `budget`, `reassembly` |
+| `capture/pcap.rs` 1375 | `pcap/` — `mod`, `sys`, `link` |
+| `config.rs` 1591 | `config/` — `mod`, `server_url`, `tests` (the crate's last convention exception, gone) |
+| `ui/editor/mod.rs` 1227 | 771 + `hunt`, `stop`, `timing` |
+
+**Four of the seven agents declined part of what the report proposed**, which is the
+result worth recording: `pcap`'s FFI layer stays whole because cutting through `Wpcap`
+would have needed `pub(super)` on 11 of the 13 ABI-verified signatures and let rustfmt
+re-wrap them; `ui/editor`'s draft regrouping does not actually avoid the widening it was
+justified by; `geometry.rs` was not split further because it would separate the guard test
+from the constants it couples; and `win/send_input.rs`'s test-majority half needs a
+directory-shape decision, not a move.
+
+**Largest production file is now `src/actuator/mod.rs` at 1492 lines** — it grew during
+this run, because `api-004`'s typestate fix moved the acquire→click precondition into the
+type. It is a fair candidate for a future pass and is not covered by any finding here.
 
 New enforcement that did not exist before, so this cannot silently regress: a `[lints]`
 table in `Cargo.toml` (`correctness`/`suspicious` at **deny**), `undocumented_unsafe_blocks`,
