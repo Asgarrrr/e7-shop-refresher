@@ -20,12 +20,13 @@ Date: 2026-08-18 · Branch: `rewrite/network-capture` · Reviewed at `97e8807`.
 
 | | |
 |---|---|
-| Commits | 14, on `rewrite/network-capture`, from `def899b` to `2213299` |
-| Tests | **516 → 577 passing**, 0 failed (+61, none weakened or removed) |
-| Gates | clippy **0 diagnostics on all six CI feature lanes** · `cargo fmt --check` clean · `cargo doc --document-private-items` **0 warnings** |
-| P0 | **fixed** (`obs-001`; the "make it unrepresentable" remainder is in the ledger) |
-| P1 | **26 of 27 fixed.** `api-005` was declined on a design argument — see below |
-| Ledger | 24 cross-file items resolved, 48 lines open (several are duplicate references to one finding, several are deliberate declines) |
+| Commits | 17, on `rewrite/network-capture`, from `def899b` to `320c20d` |
+| Tests | **516 → 589 passing**, 0 failed (+73, none weakened or removed) |
+| Test lanes | 589 / 465 / 532 / 478 across the four feature combinations, all 0 failed |
+| Gates | clippy **0 diagnostics on all six CI lanes** · `cargo fmt --check` clean · `cargo doc --document-private-items` **0 warnings** · `cargo deny check bans` ok |
+| P0 | **fixed and now unrepresentable** — `uplink::run` takes `ServerUrl`, whose `Display` redacts |
+| P1 | **26 of 27 fixed.** `api-005` declined on a design argument — see below |
+| Ledger | [`_HANDOFF.md`](_HANDOFF.md): **59 resolved, 13 open** — the file splits, two design decisions needing their own review, and one newly filed follow-up |
 
 New enforcement that did not exist before, so this cannot silently regress: a `[lints]`
 table in `Cargo.toml` (`correctness`/`suspicious` at **deny**), `undocumented_unsafe_blocks`,
