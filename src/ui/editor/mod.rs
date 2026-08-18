@@ -4,18 +4,33 @@
 //! priority — Hunt (what to buy) and Stop (when to quit) always open, Click
 //! timing (expert tuning) collapsed — under one primary action.
 
+// One file per section, plus the timing group's painting. The seam is shell
+// state, not topic: a section file holds the parts that work on a `Filter` /
+// `Limits` / `Timings` value handed in by the caller, while everything that
+// reaches into `EditorState` — the three `*_body` functions, `preset_row`, the
+// commit bar — stays here with the struct it reads. Grouping the drafts (the
+// prerequisite `24-proj.md` names, still open in `_HANDOFF.md`) is what would
+// let the bodies move down too.
+mod hunt;
+mod stop;
+mod timing;
 mod timing_meter;
-use timing_meter::{secs_range, timing_group, timing_legend};
+
+use hunt::{hunt_summary, optional_value, quick_add_names, string_list, substat_reqs};
+use stop::{duration_row, limit_row, stop_summary};
+use timing::{fine_tune_body, mode_hint, pass_estimate, timing_summary};
 
 use eframe::egui;
 
 use super::theme;
 #[cfg(test)]
 use crate::actuator::plan::DelayRange;
-use crate::actuator::plan::{self, TimingPreset, Timings};
+use crate::actuator::plan::{TimingPreset, Timings};
 use crate::app::Command;
 use crate::domain::control::Limits;
-use crate::domain::filter::{Filter, HUNTABLE_KINDS, SubstatReq};
+#[cfg(test)]
+use crate::domain::filter::SubstatReq;
+use crate::domain::filter::{Filter, HUNTABLE_KINDS};
 // The checkbox row reads `HUNTABLE_KINDS`; only the tests still name a kind
 // directly.
 #[cfg(test)]
@@ -143,89 +158,6 @@ fn section(ui: &mut egui::Ui, title: &str, summary: Option<&str>, open: &mut boo
     }
 }
 
-/// One-line recap of the hunt draft for the folded Hunt bar: the labels of what
-/// the loop would buy (tokens named via the haul headliners, then kinds, then a
-/// count of the finer criteria), so folding hides the controls, not the intent.
-fn hunt_summary(filter: &Filter) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for name in &filter.names {
-        // Reuse the haul's wire→label map so a hunted token reads "Covenant",
-        // not "ticketrare_name"; an unknown id shows verbatim. Which of the two
-        // wins is decided before anything is allocated: the common case is a
-        // quick-added headliner, and that used to clone the wire id only to drop
-        // it on the next line.
-        let label = crate::render::HAUL_HEADLINERS
-            .iter()
-            .find(|(wire, _)| name == wire)
-            .map_or(name.as_str(), |(_, headliner)| *headliner);
-        parts.push(label.to_owned());
-    }
-    for kind in &filter.kinds {
-        parts.push(kind_label(*kind).to_owned());
-    }
-    if !filter.sets.is_empty() {
-        parts.push(count_label(filter.sets.len(), "set", "sets"));
-    }
-    if !filter.required_substats.is_empty() {
-        parts.push(count_label(
-            filter.required_substats.len(),
-            "substat",
-            "substats",
-        ));
-    }
-    if parts.is_empty() {
-        return "nothing selected".to_owned();
-    }
-    // Cap the trailing summary so it never crowds the title; the body has the rest.
-    let cap = 3;
-    if parts.len() <= cap {
-        parts.join(", ")
-    } else {
-        format!("{} +{}", parts[..cap].join(", "), parts.len() - cap)
-    }
-}
-
-/// One-line recap of the active stop limits for the folded Stop bar; "no limits"
-/// when the run is uncapped.
-fn stop_summary(limits: &Limits) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(n) = limits.max_refreshes {
-        parts.push(count_label(
-            usize::try_from(n).unwrap_or(usize::MAX),
-            "refresh",
-            "refreshes",
-        ));
-    }
-    if let Some(n) = limits.max_spend {
-        parts.push(format!("{n} crystals"));
-    }
-    if let Some(n) = limits.max_matches {
-        parts.push(count_label(
-            usize::try_from(n).unwrap_or(usize::MAX),
-            "match",
-            "matches",
-        ));
-    }
-    if let Some(ms) = limits.max_duration_ms {
-        parts.push(format!("{} min", ms.div_ceil(60_000)));
-    }
-    if parts.is_empty() {
-        "no limits".to_owned()
-    } else {
-        parts.join(" · ")
-    }
-}
-
-/// The Click timing bar is always folded on arrival, so its peek names the
-/// humanization level in force — the same word the mode control shows — or
-/// "Custom" once the player fine-tuned away from every preset.
-fn timing_summary(timings: &Timings) -> &'static str {
-    match TimingPreset::from_timings(timings) {
-        Some(preset) => preset.label(),
-        None => "Custom",
-    }
-}
-
 /// `n singular` / `n plural`, e.g. `1 refresh` / `3 refreshes`. `usize` because
 /// two of the four callers pass a `len()`; the `u32` limits reach it through a
 /// saturating `try_from` rather than an `as`, so the widening carries no
@@ -297,24 +229,6 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     ui.checkbox(&mut editor.filter.include_sold_out, "include sold out");
 }
 
-/// One-click add for the two tokens ~90% of players hunt (covenant bookmark,
-/// mystic medal), spelling their internal ids so the player never types a
-/// `ticketrare_name`. Reuses the haul's headliner table — one wire→label map.
-fn quick_add_names(ui: &mut egui::Ui, names: &mut Vec<String>) {
-    ui.horizontal(|ui| {
-        ui.weak("quick add");
-        for (wire, label) in crate::render::HAUL_HEADLINERS {
-            let present = names.iter().any(|name| name == wire);
-            if ui
-                .add_enabled(!present, egui::Button::new(format!("+ {label}")))
-                .clicked()
-            {
-                names.push(wire.to_owned());
-            }
-        }
-    });
-}
-
 /// Stop: the run's safety rails, laid as a quiet ledger — a small squared
 /// checkbox, the unit read down the left column, and the cap aligned in a right
 /// column, the way a system-settings pane lists its toggles. An armed rail's
@@ -352,113 +266,15 @@ fn arm_optional<T>(armed: bool, value: &mut Option<T>, seed: T) {
 /// is silently rewritten to 1 on the first render, which desyncs the draft and
 /// makes Apply send a value the player never chose
 /// (`seeded_zero_limit_is_not_silently_clamped`). Shared so that fix lives once
-/// instead of once per widget. [`duration_row`] is the one criterion that cannot
-/// use it: it drags whole minutes derived from the stored ms, so its field has
-/// its own range and write-back, and shares only [`arm_optional`].
+/// instead of once per widget. [`stop::duration_row`] is the one criterion that
+/// cannot use it: it drags whole minutes derived from the stored ms, so its field
+/// has its own range and write-back, and shares only [`arm_optional`].
 fn optional_field<T: egui::emath::Numeric>(ui: &mut egui::Ui, value: &mut T) -> egui::Response {
     ui.add(
         egui::DragValue::new(value)
             .range(T::from_f64(1.0)..=T::MAX)
             .clamp_existing_to_range(false),
     )
-}
-
-/// One ledger row: `☑ unit …… value`. The checkbox arms the cap, the unit sits
-/// in the left column, and the value is pushed flush-right so every cap lines up
-/// in its own column. Arming is [`arm_optional`]'s, the field is
-/// [`optional_field`]'s; an unset rail reads a faint "none".
-fn limit_row<T: egui::emath::Numeric>(
-    ui: &mut egui::Ui,
-    unit: &str,
-    value: &mut Option<T>,
-    seed: T,
-) {
-    limit_ledger_row(ui, unit, value.is_some(), |on, ui| {
-        arm_optional(on, value, seed);
-        if let Some(current) = value.as_mut() {
-            compact_drag(ui, |ui| {
-                optional_field(ui, current);
-            });
-        } else {
-            ui.colored_label(theme::INK_FAINT, "none");
-        }
-    });
-}
-
-/// The duration rail, edited in whole minutes (stored as ms) — a [`limit_row`]
-/// twin kept apart for its minute↔ms conversion, exactly as `optional_value`
-/// and the old `duration_minutes` were split before. Arming is shared
-/// ([`arm_optional`]); the field is not, because it drags a derived value.
-fn duration_row(ui: &mut egui::Ui, value: &mut Option<u64>) {
-    limit_ledger_row(ui, "minutes", value.is_some(), |on, ui| {
-        arm_optional(on, value, 60 * 60_000);
-        if let Some(ms) = value {
-            // Ceil so a sub-minute config value never reads as 0; edits are whole
-            // minutes and only rewrite the stored ms on a real drag.
-            let mut minutes = ms.div_ceil(60_000);
-            compact_drag(ui, |ui| {
-                let r = ui.add(egui::DragValue::new(&mut minutes).range(1..=u64::MAX / 60_000));
-                if r.changed() {
-                    *ms = minutes.saturating_mul(60_000);
-                }
-            });
-        } else {
-            ui.colored_label(theme::INK_FAINT, "none");
-        }
-    });
-}
-
-/// The shared ledger-row chrome: the arming checkbox and unit label on the left,
-/// then the caller's value flush-right in its own column. `armed` seeds the
-/// checkbox and the unit's ink (muted when live, faint when off); `value` paints
-/// the right column after the toggle has been resolved. Splitting the chrome out
-/// keeps the two rail kinds (numeric / duration) down to just their value widget.
-fn limit_ledger_row(
-    ui: &mut egui::Ui,
-    unit: &str,
-    armed: bool,
-    value: impl FnOnce(bool, &mut egui::Ui),
-) {
-    ui.horizontal(|ui| {
-        let mut on = armed;
-        theme::accent_checkbox(ui, &mut on);
-        let color = if on {
-            theme::INK_MUTED
-        } else {
-            theme::INK_FAINT
-        };
-        // Fixed-width label cell so the value column starts at the same x on every
-        // row (aligned like a ledger) without flushing to the far edge — which
-        // opened a dead gap between label and value.
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(130.0, 20.0), egui::Sense::hover());
-        ui.painter().with_clip_rect(rect).text(
-            egui::pos2(rect.left(), rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            unit,
-            egui::FontId::new(14.0, egui::FontFamily::Proportional),
-            color,
-        );
-        value(on, ui);
-    });
-}
-
-/// A compact drag field for the ledger's value column: the default filled box —
-/// so it still reads plainly as an editable input — but with tightened padding
-/// and a 3px corner, so each value sits as a small chip instead of the bulky
-/// default pill that would dominate the column.
-fn compact_drag(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    ui.scope(|ui| {
-        ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
-        let widgets = &mut ui.style_mut().visuals.widgets;
-        for state in [
-            &mut widgets.inactive,
-            &mut widgets.hovered,
-            &mut widgets.active,
-        ] {
-            state.corner_radius = egui::CornerRadius::same(3);
-        }
-        add(ui);
-    });
 }
 
 /// Click timing: each click waits a fixed tuned delay, plus a random extra the
@@ -532,119 +348,6 @@ fn preset_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Option<TimingPrese
     // Reflect the pre-click state (as `custom` above): `None` when Custom is lit.
     if custom { None } else { detected }
 }
-
-/// The one-line hint under the mode control, worded for the lit segment (from
-/// `preset_row`) — so the copy describes the current choice instead of listing
-/// them all. `None` is Custom (bars shown).
-fn mode_hint(active: Option<TimingPreset>) -> &'static str {
-    match active {
-        None => "Custom exposes each click's random delay — drag a bar to tune it yourself.",
-        Some(TimingPreset::Instant) => {
-            "Instant runs the tuned minimums — fastest, but every click fires on the same beat."
-        }
-        Some(TimingPreset::Human) => {
-            "Human adds a little random delay to each click, so the loop never ticks like a metronome."
-        }
-        Some(TimingPreset::Cautious) => {
-            "Cautious adds the most random delay — slowest, and the hardest to read as a bot."
-        }
-    }
-}
-
-/// The steady find-and-buy pass as a single honest reading — the summed baseline
-/// to baseline-plus-slack, in seconds — so the player sees the loop's per-pass
-/// cost without decoding eight bars. Folded into the mode hint sentence by
-/// `timing_body` rather than shown as its own stat row.
-fn pass_estimate(t: &Timings) -> String {
-    let slack = [
-        t.refreshed,
-        t.confirm_refresh_modal,
-        t.buy_modal,
-        t.purchase_resumed,
-    ];
-    // A plain sum, where this used to fold with `saturating_add` over
-    // `max_ms.max(min_ms)`: `DelayRange` now carries
-    // `min_ms <= max_ms <= MAX_TIMING_MS` by construction, so `max_ms` is the
-    // band's top without a second look at `min_ms`, and four of them plus the
-    // routine total cannot come near `u64::MAX`.
-    let hi_total: u64 = ROUTINE_TOTAL_MS + slack.iter().map(|r| r.max_ms()).sum::<u64>();
-    secs_range(ROUTINE_TOTAL_MS, hi_total)
-}
-
-/// The per-action bars, revealed inline when the Custom mode segment is active.
-/// The legend rides here (not up top) so its two-tone key sits next to the bars
-/// it explains, and the presets carry the common case above.
-fn fine_tune_body(ui: &mut egui::Ui, t: &mut Timings) {
-    timing_legend(ui);
-    ui.add_space(theme::SP_SM);
-    timing_group(
-        ui,
-        "Open & refresh",
-        &mut [
-            ("shop opens", &mut t.shop_opened, plan::WAIT_SHOP_OPENED_MS),
-            ("paid refresh", &mut t.refreshed, plan::WAIT_REFRESHED_MS),
-            (
-                "confirm refresh",
-                &mut t.confirm_refresh_modal,
-                plan::WAIT_CONFIRM_REFRESH_MODAL_MS,
-            ),
-        ],
-    );
-    timing_group(
-        ui,
-        "Buy",
-        &mut [
-            ("confirm buy", &mut t.buy_modal, plan::WAIT_BUY_MODAL_MS),
-            (
-                "between buys",
-                &mut t.between_buys,
-                plan::WAIT_BETWEEN_BUYS_MS,
-            ),
-            (
-                "after a scroll",
-                &mut t.scroll_settle,
-                plan::WAIT_SCROLL_SETTLE_MS,
-            ),
-            (
-                "after a purchase",
-                &mut t.purchase_resumed,
-                plan::WAIT_PURCHASE_RESUMED_MS,
-            ),
-        ],
-    );
-    timing_group(
-        ui,
-        "Recovery",
-        &mut [("watchdog re-issue", &mut t.recovery, plan::WAIT_RECOVERY_MS)],
-    );
-}
-
-/// The tuned baselines a single steady find-and-buy pass strings together, in
-/// click order: the paid refresh, its confirm, the buy (the wait before its
-/// confirm), and the resume. Shop-open (once), scroll / between-buys
-/// (multi-item) and the watchdog (only on a miss) sit outside this steady loop,
-/// so the summary stays an honest "typical pass". `pass_estimate` adds each
-/// action's dialled-in slack on top for the high end.
-const ROUTINE: [u64; 4] = [
-    plan::WAIT_REFRESHED_MS,
-    plan::WAIT_CONFIRM_REFRESH_MODAL_MS,
-    plan::WAIT_BUY_MODAL_MS,
-    plan::WAIT_PURCHASE_RESUMED_MS,
-];
-
-/// The steady pass's baseline total. A `const` rather than `ROUTINE.iter().sum()`
-/// inside [`pass_estimate`], which re-summed four compile-time constants on every
-/// frame the Setup tab painted — and gives the test something to assert the
-/// estimate against instead of repeating the sum.
-const ROUTINE_TOTAL_MS: u64 = {
-    let mut total = 0;
-    let mut index = 0;
-    while index < ROUTINE.len() {
-        total += ROUTINE[index];
-        index += 1;
-    }
-    total
-};
 
 /// The single commit: one primary Apply that emits every draft that moved. The
 /// applied twins are *not* touched here — the shell re-seeds them through
@@ -733,115 +436,6 @@ fn dirty_summary(filter: bool, limits: bool, timings: bool) -> Option<String> {
         parts.push("Click timing");
     }
     (!parts.is_empty()).then(|| format!("{} edited", parts.join(", ")))
-}
-
-/// Row remove control: a `✕` on a 24px-square target. `small_button` gave an
-/// ~18px hit area that was easy to miss when pruning a list.
-fn remove_button(ui: &mut egui::Ui) -> egui::Response {
-    ui.add(egui::Button::new("✕").min_size(egui::vec2(24.0, 24.0)))
-}
-
-/// One editable any-of list: entries with a remove cross plus an add row.
-fn string_list(ui: &mut egui::Ui, label: &str, values: &mut Vec<String>, input: &mut String) {
-    ui.label(label);
-    let mut removed = None;
-    for (index, value) in values.iter().enumerate() {
-        // Content-keyed row ids (duplicates are rejected on add): focus and
-        // edit state survive a removal above the row.
-        ui.push_id(egui::Id::new(value), |ui| {
-            ui.horizontal(|ui| {
-                ui.monospace(value);
-                if remove_button(ui).clicked() {
-                    removed = Some(index);
-                }
-            });
-        });
-    }
-    if let Some(index) = removed {
-        values.remove(index);
-    }
-    ui.horizontal(|ui| {
-        ui.text_edit_singleline(input);
-        if ui.button("add").clicked() {
-            let value = input.trim();
-            if !value.is_empty() && !values.iter().any(|kept| kept == value) {
-                values.push(value.to_owned());
-                input.clear();
-            }
-        }
-    });
-}
-
-/// Required-substat rows: name, optional min threshold, remove cross.
-fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input: &mut String) {
-    ui.label("required substats");
-    let mut removed = None;
-    for (index, req) in reqs.iter_mut().enumerate() {
-        let row_id = egui::Id::new(&req.name);
-        ui.push_id(row_id, |ui| {
-            ui.horizontal(|ui| {
-                ui.monospace(&req.name);
-                let mut has_min = req.min.is_some();
-                ui.checkbox(&mut has_min, "min");
-                if has_min {
-                    let min = req.min.get_or_insert(1.0);
-                    ui.add(egui::DragValue::new(min).speed(0.5));
-                    // egui parses typed text with `f64::from_str`, which accepts
-                    // "nan" and "inf". Either would be a threshold no substat
-                    // value can satisfy (`value >= min` is false for every
-                    // value, including for `NaN` itself), would light Apply
-                    // forever because `NaN != NaN` in `Filter`'s derived
-                    // `PartialEq`, and would be refused by `Config::validate` on
-                    // the next launch. Snapped back here so the draft cannot
-                    // reach that state at all — no range is set instead, because
-                    // clamping would silently rewrite a config-seeded value the
-                    // way `clamp_existing_to_range(false)` exists to prevent.
-                    if !min.is_finite() {
-                        *min = 1.0;
-                    }
-                } else {
-                    req.min = None;
-                }
-                if remove_button(ui).clicked() {
-                    removed = Some(index);
-                }
-            });
-        });
-    }
-    if let Some(index) = removed {
-        reqs.remove(index);
-    }
-    ui.horizontal(|ui| {
-        ui.text_edit_singleline(input);
-        if ui.button("add").clicked() {
-            let name = input.trim();
-            if !name.is_empty() && !reqs.iter().any(|req| req.name == name) {
-                reqs.push(SubstatReq {
-                    name: name.to_owned(),
-                    min: None,
-                });
-                input.clear();
-            }
-        }
-    });
-}
-
-/// Checkbox-gated numeric criterion, laid as two grid cells (label, value) so a
-/// column of them lines up. Unchecked means "no constraint", expressed by the
-/// unchecked box — never a 0. The semantics are [`arm_optional`]'s and the field
-/// is [`optional_field`]'s, shared with the Stop rails.
-fn optional_value<T: egui::emath::Numeric>(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: &mut Option<T>,
-    seed: T,
-) {
-    let mut on = value.is_some();
-    ui.checkbox(&mut on, label);
-    arm_optional(on, value, seed);
-    if let Some(current) = value.as_mut() {
-        optional_field(ui, current);
-    }
 }
 
 #[cfg(test)]
@@ -1041,27 +635,6 @@ mod tests {
     }
 
     #[test]
-    fn pass_estimate_tops_out_at_the_widest_range_the_type_allows() {
-        // This was `pass_estimate_saturates_on_an_unvalidated_timing`, built from
-        // two `max_ms = u64::MAX` ranges — a value `DelayRange` can no longer
-        // hold. The widest legal pair is the ceiling on both, so that is what the
-        // label arithmetic is pinned against instead: the sum must be exact, not
-        // saturated, and it must be the *four* slack steps and no others.
-        let full = DelayRange::ceiling(plan::MAX_TIMING_MS);
-        let timings = Timings {
-            refreshed: full,
-            buy_modal: full,
-            ..Timings::default()
-        };
-        // Asserted against the shared const, not a re-sum of `ROUTINE`: the two
-        // used to be independent copies of the same arithmetic.
-        assert_eq!(
-            pass_estimate(&timings),
-            secs_range(ROUTINE_TOTAL_MS, ROUTINE_TOTAL_MS + 2 * plan::MAX_TIMING_MS)
-        );
-    }
-
-    #[test]
     fn hunt_kinds_exclude_the_unknown_bucket() {
         // Ticking "?" wrote `kinds = ["unknown"]`, which the next launch refused
         // — a fatal, GUI-less load failure only a hand-edit of config.toml could
@@ -1081,16 +654,6 @@ mod tests {
                 .query_by_label(kind_label(ItemKind::Unknown))
                 .is_none()
         );
-    }
-
-    #[test]
-    fn mode_hint_varies_with_the_active_mode() {
-        // Each mode gets its own line; Custom wins over the detected preset so
-        // the hint tracks the segment lit in the control.
-        assert!(mode_hint(Some(TimingPreset::Instant)).starts_with("Instant"));
-        assert!(mode_hint(Some(TimingPreset::Human)).starts_with("Human"));
-        assert!(mode_hint(Some(TimingPreset::Cautious)).starts_with("Cautious"));
-        assert!(mode_hint(None).starts_with("Custom"));
     }
 
     #[test]
@@ -1128,25 +691,6 @@ mod tests {
         let click = harness.get_by_label("Click timing · Instant").rect();
         assert_eq!(hunt.max.y, stop.min.y, "Hunt and Stop must tile");
         assert_eq!(stop.max.y, click.min.y, "Stop and Click timing must tile");
-    }
-
-    #[test]
-    fn hunt_summary_names_the_hunted_tokens() {
-        // A folded Hunt bar peeks what the loop would buy: the covenant token
-        // reads by its haul label, not its wire id.
-        assert_eq!(hunt_summary(&named_filter()), "Covenant");
-        assert_eq!(hunt_summary(&Filter::default()), "nothing selected");
-    }
-
-    #[test]
-    fn stop_summary_lists_active_limits() {
-        let limits = Limits {
-            max_refreshes: Some(1),
-            max_matches: Some(5),
-            ..Limits::default()
-        };
-        assert_eq!(stop_summary(&limits), "1 refresh · 5 matches");
-        assert_eq!(stop_summary(&Limits::default()), "no limits");
     }
 
     #[test]
