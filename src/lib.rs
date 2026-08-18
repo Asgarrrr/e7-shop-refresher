@@ -7,25 +7,20 @@
 //! click emulation (refresh and buy), steered by the decoded snapshots.
 //!
 //! ```text
-//! WinDivert copy ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket ─▶ server
-//!    (blocking)                       (ordered/dedup)                  ▲         │
-//!                                                               snapshots ◀──────┘
+//! Npcap tap ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket ─▶ server
+//!  (blocking)                  (ordered/dedup)                  ▲         │
+//!                                                        snapshots ◀──────┘
 //! ```
 
 pub mod actuator;
 pub mod app;
-// The elevated capture broker. Declared unconditionally even though everything
-// that touches Win32 inside it is gated: the argv validators are pure Rust and
-// are the whole surface the low-privilege side has on the administrator process,
-// so their tests belong in every lane, including the two portable ones that
-// build without `windivert-backend`.
-pub mod broker;
 pub mod capture;
 pub mod config;
 pub mod crash;
 pub mod domain;
 pub mod error;
 pub mod journal;
+pub mod migrate;
 mod render;
 pub mod stream;
 #[cfg(feature = "gui")]

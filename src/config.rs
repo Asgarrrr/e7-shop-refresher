@@ -118,14 +118,15 @@ pub enum ActuatorBackend {
 
 /// Vestigial. Both keys are parsed and both are ignored.
 ///
-/// They stopped meaning anything when capture moved behind a privilege
-/// boundary: the WinDivert filter is now a constant compiled into the elevated
-/// broker (`tcp and tcp.SrcPort == {game_port}`) with a validated `u16` in it,
-/// and the receive buffer is pinned to the driver's own maximum. The filter in
-/// particular *had* to stop being configurable — this file lives in per-user
-/// roaming app-data, where any medium-integrity process on the machine can
-/// rewrite it, and its contents used to be handed to a kernel driver's filter
-/// compiler inside an administrator process.
+/// They stopped meaning anything when the capture filter stopped being a
+/// string this file could supply. The backend builds its own BPF expression
+/// from the validated `u16` `game_port` (`tcp and port {game_port}`), and sizes
+/// its buffer from its own snaplen. The filter *had* to stop being configurable
+/// while capture still ran a kernel driver: this file lives in per-user roaming
+/// app-data, where any medium-integrity process on the machine can rewrite it,
+/// and its contents were handed to that driver's filter compiler inside an
+/// administrator process. The driver is gone; the reason not to reopen the key
+/// is now simply that nothing needs it.
 ///
 /// **They are still parsed on purpose, and removing them is not a cleanup.**
 /// This struct and [`Config`] are both `deny_unknown_fields`, and
@@ -143,11 +144,11 @@ pub enum ActuatorBackend {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
-    /// Accepted and ignored: the broker's receive buffer is fixed at the
-    /// driver's maximum packet size.
+    /// Accepted and ignored: the capture buffer is sized by the backend, from
+    /// the snaplen it asks libpcap for.
     pub buffer_size: Option<usize>,
-    /// Accepted and ignored: the capture filter is a constant on the elevated
-    /// side and no longer crosses the privilege boundary as a string.
+    /// Accepted and ignored: the capture filter is built by the backend from
+    /// `game_port` and never comes from this file.
     pub filter: Option<String>,
 }
 
@@ -340,9 +341,9 @@ impl Config {
         }
         // `capture.filter` used to be checked here for naming `game_port`,
         // because a filter on another port delivered traffic nothing could
-        // classify. That check went away with the thing it guarded: the filter
-        // is a constant on the elevated side now, built from `game_port`
-        // itself, so the mismatch it caught can no longer be expressed. Note
+        // classify. That check went away with the thing it guarded: the
+        // backend builds its own filter from `game_port` itself, so the
+        // mismatch it caught can no longer be expressed. Note
         // that this rejection must NOT come back in another form — a config
         // written before the change may well carry a filter naming a different
         // port, and refusing it would lock that player out of the app on
@@ -422,8 +423,8 @@ mod tests {
     #[test]
     fn a_retired_filter_naming_another_port_is_no_longer_a_startup_failure() {
         // It used to be refused, because a filter on another port delivered
-        // traffic nothing could classify. The filter is a constant on the
-        // elevated side now, so the value is inert — and refusing it would
+        // traffic nothing could classify. The backend builds its own filter
+        // from `game_port` now, so the value is inert — and refusing it would
         // lock an upgrading player out of the app over a setting that has no
         // effect at all.
         let config = parse_and_validate("[capture]\nfilter = \"tcp and tcp.SrcPort == 4444\"")
@@ -470,7 +471,7 @@ mod tests {
         assert!(error.to_string().contains("forward"));
     }
 
-    /// The WinDivert filter expresses either direction, so asking for the
+    /// The capture filter matches either direction, so asking for the
     /// client -> server context stream is a legitimate configuration.
     #[test]
     fn client_to_server_direction_is_accepted() {

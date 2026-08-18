@@ -1,7 +1,7 @@
 name: CI
-# Compiling the capture backend is safe in CI — the vendored WinDivert
-# binaries are in the repo and only linked against. Elevation and the kernel
-# driver are needed to *launch* a capture session, which CI never does.
+# The capture backend resolves `wpcap.dll` at runtime and links nothing, so CI
+# compiles and tests it on a runner that has no Npcap installed. Only *launching*
+# a capture session needs Npcap on the machine, which CI never does.
 on:
   push:
   pull_request:
@@ -27,66 +27,41 @@ jobs:
         run: cargo fmt --all --check
       - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
       - run: cargo clippy --locked --no-default-features --features gui,actuator --all-targets -- -D warnings
-      # Every arm build_source must survive: no backend (above), each backend
-      # alone, and — the one no single-feature lane reaches — both at once,
-      # which is what exercises the `not(feature = "pcap-backend")` precedence
-      # gates in `capture::mod`.
+      # Both arms of build_source must survive: no backend (above) and the
+      # backend alone. There is no third arm and no `--all-features` lane — with
+      # WinDivert removed, `--all-features` is the default feature set.
       - name: Check passive Npcap backend
         run: cargo clippy --locked --no-default-features --features pcap-backend --all-targets -- -D warnings
-      - name: Check passive WinDivert backend
-        run: cargo clippy --locked --no-default-features --features windivert-backend --all-targets -- -D warnings
-      - name: Check the WinDivert product combination
-        run: cargo clippy --locked --no-default-features --features windivert-backend,gui,actuator --all-targets -- -D warnings
       # The combination actually shipped (pcap-backend + gui + actuator).
       # Checking the pieces separately misses a cfg interaction that only the
       # product build has.
       - name: Check shipped default features
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Check both backends compiled together
-        run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - name: Build shipped release (default features)
         if: matrix.toolchain == 'stable'
         run: cargo build --locked --release
-      # The delay-load assertion below needs an exe that imports WinDivert at
-      # all, and the shipped default no longer does: `pcap-backend` is the
-      # default backend now. So build the WinDivert combination over it (same
-      # output path) purely to have something to assert on, until the removal
-      # pass drops the DLL and the assertion with it.
-      - name: Build release with the WinDivert backend
-        if: matrix.toolchain == 'stable'
-        run: cargo build --locked --release --features windivert-backend
-      # The release exe must not merely link: the WinDivert import has to be a
-      # *delay* import. A plain static import means the loader demands the DLL
-      # before the exe can extract it, and every launch dies with
-      # "WinDivert.dll not found" — invisible to any compile-only check.
-      - name: Assert WinDivert.dll is delay-loaded, not statically imported
+      # The exe drives another process's window, which UIPI refuses unless this
+      # one is at least as privileged — so the manifest is a product requirement,
+      # not a build detail. It is also invisible to every compile-time check:
+      # dropping the two link args still produces a binary that runs, and only
+      # fails once a player tries to click. Assert it on the shipped artifact.
+      - name: Assert the release exe requests administrator
         if: matrix.toolchain == 'stable'
         shell: pwsh
         run: |
           $exe = "target\release\arkyve-refresh-shop.exe"
-          $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe `
-            "${env:ProgramFiles}\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio" `
-            -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $dumpbin) { throw "dumpbin.exe not found" }
-          $out = & $dumpbin.FullName /dependents $exe
-          $text = $out -join "`n"
-          $delay = $text -split "delay load dependencies"
-          if ($delay.Count -lt 2) { throw "no delay load section: WinDivert.dll is a static import" }
-          if ($delay[0] -match "WinDivert\.dll") { throw "WinDivert.dll is a static import" }
-          if ($delay[1] -notmatch "WinDivert\.dll") { throw "WinDivert.dll is not delay-loaded" }
-          "WinDivert.dll is delay-loaded"
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+          if ($text -notmatch "requireAdministrator") {
+            throw "no requireAdministrator manifest embedded in $exe"
+          }
+          "requireAdministrator is embedded"
       - run: cargo test --locked --no-default-features
       - run: cargo test --locked --no-default-features --features gui,actuator
       - name: Test passive Npcap backend (non-elevated tests)
         run: cargo test --locked --no-default-features --features pcap-backend
-      - name: Test passive WinDivert backend (non-elevated tests)
-        run: cargo test --locked --no-default-features --features windivert-backend
-      - name: Test the WinDivert product combination (non-elevated tests)
-        run: cargo test --locked --no-default-features --features windivert-backend,gui,actuator
       - name: Test shipped default features (non-elevated tests)
         run: cargo test --locked
-      - name: Test both backends compiled together (non-elevated tests)
-        run: cargo test --locked --all-features
 
   dependency-policy:
     name: Dependency policy

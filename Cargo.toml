@@ -9,34 +9,22 @@ publish = false
 
 [features]
 default = ["pcap-backend", "gui", "actuator"]
-# Native Windows capture backend (WinDivert), no longer the default — kept
-# compiling only until the removal pass lands. Delivers IP-layer copies of the
-# game's TCP packets through a kernel driver, which needs administrator rights
-# *and* a third-party signed driver on the player's machine; `pcap-backend`
-# gets the same IP-layer copies with neither. Links *dynamically* against the
-# vendored prebuilt `WinDivert.lib`/`WinDivert.dll` (`WINDIVERT_PATH` in
-# `.cargo/config.toml`); never `WINDIVERT_STATIC`, see that file for why. Pulls
-# windows-sys for `LoadLibraryW` (the delay-loaded WinDivert.dll is preloaded by
-# full path from its extracted app-data location) and for the runtime-dir DACL
-# hardening.
-windivert-backend = ["dep:windivert", "dep:windows-sys"]
-# Npcap capture backend, the shipped default. Taps every adapter through
-# `wpcap.dll` and needs no privilege of its own: it was proven end to end from
-# an ordinary *unelevated* process (capture → reassembly → uplink → decoded
-# snapshot → refresh job). The exe is still manifested `requireAdministrator`,
-# but for the actuator and not for this — see `build.rs`. Pulls `libloading`
-# because the DLL is resolved at runtime rather than linked (a static link would
-# need the Npcap SDK to build and would kill the exe in the Windows loader on a
-# machine without Npcap), and windows-sys for the one registry read that tells
-# "Npcap is admins-only" apart from "no adapters". Wins over
-# `windivert-backend` in `app::build_source` when both are compiled.
-pcap-backend = ["dep:libloading", "dep:windows-sys"]
+# Npcap capture backend — the only one, and the shipped default. Taps every
+# adapter through `wpcap.dll` and needs no privilege of its own: it was proven
+# end to end from an ordinary *unelevated* process (capture → reassembly →
+# uplink → decoded snapshot → refresh job). The exe is still manifested
+# `requireAdministrator`, but for the actuator and not for this — see
+# `build.rs`. Pulls `libloading` because the DLL is resolved at runtime rather
+# than linked (a static link would need the Npcap SDK to build and would kill
+# the exe in the Windows loader on a machine without Npcap). Off in the two
+# portable lanes, where `app::build_source` returns "no capture backend" instead.
+pcap-backend = ["dep:libloading"]
 # egui window over the session (dashboard + player commands). Disable for the
 # console-only build.
 gui = ["dep:eframe"]
 # Click-emulation input backends (SendInput / PostMessageW). Only act on
 # Windows; elsewhere the executor is replaced by a job-draining stub.
-actuator = ["dep:windows-sys"]
+actuator = []
 
 [dependencies]
 tokio = { version = "1", features = [
@@ -75,41 +63,28 @@ eframe = { version = "0.35", optional = true, default-features = false, features
 ] }
 
 [target.'cfg(windows)'.dependencies]
-# Default features only: `static`/`vendored` are deliberately OFF. See
-# `.cargo/config.toml` — `WINDIVERT_STATIC` compiles the vendor C in-tree and
-# the resulting object breaks the release build's stack-guard probing.
-windivert = { version = "0.7.0-beta.4", optional = true }
 # Runtime resolution of `wpcap.dll` for the Npcap backend. Never a link-time
 # dependency: see the `pcap-backend` feature comment above.
 libloading = { version = "0.8", optional = true }
-windows-sys = { version = "0.61", optional = true, features = [
+# Not optional, unlike the two above: `migrate` needs it in *every* Windows
+# build to undo the admins-only DACL a WinDivert build left on the app-data
+# directory, including the `--no-default-features` one. Three features used to
+# each turn it on with `dep:windows-sys`, which is how a lane could end up
+# without it.
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    # Reading and rewriting the app-data directory's DACL (`migrate`).
     "Win32_Security",
     "Win32_Security_Authorization",
-    # `ProcessPrng`, for the 128-bit pipe nonce: the modern handle-free CSPRNG
-    # primitive (the one `getrandom` uses on Windows), so no `rand` dependency.
-    "Win32_Security_Cryptography",
-    "Win32_Storage_FileSystem",
-    # `CoInitializeEx`: `ShellExecuteExW` requires an initialized apartment on
-    # the calling thread, and nothing else in the app initializes COM.
-    "Win32_System_Com",
-    "Win32_System_IO",
+    # `GetModuleHandleW`, for the window class the actuator drives.
     "Win32_System_LibraryLoader",
-    # The elevated capture broker: the named pipe it serves (`Pipes`), the
-    # overlapped connect and write that keep every wait on it bounded (`IO`),
-    # and the UI-process handle, token and watchdog wait (`Threading`).
-    "Win32_System_Pipes",
-    # Not for the registry: `SHELLEXECUTEINFOW` carries an `HKEY` field, and
-    # windows-sys gates the whole struct behind this group.
+    # `HKLM\...\npcap\Parameters\AdminOnly`: the one read that tells "Npcap is
+    # restricted to administrators" apart from "this machine has no adapters".
     "Win32_System_Registry",
     "Win32_System_SystemServices",
-    "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
-    # `ShellExecuteExW` with the `runas` verb — the only way to launch the
-    # broker elevated (`CreateProcessW` cannot, see `capture::elevate`).
-    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

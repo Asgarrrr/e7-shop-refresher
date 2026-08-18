@@ -11,16 +11,7 @@ use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
-use arkyve_refresh_shop::{Config, app, crash};
-
-// The argv token this dispatch answers to, taken from the module that also
-// writes it (`broker::broker_command_line`, used by `capture::elevate`) rather
-// than spelled a second time here. `broker` is declared unconditionally for
-// exactly this: `capture::elevate` is a private module behind
-// `windivert-backend`, while this dispatch has to exist in builds that have no
-// backend at all — refusing the flag there is the point — so the shared home had
-// to be somewhere both can reach.
-use arkyve_refresh_shop::broker::BROKER_ARGV_FLAG;
+use arkyve_refresh_shop::{Config, app, crash, migrate};
 
 /// Location of the config file. The app owns this file (the GUI's Setup/Apply
 /// writes it); the player isn't expected to hand-edit it, so it lives out of
@@ -108,130 +99,14 @@ fn install_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     guard
 }
 
-/// This process's arguments, when they ask for the broker role.
-///
-/// `args_os` plus a lossy conversion rather than `std::env::args()`, which
-/// *panics* on an argument that is not valid Unicode. This runs before
-/// `crash::install()` — deliberately, see `main` — so that panic would be
-/// invisible in every channel the product has, and a replacement character
-/// cannot pass the validators downstream anyway.
-fn capture_broker_argv() -> Option<Vec<String>> {
-    let args: Vec<String> = std::env::args_os()
-        .skip(1)
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    args.iter()
-        .any(|arg| arg == BROKER_ARGV_FLAG)
-        .then_some(args)
-}
-
-/// The broker role, on a build that has a capture backend.
-///
-/// Every argument is validated by `broker`'s own validators rather than by a
-/// second parser written here. Two parsers that could disagree about what
-/// `--pipe` accepts is precisely the drift this design cannot afford: that
-/// command line is the entire surface the medium-integrity side has on an
-/// administrator process, and the side that *runs* elevated has to be the side
-/// that decides what it accepts.
-#[cfg(all(windows, feature = "windivert-backend"))]
-fn run_capture_broker(args: Vec<String>) -> ExitCode {
-    let outcome = parse_broker_command(&args)
-        .and_then(|(port, nonce, ui_pid)| arkyve_refresh_shop::broker::run(port, &nonce, ui_pid));
-    match outcome {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            // Not `fatal()`: that installs a tracing event this process has no
-            // subscriber for and opens an error window this process must never
-            // own. What actually reaches the player is the kind-2 frame
-            // `broker::run` wrote down the pipe before returning; this line is
-            // for a developer running the broker by hand from a console build.
-            eprintln!("capture broker: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// The broker role on a build compiled without `windivert-backend`.
-///
-/// It cannot capture: there is no driver, no `WinDivertSource`, and no pipe
-/// server. Exiting is the only honest answer — falling through into the GUI
-/// would open a *second* window, elevated, while the window that asked for
-/// capture sat waiting for a channel nobody would ever serve. In practice only
-/// a human typing the flag reaches this: the code that writes it lives behind
-/// the same feature.
-#[cfg(not(all(windows, feature = "windivert-backend")))]
-fn run_capture_broker(_args: Vec<String>) -> ExitCode {
-    eprintln!(
-        "{BROKER_ARGV_FLAG} needs the `windivert-backend` feature: this build has no capture \
-         backend, so it cannot serve a capture channel."
-    );
-    ExitCode::FAILURE
-}
-
-/// Pulls `--port`, `--pipe` and `--ui-pid` out of the broker command line.
-///
-/// Returns the three validated values as a tuple rather than a named struct so
-/// that the no-backend build above, which never calls this, does not carry
-/// fields nothing reads (every lane is `-D warnings`).
-#[cfg(all(windows, feature = "windivert-backend"))]
-fn parse_broker_command(args: &[String]) -> arkyve_refresh_shop::Result<(u16, String, u32)> {
-    use arkyve_refresh_shop::Error;
-    use arkyve_refresh_shop::broker::{parse_pipe_nonce, parse_port, parse_ui_pid};
-
-    let (mut port, mut nonce, mut ui_pid) = (None, None, None);
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        match arg.as_str() {
-            BROKER_ARGV_FLAG => {}
-            "--port" => port = Some(parse_port(next_value(&mut rest, "--port")?)?),
-            "--pipe" => {
-                nonce = Some(parse_pipe_nonce(next_value(&mut rest, "--pipe")?)?.to_owned())
-            }
-            "--ui-pid" => ui_pid = Some(parse_ui_pid(next_value(&mut rest, "--ui-pid")?)?),
-            // The offending token is deliberately not echoed, for the same
-            // reason `parse_pipe_nonce` does not echo its own: a mistyped
-            // `--pipe` makes the *nonce* the unknown argument, and a shared
-            // secret must not be what an error message hands to whoever is
-            // reading the output.
-            _ => {
-                return Err(Error::Capture(
-                    "unexpected argument on the capture broker command line".to_owned(),
-                ));
-            }
-        }
-    }
-    match (port, nonce, ui_pid) {
-        (Some(port), Some(nonce), Some(ui_pid)) => Ok((port, nonce, ui_pid)),
-        _ => Err(Error::Capture(
-            "the capture broker needs --port, --pipe and --ui-pid".to_owned(),
-        )),
-    }
-}
-
-/// The token following a flag, or a named error when the flag ends the line.
-#[cfg(all(windows, feature = "windivert-backend"))]
-fn next_value<'a>(
-    rest: &mut impl Iterator<Item = &'a String>,
-    flag: &str,
-) -> arkyve_refresh_shop::Result<&'a str> {
-    rest.next().map(String::as_str).ok_or_else(|| {
-        arkyve_refresh_shop::Error::Capture(format!("{flag} needs a value on the command line"))
-    })
-}
-
 fn main() -> ExitCode {
-    // The very first thing, ahead of the panic hook, the rustls provider, the
-    // log subscriber and the config read — because the broker role must do none
-    // of them. It installs its own `crash::install()` (one hook, not two), it
-    // opens no TLS connection, it has no subscriber to write to (which is why
-    // its diagnostics travel down the pipe as frames), and above all it does not
-    // read `config.toml`: that file lives in per-user roaming app-data, is
-    // writable by any medium-integrity process on the machine, and this is the
-    // process holding a kernel driver's handle. Its whole input is the three
-    // argv tokens below.
-    if let Some(args) = capture_broker_argv() {
-        return run_capture_broker(args);
-    }
+    // Ahead of `install_logging`, and that ordering is the point: an install
+    // that ever ran the WinDivert backend left `%LOCALAPPDATA%\<app>` locked to
+    // administrators, and the log directory sits inside it. Undo that first and
+    // this run keeps its log; undo it afterwards and the first post-upgrade run
+    // writes into a directory it cannot open and loses everything. The findings
+    // are logged below, once there is a subscriber to log them to.
+    let leftovers = migrate::clean_windivert_leftovers();
 
     // Before anything can panic: capture panics to a file. In the windowed
     // build stdout/stderr are inert, and a panic on a worker task or the
@@ -248,6 +123,7 @@ fn main() -> ExitCode {
 
     // Held to the end of `main`: dropping it flushes the log writer.
     let _log_guard = install_logging();
+    leftovers.report();
 
     let config_path = config_path();
     // Emitted before the config is even read: a run that dies on an invalid
@@ -256,11 +132,7 @@ fn main() -> ExitCode {
         version = env!("CARGO_PKG_VERSION"),
         os = %std::env::consts::OS,
         gui = cfg!(feature = "gui"),
-        // Both backends, not just WinDivert: `pcap-backend` is the shipped
-        // default now, so logging only the other one would put "no capture
-        // backend" in every bug report we receive.
         pcap = cfg!(feature = "pcap-backend"),
-        windivert = cfg!(feature = "windivert-backend"),
         actuator = cfg!(feature = "actuator"),
         config_path = %config_path.display(),
         "arkyve-refresh-shop starting"
@@ -277,10 +149,9 @@ fn main() -> ExitCode {
     };
     // Said out loud, once, at the one moment the player might correlate it with
     // something: these keys still parse but no longer do anything. The capture
-    // filter is a constant inside the elevated broker now — that is what keeps a
-    // string from a world-writable file out of a kernel driver's filter compiler
-    // — and the receive buffer is pinned to the driver's own maximum. They are
-    // still accepted because deleting them would make `Config::load` fail on
+    // filter is a BPF expression built from `game_port` inside the Npcap
+    // backend, and the receive buffer is the snaplen that backend picks. They
+    // are still accepted because deleting them would make `Config::load` fail on
     // every config file written by an earlier release, which is every config
     // file that exists.
     if let Some(keys) = config.capture.retired_keys() {
@@ -429,127 +300,5 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config, config_path: PathB
             eprintln!("GUI error: {err}");
             ExitCode::FAILURE
         }
-    }
-}
-
-/// The argv dispatch, and nothing else: everything past it needs a window, a
-/// runtime or a driver.
-///
-/// Gated with the broker itself. The three *values* are validated by
-/// `broker::parse_*`, which is unconditional and tested in every lane; what is
-/// tested here is only the walk over the command line that feeds them.
-#[cfg(all(test, windows, feature = "windivert-backend"))]
-mod tests {
-    use super::*;
-
-    fn argv(line: &str) -> Vec<String> {
-        line.split_whitespace().map(str::to_owned).collect()
-    }
-
-    const NONCE: &str = "0123456789abcdef0123456789abcdef";
-
-    /// The one test that ties the two halves of the command line together.
-    ///
-    /// Everything else in this module feeds the parser literals. This feeds it
-    /// the *producer's* output: `broker::broker_command_line` is what
-    /// `capture::elevate` hands to `ShellExecuteExW`, and `parse_broker_command`
-    /// is what the elevated copy reads it back with. Rename a flag on either
-    /// side, reorder the tokens, quote a value — and this fails, where two
-    /// independent sets of literals would both have kept passing while the
-    /// product silently opened a second elevated window and timed out on a
-    /// channel nobody served.
-    #[test]
-    fn the_command_line_the_launcher_writes_is_the_one_the_dispatch_parses() {
-        use arkyve_refresh_shop::broker::broker_command_line;
-
-        let line = broker_command_line(3333, NONCE, 4242);
-        // Split the way the shell splits argv before `capture_broker_argv` sees
-        // it, so a value that grew a space would break here too.
-        let args = argv(&line);
-        assert!(
-            args.iter().any(|arg| arg == BROKER_ARGV_FLAG),
-            "the dispatch would never recognise its own command line: {line}"
-        );
-        assert_eq!(
-            parse_broker_command(&args).expect("the launcher's own command line must parse"),
-            (3333, NONCE.to_owned(), 4242)
-        );
-    }
-
-    #[test]
-    fn a_complete_broker_command_line_yields_the_three_validated_values() {
-        let args = argv(&format!(
-            "--capture-broker --port 3333 --pipe {NONCE} --ui-pid 4242"
-        ));
-        let (port, nonce, ui_pid) = parse_broker_command(&args).expect("a well-formed command");
-        assert_eq!(port, 3333);
-        assert_eq!(nonce, NONCE);
-        assert_eq!(ui_pid, 4242);
-    }
-
-    #[test]
-    fn the_order_of_the_three_arguments_does_not_matter() {
-        let args = argv(&format!(
-            "--ui-pid 7 --pipe {NONCE} --capture-broker --port 1"
-        ));
-        assert_eq!(
-            parse_broker_command(&args).expect("order is not a contract"),
-            (1, NONCE.to_owned(), 7)
-        );
-    }
-
-    #[test]
-    fn a_missing_argument_is_refused_rather_than_defaulted() {
-        // Defaulting any of the three would mean the elevated side inventing a
-        // port, a pipe name or a process to watch.
-        for line in [
-            "--capture-broker".to_owned(),
-            "--capture-broker --port 3333".to_owned(),
-            format!("--capture-broker --port 3333 --pipe {NONCE}"),
-            format!("--capture-broker --pipe {NONCE} --ui-pid 42"),
-        ] {
-            let error = parse_broker_command(&argv(&line))
-                .expect_err("an incomplete command line must be refused");
-            assert!(error.to_string().contains("--port"), "{line}: {error}");
-        }
-    }
-
-    #[test]
-    fn a_flag_with_no_value_after_it_is_refused_by_name() {
-        let args = argv(&format!(
-            "--capture-broker --pipe {NONCE} --ui-pid 42 --port"
-        ));
-        let error = parse_broker_command(&args).expect_err("a dangling flag");
-        assert!(error.to_string().contains("--port"), "{error}");
-    }
-
-    #[test]
-    fn the_broker_validators_are_the_ones_that_decide_what_is_acceptable() {
-        // Not a second parser: these three all fail inside `broker::parse_*`,
-        // which is what the elevated side itself enforces.
-        for line in [
-            format!("--capture-broker --port 0 --pipe {NONCE} --ui-pid 42"),
-            format!("--capture-broker --port 70000 --pipe {NONCE} --ui-pid 42"),
-            "--capture-broker --port 3333 --pipe nothex --ui-pid 42".to_owned(),
-            format!("--capture-broker --port 3333 --pipe {NONCE} --ui-pid 0"),
-        ] {
-            assert!(
-                parse_broker_command(&argv(&line)).is_err(),
-                "{line} must not be accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn an_unknown_argument_is_refused_without_echoing_it_back() {
-        // A mistyped `--pipe` turns the nonce itself into the unknown argument;
-        // a message that quoted it would be the thing that leaked the secret.
-        let args = argv(&format!(
-            "--capture-broker --pipes {NONCE} --port 1 --ui-pid 2"
-        ));
-        let error = parse_broker_command(&args).expect_err("an unknown flag");
-        let message = error.to_string();
-        assert!(!message.contains(NONCE), "the message leaked the nonce");
-        assert!(!message.contains("--pipes"), "{message}");
     }
 }

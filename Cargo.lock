@@ -120,7 +120,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui_kittest",
- "etherparse 0.20.3",
+ "etherparse",
  "futures-util",
  "libloading",
  "rustls",
@@ -134,7 +134,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "windivert",
  "windows-sys 0.61.2",
 ]
 
@@ -802,15 +801,6 @@ name = "error-code"
 version = "3.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
-
-[[package]]
-name = "etherparse"
-version = "0.18.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54a48e7bdc36cdf86876a6890c0840957029374ea07f6697c96fa15898730375"
-dependencies = [
- "arrayvec",
-]
 
 [[package]]
 name = "etherparse"
@@ -3761,28 +3751,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "windivert"
-version = "0.7.0-beta.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bbb7dcc054cce9781ee0d258fa4115182bdc3fc8706350476d4ce96206daed9"
-dependencies = [
- "etherparse 0.18.2",
- "thiserror 2.0.18",
- "windivert-sys",
- "windows",
-]
-
-[[package]]
-name = "windivert-sys"
-version = "0.11.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eace207a00d158e8340b0f9217f1f7e379eaedf364a21edb92109f0e8eb0778"
-dependencies = [
- "cc",
- "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -2,64 +2,21 @@
 
 mod ip;
 
-// The unelevated end of the split: launching the broker and connecting to it.
-// Gated with the backend rather than with `windows` alone, because without the
-// backend there is no broker to launch — and `windows-sys` itself is an optional
-// dependency this feature turns on.
-//
-// Also gated *off* by `pcap-backend`, which outranks WinDivert in
-// `app::build_source` when both are compiled: nothing would then ever launch a
-// broker, and every item in here would be dead code in a lane that builds with
-// `-D warnings`. The two cfgs must stay in step with that precedence.
-#[cfg(all(windows, feature = "windivert-backend", not(feature = "pcap-backend")))]
-mod elevate;
-
-// Unconditional on purpose. The broker protocol is pure `std::io` with no Win32
-// in it, and gating it on `windivert-backend` would keep its tests out of both
-// portable lanes of `just verify` — the only lanes that ever exercise it, since
-// the elevated side is untestable by construction.
-mod pipe;
-
-// Experimental Npcap backend. Coexists with WinDivert rather than replacing it:
-// it captures from an *unelevated* process, so if it holds up it retires the
-// broker, the pipe and the UAC prompt — which is a decision to take on evidence,
-// not one to pre-empt by deleting the shipped path.
+// The one capture backend: an Npcap tap over every adapter, in this very
+// process. There is no second backend to arbitrate against — `pcap-backend` is
+// either on, or the crate has no way to capture and says so (see
+// `app::build_source`).
 #[cfg(all(windows, feature = "pcap-backend"))]
 mod pcap;
-
-#[cfg(all(windows, feature = "windivert-backend"))]
-mod windivert;
 
 use std::net::SocketAddr;
 
 use crate::error::Result;
 
 pub use ip::parse_segment;
-// Re-exported rather than left `pub` inside a private module: this crate is a
-// lib plus a bin, so only an item reachable from the crate root escapes
-// `dead_code`, and every lane builds with `-D warnings`. The broker (the sole
-// caller of `write_frame`) does not exist yet.
-pub use pipe::{
-    FRAME_FLAG_CAPTURE_LOSS, FRAME_KIND_DIAGNOSTIC, FRAME_KIND_FATAL, FRAME_KIND_PACKET,
-    PipeSource, write_frame,
-};
 
-#[cfg(all(windows, feature = "windivert-backend", not(feature = "pcap-backend")))]
-pub(crate) use elevate::spawn_elevated_broker;
 #[cfg(all(windows, feature = "pcap-backend"))]
 pub use pcap::PcapSource;
-#[cfg(all(windows, feature = "windivert-backend"))]
-pub use windivert::WinDivertSource;
-
-/// Largest packet the capture driver can deliver (`WINDIVERT_MTU_MAX`), and by
-/// extension the largest frame payload the broker may put on the pipe.
-/// Coalesced receives (RSC/LSO) routinely exceed the wire MTU, so anything
-/// smaller as a buffer makes `recv` fail on the first bulk transfer.
-///
-/// Lives here rather than in the backend because both ends of the pipe have to
-/// agree on it: the elevated side sizes its receive buffer from it, the
-/// unelevated side refuses any frame claiming more.
-pub const MAX_PACKET_BYTES: usize = 65_575;
 
 /// A blocking capture source paired with the capability that wakes it during
 /// session teardown. Keeping the pair together makes it impossible for the
@@ -69,10 +26,7 @@ pub(crate) struct CaptureSource {
     pub(crate) stop: Box<dyn CaptureStop>,
 }
 
-#[cfg(any(
-    test,
-    all(windows, any(feature = "windivert-backend", feature = "pcap-backend"))
-))]
+#[cfg(any(test, all(windows, feature = "pcap-backend")))]
 impl CaptureSource {
     pub(crate) fn new(
         packets: impl PacketSource + 'static,

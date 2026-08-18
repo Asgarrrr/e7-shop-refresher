@@ -2,19 +2,19 @@
 //!
 //! # Why this exists
 //!
-//! The shipped WinDivert backend needs a kernel driver load, which needs
-//! administrator rights, which is why this product carries an elevated broker,
-//! a named pipe, a UAC prompt and everything under `capture::elevate`. Npcap's
+//! The backend this replaced (WinDivert) needed a kernel driver load, which
+//! needs administrator rights, which is what the product's elevated broker, its
+//! named pipe and its UAC prompt existed to contain — 3 274 lines of it. Npcap's
 //! installer offers to leave its driver open to ordinary users (the `AdminOnly`
 //! option, off by default), and a measured probe on the development machine
 //! confirmed a **non-elevated** process capturing the game's traffic: 82 packets
-//! matched, 82 parsed, 0 unparsed, on the Wi-Fi adapter, `DLT_EN10MB`. This
-//! module is that probe turned into a real backend so the question "can the
-//! elevated architecture be retired?" can be answered against the whole
-//! pipeline rather than against a toy.
+//! matched, 82 parsed, 0 unparsed, on the Wi-Fi adapter, `DLT_EN10MB`. That
+//! probe became this backend, it held up over the whole pipeline, and the
+//! elevated architecture was then deleted — see `docs/capture-backend-choice.md`.
 //!
-//! It coexists with WinDivert on purpose: nothing here deletes or weakens the
-//! shipped path, and the feature is not in `default`.
+//! The exe is still manifested `requireAdministrator`, and not for this module:
+//! the actuator cannot click a window that runs at higher integrity than this
+//! process, and Epic Seven inherits high integrity from STOVE. See `build.rs`.
 //!
 //! # Why `wpcap.dll` is loaded by hand
 //!
@@ -61,10 +61,10 @@ const PCAP_ERRBUF_SIZE: usize = 256;
 
 /// Bytes captured per packet.
 ///
-/// Deliberately **not** [`super::MAX_PACKET_BYTES`] (65 575, the WinDivert
-/// driver's own maximum). Receive-side coalescing (RSC/LRO) hands the stack a
-/// single "packet" made of many wire frames, and the probe measured one of
-/// **48 870 bytes** on this machine — 32 times the MTU. 65 575 happened to be
+/// Deliberately not the wire MTU, and deliberately not the 65 575 the removed
+/// WinDivert backend used either. Receive-side coalescing (RSC/LRO) hands the
+/// stack a single "packet" made of many wire frames, and the probe measured one
+/// of **48 870 bytes** on this machine — 32 times the MTU. 65 575 happened to be
 /// above that here; there is no reason it is above it everywhere, and a
 /// too-small snaplen does not fail, it silently truncates, which reaches
 /// `parse_segment` as a malformed packet and reads as a parser bug. 262 144 is
@@ -450,15 +450,13 @@ struct Refusal {
 
 /// Where packets that reach this process go to die.
 ///
-/// The same instrument [`super::PipeSource`] carries, and deliberately a
-/// separate copy of it: its `delivered` counts frames read off a pipe, this one
-/// counts frames pulled off *n* adapters and stripped of their link header, and
-/// merging the two would mean touching the broker path this experiment must
-/// leave alone. Two things can drop a packet between the driver and the
-/// reassembler — the parser refusing it, and a segment travelling the wrong way
-/// — and each is individually plausible as the reason a healthy-looking session
-/// yields nothing. `delivered` staying at zero is itself the headline result:
-/// the adapters are open but the kernel filter matches no traffic.
+/// `delivered` counts frames pulled off *n* adapters and stripped of their link
+/// header; the three counters after it are where those frames stop. Two things
+/// can drop a packet between the driver and the reassembler — the parser
+/// refusing it, and a segment travelling the wrong way — and each is
+/// individually plausible as the reason a healthy-looking session yields
+/// nothing. `delivered` staying at zero is itself the headline result: the
+/// adapters are open but the kernel filter matches no traffic.
 #[derive(Default)]
 struct Funnel {
     delivered: u64,
@@ -530,8 +528,8 @@ impl PcapSource {
     /// Opens every usable adapter and starts capturing.
     ///
     /// Blocking, and quick: enumeration plus one `pcap_open_live` and one filter
-    /// compile per device. Unlike the WinDivert path there is no UAC prompt in
-    /// the middle of it — that absence is the entire point of this backend.
+    /// compile per device. Nothing in it waits on a human — the backend it
+    /// replaced put a UAC prompt in the middle of this call.
     ///
     /// A device that fails to open, or reports a link type [`LinkStrip`] cannot
     /// see past, is logged and skipped: a machine with a dozen virtual adapters
@@ -645,8 +643,8 @@ impl PacketSource for PcapSource {
             // The link header is already gone: each capture thread strips its
             // own adapter's framing, because the strip length is a property of
             // the adapter and nothing down here knows which one a packet came
-            // from. What arrives is a raw IP packet, exactly the shape the
-            // broker forwards, so the parser is shared verbatim.
+            // from. What arrives is a raw IP packet, which is the only shape
+            // `parse_segment` has ever accepted.
             let Some(segment) = parse_segment(&packet, self.game_port) else {
                 self.funnel.unparsed += 1;
                 self.funnel.report();

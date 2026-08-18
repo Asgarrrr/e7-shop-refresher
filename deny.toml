@@ -32,15 +32,6 @@ exceptions = [
   { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
   # Fonts embedded by egui; scope font licences to that asset crate.
   { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
-  # WinDivert's user-mode library and its Rust bindings are LGPL-3.0-or-later.
-  # The LGPL is satisfied by *dynamic* linking: `WinDivert.dll` is the official
-  # prebuilt binary (never statically linked, see `.cargo/config.toml`) and the
-  # exe re-materializes it, with its licence text, into
-  # `%LOCALAPPDATA%\arkyve-refresh-shop\` on first run — so a user can drop in
-  # their own build of the library, which is the relink freedom the licence
-  # requires. Scoped to these two crates only.
-  { crate = "windivert", allow = ["LGPL-3.0-or-later"] },
-  { crate = "windivert-sys", allow = ["LGPL-3.0-or-later"] },
 ]
 
 [bans]
