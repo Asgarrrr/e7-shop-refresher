@@ -51,6 +51,9 @@ pub(super) const METER_BASE: Color32 = Color32::from_rgb(0x2c, 0x42, 0x60);
 /// numbers. Named by size, applied by role at the call site.
 pub(super) const SP_XS: f32 = 4.0;
 pub(super) const SP_SM: f32 = 8.0;
+/// The one step between `SP_SM` and `SP_XL`: horizontal button padding, which is
+/// wider than the vertical rhythm on purpose (the Linear-style pill).
+pub(super) const SP_MD: f32 = 12.0;
 pub(super) const SP_XL: f32 = 24.0;
 
 /// Horizontal inset for tab content: full-width rules and row-hover fills bleed
@@ -117,10 +120,11 @@ pub(super) fn apply(ctx: &egui::Context) {
             ),
         ]
         .into();
-        // On the 4px grid: an even 8px between items, roomy button padding
-        // that reads as a Linear-style pill.
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        // On the 4px grid, from the scale above rather than repeated as
+        // literals in the file that declares it: an even `SP_SM` between items,
+        // roomy button padding that reads as a Linear-style pill.
+        style.spacing.item_spacing = egui::vec2(SP_SM, SP_SM);
+        style.spacing.button_padding = egui::vec2(SP_MD, SP_SM);
     });
 }
 

@@ -53,9 +53,10 @@ pub(super) fn render_journal_header(
     // bar was just clicked; outside, the `format!` would be paid every frame.
     let enabled = ui.is_enabled();
     response.widget_info(|| {
-        let name = match (open, latest) {
-            (false, Some(latest)) => format!("Journal · {latest}"),
-            _ => "Journal".to_owned(),
+        let name = if !open && let Some(latest) = latest {
+            format!("Journal · {latest}")
+        } else {
+            "Journal".to_owned()
         };
         egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &name)
     });
@@ -91,7 +92,7 @@ pub(super) fn render_journal_header(
         font.clone(),
         tint,
     );
-    if let (false, Some(latest)) = (open, latest) {
+    if !open && let Some(latest) = latest {
         painter.text(
             egui::pos2(title.right() + theme::SP_SM, content.center().y),
             egui::Align2::LEFT_CENTER,
@@ -118,8 +119,16 @@ pub(super) fn render_journal_body(ui: &mut egui::Ui, journal: &[LogLine]) {
         .auto_shrink([false, false])
         .show_rows(ui, row_height, journal.len(), |ui, rows| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            // One buffer for the whole visible slice: the stamp is written into
+            // it rather than returned as its own `String`, so a row costs the one
+            // copy `RichText` makes and nothing else.
+            let mut row = String::with_capacity(64);
             for line in &journal[rows] {
-                ui.monospace(format!("{}  {}", timestamp(line.at_ms), line.text));
+                row.clear();
+                write_timestamp(&mut row, line.at_ms);
+                row.push_str("  ");
+                row.push_str(&line.text);
+                ui.monospace(row.as_str());
             }
         });
 }
@@ -142,24 +151,32 @@ fn paint_edge_fade(painter: &egui::Painter, row: egui::Rect, bg: egui::Color32) 
     painter.add(mesh);
 }
 
-/// Session-relative `+m:ss` (hours appear once the session runs that long).
-fn timestamp(at_ms: u64) -> String {
+/// Session-relative `+m:ss` (hours appear once the session runs that long),
+/// appended to the caller's buffer so a visible row needs no `String` of its own.
+fn write_timestamp(out: &mut String, at_ms: u64) {
+    use std::fmt::Write as _;
+
     let secs = at_ms / 1000;
     let (hours, minutes, seconds) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if hours > 0 {
-        format!("+{hours}:{minutes:02}:{seconds:02}")
+    // Writing to a `String` is infallible.
+    let _ = if hours > 0 {
+        write!(out, "+{hours}:{minutes:02}:{seconds:02}")
     } else {
-        format!("+{minutes}:{seconds:02}")
-    }
+        write!(out, "+{minutes}:{seconds:02}")
+    };
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
     use egui_kittest::{Harness, kittest::Queryable};
 
     use super::*;
+
+    fn timestamp(at_ms: u64) -> String {
+        let mut out = String::new();
+        write_timestamp(&mut out, at_ms);
+        out
+    }
 
     #[test]
     fn timestamp_rolls_into_hours() {
@@ -183,16 +200,18 @@ mod tests {
         // The header toggles the panel open/closed; the caller flips its
         // `journal_open` on a reported click. The whole row is the single
         // interactive widget, named "Journal".
-        let toggled = RefCell::new(false);
+        // `Harness::new_ui` takes `impl FnMut`, so the flag is captured mutably;
+        // `drop(harness)` releases the borrow before the assert reads it.
+        let mut toggled = false;
         let mut harness = Harness::new_ui(|ui| {
             if render_journal_header(ui, false, None, egui::Margin::symmetric(16, 10)) {
-                *toggled.borrow_mut() = true;
+                toggled = true;
             }
         });
         harness.get_by_label("Journal").click();
         harness.run();
         drop(harness);
-        assert!(toggled.into_inner());
+        assert!(toggled);
     }
 
     #[test]

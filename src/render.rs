@@ -21,7 +21,7 @@ pub(crate) const HAUL_HEADLINERS: [(&str, &str); 2] = [
 /// order, shown even at zero so the player sees what's hunted), and the count
 /// of everything else bought this run.
 #[cfg(feature = "gui")]
-pub(crate) fn haul_tally(haul: &Haul) -> ([(&'static str, u32); 2], u32) {
+pub(crate) fn haul_tally(haul: &Haul) -> ([(&'static str, u32); HAUL_HEADLINERS.len()], u32) {
     let named = HAUL_HEADLINERS.map(|(wire, label)| (label, haul.count(wire)));
     let known = HAUL_HEADLINERS.map(|(wire, _)| wire);
     (named, haul.others(&known))
@@ -41,14 +41,28 @@ pub(crate) fn kind_label(kind: ItemKind) -> &'static str {
 /// slot table's prices, and the console item line so every number reads the
 /// same.
 pub(crate) fn grouped(n: u32) -> String {
-    let digits = n.to_string();
-    let len = digits.len();
+    // Digits are extracted least-significant-first into a fixed buffer —
+    // `u32::MAX` is ten digits, so it always fits — rather than through
+    // `n.to_string()`, which allocated a second `String` purely to iterate its
+    // characters into the one this returns. Every price cell and balance tile
+    // calls this on the repaint path.
+    let mut digits = ['0'; 10];
+    let mut len = 0;
+    let mut rest = n;
+    loop {
+        digits[len] = char::from_digit(rest % 10, 10).unwrap_or('0');
+        len += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
     let mut out = String::with_capacity(len + (len - 1) / 3);
-    for (index, ch) in digits.chars().enumerate() {
+    for index in 0..len {
         if index > 0 && (len - index).is_multiple_of(3) {
             out.push(',');
         }
-        out.push(ch);
+        out.push(digits[len - 1 - index]);
     }
     out
 }
@@ -127,40 +141,61 @@ pub(crate) fn render_shop(snapshot: &ShopSnapshot) {
 
 /// `index` is the item's 0-based position, needed for the player-facing slot
 /// number when the wire slot is omitted (`effective_slot`).
+///
+/// Appended with `write!` rather than `push_str(&format!(..))`: this is the shop
+/// table's hover tooltip as well as the console dump, and each `format!` used to
+/// allocate a throwaway `String` per present field only to copy it in and drop
+/// it — the substat clause added one more per substat plus a `join`. Writing
+/// into a `String` is infallible, so the `Result`s are discarded rather than
+/// unwrapped.
 pub(crate) fn format_item(item: &ShopItem, index: usize) -> String {
+    use std::fmt::Write as _;
+
     let kind = kind_label(item.kind);
 
-    let mut line = format!("slot {} · {kind}", item.effective_slot(index));
+    let mut line = String::with_capacity(64);
+    let _ = write!(line, "slot {} · {kind}", item.effective_slot(index));
     if let Some(name) = &item.name {
-        line.push_str(&format!(" · {name}"));
+        let _ = write!(line, " · {name}");
     }
     if let Some(set) = &item.set {
-        line.push_str(&format!(" · set {set}"));
+        let _ = write!(line, " · set {set}");
     }
     if let Some(grade) = item.grade {
-        line.push_str(&format!(" · grade {grade}"));
+        let _ = write!(line, " · grade {grade}");
     }
     if let Some(price) = item.price {
-        line.push_str(&format!(" · {} gold", grouped(price)));
+        let _ = write!(line, " · {} gold", grouped(price));
     }
     if !item.substats.is_empty() {
-        let stats: Vec<String> = item
-            .substats
-            .iter()
-            .map(|stat| match stat.value {
-                Some(value) => format!("{} {value}", stat.name),
-                None => stat.name.clone(),
-            })
-            .collect();
-        line.push_str(&format!(" · [{}]", stats.join(", ")));
+        line.push_str(" · [");
+        for (position, stat) in item.substats.iter().enumerate() {
+            if position > 0 {
+                line.push_str(", ");
+            }
+            match stat.value {
+                Some(value) => {
+                    let _ = write!(line, "{} {value}", stat.name);
+                }
+                None => line.push_str(&stat.name),
+            }
+        }
+        line.push(']');
     }
     if let Some(limit) = item.limit {
-        line.push_str(&format!(" · {}/{}", limit.remaining, limit.total));
+        let _ = write!(line, " · {}/{}", limit.remaining, limit.total);
     }
     line
 }
 
+/// The stdin key for the console lane. Silent in the windowed build: that build
+/// carries `windows_subsystem = "windows"`, so it has no console to print into
+/// and stdin is inert — the line would be written to a sink nobody can read,
+/// while `journal.rs` holds the invariant that player-facing text has one sink.
+/// The `#[cfg]` sits on the body, not the item, so the one caller
+/// (`app::supervise`) stays feature-independent.
 pub(crate) fn print_controls() {
+    #[cfg(not(feature = "gui"))]
     println!("Commands: start, stop, [Enter] toggle, Ctrl+C to quit");
 }
 

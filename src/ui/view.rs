@@ -1,12 +1,15 @@
 //! Pure projection of the controller for the window: everything one frame
 //! shows, copied under a single short lock.
+//!
+//! The one thing deliberately *not* in the projection is the slot table's hover
+//! tooltip — see [`slot_detail`].
 
 use crate::domain::control::{Controller, Limits, Progress, Status};
-use crate::render::{format_item, haul_tally, kind_label, status_summary};
+use crate::render::{HAUL_HEADLINERS, format_item, haul_tally, kind_label, status_summary};
 
 /// Plain per-frame copy of everything the window shows; built under the
 /// controller lock, rendered after the guard is dropped.
-pub struct ViewState {
+pub(super) struct ViewState {
     /// State word (idle/watching/…), carrying the severity color in the bar.
     pub status_word: &'static str,
     /// Secondary clause beside the word: a hint, or the stop reason when
@@ -31,13 +34,16 @@ pub struct ViewState {
     pub rows: Vec<SlotRow>,
     /// Confirmed buys this run, per headline token (label, count), in order —
     /// shown even at zero once a run exists, so the player sees the target.
-    pub haul: [(&'static str, u32); 2],
+    pub haul: [(&'static str, u32); HAUL_HEADLINERS.len()],
     /// Everything else bought this run, folded into one "+N other" bucket.
     pub haul_others: u32,
 }
 
 /// One shop slot as the table shows it.
-pub struct SlotRow {
+///
+/// The full console line the row shows on hover is **not** a field here: see
+/// [`slot_detail`].
+pub(super) struct SlotRow {
     pub slot: u8,
     pub kind: &'static str,
     pub name: Option<String>,
@@ -45,12 +51,37 @@ pub struct SlotRow {
     pub sold_out: bool,
     /// Matched and still to buy: the catalog id sits in the checklist.
     pub wanted: bool,
-    /// Full console line for the item, shown as the hover tooltip.
-    pub detail: String,
+}
+
+/// The full console line for one slot — the shop table's hover tooltip — built
+/// on demand instead of being projected into every [`SlotRow`].
+///
+/// It used to be a `SlotRow` field, which meant `format_item` ran once per slot
+/// on every frame, *inside* the controller lock, for a string at most one row
+/// ever reads (only the row under the pointer shows a tooltip). That lock is the
+/// same one the session loop takes to turn a captured shop into a click job, and
+/// hover state is input — so the pointer moving over the table repaints at
+/// display rate, not the 250 ms poll floor, lengthening every hold the session
+/// loop competes for. `shop_table` now calls this from inside `on_hover_ui`,
+/// which egui invokes only for the hovered widget, so it costs one line per
+/// hovered frame and nothing at all otherwise. The same deferral the accessible
+/// names in `theme.rs` and `journal.rs` already use.
+///
+/// `index` is the row's position in the snapshot the frame projected. A shop
+/// message landing between that projection and the hover makes the line
+/// describe the new roll at that position — a sub-repaint skew on a tooltip,
+/// which the table itself resolves on the next poll. Empty when the snapshot no
+/// longer has that slot.
+pub(super) fn slot_detail(controller: &Controller, index: usize) -> String {
+    controller
+        .last_snapshot()
+        .and_then(|snapshot| snapshot.slots.get(index))
+        .map(|item| format_item(item, index))
+        .unwrap_or_default()
 }
 
 /// Pure extraction: the caller holds the controller lock only for this call.
-pub fn view_state(controller: &Controller) -> ViewState {
+pub(super) fn view_state(controller: &Controller) -> ViewState {
     let (status_word, status_hint) = status_summary(controller);
     let (haul, haul_others) = haul_tally(controller.haul());
     let checklist = controller.checklist();
@@ -68,7 +99,6 @@ pub fn view_state(controller: &Controller) -> ViewState {
                     price: item.price,
                     sold_out: item.is_sold_out(),
                     wanted: item.catalog_id().is_some_and(|id| checklist.contains(&id)),
-                    detail: format_item(item, index),
                 })
                 .collect()
         })
@@ -272,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn view_state_detail_matches_format_item() {
+    fn slot_detail_matches_format_item() {
         let mut ctrl = controller();
         let item = ShopItem {
             id: 7,
@@ -286,6 +316,21 @@ mod tests {
             snapshot: shop(vec![item]),
             now_ms: 0,
         });
-        assert_eq!(view_state(&ctrl).rows[0].detail, expected);
+        // Same line the row used to carry as a field, now built per hover.
+        assert_eq!(slot_detail(&ctrl, 0), expected);
+    }
+
+    #[test]
+    fn slot_detail_of_a_vanished_slot_is_empty() {
+        // The tooltip is built after the projection lock is released, so the
+        // index it is asked about may no longer exist: an absent slot (or an
+        // absent snapshot) must read empty, not panic.
+        let mut ctrl = controller();
+        assert_eq!(slot_detail(&ctrl, 0), "");
+        ctrl.handle(Event::Snapshot {
+            snapshot: shop(vec![ShopItem::default()]),
+            now_ms: 0,
+        });
+        assert_eq!(slot_detail(&ctrl, 3), "");
     }
 }

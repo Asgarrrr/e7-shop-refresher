@@ -15,6 +15,7 @@ use crate::render::grouped_or_dash;
 /// clause) alone on the left with the one contextual button on the right, and
 /// under it a row of stat tiles (balances | refreshes + the per-token haul).
 /// Returns the clicked command.
+#[must_use]
 pub(super) fn render_status_bar(
     ui: &mut egui::Ui,
     view: &ViewState,
@@ -91,7 +92,7 @@ pub(super) fn render_status_bar(
             stat_tile(
                 ui,
                 "Refreshes",
-                against(view.progress.refreshes, view.limits.max_refreshes),
+                value_over_limit(view.progress.refreshes, view.limits.max_refreshes),
             );
             for (label, count) in &view.haul {
                 stat_tile(ui, label, count.to_string());
@@ -149,7 +150,7 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
 }
 
 /// `3/10` against a limit, `3/—` without one.
-fn against(value: u32, limit: Option<u32>) -> String {
+fn value_over_limit(value: u32, limit: Option<u32>) -> String {
     match limit {
         Some(limit) => format!("{value}/{limit}"),
         None => format!("{value}/—"),
@@ -158,8 +159,6 @@ fn against(value: u32, limit: Option<u32>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
     use egui_kittest::{Harness, kittest::Queryable};
 
     use crate::domain::control::{Controller, Event, Limits};
@@ -180,16 +179,16 @@ mod tests {
     }
 
     #[test]
-    fn against_renders_missing_limit_as_dash() {
-        assert_eq!(against(3, Some(10)), "3/10");
-        assert_eq!(against(3, None), "3/—");
+    fn value_over_limit_renders_missing_limit_as_dash() {
+        assert_eq!(value_over_limit(3, Some(10)), "3/10");
+        assert_eq!(value_over_limit(3, None), "3/—");
     }
 
     #[test]
     fn idle_status_bar_hides_stop_and_toggle() {
         let view = idle_view();
         let harness = Harness::new_ui(|ui| {
-            render_status_bar(ui, &view, None, true);
+            let _ = render_status_bar(ui, &view, None, true);
         });
         assert!(harness.query_by_label("Stop").is_none());
         assert!(harness.query_by_label("Toggle").is_none());
@@ -199,7 +198,7 @@ mod tests {
     fn status_bar_shows_currencies_and_a_clean_status() {
         let view = idle_view();
         let harness = Harness::new_ui(|ui| {
-            render_status_bar(ui, &view, None, true);
+            let _ = render_status_bar(ui, &view, None, true);
         });
         // The balance tiles show always (uppercase KPI labels), the state word
         // is title-cased, and its clause is a plain hint.
@@ -216,7 +215,7 @@ mod tests {
         // run-tile label that only exists once the group renders.
         let idle = idle_view();
         let idle_bar = Harness::new_ui(|ui| {
-            render_status_bar(ui, &idle, None, true);
+            let _ = render_status_bar(ui, &idle, None, true);
         });
         idle_bar.get_by_label("SKYSTONES");
         assert!(idle_bar.query_by_label("REFRESHES").is_none());
@@ -231,7 +230,7 @@ mod tests {
         controller.handle(Event::Start { now_ms: 0 });
         let armed = view_state(&controller);
         let armed_bar = Harness::new_ui(|ui| {
-            render_status_bar(ui, &armed, None, true);
+            let _ = render_status_bar(ui, &armed, None, true);
         });
         for label in ["REFRESHES", "0/10", "COVENANT", "MYSTIC"] {
             armed_bar.get_by_label(label);
@@ -246,7 +245,7 @@ mod tests {
         controller.handle(Event::Stop);
         let stopped = view_state(&controller);
         let stopped_bar = Harness::new_ui(|ui| {
-            render_status_bar(ui, &stopped, None, true);
+            let _ = render_status_bar(ui, &stopped, None, true);
         });
         stopped_bar.get_by_label("REFRESHES");
     }
@@ -254,23 +253,25 @@ mod tests {
     #[test]
     fn idle_start_click_emits_start() {
         let view = idle_view();
-        let clicked = RefCell::new(None);
+        // `Harness::new_ui`'s bound is `impl FnMut`, so the closure captures
+        // `clicked` mutably; `drop(harness)` releases the borrow before the read.
+        let mut clicked = None;
         let mut harness = Harness::new_ui(|ui| {
             if let Some(command) = render_status_bar(ui, &view, None, true) {
-                *clicked.borrow_mut() = Some(command);
+                clicked = Some(command);
             }
         });
         harness.get_by_label("Start").click();
         harness.run();
         drop(harness);
-        assert_eq!(clicked.into_inner(), Some(Command::Start));
+        assert_eq!(clicked, Some(Command::Start));
     }
 
     #[test]
     fn armed_status_bar_hides_start_and_toggle() {
         let view = watching_view();
         let harness = Harness::new_ui(|ui| {
-            render_status_bar(ui, &view, None, true);
+            let _ = render_status_bar(ui, &view, None, true);
         });
         assert!(harness.query_by_label("Start").is_none());
         assert!(harness.query_by_label("Toggle").is_none());
@@ -279,15 +280,15 @@ mod tests {
     #[test]
     fn armed_stop_click_emits_stop() {
         let view = watching_view();
-        let clicked = RefCell::new(None);
+        let mut clicked = None;
         let mut harness = Harness::new_ui(|ui| {
             if let Some(command) = render_status_bar(ui, &view, None, true) {
-                *clicked.borrow_mut() = Some(command);
+                clicked = Some(command);
             }
         });
         harness.get_by_label("Stop").click();
         harness.run();
         drop(harness);
-        assert_eq!(clicked.into_inner(), Some(Command::Stop));
+        assert_eq!(clicked, Some(Command::Stop));
     }
 }

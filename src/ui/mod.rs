@@ -28,7 +28,7 @@ use crate::journal::LogLine;
 use crate::watch::HaltSource;
 
 use editor::EditorState;
-use view::{ViewState, view_state};
+use view::{ViewState, slot_detail, view_state};
 
 /// Where the session's terminal outcome lands (fatal error, crash, or clean
 /// end): written once by the spawn wrapper in `main`, shown as a banner.
@@ -150,7 +150,10 @@ impl eframe::App for ShopApp {
         let session_alive = outcome.is_none();
 
         // Roomier margins than egui's stock 8px: the chrome needs to breathe.
-        let margin = egui::Margin::symmetric(16, 10);
+        // The side inset is `theme::EDGE` itself, not a second copy of 16 — the
+        // table text is inset by that same constant so the columns line up
+        // under the status bar.
+        let margin = egui::Margin::symmetric(theme::EDGE, 10);
         let clicked = egui::Panel::top("status_bar")
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
             .show(ui, |ui| {
@@ -204,10 +207,23 @@ impl eframe::App for ShopApp {
         // edges; text is inset per-tab (`theme::EDGE`) instead. No vertical
         // margin: the tab strip's own SP_XS below the underline is the only gap
         // to the content, and the journal's separator sits flush below.
+        // The slot table's tooltip is built through this, not carried in the
+        // projection: egui calls it for the hovered row only, so the item line
+        // costs one short lock per hovered frame instead of one `format_item`
+        // per row inside the frame's own lock hold (see `view::slot_detail`).
+        let controller = &self.handles.controller;
+        let detail = |index: usize| slot_detail(&lock_ignoring_poison(controller), index);
         let applied = egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::ZERO))
             .show(ui, |ui| {
-                render_tab_content(ui, &view, self.tab, &mut self.editor, session_alive)
+                render_tab_content(
+                    ui,
+                    &view,
+                    self.tab,
+                    &mut self.editor,
+                    session_alive,
+                    &detail,
+                )
             })
             .inner;
         // Dispatch first, then record. Everything downstream — the editor's
@@ -230,9 +246,22 @@ impl eframe::App for ShopApp {
         if !sections.is_empty()
             && let Err(err) = config::persist::save(&self.config_path, &sections)
         {
+            // The journal is a 500-entry in-memory ring that dies with the
+            // window, and this is exactly the failure a player comes back to ask
+            // about ("my Setup changes keep reverting") — so it also goes to the
+            // subscriber, which is what reaches the log file they are asked to
+            // send. The journal line names the sections so the banner says
+            // *what* was lost, not only that something was.
+            let labels = section_labels(&sections);
+            tracing::warn!(
+                error = ?err,
+                path = %self.config_path.display(),
+                sections = %labels,
+                "config.toml not saved"
+            );
             self.handles
                 .journal
-                .push(&[format!("config.toml not saved: {err}")]);
+                .push(&[format!("config.toml not saved ({labels}): {err}")]);
         }
     }
 }
@@ -254,6 +283,10 @@ fn deliver_command(handles: &SessionHandles, command: Command) -> bool {
         return true;
     }
     if handles.commands.try_send(command).is_err() {
+        // Journalled for the player and logged for us: the ring is gone once the
+        // window closes, and "the button did nothing" is only diagnosable after
+        // the fact from the file.
+        tracing::debug!("a player command was dropped: the session queue is full or closed");
         handles
             .journal
             .push(&[">> command dropped — the session is busy, try again".to_owned()]);
@@ -300,6 +333,14 @@ fn render_tabs(ui: &mut egui::Ui, tab: &mut Tab) {
 
 /// The persistable sections for a batch of Apply commands — only the three
 /// `Set*` producers; Start/Stop and friends are skipped.
+///
+/// The non-`Set*` arm is spelled out rather than a `_`, like the sibling
+/// [`EditorState::mark_applied`]: this function is the *only* bridge from a
+/// delivered Apply to `config.toml`, so a fourth `Set*` falling into a wildcard
+/// would retune the live session and then silently vanish on the next launch.
+/// Nothing else would catch it — `persist::write_sections` is exhaustive over
+/// `Section`, so the compiler would demand the new section be *written* while
+/// never demanding it be collected here.
 fn persisted_sections(commands: &[Command]) -> Vec<config::persist::Section> {
     commands
         .iter()
@@ -307,20 +348,37 @@ fn persisted_sections(commands: &[Command]) -> Vec<config::persist::Section> {
             Command::SetFilter(filter) => Some(config::persist::Section::Filter(filter.clone())),
             Command::SetLimits(limits) => Some(config::persist::Section::Limits(limits.clone())),
             Command::SetTimings(timings) => Some(config::persist::Section::Timings(*timings)),
-            _ => None,
+            Command::Start | Command::Stop | Command::Toggle => None,
         })
         .collect()
+}
+
+/// The Setup section titles behind a batch of sections, for the "not saved"
+/// report. Same words the collapsible bars and the commit-bar peek use, so the
+/// message points straight at the block whose edit did not reach disk.
+fn section_labels(sections: &[config::persist::Section]) -> String {
+    sections
+        .iter()
+        .map(|section| match section {
+            config::persist::Section::Filter(_) => "Hunt",
+            config::persist::Section::Limits(_) => "Stop",
+            config::persist::Section::Timings(_) => "Click timing",
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The active tab's content. Returns the commands the player committed (Setup's
 /// single Apply lives here, and may send several). One scroll state per tab —
 /// Setup's offset must not bleed into the table.
+#[must_use]
 fn render_tab_content(
     ui: &mut egui::Ui,
     view: &ViewState,
     tab: Tab,
     editor: &mut EditorState,
     session_alive: bool,
+    detail: &dyn Fn(usize) -> String,
 ) -> Vec<Command> {
     match tab {
         // The shop table bleeds its hover fill to the edges itself, so it takes
@@ -329,7 +387,7 @@ fn render_tab_content(
             egui::ScrollArea::vertical()
                 .id_salt("tab-shop")
                 .auto_shrink([false, false])
-                .show(ui, |ui| shop::render_shop_tab(ui, view));
+                .show(ui, |ui| shop::render_shop_tab(ui, view, detail));
             Vec::new()
         }
         Tab::Setup => render_setup_tab(ui, editor, session_alive),
@@ -341,6 +399,7 @@ fn render_tab_content(
 /// scroll in whatever height is left. This keeps Apply reachable at any scroll
 /// offset instead of trailing the last section off-screen. Its `side_top_panel`
 /// frame draws the hairline that separates it from the body.
+#[must_use]
 fn render_setup_tab(
     ui: &mut egui::Ui,
     editor: &mut EditorState,
@@ -400,7 +459,9 @@ mod tests {
         session_alive: bool,
     ) -> Vec<Command> {
         render_tabs(ui, tab);
-        render_tab_content(ui, view, *tab, editor, session_alive)
+        // No test here hovers a row, so the tooltip source is never called;
+        // `view::tests` covers what the live shell passes in its place.
+        render_tab_content(ui, view, *tab, editor, session_alive, &|_| String::new())
     }
 
     fn idle_view() -> ViewState {
@@ -429,11 +490,12 @@ mod tests {
         ];
         let sections = persisted_sections(&commands);
         // Start is not persisted; the limits edit is.
-        assert_eq!(sections.len(), 1);
-        assert!(matches!(
-            sections[0],
-            crate::config::persist::Section::Limits(_)
-        ));
+        assert_eq!(
+            sections,
+            vec![crate::config::persist::Section::Limits(Limits::default())]
+        );
+        // …and the failure report names it by its Setup section title.
+        assert_eq!(section_labels(&sections), "Stop");
     }
 
     /// Live handles built the way `main` builds them, so a field added to

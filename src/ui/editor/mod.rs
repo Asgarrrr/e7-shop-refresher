@@ -26,7 +26,7 @@ use crate::render::kind_label;
 /// still session-seeded from the controller, but Apply now both retunes the
 /// live session AND writes the changed sections back to config.toml (via
 /// `config::persist`, format-preserving, best-effort).
-pub struct EditorState {
+pub(super) struct EditorState {
     filter: Filter,
     limits: Limits,
     timings: Timings,
@@ -49,7 +49,7 @@ pub struct EditorState {
 }
 
 impl EditorState {
-    pub fn new(filter: Filter, limits: Limits, timings: Timings) -> Self {
+    pub(super) fn new(filter: Filter, limits: Limits, timings: Timings) -> Self {
         Self {
             applied_filter: filter.clone(),
             applied_limits: limits.clone(),
@@ -187,13 +187,21 @@ fn hunt_summary(filter: &Filter) -> String {
 fn stop_summary(limits: &Limits) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(n) = limits.max_refreshes {
-        parts.push(count_label(n as usize, "refresh", "refreshes"));
+        parts.push(count_label(
+            usize::try_from(n).unwrap_or(usize::MAX),
+            "refresh",
+            "refreshes",
+        ));
     }
     if let Some(n) = limits.max_spend {
         parts.push(format!("{n} crystals"));
     }
     if let Some(n) = limits.max_matches {
-        parts.push(count_label(n as usize, "match", "matches"));
+        parts.push(count_label(
+            usize::try_from(n).unwrap_or(usize::MAX),
+            "match",
+            "matches",
+        ));
     }
     if let Some(ms) = limits.max_duration_ms {
         parts.push(format!("{} min", ms.div_ceil(60_000)));
@@ -215,7 +223,10 @@ fn timing_summary(timings: &Timings) -> &'static str {
     }
 }
 
-/// `n singular` / `n plural`, e.g. `1 refresh` / `3 refreshes`.
+/// `n singular` / `n plural`, e.g. `1 refresh` / `3 refreshes`. `usize` because
+/// two of the four callers pass a `len()`; the `u32` limits reach it through a
+/// saturating `try_from` rather than an `as`, so the widening carries no
+/// unchecked cast even on a 16-bit target.
 fn count_label(n: usize, singular: &str, plural: &str) -> String {
     format!("{n} {}", if n == 1 { singular } else { plural })
 }
@@ -316,12 +327,42 @@ fn stop_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     duration_row(ui, &mut editor.limits.max_duration_ms);
 }
 
+/// The arming semantics of every optional criterion, in one place: unchecked
+/// means "no constraint" and writes `None`; a freshly checked box seeds a
+/// non-zero value; an already-present value is left exactly as it is. All three
+/// editors (Hunt's grid cells, the Stop rails, the duration rail) resolve their
+/// toggle through this — the chrome was already factored out, these semantics
+/// were not.
+fn arm_optional<T>(armed: bool, value: &mut Option<T>, seed: T) {
+    if armed {
+        value.get_or_insert(seed);
+    } else {
+        *value = None;
+    }
+}
+
+/// The drag field for an armed optional criterion, floored at 1.
+///
+/// `clamp_existing_to_range` is **off** and that is not a style choice: without
+/// it a value already present — a `max_refreshes = 0` seeded from config.toml —
+/// is silently rewritten to 1 on the first render, which desyncs the draft and
+/// makes Apply send a value the player never chose
+/// (`seeded_zero_limit_is_not_silently_clamped`). Shared so that fix lives once
+/// instead of once per widget. [`duration_row`] is the one criterion that cannot
+/// use it: it drags whole minutes derived from the stored ms, so its field has
+/// its own range and write-back, and shares only [`arm_optional`].
+fn optional_field<T: egui::emath::Numeric>(ui: &mut egui::Ui, value: &mut T) -> egui::Response {
+    ui.add(
+        egui::DragValue::new(value)
+            .range(T::from_f64(1.0)..=T::MAX)
+            .clamp_existing_to_range(false),
+    )
+}
+
 /// One ledger row: `☑ unit …… value`. The checkbox arms the cap, the unit sits
 /// in the left column, and the value is pushed flush-right so every cap lines up
-/// in its own column. Mirrors [`optional_value`]'s semantics — unchecked means
-/// "no constraint", a freshly checked box seeds a non-zero value, and
-/// `clamp_existing_to_range(false)` keeps a config-seeded `0` from being silently
-/// rewritten to `1`.
+/// in its own column. Arming is [`arm_optional`]'s, the field is
+/// [`optional_field`]'s; an unset rail reads a faint "none".
 fn limit_row<T: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     unit: &str,
@@ -329,18 +370,10 @@ fn limit_row<T: egui::emath::Numeric>(
     seed: T,
 ) {
     limit_ledger_row(ui, unit, value.is_some(), |on, ui| {
-        if on {
-            value.get_or_insert(seed);
-        } else {
-            *value = None;
-        }
-        if let Some(v) = value {
+        arm_optional(on, value, seed);
+        if let Some(current) = value.as_mut() {
             compact_drag(ui, |ui| {
-                ui.add(
-                    egui::DragValue::new(v)
-                        .range(T::from_f64(1.0)..=T::MAX)
-                        .clamp_existing_to_range(false),
-                )
+                optional_field(ui, current);
             });
         } else {
             ui.colored_label(theme::INK_FAINT, "none");
@@ -350,14 +383,11 @@ fn limit_row<T: egui::emath::Numeric>(
 
 /// The duration rail, edited in whole minutes (stored as ms) — a [`limit_row`]
 /// twin kept apart for its minute↔ms conversion, exactly as `optional_value`
-/// and the old `duration_minutes` were split before.
+/// and the old `duration_minutes` were split before. Arming is shared
+/// ([`arm_optional`]); the field is not, because it drags a derived value.
 fn duration_row(ui: &mut egui::Ui, value: &mut Option<u64>) {
     limit_ledger_row(ui, "minutes", value.is_some(), |on, ui| {
-        if on {
-            value.get_or_insert(60 * 60_000);
-        } else {
-            *value = None;
-        }
+        arm_optional(on, value, 60 * 60_000);
         if let Some(ms) = value {
             // Ceil so a sub-minute config value never reads as 0; edits are whole
             // minutes and only rewrite the stored ms on a real drag.
@@ -367,7 +397,6 @@ fn duration_row(ui: &mut egui::Ui, value: &mut Option<u64>) {
                 if r.changed() {
                     *ms = minutes.saturating_mul(60_000);
                 }
-                r
             });
         } else {
             ui.colored_label(theme::INK_FAINT, "none");
@@ -413,7 +442,7 @@ fn limit_ledger_row(
 /// so it still reads plainly as an editable input — but with tightened padding
 /// and a 3px corner, so each value sits as a small chip instead of the bulky
 /// default pill that would dominate the column.
-fn compact_drag(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> egui::Response) {
+fn compact_drag(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ui.scope(|ui| {
         ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
         let widgets = &mut ui.style_mut().visuals.widgets;
@@ -529,15 +558,15 @@ fn pass_estimate(t: &Timings) -> String {
         t.buy_modal,
         t.purchase_resumed,
     ];
-    let base_total: u64 = ROUTINE.iter().sum();
     // Folded with `saturating_add` rather than summed then added: the slack
-    // comes from an unvalidated `[actuator.timings]` where a `u64::MAX` wait is
-    // a supported engine value, so a plain `sum::<u64>()` overflows on its own.
+    // comes from a `DelayRange` that carries no invariant of its own, where a
+    // `u64::MAX` wait is a supported engine value, so a plain `sum::<u64>()`
+    // overflows on its own.
     let hi_total: u64 = slack
         .iter()
         .map(|r| r.max_ms.max(r.min_ms))
-        .fold(base_total, u64::saturating_add);
-    secs_range(base_total, hi_total)
+        .fold(ROUTINE_TOTAL_MS, u64::saturating_add);
+    secs_range(ROUTINE_TOTAL_MS, hi_total)
 }
 
 /// The per-action bars, revealed inline when the Custom mode segment is active.
@@ -601,6 +630,20 @@ const ROUTINE: [u64; 4] = [
     plan::WAIT_PURCHASE_RESUMED_MS,
 ];
 
+/// The steady pass's baseline total. A `const` rather than `ROUTINE.iter().sum()`
+/// inside [`pass_estimate`], which re-summed four compile-time constants on every
+/// frame the Setup tab painted — and gives the test something to assert the
+/// estimate against instead of repeating the sum.
+const ROUTINE_TOTAL_MS: u64 = {
+    let mut total = 0;
+    let mut index = 0;
+    while index < ROUTINE.len() {
+        total += ROUTINE[index];
+        index += 1;
+    }
+    total
+};
+
 /// The single commit: one primary Apply that emits every draft that moved. The
 /// applied twins are *not* touched here — the shell re-seeds them through
 /// [`EditorState::mark_applied`] for the commands the session actually took, so
@@ -615,11 +658,19 @@ const ROUTINE: [u64; 4] = [
 /// pinned bar reads as a pending-changes summary, not a lone button. Disabled
 /// wholesale once the session is dead — the click would vanish into a closed
 /// channel.
+#[must_use]
 pub(super) fn commit_row(
     ui: &mut egui::Ui,
     editor: &mut EditorState,
     session_alive: bool,
 ) -> Vec<Command> {
+    // Bit-exact on purpose, `required_substats[].min`'s `f64` included: these are
+    // change detection since the last write, not numeric tests. "Did this draft
+    // move?" is answered by the same equality the twin was seeded with, so an
+    // epsilon would make a real edit invisible. What the exactness *cannot*
+    // survive is a non-finite `min` (`NaN != NaN` lights Apply forever): the
+    // loader rejects one and `substat_reqs` cannot produce one, so no `Filter`
+    // reaching here carries it.
     let dirty_filter = editor.filter != editor.applied_filter;
     let dirty_limits = editor.limits != editor.applied_limits;
     let dirty_timings = editor.timings != editor.applied_timings;
@@ -731,7 +782,21 @@ fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input: &mut Strin
                 let mut has_min = req.min.is_some();
                 ui.checkbox(&mut has_min, "min");
                 if has_min {
-                    ui.add(egui::DragValue::new(req.min.get_or_insert(1.0)).speed(0.5));
+                    let min = req.min.get_or_insert(1.0);
+                    ui.add(egui::DragValue::new(min).speed(0.5));
+                    // egui parses typed text with `f64::from_str`, which accepts
+                    // "nan" and "inf". Either would be a threshold no substat
+                    // value can satisfy (`value >= min` is false for every
+                    // value, including for `NaN` itself), would light Apply
+                    // forever because `NaN != NaN` in `Filter`'s derived
+                    // `PartialEq`, and would be refused by `Config::validate` on
+                    // the next launch. Snapped back here so the draft cannot
+                    // reach that state at all — no range is set instead, because
+                    // clamping would silently rewrite a config-seeded value the
+                    // way `clamp_existing_to_range(false)` exists to prevent.
+                    if !min.is_finite() {
+                        *min = 1.0;
+                    }
                 } else {
                     req.min = None;
                 }
@@ -761,11 +826,8 @@ fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input: &mut Strin
 
 /// Checkbox-gated numeric criterion, laid as two grid cells (label, value) so a
 /// column of them lines up. Unchecked means "no constraint", expressed by the
-/// unchecked box — never a 0. A freshly checked box seeds a non-zero value and
-/// dragging is floored at 1, but `clamp_existing_to_range` is off: a value
-/// already present (e.g. a `max_refreshes = 0` seeded from config.toml) is shown
-/// as-is, not silently rewritten to 1 on the first render — which would desync
-/// the draft and make Apply send a value the player never chose.
+/// unchecked box — never a 0. The semantics are [`arm_optional`]'s and the field
+/// is [`optional_field`]'s, shared with the Stop rails.
 fn optional_value<T: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     label: &str,
@@ -774,21 +836,14 @@ fn optional_value<T: egui::emath::Numeric>(
 ) {
     let mut on = value.is_some();
     ui.checkbox(&mut on, label);
-    if on {
-        ui.add(
-            egui::DragValue::new(value.get_or_insert(seed))
-                .range(T::from_f64(1.0)..=T::MAX)
-                .clamp_existing_to_range(false),
-        );
-    } else {
-        *value = None;
+    arm_optional(on, value, seed);
+    if let Some(current) = value.as_mut() {
+        optional_field(ui, current);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
     use egui_kittest::{Harness, kittest::Queryable};
 
     use super::*;
@@ -804,17 +859,20 @@ mod tests {
     /// over several frames and the final one is a quiet no-click, so only a
     /// non-empty commit is latched — the last frame must not wipe it.
     fn run_setup(editor: &mut EditorState) -> Vec<Command> {
-        let sent = RefCell::new(Vec::new());
+        // `Harness::new_ui` takes `impl FnMut`, so the closure captures `sent`
+        // mutably (it already captures `editor` that way) — no interior
+        // mutability needed. `drop(harness)` is what releases the borrow.
+        let mut sent = Vec::new();
         let mut harness = Harness::new_ui(|ui| {
             let commands = edit_setup(ui, editor);
             if !commands.is_empty() {
-                *sent.borrow_mut() = commands;
+                sent = commands;
             }
         });
         harness.get_by_label("Apply").click();
         harness.run();
         drop(harness);
-        sent.into_inner()
+        sent
     }
 
     #[test]
@@ -861,6 +919,31 @@ mod tests {
     fn apply_inert_while_nothing_changed() {
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         assert!(run_setup(&mut editor).is_empty());
+    }
+
+    #[test]
+    fn a_non_finite_substat_threshold_cannot_survive_a_render() {
+        // `Config::validate` refuses `min = nan` from config.toml, but egui's
+        // DragValue parses typed text with `f64::from_str`, which accepts "nan"
+        // and "inf". Either would light Apply forever — `NaN != NaN` in the
+        // derived `PartialEq` the dirty-check uses — while `value >= min` matched
+        // nothing. Seeded directly here (the loader's own path is covered in
+        // `config`): rendering the row must snap it back, so no draft the window
+        // hands over can carry one.
+        let filter = Filter {
+            required_substats: vec![SubstatReq {
+                name: "speed".to_owned(),
+                min: Some(f64::NAN),
+            }],
+            ..Filter::default()
+        };
+        let mut editor = EditorState::new(filter, Limits::default(), Timings::default());
+        let harness = Harness::new_ui(|ui| {
+            edit_sections(ui, &mut editor);
+        });
+        drop(harness);
+        assert_eq!(editor.filter.required_substats[0].min, Some(1.0));
+        assert_eq!(editor.filter, editor.filter.clone());
     }
 
     #[test]
@@ -957,8 +1040,8 @@ mod tests {
 
     #[test]
     fn pass_estimate_saturates_on_an_unvalidated_timing() {
-        // `Config::validate` never inspects `[actuator.timings]`, and the
-        // engine deliberately supports a full-range wait (`DelayRange::draw`
+        // `DelayRange` carries no invariant of its own, and the engine
+        // deliberately supports a full-range wait (`DelayRange::draw`
         // saturates), so the summary must not overflow on the way to the label.
         let full = DelayRange {
             min_ms: 0,
@@ -969,8 +1052,12 @@ mod tests {
             buy_modal: full,
             ..Timings::default()
         };
-        let base: u64 = ROUTINE.iter().sum();
-        assert_eq!(pass_estimate(&timings), secs_range(base, u64::MAX));
+        // Asserted against the shared const, not a re-sum of `ROUTINE`: the two
+        // used to be independent copies of the same arithmetic.
+        assert_eq!(
+            pass_estimate(&timings),
+            secs_range(ROUTINE_TOTAL_MS, u64::MAX)
+        );
     }
 
     #[test]

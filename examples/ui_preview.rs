@@ -1,13 +1,17 @@
 //! Dashboard preview with injected mock data.
 //!
-//! On a machine without the native capture backend (mac dev), no shop
-//! snapshot ever arrives, so the live window only shows the welcome screen.
-//! This example builds the *real* `ShopApp` over a hand-seeded controller —
-//! same rendering path as production, just fed fixtures — so the redesigned
-//! status bar, slot table, currencies and journal can be seen and clicked.
+//! On a machine without the capture backend (`pcap-backend` is Windows-only;
+//! mac dev), no shop snapshot ever arrives, so the live window only shows the
+//! welcome screen. This example builds the *real* `ShopApp` over a hand-seeded
+//! controller — same rendering path as production, just fed fixtures — so the
+//! redesigned status bar, slot table, currencies and journal can be seen and
+//! clicked.
 //!
 //! Run:
-//!   cargo run --example ui_preview --no-default-features --features gui
+//!
+//! ```text
+//! cargo run --example ui_preview --no-default-features --features gui
+//! ```
 //!
 //! Not part of the shipped binary; nothing here touches production wiring.
 
@@ -96,19 +100,23 @@ fn main() -> eframe::Result {
     // still-green matched row remains on show.
     {
         let mut ctrl = controller.lock().expect("controller mutex");
-        ctrl.handle(Event::Start {
+        // Each `handle` returns the actions the session would run; the preview
+        // has no actuator, so every one is dropped on purpose. Spelled out
+        // rather than implied, so these do not read like the accidental drops
+        // they would be on a real call path.
+        let _ = ctrl.handle(Event::Start {
             now_ms: journal.now_ms(),
         });
-        ctrl.handle(Event::Snapshot {
+        let _ = ctrl.handle(Event::Snapshot {
             snapshot: mock_snapshot(),
             now_ms: journal.now_ms(),
         });
-        ctrl.handle(Event::Purchase {
+        let _ = ctrl.handle(Event::Purchase {
             item: 101,
             gold: Some(300_184_000),
             now_ms: journal.now_ms(),
         });
-        ctrl.handle(Event::Purchase {
+        let _ = ctrl.handle(Event::Purchase {
             item: 201,
             gold: Some(300_000_000),
             now_ms: journal.now_ms(),
@@ -145,9 +153,12 @@ fn main() -> eframe::Result {
                     let event = match command {
                         Command::Start => Some(Event::Start { now_ms }),
                         Command::Stop => Some(Event::Stop),
+                        // Exhaustive, like the production twin
+                        // (`session::handle_command`): a new `Status` must be a
+                        // compile error here, not a silent "treat it as idle".
                         Command::Toggle => Some(match ctrl.status() {
                             Status::Watching | Status::Paused => Event::Stop,
-                            _ => Event::Start { now_ms },
+                            Status::Idle | Status::Stopped(_) => Event::Start { now_ms },
                         }),
                         Command::SetFilter(filter) => Some(Event::FilterChanged(filter)),
                         Command::SetLimits(limits) => Some(Event::LimitsChanged(limits)),
@@ -156,7 +167,8 @@ fn main() -> eframe::Result {
                         Command::SetTimings(_) => None,
                     };
                     if let Some(event) = event {
-                        ctrl.handle(event);
+                        // Dropped for the same reason as the seeding above.
+                        let _ = ctrl.handle(event);
                     }
                     gate.set(matches!(ctrl.status(), Status::Watching | Status::Paused));
                 }

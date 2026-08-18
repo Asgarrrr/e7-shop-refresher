@@ -128,9 +128,11 @@ fn timing_meter(ui: &mut egui::Ui, width: f32, baseline: u64, value: &mut DelayR
     let painter = ui.painter().clone();
     let radius = egui::CornerRadius::same(4);
     painter.rect_filled(rect, radius, theme::HAIRLINE);
-    // Saturating: `[actuator.timings]` is not validated at load, and the engine
+    // Saturating: `DelayRange` itself carries no invariant, and the engine
     // deliberately supports a `max_ms` up to `u64::MAX` (`DelayRange::draw`
-    // saturates too). A plain `+` here would panic in debug and, worse, wrap
+    // saturates too). The loader's `validate_timings` bounds what `config.toml`
+    // may seed, but the type it produces does not, so the widget must still cope
+    // with any `u64`. A plain `+` here would panic in debug and, worse, wrap
     // silently in release — painting a full-ruler wait as a 0.3% sliver.
     let total = baseline.saturating_add(value.max_ms.max(value.min_ms));
     let base_w = rect.width() * (baseline as f32 / RULER_MS);
@@ -184,6 +186,12 @@ fn timing_meter(ui: &mut egui::Ui, width: f32, baseline: u64, value: &mut DelayR
 /// clamp total anyway, since the two guards protect different edits.
 fn slack_from_target(target_ms: f32, baseline: u64) -> u64 {
     let headroom = (RULER_MS - baseline as f32).max(0.0);
+    // The `as u64` is range-verified rather than lucky: `target_ms` is
+    // `frac * RULER_MS` where `frac` came from a division by a bar width floored
+    // at 80.0 (`editor/mod.rs`), so it is finite — no `NaN`, which `as` would map
+    // to 0 — and the `clamp` bounds the result to `0..=RULER_MS`, well inside
+    // `u64`. Both guards are needed: the clamp alone would still pass a `NaN`
+    // through, and finiteness alone would not bound the value.
     (target_ms - baseline as f32).clamp(0.0, headroom).round() as u64
 }
 
@@ -191,8 +199,8 @@ fn slack_from_target(target_ms: f32, baseline: u64) -> u64 {
 /// `baseline + max`, in seconds. A point range (no slack, or a reversed one)
 /// collapses to a single figure, matching the draw.
 fn resolved_band(baseline: u64, value: &DelayRange) -> String {
-    // Saturating for the same reason as the bar's `total`: an unvalidated
-    // config can seed a `u64::MAX` wait, which the engine honours.
+    // Saturating for the same reason as the bar's `total`: `DelayRange` carries
+    // no invariant of its own, and the engine honours a `u64::MAX` wait.
     let lo = baseline.saturating_add(value.min_ms);
     let hi = baseline.saturating_add(value.max_ms.max(value.min_ms));
     secs_range(lo, hi)
@@ -218,9 +226,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolved_band_saturates_on_an_unvalidated_max() {
-        // `[actuator.timings]` is not validated at load and the engine honours
-        // a full-range wait, so the display must saturate, not overflow.
+    fn resolved_band_saturates_on_an_unbounded_max() {
+        // `DelayRange` carries no invariant — the loader bounds what config.toml
+        // may seed, the type does not — and the engine honours a full-range
+        // wait, so the display must saturate, not overflow.
         let value = DelayRange {
             min_ms: 0,
             max_ms: u64::MAX,
