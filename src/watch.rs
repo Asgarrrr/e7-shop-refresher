@@ -6,7 +6,7 @@
 //! synchronously without relying on a bounded command queue.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use tokio::sync::Notify;
 
@@ -31,6 +31,9 @@ impl HaltSource {
     /// Lowest set bit first. The mask carries no arrival order, and taking the
     /// lower discriminant keeps the historical first-cause order for the usual
     /// "player stops, then something fails" sequence.
+    ///
+    /// Reads the cause bits out of a whole gate state, so every non-cause bit
+    /// (that is, [`OFF`]) is ignored.
     fn lowest_in(mask: u8) -> Option<Self> {
         [Self::PlayerStopped, Self::ActuatorFailed]
             .into_iter()
@@ -38,12 +41,49 @@ impl HaltSource {
     }
 }
 
+/// Every cause bit [`HaltSource`] can latch.
+const HALT_MASK: u8 = HaltSource::PlayerStopped as u8 | HaltSource::ActuatorFailed as u8;
+
+/// The gate's own position, stored **inverted**: set means shut.
+///
+/// Inverted so that `request_halt` is a single unconditional `fetch_or` —
+/// closing the gate and latching the cause are then one indivisible update, and
+/// the safety path carries no retry loop.
+const OFF: u8 = 1 << 7;
+
+// A cause bit overlapping `OFF` would make a latched halt read as an armed
+// gate. Six cause bits are free; this fails the build at the seventh, which is
+// where the layout has to be re-thought rather than extended.
+const _: () = assert!(HALT_MASK & OFF == 0);
+
 struct Inner {
-    enabled: AtomicBool,
-    pending_halt: AtomicU8,
+    /// The pending halt mask (low bits, see [`HaltSource`]) and the gate's own
+    /// position ([`OFF`]) in **one** atomic.
+    ///
+    /// These were two fields, and the handshake between them was a
+    /// store-then-load protocol over two locations whose comments had to argue
+    /// that no interleaving could re-arm a halted gate. It could: a re-arming
+    /// store and a halting store could both be in flight, and whichever landed
+    /// last won — leaving the gate armed with a cause latched. One location
+    /// removes the question. "A latched cause implies a shut gate" is now an
+    /// invariant of a single value that every update preserves atomically, so it
+    /// holds at every instant rather than eventually.
+    ///
+    /// That also makes `Relaxed` sufficient throughout: modification order on
+    /// one location is total, a read-modify-write always sees the latest value
+    /// in it, and the gate publishes no memory besides itself — the position and
+    /// the cause *are* the whole message.
+    state: AtomicU8,
     halt_notify: Notify,
 }
 
+/// The capture and action gate: while it is shut, captured bytes are not
+/// forwarded and the actuator refuses jobs.
+///
+/// One `Arc` behind a cheap clone, shared by the GUI thread, the session loop,
+/// the capture thread and the actuator task. It is the crate's only safety
+/// cutoff, which is why a halt latches (see [`WatchGate::request_halt`]) and
+/// cannot be undone by the controller's ordinary status projection.
 #[derive(Clone)]
 pub struct WatchGate {
     inner: Arc<Inner>,
@@ -53,37 +93,36 @@ impl WatchGate {
     pub fn new(enabled: bool) -> Self {
         Self {
             inner: Arc::new(Inner {
-                enabled: AtomicBool::new(enabled),
-                pending_halt: AtomicU8::new(NO_HALT),
+                state: AtomicU8::new(if enabled { NO_HALT } else { OFF }),
                 halt_notify: Notify::new(),
             }),
         }
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.inner.enabled.load(Ordering::Acquire)
+        self.inner.state.load(Ordering::Relaxed) & OFF == 0
     }
 
     /// Projects ordinary controller state into the gate.
     ///
-    /// A pending safety halt always wins over an attempt to re-arm. The
-    /// second check closes the race with a request that starts between the
-    /// first check and the enabled store.
+    /// A pending safety halt always wins over an attempt to re-arm. Reading the
+    /// mask and re-arming are one atomic update of one location, so no request
+    /// can land between them; the two defensive re-checks this needed while the
+    /// position lived in a second atomic are gone with it.
     pub fn set(&self, on: bool) {
         if !on {
-            self.inner.enabled.store(false, Ordering::Release);
+            self.inner.state.fetch_or(OFF, Ordering::Relaxed);
             return;
         }
 
-        if self.inner.pending_halt.load(Ordering::SeqCst) != NO_HALT {
-            self.inner.enabled.store(false, Ordering::Release);
-            return;
-        }
-
-        self.inner.enabled.store(true, Ordering::Release);
-        if self.inner.pending_halt.load(Ordering::SeqCst) != NO_HALT {
-            self.inner.enabled.store(false, Ordering::Release);
-        }
+        // `Err` is the ordinary "a cause is latched, stay shut" outcome, not a
+        // failure: the closure declines the update rather than reporting one.
+        let _ = self
+            .inner
+            .state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                (state & HALT_MASK == NO_HALT).then_some(state & !OFF)
+            });
     }
 
     /// Forces the gate off and durably latches the cause alongside any other
@@ -94,24 +133,22 @@ impl WatchGate {
     /// the controller instead of being dropped behind it. A repeat of a cause
     /// already latched is idempotent — the domain event it maps to is too.
     ///
-    /// This operation does not allocate, block, or depend on queue capacity.
+    /// This operation does not allocate, block, or depend on queue capacity — it
+    /// is one `fetch_or`, so it cannot even spin against a concurrent re-arm.
+    /// Once it returns, the gate is shut and stays shut until
+    /// [`WatchGate::acknowledge_halt`] clears this cause: nothing can re-arm
+    /// behind the player's back.
     pub fn request_halt(&self, source: HaltSource) {
-        self.inner.enabled.store(false, Ordering::Release);
         self.inner
-            .pending_halt
-            .fetch_or(source as u8, Ordering::SeqCst);
-        // Close the race with `set(true)` if it observed an empty mask before
-        // this cause was published.
-        self.inner.enabled.store(false, Ordering::Release);
+            .state
+            .fetch_or(source as u8 | OFF, Ordering::Relaxed);
         self.inner.halt_notify.notify_one();
     }
 
     /// Waits for a pending cause without consuming it.
     pub async fn halt_requested(&self) -> HaltSource {
         loop {
-            if let Some(source) =
-                HaltSource::lowest_in(self.inner.pending_halt.load(Ordering::SeqCst))
-            {
+            if let Some(source) = HaltSource::lowest_in(self.inner.state.load(Ordering::Relaxed)) {
                 return source;
             }
             // Notify retains a permit when the request wins before this wait,
@@ -126,15 +163,20 @@ impl WatchGate {
     /// Only the session loop may acknowledge halts. Keeping acknowledgement
     /// separate from waiting makes cancellation of a `tokio::select!` branch
     /// harmless and preserves the cause through controller dispatch.
+    ///
+    /// Acknowledging does not re-arm: `OFF` survives the clear, so the gate
+    /// reopens only once the controller projects `Watching` through `set(true)`.
     pub fn acknowledge_halt(&self, dispatched: HaltSource) {
         self.inner
-            .pending_halt
-            .fetch_and(!(dispatched as u8), Ordering::SeqCst);
+            .state
+            .fetch_and(!(dispatched as u8), Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::{HaltSource, WatchGate};
 
     #[test]
@@ -214,5 +256,73 @@ mod tests {
         gate.request_halt(HaltSource::ActuatorFailed);
         gate.acknowledge_halt(HaltSource::PlayerStopped);
         assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+    }
+
+    /// The one test in this module that is not sequential, and the only shape
+    /// that can observe the halt/re-arm race at all. The three roles really do
+    /// run on three different threads in the shipped build: `set(true)` from
+    /// `apply()` on the session-loop task, `request_halt(PlayerStopped)` from
+    /// the egui main thread, `request_halt(ActuatorFailed)` from the actuator
+    /// task.
+    ///
+    /// What is asserted is `request_halt`'s documented contract, checked from
+    /// the thread that just called it — once it returns, the gate is shut and
+    /// stays shut until *that* caller acknowledges its own cause.
+    ///
+    /// This fails within milliseconds on the two-atomic version of this file,
+    /// and it still fails if that version is merely promoted to `SeqCst`
+    /// throughout: an all-`SeqCst` Dekker handshake only makes `false` the last
+    /// store in the total order, so a reader can still catch the gate armed
+    /// while a cause is latched. Only folding both fields into one atomic makes
+    /// the state unrepresentable, which is why that is the shape shipped.
+    #[test]
+    fn a_concurrent_rearm_can_never_reopen_a_latched_halt() {
+        // Enough rounds to lose the race many times over on a loaded box, and
+        // still a few milliseconds of runtime.
+        const ROUNDS: usize = 20_000;
+        // The window is a handful of instructions wide, so each round polls
+        // rather than sampling once.
+        const POLLS: usize = 16;
+
+        let gate = WatchGate::new(true);
+        let stop = AtomicBool::new(false);
+
+        let halt_loop = |source: HaltSource| {
+            for _ in 0..ROUNDS {
+                gate.request_halt(source);
+                for _ in 0..POLLS {
+                    assert!(
+                        !gate.is_enabled(),
+                        "{source:?} was latched and the gate re-armed anyway"
+                    );
+                }
+                gate.acknowledge_halt(source);
+            }
+        };
+
+        // The re-arming thread spins until told to stop, so the flag has to be
+        // set on the unwind path too: a bare `store` after the assertions would
+        // leave `thread::scope` joining a thread that never exits, turning a
+        // failure into a hang.
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        std::thread::scope(|scope| {
+            // The session loop projects the controller status on every
+            // snapshot, purchase, tick and command.
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    gate.set(true);
+                }
+            });
+            scope.spawn(|| halt_loop(HaltSource::PlayerStopped));
+
+            let _stop_spinner = StopOnDrop(&stop);
+            halt_loop(HaltSource::ActuatorFailed);
+        });
     }
 }
