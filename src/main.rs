@@ -150,14 +150,22 @@ fn main() -> ExitCode {
     // Said out loud, once, at the one moment the player might correlate it with
     // something: these keys still parse but no longer do anything. The capture
     // filter is a BPF expression built from `game_port` inside the Npcap
-    // backend, and the receive buffer is the snaplen that backend picks. They
-    // are still accepted because deleting them would make `Config::load` fail on
-    // every config file written by an earlier release, which is every config
-    // file that exists.
-    if let Some(keys) = config.capture.retired_keys() {
+    // backend, the receive buffer is the snaplen that backend picks, and the
+    // forward directions stopped being a choice when the pipeline dropped the
+    // client -> server half it never decoded. They are still accepted because
+    // deleting them would make `Config::load` fail on every config file written
+    // by an earlier release, which is every config file that exists.
+    //
+    // One line per section rather than one merged list: the sections were
+    // retired for unrelated reasons and in different releases, so a player
+    // searching the log for the key they set finds it next to its own story.
+    for keys in [config.capture.retired_keys(), config.forward.retired_keys()]
+        .into_iter()
+        .flatten()
+    {
         tracing::warn!(
             keys = %keys,
-            "these [capture] keys are accepted but ignored, and will be refused in a later release"
+            "these config keys are accepted but ignored, and will be refused in a later release"
         );
     }
     // No `server_url` here: it can carry a credential (see

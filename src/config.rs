@@ -47,7 +47,7 @@ pub struct Config {
     /// Analysis server URL (`ws://` or `wss://`).
     pub server_url: String,
 
-    /// Stream directions to forward to the server.
+    /// Vestigial; see [`ForwardConfig`].
     pub forward: ForwardConfig,
 
     /// Reconnection policy for the server link.
@@ -68,13 +68,39 @@ pub struct Config {
     pub actuator: ActuatorConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Vestigial. Both keys are parsed and both are ignored.
+///
+/// They described a choice the pipeline no longer has. Only the server's half
+/// of a connection was ever decoded — the analysis server reads shop responses,
+/// and nothing has ever read the client's requests — so `server_to_client` was
+/// a knob whose only useful position was `true`, and `client_to_server` a knob
+/// for a feature that does not exist. `parse_segment` now refuses anything the
+/// game server did not send, which leaves the two keys describing a distinction
+/// the code cannot express.
+///
+/// **They are still parsed on purpose, and removing them is not a cleanup.**
+/// The reasoning is the same as for [`CaptureConfig`], and the evidence is
+/// stronger: `config.example.toml` shipped the whole `[forward]` block
+/// uncommented, and `main::seed_config_if_missing` writes that file to
+/// `%APPDATA%` on every first run. With `deny_unknown_fields` on this struct
+/// and on [`Config`], deleting the fields turns the next launch of every
+/// existing installation into `Config::load` failing, an "Invalid
+/// configuration" window, and an app that no longer starts. Editing
+/// `config.example.toml` does nothing for files already written.
+///
+/// Plan: keep them accepted-and-ignored for this release, with the startup
+/// warning `main` emits from [`ForwardConfig::retired_keys`], then delete both
+/// fields (and this struct with them) in a later one, once a player upgrading
+/// across two releases is no longer plausible.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ForwardConfig {
-    /// Server -> client responses: carry the shop contents.
-    pub server_to_client: bool,
-    /// Client -> server requests: context (issued command), optional.
-    pub client_to_server: bool,
+    /// Accepted and ignored: the server -> client responses are the only thing
+    /// captured at all, so this can no longer be turned off.
+    pub server_to_client: Option<bool>,
+    /// Accepted and ignored: the client -> server half is never captured, so
+    /// this can no longer be turned on.
+    pub client_to_server: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,13 +146,13 @@ pub enum ActuatorBackend {
 ///
 /// They stopped meaning anything when the capture filter stopped being a
 /// string this file could supply. The backend builds its own BPF expression
-/// from the validated `u16` `game_port` (`tcp and port {game_port}`), and sizes
-/// its buffer from its own snaplen. The filter *had* to stop being configurable
-/// while capture still ran a kernel driver: this file lives in per-user roaming
-/// app-data, where any medium-integrity process on the machine can rewrite it,
-/// and its contents were handed to that driver's filter compiler inside an
-/// administrator process. The driver is gone; the reason not to reopen the key
-/// is now simply that nothing needs it.
+/// from the validated `u16` `game_port` (`tcp and src port {game_port}`), and
+/// sizes its buffer from its own snaplen. The filter *had* to stop being
+/// configurable while capture still ran a kernel driver: this file lives in
+/// per-user roaming app-data, where any medium-integrity process on the machine
+/// can rewrite it, and its contents were handed to that driver's filter
+/// compiler inside an administrator process. The driver is gone; the reason not
+/// to reopen the key is now simply that nothing needs it.
 ///
 /// **They are still parsed on purpose, and removing them is not a cleanup.**
 /// This struct and [`Config`] are both `deny_unknown_fields`, and
@@ -167,16 +193,6 @@ impl Default for Config {
     }
 }
 
-impl Default for ForwardConfig {
-    fn default() -> Self {
-        // Shop contents live in the server -> client responses.
-        Self {
-            server_to_client: true,
-            client_to_server: false,
-        }
-    }
-}
-
 impl Default for ReconnectConfig {
     fn default() -> Self {
         Self {
@@ -202,6 +218,24 @@ impl CaptureConfig {
         }
         if self.filter.is_some() {
             keys.push("capture.filter");
+        }
+        (!keys.is_empty()).then(|| keys.join(", "))
+    }
+}
+
+impl ForwardConfig {
+    /// The retired keys this file actually sets, as a readable list, or `None`
+    /// when it sets neither. Same contract, and same reason, as
+    /// [`CaptureConfig::retired_keys`]: a player who set `client_to_server`
+    /// expecting their requests to be forwarded has to be told they are not.
+    #[must_use]
+    pub fn retired_keys(&self) -> Option<String> {
+        let mut keys = Vec::new();
+        if self.server_to_client.is_some() {
+            keys.push("forward.server_to_client");
+        }
+        if self.client_to_server.is_some() {
+            keys.push("forward.client_to_server");
         }
         (!keys.is_empty()).then(|| keys.join(", "))
     }
@@ -267,8 +301,6 @@ impl Config {
     ///   ignored), wrong type, or an integer out of range.
     /// - [`Error::Config`] — it parsed but breaks an invariant:
     ///   - `game_port = 0`;
-    ///   - `[forward]` with both directions off — nothing would be captured at
-    ///     all;
     ///   - an empty `server_url`, a scheme other than `ws://` / `wss://`, or a
     ///     `ws://` URL pointing anywhere but loopback (it would forward the
     ///     captured game stream, session tokens included, in cleartext);
@@ -301,11 +333,6 @@ impl Config {
     fn validate(&self) -> Result<()> {
         if self.game_port == 0 {
             return Err(crate::Error::Config("game_port cannot be 0".into()));
-        }
-        if !self.forward.server_to_client && !self.forward.client_to_server {
-            return Err(crate::Error::Config(
-                "at least one direction must be forwarded (forward)".into(),
-            ));
         }
         if self.server_url.trim().is_empty() {
             return Err(crate::Error::Config("server_url is empty".into()));
@@ -348,6 +375,13 @@ impl Config {
         // written before the change may well carry a filter naming a different
         // port, and refusing it would lock that player out of the app on
         // upgrade for a setting that no longer has any effect.
+        //
+        // `[forward]` with both directions off was refused here for the same
+        // kind of reason — it asked for a capture that forwarded nothing — and
+        // it is gone for the same reason: there is one direction now, the keys
+        // are inert, and no combination of them can express a broken relay.
+        // Refusing any `[forward]` value would only lock out a player whose
+        // file predates the change, which is every player's file.
         //
         // `[actuator.timings]` reaches both the refresh loop and the Setup
         // meter unchecked otherwise. Two shapes have to be refused here, at the
@@ -463,22 +497,78 @@ mod tests {
         );
     }
 
+    /// **The same regression, for the `[forward]` block.**
+    ///
+    /// `config.example.toml` shipped this exact text uncommented, so it is on
+    /// disk for every player who has ever launched the app — the user's live
+    /// `%APPDATA%\arkyve-refresh-shop\config.toml` included. With
+    /// `deny_unknown_fields` on both structs, retiring the keys by deleting
+    /// them turns the next launch into an "Invalid configuration" window and an
+    /// app that will not start.
     #[test]
-    fn both_forward_directions_off_is_rejected() {
-        let error =
-            parse_and_validate("[forward]\nserver_to_client = false\nclient_to_server = false")
-                .expect_err("nothing would be captured");
-        assert!(error.to_string().contains("forward"));
+    fn a_config_written_before_the_forward_keys_were_retired_still_loads() {
+        let config =
+            parse_and_validate("[forward]\nserver_to_client = true\nclient_to_server = false")
+                .expect("an upgrading player's existing config must still load");
+        assert_eq!(config.forward.server_to_client, Some(true));
+        assert_eq!(config.forward.client_to_server, Some(false));
     }
 
-    /// The capture filter matches either direction, so asking for the
-    /// client -> server context stream is a legitimate configuration.
     #[test]
-    fn client_to_server_direction_is_accepted() {
-        let config =
-            parse_and_validate("[forward]\nserver_to_client = true\nclient_to_server = true")
-                .expect("both directions are expressible");
-        assert!(config.forward.client_to_server);
+    fn a_retired_forward_combination_is_no_longer_a_startup_failure() {
+        // Both directions off used to be refused, because it described a relay
+        // that forwarded nothing. There is one direction now and neither key
+        // reaches the pipeline, so no combination can describe a broken relay —
+        // and refusing one would lock an upgrading player out of the app over a
+        // setting that has no effect at all.
+        assert!(
+            parse_and_validate("[forward]\nserver_to_client = false\nclient_to_server = false")
+                .is_ok()
+        );
+        // Asking for the client -> server stream is inert, not fatal: it is
+        // never captured, so it is simply not forwarded.
+        let config = parse_and_validate("[forward]\nclient_to_server = true")
+            .expect("an inert setting must not stop the app from starting");
+        assert_eq!(config.forward.client_to_server, Some(true));
+    }
+
+    #[test]
+    fn the_retired_forward_keys_are_named_only_when_they_are_actually_set() {
+        // This list is what the startup warning prints; an empty file must not
+        // produce a warning about keys the player never wrote.
+        assert_eq!(Config::default().forward.retired_keys(), None);
+        assert_eq!(
+            parse_and_validate("[forward]\nserver_to_client = true")
+                .expect("still accepted")
+                .forward
+                .retired_keys()
+                .as_deref(),
+            Some("forward.server_to_client")
+        );
+        assert_eq!(
+            parse_and_validate("[forward]\nclient_to_server = false")
+                .expect("still accepted")
+                .forward
+                .retired_keys()
+                .as_deref(),
+            Some("forward.client_to_server")
+        );
+        assert_eq!(
+            parse_and_validate("[forward]\nserver_to_client = true\nclient_to_server = false")
+                .expect("still accepted")
+                .forward
+                .retired_keys()
+                .as_deref(),
+            Some("forward.server_to_client, forward.client_to_server")
+        );
+    }
+
+    #[test]
+    fn a_misspelled_forward_key_is_still_rejected() {
+        // The section is vestigial, not untyped: `deny_unknown_fields` still
+        // catches a typo, which is the only way a player learns the key they
+        // meant does not exist.
+        assert!(toml::from_str::<Config>("[forward]\nserver_to_clients = true").is_err());
     }
 
     #[test]
@@ -492,9 +582,11 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_capture_section_leaves_both_retired_keys_unset() {
+    fn an_absent_capture_or_forward_section_leaves_every_retired_key_unset() {
         assert_eq!(Config::default().capture.buffer_size, None);
         assert_eq!(Config::default().capture.filter, None);
+        assert_eq!(Config::default().forward.server_to_client, None);
+        assert_eq!(Config::default().forward.client_to_server, None);
     }
 
     #[test]
@@ -767,8 +859,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Builds a default `Config` (which forwards `server_to_client`, so
-    /// `validate` reaches the scheme check) with `server_url` overwritten.
+    /// Builds a default `Config` with `server_url` overwritten, so `validate`
+    /// reaches the scheme check with nothing else able to fail first.
     fn config_with_url(server_url: &str) -> Config {
         Config {
             server_url: server_url.to_owned(),
@@ -969,8 +1061,6 @@ mod tests {
         let config = Config::load(&path).expect("a missing file is not an error");
         assert_eq!(config.game_port, DEFAULT_GAME_PORT);
         assert_eq!(config.server_url, Config::default().server_url);
-        assert!(config.forward.server_to_client);
-        assert!(!config.forward.client_to_server);
         assert!(config.filter.is_unrestricted(), "defaults set no criterion");
     }
 

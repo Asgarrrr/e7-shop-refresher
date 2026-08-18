@@ -47,26 +47,22 @@ pub(crate) trait CaptureStop: Send {
     fn stop(&mut self) -> Result<()>;
 }
 
-/// Direction of a segment relative to the game server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Direction {
-    ClientToServer,
-    /// Server response — carries the shop contents.
-    ServerToClient,
-}
-
-/// Identifies a TCP connection independently of the observed direction.
+/// Identifies the TCP connection a segment belongs to.
+///
+/// The two endpoints are stored under the roles they play, not under the
+/// direction of travel: `server` is whichever side owns `game_port`. Only one
+/// direction of a connection is ever captured (see [`parse_segment`]), so a
+/// flow and its server-to-client byte stream are the same thing here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowKey {
     pub client: SocketAddr,
     pub server: SocketAddr,
 }
 
-/// A captured TCP segment, normalized for reassembly.
+/// A captured server-to-client TCP segment, normalized for reassembly.
 #[derive(Debug, Clone)]
 pub struct Segment {
     pub flow: FlowKey,
-    pub direction: Direction,
     /// TCP sequence number of the first byte of `payload`.
     pub seq: u32,
     pub syn: bool,
@@ -82,7 +78,7 @@ pub struct Segment {
 const _: () = {
     // Two `SocketAddr` (32 each: the IPv6 variant is 28 bytes plus a tag).
     assert!(std::mem::size_of::<FlowKey>() == 64);
-    // 64 (FlowKey) + 24 (Vec) + 4 (seq) + 1 (direction) + 1 (syn), padded to 96.
+    // 64 (FlowKey) + 24 (Vec) + 4 (seq) + 1 (syn), padded to 96.
     assert!(std::mem::size_of::<Segment>() == 96);
 };
 

@@ -12,10 +12,16 @@ game_port = 3333
 server_url = "wss://ingest.arkyve.dev/refresh-shop"
 
 [forward]
-# Server -> client responses: carry the shop contents (forward these).
-server_to_client = true
-# Client -> server requests: optional context.
-client_to_server = false
+# Both keys below are retired: still accepted so that config files written by
+# earlier versions keep loading, but ignored, and a later release will refuse
+# them outright. If yours sets either, the log says so once at startup — delete
+# the line, nothing depends on it.
+#
+# Only the server -> client half of the connection is captured at all: it is the
+# one that carries the shop contents, and it is the only one the analysis server
+# has ever decoded. There is no longer a direction to choose.
+# server_to_client = true
+# client_to_server = false
 
 [reconnect]
 # Values below 100 ms are raised to 100 ms. A max_ms below the effective

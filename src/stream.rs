@@ -2,8 +2,12 @@
 //!
 //! Capture observes traffic below TCP, so segments may arrive out of order,
 //! duplicated (retransmissions), or overlapping. This layer reconstructs, per
-//! half-stream, the ordered byte stream the TCP stack would deliver — which is
+//! connection, the ordered byte stream the TCP stack would deliver — which is
 //! what the analysis server expects.
+//!
+//! Only the server-to-client half of a connection is ever captured, so "the
+//! stream of a flow" is unambiguous: there is no second half to disambiguate
+//! against, and a `FlowKey` is the whole reassembly identity.
 //!
 //! All work is done in *relative offsets* from the stream origin (the first
 //! observed segment). TCP sequence numbers are `u32` and wrap; a segment's
@@ -21,9 +25,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::{error, warn};
 
-use crate::capture::{Direction, FlowKey, Segment};
+use crate::capture::{FlowKey, Segment};
 
-/// Cap on out-of-order bytes buffered per half-stream (memory guard).
+/// Cap on out-of-order bytes buffered per tracked stream (memory guard).
 const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) const PIPELINE_GLOBAL_BYTES: usize = 32 * 1024 * 1024;
@@ -126,7 +130,6 @@ impl PipelineBudget {
         }
         Ok(BudgetedSegment {
             flow: segment.flow,
-            direction: segment.direction,
             seq: segment.seq,
             syn: segment.syn,
             payload: BudgetedChunk {
@@ -382,7 +385,6 @@ impl Deref for BudgetedChunk {
 
 pub(crate) struct BudgetedSegment {
     pub flow: FlowKey,
-    pub direction: Direction,
     pub seq: u32,
     pub syn: bool,
     payload: BudgetedChunk,
@@ -417,16 +419,16 @@ impl Deref for BudgetedSegment {
 const _: () = {
     // 24 (Vec) + 24 (PayloadLease: Arc + usize + Stage) = 48.
     assert!(std::mem::size_of::<BudgetedChunk>() == 48);
-    // 64 (FlowKey) + 48 (BudgetedChunk) + 4 (seq) + 1 + 1, padded to 120.
+    // 64 (FlowKey) + 48 (BudgetedChunk) + 4 (seq) + 1 (syn), padded to 120.
     assert!(std::mem::size_of::<BudgetedSegment>() == 120);
 };
 
-/// Cap on the number of tracked half-streams. One armed game connection needs
-/// two (a direction each); reconnections and — since capture is port-wide —
-/// any host landing a packet on the game port would otherwise mint keys
-/// without bound, each able to buffer up to `MAX_PENDING_BYTES`. Well above
-/// legitimate need; the stalest entry is evicted past it.
-const MAX_HALVES: usize = 64;
+/// Cap on the number of tracked streams. One armed game connection needs one;
+/// reconnections and — since capture is port-wide — any host sending from the
+/// game port would otherwise mint keys without bound, each able to buffer up to
+/// `MAX_PENDING_BYTES`. Well above legitimate need; the stalest entry is
+/// evicted past it.
+const MAX_STREAMS: usize = 64;
 
 /// One post-resync burst is deliberately small: it only gives reordered
 /// predecessors a chance to establish the initial sequence anchor.
@@ -435,10 +437,10 @@ pub(crate) const INITIAL_ANCHOR_MAX_SEGMENTS: usize = 128;
 
 /// Segments held during the one-shot initial anchor window.
 ///
-/// Ordering is isolated per TCP half-stream. Replacing each half-stream's
-/// original slots with its sequence-ordered segments preserves the observed
-/// inter-flow/inter-direction cadence while letting [`Reassembler`] remain the
-/// sole authority for overlap, deduplication, gaps, and SYN incarnations.
+/// Ordering is isolated per flow. Replacing each flow's original slots with its
+/// sequence-ordered segments preserves the observed inter-flow cadence while
+/// letting [`Reassembler`] remain the sole authority for overlap,
+/// deduplication, gaps, and SYN incarnations.
 pub(crate) struct InitialBurst {
     segments: Vec<BudgetedSegment>,
     payload_bytes: usize,
@@ -490,20 +492,13 @@ impl InitialBurst {
     pub(crate) fn into_ordered(self) -> Vec<BudgetedSegment> {
         // `collect` over a slice iterator is already exact-size (TrustedLen):
         // one allocation, no growth. Only the map needs a hint — a nominal
-        // burst spans the two halves of a single connection.
-        let slots: Vec<_> = self
-            .segments
-            .iter()
-            .map(|segment| (segment.flow, segment.direction))
-            .collect();
-        let mut halves: HashMap<_, Vec<BudgetedSegment>> = HashMap::with_capacity(2);
+        // burst is the single armed game connection.
+        let slots: Vec<_> = self.segments.iter().map(|segment| segment.flow).collect();
+        let mut flows: HashMap<_, Vec<BudgetedSegment>> = HashMap::with_capacity(1);
         for segment in self.segments {
-            halves
-                .entry((segment.flow, segment.direction))
-                .or_default()
-                .push(segment);
+            flows.entry(segment.flow).or_default().push(segment);
         }
-        let mut halves: HashMap<_, VecDeque<BudgetedSegment>> = halves
+        let mut flows: HashMap<_, VecDeque<BudgetedSegment>> = flows
             .into_iter()
             .map(|(key, mut segments)| {
                 // A valid TCP receive window spans less than the signed
@@ -520,7 +515,7 @@ impl InitialBurst {
                             earliest
                         }
                     })
-                    .expect("a burst half-stream is never empty");
+                    .expect("a burst flow is never empty");
                 segments.sort_by_key(|segment| seq_diff(segment_data_seq(segment), origin));
                 (key, segments.into())
             })
@@ -529,7 +524,7 @@ impl InitialBurst {
         slots
             .into_iter()
             .map(|key| {
-                halves
+                flows
                     .get_mut(&key)
                     .and_then(VecDeque::pop_front)
                     .expect("every burst slot has one segment")
@@ -538,10 +533,10 @@ impl InitialBurst {
     }
 }
 
-/// Reassembles traffic from several connections, keyed by (flow, direction).
+/// Reassembles traffic from several connections, keyed by flow.
 #[derive(Default)]
 pub struct Reassembler {
-    halves: HashMap<(FlowKey, Direction), HalfStream>,
+    streams: HashMap<FlowKey, HalfStream>,
     /// Monotonic activity stamp, bumped per segment; the eviction clock.
     clock: u64,
 }
@@ -555,27 +550,26 @@ impl Reassembler {
     ///
     /// Returns an empty vector when the segment is a duplicate, partially fills
     /// a gap, or still waits on a missing segment. FIN is not modelled: a
-    /// half-stream is never torn down, so a segment reordered ahead of a gap
+    /// stream is never torn down, so a segment reordered ahead of a gap
     /// (a FIN-flagged one included) keeps its buffered payload until the gap
     /// fills.
     pub(crate) fn push_budgeted(&mut self, segment: BudgetedSegment) -> ReassemblyOutcome {
-        let key = (segment.flow, segment.direction);
+        let key = segment.flow;
         let dropped_capacity = segment.capacity();
         let budget = segment.payload.lease.budget.clone();
         self.clock += 1;
         if segment.syn && self.syn_starts_new_incarnation(&segment) {
-            self.remove_flow(segment.flow);
+            self.streams.remove(&key);
         }
         // A genuinely new flow past the cap evicts the stalest one first, so a
         // reconnect churn or a flood of forged source ports cannot grow the
         // map without bound. An existing flow never triggers eviction.
-        if self.halves.len() >= MAX_HALVES && !self.halves.contains_key(&key) {
+        if self.streams.len() >= MAX_STREAMS && !self.streams.contains_key(&key) {
             self.evict_stalest();
         }
         let clock = self.clock;
-        let half = self.halves.entry(key).or_default();
+        let half = self.streams.entry(key).or_default();
         half.last_active = clock;
-        half.record_segment(segment.seq, segment.syn, segment.payload());
         let outcome = half.push(segment.seq, segment.syn, segment.payload);
         // Exhaustive by construction: a variant added to `HalfOutcome` becomes
         // a compile error here rather than a runtime panic that would kill the
@@ -617,47 +611,41 @@ impl Reassembler {
     }
 
     /// Returns whether this SYN starts a new incarnation of an already tracked
-    /// connection. The ordered checks distinguish retransmissions, a SYN seen
-    /// after a compatible mid-stream anchor, and the peer's handshake SYN.
+    /// connection, in which case the caller drops the stale sequence space.
+    ///
+    /// Only two of this connection's SYNs can ever reach here — the server's
+    /// handshake SYN-ACK and its retransmissions — because the client's own SYN
+    /// travels the direction that is never captured. So the question is purely
+    /// "is this the same incarnation as the one already tracked": a SYN on a
+    /// flow nothing has been seen on yet starts nothing, it simply anchors.
     fn syn_starts_new_incarnation(&self, segment: &BudgetedSegment) -> bool {
         debug_assert!(segment.syn);
 
-        let key = (segment.flow, segment.direction);
-        if let Some(half) = self.halves.get(&key) {
-            if half.syn_seq == Some(segment.seq) {
-                return false;
-            }
-            if half.syn_seq.is_none() && half.baseline == Some(segment.seq.wrapping_add(1)) {
-                return false;
-            }
-            return true;
+        let Some(half) = self.streams.get(&segment.flow) else {
+            return false;
+        };
+        // A retransmitted SYN carries the sequence number already anchored on.
+        if half.syn_seq == Some(segment.seq) {
+            return false;
         }
-
-        let opposite_key = (segment.flow, opposite(segment.direction));
-        if let Some(opposite) = self.halves.get(&opposite_key) {
-            return opposite.syn_seq.is_none() || opposite.saw_non_syn_data;
+        // The handshake SYN arriving late, after data already anchored this
+        // stream mid-flight at exactly the byte that SYN would have produced.
+        if half.syn_seq.is_none() && half.baseline == Some(segment.seq.wrapping_add(1)) {
+            return false;
         }
-
-        false
+        true
     }
 
-    /// Drops both sequence spaces for one connection while preserving every
-    /// unrelated flow.
-    fn remove_flow(&mut self, flow: FlowKey) {
-        self.halves
-            .retain(|(tracked_flow, _), _| *tracked_flow != flow);
-    }
-
-    /// Drops the least-recently-active half-stream. Called only when a new key
-    /// would exceed `MAX_HALVES`; the scan is over a small, capped map.
+    /// Drops the least-recently-active stream. Called only when a new key
+    /// would exceed `MAX_STREAMS`; the scan is over a small, capped map.
     fn evict_stalest(&mut self) {
         if let Some(&key) = self
-            .halves
+            .streams
             .iter()
             .min_by_key(|(_, half)| half.last_active)
             .map(|(key, _)| key)
         {
-            self.halves.remove(&key);
+            self.streams.remove(&key);
         }
     }
 
@@ -665,22 +653,21 @@ impl Reassembler {
     /// origin. Used after a Shop Watch pause to restart from a clean resync
     /// point rather than a stale `next_off`.
     pub fn clear(&mut self) {
-        self.halves.clear();
+        self.streams.clear();
     }
 }
 
-/// Reassembly state of one direction of a connection, in relative offsets.
+/// Reassembly state of the captured half of a connection — the server-to-client
+/// one, the only half that reaches this layer — in relative offsets.
 #[derive(Default)]
 struct HalfStream {
-    /// Last `Reassembler::clock` value at which this half-stream saw a segment;
+    /// Last `Reassembler::clock` value at which this stream saw a segment;
     /// the eviction key.
     last_active: u64,
     /// Stream origin (sequence number of the first byte); `None` until first seen.
     baseline: Option<u32>,
     /// Initial SYN sequence number for this connection incarnation, if seen.
     syn_seq: Option<u32>,
-    /// Whether this half has observed a non-SYN data segment.
-    saw_non_syn_data: bool,
     /// Offset (from `baseline`) of the next expected byte.
     next_off: i64,
     /// Buffered future segments, keyed by offset (monotonic order, no wrap).
@@ -689,15 +676,13 @@ struct HalfStream {
 }
 
 impl HalfStream {
-    fn record_segment(&mut self, seq: u32, syn: bool, payload: &[u8]) {
+    fn push(&mut self, seq: u32, syn: bool, payload: BudgetedChunk) -> HalfOutcome {
+        // Recorded before the baseline below, so `syn_starts_new_incarnation`
+        // can tell a retransmitted SYN from a fresh incarnation on the next
+        // segment.
         if syn {
             self.syn_seq.get_or_insert(seq);
-        } else if !payload.is_empty() {
-            self.saw_non_syn_data = true;
         }
-    }
-
-    fn push(&mut self, seq: u32, syn: bool, payload: BudgetedChunk) -> HalfOutcome {
         // SYN consumes a sequence number: data starts at seq + 1.
         let data_seq = if syn { seq.wrapping_add(1) } else { seq };
         self.baseline.get_or_insert(data_seq);
@@ -837,13 +822,6 @@ fn flatten_chunks(outcome: ReassemblyOutcome) -> Vec<u8> {
     }
 }
 
-fn opposite(direction: Direction) -> Direction {
-    match direction {
-        Direction::ClientToServer => Direction::ServerToClient,
-        Direction::ServerToClient => Direction::ClientToServer,
-    }
-}
-
 fn segment_data_seq(segment: &BudgetedSegment) -> u32 {
     if segment.syn {
         segment.seq.wrapping_add(1)
@@ -874,10 +852,9 @@ mod tests {
         }
     }
 
-    fn seg_in(flow: FlowKey, direction: Direction, seq: u32, syn: bool, payload: &[u8]) -> Segment {
+    fn seg_in(flow: FlowKey, seq: u32, syn: bool, payload: &[u8]) -> Segment {
         Segment {
             flow,
-            direction,
             seq,
             syn,
             payload: Vec::from(payload),
@@ -885,12 +862,12 @@ mod tests {
     }
 
     fn seg(seq: u32, syn: bool, payload: &[u8]) -> Segment {
-        seg_in(flow(), Direction::ServerToClient, seq, syn, payload)
+        seg_in(flow(), seq, syn, payload)
     }
 
     /// A plain data segment on a given flow (no SYN): for multi-flow tests.
     fn seg_on(flow: FlowKey, seq: u32, payload: &[u8]) -> Segment {
-        seg_in(flow, Direction::ServerToClient, seq, false, payload)
+        seg_in(flow, seq, false, payload)
     }
 
     fn test_budget(
@@ -912,7 +889,6 @@ mod tests {
         payload.resize(len, b'X');
         Segment {
             flow,
-            direction: Direction::ServerToClient,
             seq,
             syn: false,
             payload,
@@ -1004,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_bytes_are_global_across_sixty_four_halves() {
+    fn pending_bytes_are_global_across_sixty_four_streams() {
         let budget = test_budget(4096, 4096, 1024, 4096);
         let mut reassembler = Reassembler::new();
         for port in 0..64u16 {
@@ -1145,41 +1121,27 @@ mod tests {
         assert_eq!(collect_anchored(&overlap, [1, 2, 0]), b"ABCDEFGH");
     }
 
+    /// Sorting is per flow, but the *slots* are global: a burst interleaving
+    /// two connections must come back with each connection ordered and the
+    /// observed alternation between them untouched.
     #[test]
-    fn initial_anchor_burst_preserves_inter_half_stream_slots() {
+    fn initial_anchor_burst_preserves_inter_flow_slots() {
         let first = flow();
         let second = flow_from(52000);
         let mut burst = InitialBurst::new();
-        burst.push_test(seg_in(first, Direction::ServerToClient, 1002, false, b"CD"));
-        burst.push_test(seg_in(
-            second,
-            Direction::ClientToServer,
-            2002,
-            false,
-            b"WX",
-        ));
-        burst.push_test(seg_in(first, Direction::ServerToClient, 1000, false, b"AB"));
-        burst.push_test(seg_in(
-            second,
-            Direction::ClientToServer,
-            2000,
-            false,
-            b"UV",
-        ));
+        burst.push_test(seg_on(first, 1002, b"CD"));
+        burst.push_test(seg_on(second, 2002, b"WX"));
+        burst.push_test(seg_on(first, 1000, b"AB"));
+        burst.push_test(seg_on(second, 2000, b"UV"));
 
         let ordered = burst.into_ordered();
         let observed: Vec<_> = ordered
             .iter()
-            .map(|segment| (segment.flow, segment.direction, segment.seq))
+            .map(|segment| (segment.flow, segment.seq))
             .collect();
         assert_eq!(
             observed,
-            vec![
-                (first, Direction::ServerToClient, 1000),
-                (second, Direction::ClientToServer, 2000),
-                (first, Direction::ServerToClient, 1002),
-                (second, Direction::ClientToServer, 2002),
-            ]
+            vec![(first, 1000), (second, 2000), (first, 1002), (second, 2002)]
         );
     }
 
@@ -1237,45 +1199,20 @@ mod tests {
         assert_eq!(output, b"CDEFGH");
     }
 
+    /// Each flow anchors on its own first segment: a mid-stream start on one
+    /// connection must neither hold back nor re-anchor another. The `1000`
+    /// segment arriving after `1002` on `first` is already-delivered history for
+    /// *that* flow only, while the identical sequence on `second` is its origin.
     #[test]
-    fn initial_anchor_is_isolated_by_flow_and_direction() {
+    fn initial_anchor_is_isolated_by_flow() {
         let mut reassembler = Reassembler::new();
         let first = flow();
         let second = flow_from(52000);
 
-        assert_eq!(
-            reassembler.push(&seg_in(
-                first,
-                Direction::ServerToClient,
-                1002,
-                false,
-                b"CD"
-            )),
-            b"CD"
-        );
-        assert_eq!(
-            reassembler.push(&seg_in(
-                first,
-                Direction::ClientToServer,
-                2000,
-                false,
-                b"UV"
-            )),
-            b"UV"
-        );
+        assert_eq!(reassembler.push(&seg_on(first, 1002, b"CD")), b"CD");
         assert_eq!(reassembler.push(&seg_on(second, 1000, b"XY")), b"XY");
 
         assert!(reassembler.push(&seg_on(first, 1000, b"AB")).is_empty());
-        assert_eq!(
-            reassembler.push(&seg_in(
-                first,
-                Direction::ClientToServer,
-                2002,
-                false,
-                b"WX"
-            )),
-            b"WX"
-        );
         assert_eq!(reassembler.push(&seg_on(second, 1002, b"Z!")), b"Z!");
     }
 
@@ -1376,14 +1313,14 @@ mod tests {
     }
 
     #[test]
-    fn half_stream_count_is_bounded() {
+    fn tracked_stream_count_is_bounded() {
         let mut r = Reassembler::new();
         // Far more distinct flows than the cap (e.g. a forged-source-port
         // flood on the game port): the map must not grow without bound.
-        for port in 0..(MAX_HALVES as u32 * 3) {
+        for port in 0..(MAX_STREAMS as u32 * 3) {
             r.push(&seg_on(flow_from(port as u16), 1000, b"AB"));
         }
-        assert_eq!(r.halves.len(), MAX_HALVES);
+        assert_eq!(r.streams.len(), MAX_STREAMS);
     }
 
     #[test]
@@ -1393,12 +1330,12 @@ mod tests {
         // Fill to the cap, keeping `hot` continuously active as newcomers
         // arrive, so it is never the stalest and survives eviction.
         r.push(&seg_on(hot, 1000, b"AB"));
-        for port in 100..(100 + MAX_HALVES as u32 * 2) {
+        for port in 100..(100 + MAX_STREAMS as u32 * 2) {
             r.push(&seg_on(flow_from(port as u16), 1000, b"XY"));
             r.push(&seg_on(hot, 1002, b"CD")); // keep hot fresh
         }
-        assert_eq!(r.halves.len(), MAX_HALVES);
-        assert!(r.halves.contains_key(&(hot, Direction::ServerToClient)));
+        assert_eq!(r.streams.len(), MAX_STREAMS);
+        assert!(r.streams.contains_key(&hot));
     }
 
     #[test]
@@ -1412,63 +1349,28 @@ mod tests {
     }
 
     #[test]
-    fn new_syn_resets_both_halves_for_reused_flow() {
+    fn a_new_syn_resets_the_reused_flow_and_leaves_every_other_one_alone() {
         let mut r = Reassembler::new();
         let reused = flow();
         let unrelated = flow_from(52000);
 
-        assert!(
-            r.push(&seg_in(reused, Direction::ServerToClient, 999, true, b""))
-                .is_empty()
-        );
-        assert!(
-            r.push(&seg_in(reused, Direction::ClientToServer, 1999, true, b""))
-                .is_empty()
-        );
-        assert_eq!(
-            r.push(&seg_in(
-                reused,
-                Direction::ServerToClient,
-                1000,
-                false,
-                b"AB"
-            )),
-            b"AB"
-        );
-        assert!(
-            r.push(&seg_in(
-                reused,
-                Direction::ServerToClient,
-                1004,
-                false,
-                b"EF"
-            ))
-            .is_empty()
-        );
-        assert_eq!(
-            r.push(&seg_in(
-                reused,
-                Direction::ClientToServer,
-                2000,
-                false,
-                b"XY"
-            )),
-            b"XY"
-        );
+        assert!(r.push(&seg(999, true, b"")).is_empty());
+        assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
+        // Buffered behind a gap: bytes of the incarnation about to be replaced.
+        assert!(r.push(&seg(1004, false, b"EF")).is_empty());
         assert_eq!(r.push(&seg_on(unrelated, 3000, b"UV")), b"UV");
 
-        assert!(
-            r.push(&seg_in(reused, Direction::ServerToClient, 8999, true, b""))
-                .is_empty()
-        );
+        assert!(r.push(&seg(8999, true, b"")).is_empty());
 
-        assert!(!r.halves.contains_key(&(reused, Direction::ClientToServer)));
-        let fresh = &r.halves[&(reused, Direction::ServerToClient)];
+        let fresh = &r.streams[&reused];
         assert_eq!(fresh.baseline, Some(9000));
         assert_eq!(fresh.syn_seq, Some(8999));
         assert_eq!(fresh.next_off, 0);
-        assert!(fresh.pending.is_empty());
-        let untouched = &r.halves[&(unrelated, Direction::ServerToClient)];
+        assert!(
+            fresh.pending.is_empty(),
+            "the previous incarnation's gap buffer must not survive the reset"
+        );
+        let untouched = &r.streams[&unrelated];
         assert_eq!(untouched.baseline, Some(3000));
         assert_eq!(untouched.next_off, 2);
     }
@@ -1486,29 +1388,6 @@ mod tests {
     }
 
     #[test]
-    fn complementary_handshake_syn_does_not_reset_first_half() {
-        let mut r = Reassembler::new();
-        assert!(
-            r.push(&seg_in(flow(), Direction::ClientToServer, 999, true, b""))
-                .is_empty()
-        );
-        assert!(
-            r.push(&seg_in(flow(), Direction::ServerToClient, 1999, true, b""))
-                .is_empty()
-        );
-
-        assert_eq!(r.halves.len(), 2);
-        assert_eq!(
-            r.halves[&(flow(), Direction::ClientToServer)].syn_seq,
-            Some(999)
-        );
-        assert_eq!(
-            r.halves[&(flow(), Direction::ServerToClient)].syn_seq,
-            Some(1999)
-        );
-    }
-
-    #[test]
     fn late_matching_syn_does_not_reset_midstream_anchor() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
@@ -1516,7 +1395,7 @@ mod tests {
         assert!(r.push(&seg(999, true, b"")).is_empty());
         assert_eq!(r.push(&seg(1002, false, b"CD")), b"CD");
 
-        let half = &r.halves[&(flow(), Direction::ServerToClient)];
+        let half = &r.streams[&flow()];
         assert_eq!(half.baseline, Some(1000));
         assert_eq!(half.syn_seq, Some(999));
         assert_eq!(half.next_off, 4);
@@ -1533,10 +1412,7 @@ mod tests {
     fn new_syn_handles_wrapped_data_sequence() {
         let mut r = Reassembler::new();
         assert!(r.push(&seg(u32::MAX, true, b"")).is_empty());
-        assert_eq!(
-            r.halves[&(flow(), Direction::ServerToClient)].baseline,
-            Some(0)
-        );
+        assert_eq!(r.streams[&flow()].baseline, Some(0));
         assert_eq!(r.push(&seg(0, false, b"AB")), b"AB");
     }
 }

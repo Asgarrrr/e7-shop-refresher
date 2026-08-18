@@ -52,7 +52,7 @@ use std::thread::JoinHandle;
 
 use tracing::{debug, info, warn};
 
-use super::{CaptureStop, Direction, PacketSource, Segment, parse_segment};
+use super::{CaptureStop, PacketSource, Segment, parse_segment};
 use crate::error::{Error, Result};
 
 /// Size libpcap requires of every error buffer it is handed. Not negotiable:
@@ -451,18 +451,18 @@ struct Refusal {
 /// Where packets that reach this process go to die.
 ///
 /// `delivered` counts frames pulled off *n* adapters and stripped of their link
-/// header; the three counters after it are where those frames stop. Two things
-/// can drop a packet between the driver and the reassembler — the parser
-/// refusing it, and a segment travelling the wrong way — and each is
-/// individually plausible as the reason a healthy-looking session yields
-/// nothing. `delivered` staying at zero is itself the headline result: the
-/// adapters are open but the kernel filter matches no traffic.
+/// header; `admitted` and `unparsed` are the two ways those frames end. Exactly
+/// one thing can drop a packet between the driver and the reassembler —
+/// `parse_segment` refusing it, whether because the bytes are malformed or
+/// because they are not the game server talking — and it is plausible on its
+/// own as the reason a healthy-looking session yields nothing. `delivered`
+/// staying at zero is itself the headline result: the adapters are open but the
+/// kernel filter matches no traffic.
 #[derive(Default)]
 struct Funnel {
     delivered: u64,
     unparsed: u64,
     admitted: u64,
-    server_to_client: u64,
 }
 
 impl Funnel {
@@ -473,7 +473,6 @@ impl Funnel {
         debug!(
             delivered = self.delivered,
             admitted = self.admitted,
-            server_to_client = self.server_to_client,
             unparsed = self.unparsed,
             "capture funnel"
         );
@@ -652,22 +651,19 @@ impl PacketSource for PcapSource {
             };
 
             self.funnel.admitted += 1;
-            if segment.direction == Direction::ServerToClient {
-                self.funnel.server_to_client += 1;
-                if self.funnel.server_to_client == 1 {
-                    // The shop response travels in this direction only, so this
-                    // line is the proof that the filter, the port, the adapter
-                    // choice and the link-layer strip all agree. Its *absence*
-                    // in a session log means capture is open but sees nothing
-                    // from the game server.
-                    info!(
-                        payload = segment.payload.len(),
-                        syn = segment.syn,
-                        server = %segment.flow.server,
-                        client = %segment.flow.client,
-                        "first server-to-client segment admitted"
-                    );
-                }
+            if self.funnel.admitted == 1 {
+                // Anything admitted at all was sent *by* the game server —
+                // `parse_segment` accepts nothing else — so this line is the
+                // proof that the filter, the port, the adapter choice and the
+                // link-layer strip all agree. Its *absence* in a session log
+                // means capture is open but sees nothing from the game server.
+                info!(
+                    payload = segment.payload.len(),
+                    syn = segment.syn,
+                    server = %segment.flow.server,
+                    client = %segment.flow.client,
+                    "first server-to-client segment admitted"
+                );
             }
             self.funnel.report();
             return Ok(segment);
@@ -1163,7 +1159,6 @@ mod tests {
         let frame = ethernet_frame(&[], &packet);
         let ip = LinkStrip::Ethernet.ip_bytes(&frame).expect("strip");
         let segment = parse_segment(ip, GAME_PORT).expect("parse");
-        assert_eq!(segment.direction, Direction::ServerToClient);
         assert_eq!(segment.seq, 1000);
         assert_eq!(segment.payload, b"AB");
     }

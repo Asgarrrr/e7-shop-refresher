@@ -4,12 +4,19 @@ use std::net::{IpAddr, SocketAddr};
 
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 
-use super::{Direction, FlowKey, Segment};
+use super::{FlowKey, Segment};
 
-/// Extracts a TCP segment from an IP packet.
+/// Extracts a server-to-client TCP segment from an IP packet.
 ///
-/// Returns `None` when the packet is not TCP concerning `game_port`, or is
-/// malformed. Direction is inferred from which side owns `game_port`.
+/// Returns `None` when the packet is malformed, or is not TCP *sent by*
+/// `game_port`. The port test is what identifies the server: only the side that
+/// owns `game_port` can be it, and only what that side sends carries the shop
+/// response this product decodes. A client-to-server segment is therefore not
+/// a segment with another label — it is not a segment at all, and stops here.
+/// The kernel filter (`tcp and src port {game_port}`, see `pcap`) already makes
+/// that the only traffic delivered; this is the same rule restated where the
+/// bytes are actually interpreted, so a backend with a laxer filter cannot
+/// smuggle the wrong half of a connection into reassembly.
 pub fn parse_segment(bytes: &[u8], game_port: u16) -> Option<Segment> {
     let sliced = SlicedPacket::from_ip(bytes).ok()?;
     let (src_ip, dst_ip) = match sliced.net? {
@@ -44,29 +51,16 @@ pub fn parse_segment(bytes: &[u8], game_port: u16) -> Option<Segment> {
     let src = SocketAddr::new(src_ip, tcp.source_port());
     let dst = SocketAddr::new(dst_ip, tcp.destination_port());
 
-    let (direction, flow) = if dst.port() == game_port {
-        (
-            Direction::ClientToServer,
-            FlowKey {
-                client: src,
-                server: dst,
-            },
-        )
-    } else if src.port() == game_port {
-        (
-            Direction::ServerToClient,
-            FlowKey {
-                client: dst,
-                server: src,
-            },
-        )
-    } else {
+    if src.port() != game_port {
         return None;
+    }
+    let flow = FlowKey {
+        client: dst,
+        server: src,
     };
 
     Some(Segment {
         flow,
-        direction,
         seq: tcp.sequence_number(),
         syn: tcp.syn(),
         payload: tcp.payload().to_vec(),
@@ -116,32 +110,33 @@ mod tests {
     }
 
     #[test]
-    fn server_to_client_data_is_parsed() {
-        let bytes = ipv4_tcp(
-            ([104, 116, 20, 111], GAME_PORT), // src port == game_port
-            ([192, 168, 1, 10], 51000),
-            1000,
-            false,
-            b"AB",
-        );
+    fn a_segment_sent_by_the_game_port_is_parsed_and_names_both_endpoints() {
+        let server = ([104, 116, 20, 111], GAME_PORT); // src port == game_port
+        let client = ([192, 168, 1, 10], 51000);
+        let bytes = ipv4_tcp(server, client, 1000, false, b"AB");
         let seg = parse_segment(&bytes, GAME_PORT).expect("should parse");
-        assert_eq!(seg.direction, Direction::ServerToClient);
+        // The sender owns the game port, so it is the server; the peer is the
+        // client. Roles, not direction of travel — the flow key is symmetric.
+        assert_eq!(seg.flow.server, SocketAddr::from((server.0, server.1)));
+        assert_eq!(seg.flow.client, SocketAddr::from((client.0, client.1)));
         assert_eq!(seg.seq, 1000);
         assert_eq!(seg.payload, b"AB");
         assert!(!seg.syn);
     }
 
     #[test]
-    fn client_to_server_when_dst_is_game_port() {
-        let src = ([192, 168, 1, 10], 51000);
-        let dst = ([104, 116, 20, 111], GAME_PORT); // dst port == game_port
-        let bytes = ipv4_tcp(src, dst, 2000, false, b"XY");
-        let seg = parse_segment(&bytes, GAME_PORT).expect("should parse");
-        assert_eq!(seg.direction, Direction::ClientToServer);
-        // client is the sender, server is the game_port owner.
-        assert_eq!(seg.flow.client, SocketAddr::from((src.0, src.1)));
-        assert_eq!(seg.flow.server, SocketAddr::from((dst.0, dst.1)));
-        assert_eq!(seg.payload, b"XY");
+    fn a_segment_sent_to_the_game_port_is_not_a_segment_at_all() {
+        // The client -> server half of the very connection the test above
+        // parses. It used to be decoded and labelled, then discarded further
+        // down; nothing has ever decoded it, so it is refused here instead.
+        let bytes = ipv4_tcp(
+            ([192, 168, 1, 10], 51000),
+            ([104, 116, 20, 111], GAME_PORT), // dst port == game_port
+            2000,
+            false,
+            b"XY",
+        );
+        assert!(parse_segment(&bytes, GAME_PORT).is_none());
     }
 
     #[test]
@@ -210,7 +205,6 @@ mod tests {
         ];
         let bytes = ipv6_tcp((server, GAME_PORT), (client, 51000), 7000, false, b"AB");
         let seg = parse_segment(&bytes, GAME_PORT).expect("should parse");
-        assert_eq!(seg.direction, Direction::ServerToClient);
         assert_eq!(seg.seq, 7000);
         assert_eq!(seg.payload, b"AB");
     }

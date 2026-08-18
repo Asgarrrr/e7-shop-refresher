@@ -17,8 +17,7 @@ use tracing::{debug, error, info, warn};
 use crate::actuator::{ActuatorHandle, Mode, SnapshotEpoch, plan};
 #[cfg(test)]
 use crate::capture::Segment;
-use crate::capture::{CaptureSource, CaptureStop, Direction, PacketSource};
-use crate::config::ForwardConfig;
+use crate::capture::{CaptureSource, CaptureStop, PacketSource};
 use crate::domain::control::{Controller, Limits};
 use crate::domain::filter::Filter;
 use crate::journal::EventLog;
@@ -134,7 +133,7 @@ impl PressureResync {
 enum AnchorState {
     /// Normal forwarding, including process startup before the first Resync.
     Steady,
-    /// A Resync occurred, but no segment allowed by `ForwardConfig` has arrived.
+    /// A Resync occurred and no segment has arrived since.
     AwaitingFirst,
     /// The one bounded post-resync burst is waiting for predecessors.
     Buffering {
@@ -358,16 +357,11 @@ impl Session {
             ),
         );
 
-        // Reassembly + filtering of the directions to forward.
+        // Reassembly of the captured server-to-client stream.
         workers.spawn(
             "reassembly",
             &fatal_tx,
-            reassemble_loop_with_pressure(
-                segment_rx,
-                raw_tx,
-                config.forward.clone(),
-                pressure_resync,
-            ),
+            reassemble_loop_with_pressure(segment_rx, raw_tx, pressure_resync),
         );
 
         // Click jobs -> the game window, through the configured backend.
@@ -646,15 +640,13 @@ pub async fn supervise(
 async fn reassemble_loop(
     events: mpsc::Receiver<CaptureEvent>,
     raw_tx: mpsc::Sender<BudgetedChunk>,
-    forward: ForwardConfig,
 ) {
-    reassemble_loop_with_pressure(events, raw_tx, forward, PressureResync::default()).await;
+    reassemble_loop_with_pressure(events, raw_tx, PressureResync::default()).await;
 }
 
 async fn reassemble_loop_with_pressure(
     mut events: mpsc::Receiver<CaptureEvent>,
     raw_tx: mpsc::Sender<BudgetedChunk>,
-    forward: ForwardConfig,
     pressure_resync: PressureResync,
 ) {
     let mut reassembler = Reassembler::new();
@@ -705,9 +697,6 @@ async fn reassemble_loop_with_pressure(
                 .admit_capture(segment)
                 .expect("test segment fits capture quota"),
         };
-        if !should_forward(segment.direction, &forward) {
-            continue;
-        }
 
         // Plan 008 remains authoritative: never hold a SYN behind the anchor
         // deadline. Commit any older burst first, then let `Reassembler`
@@ -867,13 +856,6 @@ async fn forward_chunks(
         }
     }
     ForwardStatus::Open
-}
-
-fn should_forward(direction: Direction, forward: &ForwardConfig) -> bool {
-    match direction {
-        Direction::ServerToClient => forward.server_to_client,
-        Direction::ClientToServer => forward.client_to_server,
-    }
 }
 
 /// Capture loop (synchronous context). Stops when the pipeline closes.
@@ -1151,23 +1133,15 @@ mod tests {
                 client: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), 51000)),
                 server: SocketAddr::from((Ipv4Addr::new(104, 116, 20, 111), 3333)),
             },
-            Direction::ServerToClient,
             seq,
             false,
             payload,
         )
     }
 
-    fn initial_anchor_segment_in(
-        flow: FlowKey,
-        direction: Direction,
-        seq: u32,
-        syn: bool,
-        payload: &[u8],
-    ) -> Segment {
+    fn initial_anchor_segment_in(flow: FlowKey, seq: u32, syn: bool, payload: &[u8]) -> Segment {
         Segment {
             flow,
-            direction,
             seq,
             syn,
             payload: Vec::from(payload),
@@ -1436,7 +1410,6 @@ mod tests {
         let task = tokio::spawn(reassemble_loop_with_pressure(
             event_rx,
             raw_tx,
-            ForwardConfig::default(),
             PressureResync::default(),
         ));
 
@@ -1586,7 +1559,7 @@ mod tests {
     async fn initial_anchor_first_post_resync_segment_waits_once_then_forwards() {
         let (event_tx, event_rx) = mpsc::channel(4);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
 
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
@@ -1622,7 +1595,7 @@ mod tests {
         ] {
             let (event_tx, event_rx) = mpsc::channel(4);
             let (raw_tx, mut raw_rx) = mpsc::channel(1);
-            let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+            let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
             event_tx.send(CaptureEvent::Resync).await.unwrap();
             for index in permutation {
                 event_tx
@@ -1651,7 +1624,7 @@ mod tests {
     async fn initial_anchor_exact_segment_limit_flushes_immediately() {
         let (event_tx, event_rx) = mpsc::channel(256);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         for index in 0..128u32 {
             event_tx
@@ -1672,7 +1645,7 @@ mod tests {
     async fn initial_anchor_exact_byte_limit_flushes_immediately() {
         let (event_tx, event_rx) = mpsc::channel(2);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment(
@@ -1694,7 +1667,7 @@ mod tests {
     async fn initial_anchor_byte_overflow_flushes_before_processing_next_segment() {
         let (event_tx, event_rx) = mpsc::channel(3);
         let (raw_tx, mut raw_rx) = mpsc::channel(2);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment(
@@ -1724,7 +1697,7 @@ mod tests {
     async fn initial_anchor_channel_close_flushes_pending_burst() {
         let (event_tx, event_rx) = mpsc::channel(2);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment(1000, b"AB")))
@@ -1740,7 +1713,7 @@ mod tests {
     async fn initial_anchor_downstream_close_does_not_wait_for_deadline() {
         let (event_tx, event_rx) = mpsc::channel(2);
         let (raw_tx, raw_rx) = mpsc::channel(1);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment(1000, b"AB")))
@@ -1757,7 +1730,7 @@ mod tests {
     async fn initial_anchor_new_resync_discards_and_rearms_pending_epoch() {
         let (event_tx, event_rx) = mpsc::channel(4);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment(1000, b"AB")))
@@ -1780,7 +1753,7 @@ mod tests {
     async fn initial_anchor_returns_to_immediate_steady_state_after_one_flush() {
         let (event_tx, event_rx) = mpsc::channel(3);
         let (raw_tx, mut raw_rx) = mpsc::channel(2);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment(1000, b"AB")))
@@ -1799,57 +1772,14 @@ mod tests {
         task.await.unwrap();
     }
 
+    /// Two game connections captured at once: the burst sorts each one on its
+    /// own sequence space, but replays them into the slots they were observed
+    /// in, so the alternation between the connections survives the reordering.
     #[tokio::test(start_paused = true)]
-    async fn initial_anchor_filters_before_starting_timer_or_counting_budget() {
-        let (event_tx, event_rx) = mpsc::channel(4);
-        let (raw_tx, mut raw_rx) = mpsc::channel(1);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
-        let base = initial_anchor_segment(1000, b"ignored");
-        event_tx.send(CaptureEvent::Resync).await.unwrap();
-        event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                base.flow,
-                Direction::ClientToServer,
-                2000,
-                false,
-                b"ignored",
-            )))
-            .await
-            .unwrap();
-        tokio::task::yield_now().await;
-        tokio::time::advance(INITIAL_ANCHOR_WINDOW).await;
-        assert!(matches!(
-            raw_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-
-        event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(1000, b"AB")))
-            .await
-            .unwrap();
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            raw_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        tokio::time::advance(INITIAL_ANCHOR_WINDOW).await;
-        assert_eq!(recv_exact(&mut raw_rx, 2).await, b"AB");
-        drop(event_tx);
-        task.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn initial_anchor_isolates_flow_and_direction_while_preserving_slots() {
+    async fn initial_anchor_isolates_flows_while_preserving_slots() {
         let (event_tx, event_rx) = mpsc::channel(6);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
-        let task = tokio::spawn(reassemble_loop(
-            event_rx,
-            raw_tx,
-            ForwardConfig {
-                server_to_client: true,
-                client_to_server: true,
-            },
-        ));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
         let first = initial_anchor_segment(1000, b"AB").flow;
         let second = FlowKey {
             client: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), 52000)),
@@ -1857,10 +1787,10 @@ mod tests {
         };
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         for segment in [
-            initial_anchor_segment_in(first, Direction::ServerToClient, 1002, false, b"CD"),
-            initial_anchor_segment_in(second, Direction::ClientToServer, 2002, false, b"WX"),
-            initial_anchor_segment_in(first, Direction::ServerToClient, 1000, false, b"AB"),
-            initial_anchor_segment_in(second, Direction::ClientToServer, 2000, false, b"UV"),
+            initial_anchor_segment_in(first, 1002, false, b"CD"),
+            initial_anchor_segment_in(second, 2002, false, b"WX"),
+            initial_anchor_segment_in(first, 1000, false, b"AB"),
+            initial_anchor_segment_in(second, 2000, false, b"UV"),
         ] {
             event_tx.send(CaptureEvent::Segment(segment)).await.unwrap();
         }
@@ -1876,7 +1806,7 @@ mod tests {
     async fn initial_anchor_wrap_and_overlap_are_reassembled_after_burst_ordering() {
         let (event_tx, event_rx) = mpsc::channel(5);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         for segment in [
             initial_anchor_segment(0, b"CDEF"),
@@ -1897,16 +1827,12 @@ mod tests {
     async fn initial_anchor_syn_is_never_delayed_and_new_flows_need_no_global_window() {
         let (event_tx, event_rx) = mpsc::channel(6);
         let (raw_tx, mut raw_rx) = mpsc::channel(2);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
         let first = initial_anchor_segment(1000, b"AB").flow;
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                first,
-                Direction::ServerToClient,
-                999,
-                true,
-                b"",
+                first, 999, true, b"",
             )))
             .await
             .unwrap();
@@ -1922,21 +1848,13 @@ mod tests {
         };
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                second,
-                Direction::ServerToClient,
-                4999,
-                true,
-                b"",
+                second, 4999, true, b"",
             )))
             .await
             .unwrap();
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                second,
-                Direction::ServerToClient,
-                5000,
-                false,
-                b"XY",
+                second, 5000, false, b"XY",
             )))
             .await
             .unwrap();
@@ -1949,36 +1867,24 @@ mod tests {
     async fn initial_anchor_new_syn_flushes_pending_burst_then_resets_immediately() {
         let (event_tx, event_rx) = mpsc::channel(5);
         let (raw_tx, mut raw_rx) = mpsc::channel(2);
-        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx, ForwardConfig::default()));
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
         let flow = initial_anchor_segment(1000, b"old").flow;
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                flow,
-                Direction::ServerToClient,
-                1000,
-                false,
-                b"old",
+                flow, 1000, false, b"old",
             )))
             .await
             .unwrap();
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                flow,
-                Direction::ServerToClient,
-                8999,
-                true,
-                b"",
+                flow, 8999, true, b"",
             )))
             .await
             .unwrap();
         event_tx
             .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                flow,
-                Direction::ServerToClient,
-                9000,
-                false,
-                b"new",
+                flow, 9000, false, b"new",
             )))
             .await
             .unwrap();

@@ -188,8 +188,8 @@ leave it untouched. Delete it to regenerate the example on the next launch.
 |-----|---------|---------|
 | `game_port` | `3333` | Game server TCP port |
 | `server_url` | `wss://ingest.arkyve.dev/refresh-shop` | Analysis server |
-| `forward.server_to_client` | `true` | Forward responses (shop contents) |
-| `forward.client_to_server` | `false` | Forward requests (context) |
+| `forward.server_to_client` | — | **Retired.** Still parsed so older files keep loading; ignored (the server → client stream is the only one captured) |
+| `forward.client_to_server` | — | **Retired.** Still parsed so older files keep loading; ignored (the client → server stream is never captured) |
 | `capture.buffer_size` | — | **Retired.** Still parsed so older files keep loading; ignored (the backend sizes its own buffer) |
 | `capture.filter` | — | **Retired.** Still parsed so older files keep loading; ignored (the backend builds its own filter from `game_port`) |
 | `[filter]` | matches everything | Item interest criteria (kinds, sets, substats, price) |
