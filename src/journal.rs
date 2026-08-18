@@ -20,11 +20,22 @@ pub struct LogLine {
 /// grow the journal without bound.
 const JOURNAL_CAP: usize = 500;
 
+/// The crate's single sink for player-facing lines: several writers (the
+/// session loop, the actuator executor, the watchdog) append, one reader (the
+/// window) copies entries out. Cloning it is another handle on the same
+/// journal, not another journal.
 #[derive(Clone)]
 pub struct EventLog {
     epoch: Instant,
     /// Bumped on every push so readers can cache [`EventLog::entries`] and
     /// re-clone only when something actually changed.
+    ///
+    /// A change *hint*, not a publication, so both sides are `Relaxed`:
+    /// [`EventLog::entries`] takes the same `Mutex` as `push`, and that
+    /// unlock/lock pair is already the happens-before edge — a stronger one
+    /// than an atomic gives. A `Relaxed` load that returns a stale value costs
+    /// one frame of a 4 Hz repaint, which is exactly what `Acquire` would cost
+    /// too: an `Acquire` load carries no freshness guarantee either.
     generation: Arc<AtomicU64>,
     entries: Arc<Mutex<VecDeque<LogLine>>>,
 }
@@ -54,10 +65,34 @@ impl EventLog {
     /// at all. `target: "journal"` keeps the player view isolable
     /// (`RUST_LOG=journal=info`) while a single file interleaves technical and
     /// player events chronologically.
+    ///
+    /// Records at `INFO`. A line that reports a failure — an actuator halt, an
+    /// aborted session, a config write the OS refused — belongs at
+    /// [`EventLog::emit_at`] instead, so the file stays triageable by level and
+    /// not only by prose.
     pub fn emit(&self, lines: &[String]) {
+        self.emit_at(tracing::Level::INFO, lines);
+    }
+
+    /// [`EventLog::emit`] with a severity for the log-file half.
+    ///
+    /// The player reads the same text either way; the level is for whoever
+    /// reads the file afterwards. Without it every line lands at `INFO`, so
+    /// narrowing `RUST_LOG` to `warn` deletes precisely the lines that say what
+    /// went wrong.
+    pub fn emit_at(&self, level: tracing::Level, lines: &[String]) {
         self.push(lines);
         for line in lines {
-            tracing::info!(target: "journal", line, "journal");
+            // A callsite's level is part of `tracing`'s static metadata, so a
+            // runtime level cannot be handed to one macro — the three the
+            // journal has a use for are spelled out.
+            if level == tracing::Level::ERROR {
+                tracing::error!(target: "journal", line, "journal");
+            } else if level == tracing::Level::WARN {
+                tracing::warn!(target: "journal", line, "journal");
+            } else {
+                tracing::info!(target: "journal", line, "journal");
+            }
             // The windowed build's stdout is an inert sink; only the console
             // build has a reader.
             #[cfg(not(feature = "gui"))]
@@ -65,6 +100,14 @@ impl EventLog {
         }
     }
 
+    /// Ring only: the line reaches the window and **nothing else** — no
+    /// `tracing` event, so no log file, so no record at all once the process is
+    /// gone.
+    ///
+    /// This is not the cheap `emit`, it is the forgetful one. Reserve it for
+    /// lines whose entire audience is the player looking at the window right
+    /// now; anything a support engineer would later go looking for must go
+    /// through [`EventLog::emit`] or [`EventLog::emit_at`].
     pub fn push(&self, lines: &[String]) {
         if lines.is_empty() {
             return;
@@ -87,12 +130,15 @@ impl EventLog {
         while entries.len() > JOURNAL_CAP {
             entries.pop_front();
         }
+        // Bumped outside the lock: right for its own reason (never hold the
+        // lock longer than needed), not because the ordering needs it — see the
+        // `generation` field.
         drop(entries);
-        self.generation.fetch_add(1, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Poison-tolerant: the GUI reads this after a session panic and must
@@ -146,6 +192,27 @@ mod tests {
             entries[1].at_ms > entries[0].at_ms,
             "a later push carries a later stamp"
         );
+    }
+
+    #[test]
+    fn emit_at_records_every_level_in_the_ring() {
+        // The level only steers the `tracing` half; the player-facing ring must
+        // hold the line whatever the severity, or a failure would be visible in
+        // the log file and invisible in the window.
+        let journal = EventLog::default();
+        for level in [
+            tracing::Level::ERROR,
+            tracing::Level::WARN,
+            tracing::Level::INFO,
+        ] {
+            journal.emit_at(level, &[format!("{level}")]);
+        }
+        let texts: Vec<String> = journal
+            .entries()
+            .into_iter()
+            .map(|line| line.text)
+            .collect();
+        assert_eq!(texts, ["ERROR", "WARN", "INFO"]);
     }
 
     #[test]
