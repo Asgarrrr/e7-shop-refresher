@@ -3,7 +3,6 @@
 //! The connection re-establishes automatically (capped exponential backoff). A
 //! closed outbound channel signals a clean shutdown: reconnection then stops.
 
-use std::future::Future;
 use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -23,6 +22,23 @@ use super::protocol::ServerMessage;
 /// parks the capture thread, and the kernel starts dropping packet copies.
 /// Dropping the connection turns the stall into a normal reconnect cycle.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The same class of stall as `SEND_TIMEOUT`, on the way in: a handshake that
+/// opens but never completes (captive portal, a middlebox that accepts the SYN
+/// and never speaks TLS, a resolver that never answers) has no upper bound of
+/// its own, so the future simply stays pending forever.
+///
+/// Nothing else recovers that: no `LinkDown` is emitted, so the journal — the
+/// only surface a windowed build has — stays empty, and the controller starts
+/// `link_up: true` with no refresh issued, so the watchdog never arms an
+/// expectation and its recovery ladder never runs. The relay looks armed and
+/// forwards nothing, forever. Elapsed is reported and retried like any refused
+/// connection.
+///
+/// 15 s sits above a TLS handshake on a bad connection and below Windows' own
+/// ~21 s SYN-retry give-up, so a black-holed address is also reported sooner
+/// than the OS would.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Normalized, bounded exponential reconnect delay.
 struct Backoff {
@@ -63,8 +79,10 @@ impl Backoff {
 enum Outcome {
     /// The outbound channel is closed: shutdown requested.
     Shutdown,
-    /// The link dropped: reconnection expected.
-    Disconnected,
+    /// The link dropped: reconnection expected. Carries the reason, so a
+    /// rejected TLS record, a protocol violation and a peer that closed the
+    /// socket do not all read as one fixed string in the log and the journal.
+    Disconnected(String),
 }
 
 /// Connection loop, to be spawned in its own task.
@@ -89,7 +107,7 @@ pub async fn run(
     .await;
 }
 
-async fn run_with_connector<C, F, S>(
+async fn run_with_connector<C, S>(
     url: String,
     mut outbound: mpsc::Receiver<BudgetedChunk>,
     inbound: mpsc::Sender<UplinkEvent>,
@@ -97,39 +115,60 @@ async fn run_with_connector<C, F, S>(
     max_backoff: Duration,
     mut connect: C,
 ) where
-    C: FnMut(String) -> F,
-    F: Future<Output = Result<S, WsError>>,
+    C: AsyncFnMut(String) -> Result<S, WsError>,
     S: Stream<Item = Result<Message, WsError>> + Sink<Message, Error = WsError> + Unpin,
 {
     let mut backoff = Backoff::new(initial_backoff, max_backoff);
     // The player only hears transitions: the first failure reports the outage,
     // each retry stays a tracing detail, recovery reports once.
     let mut outage_reported = false;
+    // `url` is never a log field. It is `Config::server_url` verbatim, and
+    // `Config::validate` accepts any `wss://` URL without inspecting userinfo
+    // or query — either can carry a credential, and the log file is what the
+    // README asks the player to send us, under an explicit promise that it
+    // contains neither. The redacted form is written once at startup by
+    // `app::redacted_server_url`; there is exactly one server per process, so
+    // these lines only need to say *which attempt*, which is also what makes
+    // the 1st reconnect legible from the 40th.
+    let mut attempt: u64 = 0;
 
     loop {
-        match connect(url.clone()).await {
-            Ok(stream) => {
-                info!(url = %url, "server link established");
+        attempt += 1;
+        match tokio::time::timeout(CONNECT_TIMEOUT, connect(url.clone())).await {
+            Ok(Ok(stream)) => {
+                info!(attempt, "server link established");
                 if std::mem::take(&mut outage_reported) {
                     let _ = inbound.send(UplinkEvent::LinkUp).await;
                 }
                 backoff.reset();
                 match pump(stream, &mut outbound, &inbound).await {
                     Outcome::Shutdown => return,
-                    Outcome::Disconnected => {
-                        warn!("server link interrupted");
+                    Outcome::Disconnected(reason) => {
+                        warn!(attempt, reason = %reason, "server link interrupted");
                         outage_reported = true;
-                        let _ = inbound
-                            .send(UplinkEvent::LinkDown("connection interrupted".to_owned()))
-                            .await;
+                        let _ = inbound.send(UplinkEvent::LinkDown(reason)).await;
                     }
                 }
             }
-            Err(err) => {
-                warn!(url = %url, error = %err, "server connection failed");
+            Ok(Err(err)) => {
+                warn!(attempt, error = ?err, "server connection failed");
                 if !outage_reported {
                     outage_reported = true;
+                    // Safe to mirror into the journal: of the `WsError` variants
+                    // reachable from `connect_async`, none embeds the URL in its
+                    // `Display` (`UrlError::UnableToConnect`, the only one that
+                    // does, is built solely by the blocking `client::connect` —
+                    // checked against tungstenite 0.29).
                     let _ = inbound.send(UplinkEvent::LinkDown(err.to_string())).await;
+                }
+            }
+            Err(_elapsed) => {
+                warn!(attempt, "server handshake stalled — retrying");
+                if !outage_reported {
+                    outage_reported = true;
+                    let _ = inbound
+                        .send(UplinkEvent::LinkDown("handshake stalled".to_owned()))
+                        .await;
                 }
             }
         }
@@ -169,6 +208,20 @@ async fn drain_until(outbound: &mut mpsc::Receiver<BudgetedChunk>, wait: Duratio
 }
 
 /// Pumps outbound bytes and inbound messages over one connection.
+///
+/// The two halves are independent futures raced against each other rather than
+/// two arms of one `select!` body, because awaiting the send *inside* an arm
+/// stops polling `read` for as long as it takes — up to `SEND_TIMEOUT`, 10 s,
+/// which is exactly the watchdog's `EXPECT_SNAPSHOT_MS`/`EXPECT_PURCHASE_MS`
+/// window. A write stall would then hold back an already-arrived `Shop` or
+/// `Purchase` proof past its own deadline and let the `Tick` escalate the
+/// recovery ladder to a refresh re-issue, which spends crystals and re-rolls
+/// the shop out from under a purchase in flight.
+///
+/// Whichever half finishes first ends the connection, as before. A send still in
+/// flight when the read half ends is dropped along with its budget lease: the
+/// same "drop bytes while the link is gone, the server resyncs on reconnect"
+/// tolerance `drain_until` documents.
 async fn pump<S>(
     stream: S,
     outbound: &mut mpsc::Receiver<BudgetedChunk>,
@@ -179,51 +232,89 @@ where
 {
     let (mut write, mut read) = stream.split();
 
-    loop {
-        tokio::select! {
-            outgoing = outbound.recv() => match outgoing {
-                Some(chunk) => {
-                    let (bytes, lease) = chunk.into_parts();
-                    let send = write.send(Message::Binary(bytes.into()));
-                    match tokio::time::timeout(SEND_TIMEOUT, send).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => return Outcome::Disconnected,
-                        Err(_elapsed) => {
-                            warn!("server send stalled — dropping the connection");
-                            return Outcome::Disconnected;
-                        }
-                    }
-                    drop(lease);
+    let writer = async {
+        while let Some(chunk) = outbound.recv().await {
+            let (bytes, lease) = chunk.into_parts();
+            let send = write.send(Message::Binary(bytes.into()));
+            match tokio::time::timeout(SEND_TIMEOUT, send).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    warn!(error = ?err, "server send failed");
+                    return Outcome::Disconnected(format!("send failed: {err}"));
                 }
-                None => return Outcome::Shutdown,
-            },
-            incoming = read.next() => match incoming {
-                Some(Ok(Message::Text(text))) => forward(text.as_bytes(), inbound).await,
-                Some(Ok(Message::Binary(bytes))) => forward(&bytes, inbound).await,
-                Some(Ok(Message::Close(_))) | None => return Outcome::Disconnected,
-                Some(Ok(_)) => {} // ping/pong/frame: handled by the library.
-                Some(Err(err)) => {
-                    warn!(error = %err, "WebSocket read error");
-                    return Outcome::Disconnected;
+                Err(_elapsed) => {
+                    warn!("server send stalled — dropping the connection");
+                    return Outcome::Disconnected("send stalled".to_owned());
                 }
-            },
+            }
+            drop(lease);
         }
+        Outcome::Shutdown
+    };
+
+    // Latched per connection: an unknown `type` tag means the server speaks a
+    // dialect this build does not, which otherwise reads exactly like a mute
+    // server. One line per connection is enough to tell those two apart.
+    let mut dialect_reported = false;
+    let reader = async {
+        loop {
+            match read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    forward(text.as_bytes(), inbound, &mut dialect_reported).await;
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    forward(&bytes, inbound, &mut dialect_reported).await;
+                }
+                Some(Ok(Message::Close(_))) => {
+                    return Outcome::Disconnected("peer closed the connection".to_owned());
+                }
+                None => return Outcome::Disconnected("server stream ended".to_owned()),
+                // ping/pong/frame: handled by the library. Named rather than
+                // `_` because `tungstenite::Message` is not `#[non_exhaustive]`,
+                // so a variant added by a major bump must stop compiling here
+                // instead of being silently dropped.
+                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+                Some(Err(err)) => {
+                    warn!(error = ?err, "WebSocket read error");
+                    return Outcome::Disconnected(format!("read error: {err}"));
+                }
+            }
+        }
+    };
+
+    tokio::pin!(writer, reader);
+    tokio::select! {
+        outcome = &mut writer => outcome,
+        outcome = &mut reader => outcome,
     }
 }
 
 /// Decodes a server message and pushes it downstream (undecodable ones dropped).
-async fn forward(payload: &[u8], inbound: &mpsc::Sender<UplinkEvent>) {
+///
+/// Both ways the inbound path can fail are recorded, because they look the same
+/// from the outside — `since_last_shop_s` climbing forever. A payload that does
+/// not deserialize is `Err` here; a payload whose `type` tag this build does not
+/// know deserializes *successfully* into `ServerMessage::Unknown`, which the
+/// session drops as a no-op. `reported_dialect` latches the second case so it
+/// costs one line per connection rather than one per message.
+async fn forward(payload: &[u8], inbound: &mpsc::Sender<UplinkEvent>, reported_dialect: &mut bool) {
     match serde_json::from_slice::<ServerMessage>(payload) {
         Ok(message) => {
+            if matches!(message, ServerMessage::Unknown)
+                && !std::mem::replace(reported_dialect, true)
+            {
+                warn!("server sent a message type this build does not understand");
+            }
             let _ = inbound.send(UplinkEvent::Message(message)).await;
         }
-        Err(err) => debug!(error = %err, "unrecognized server message, ignored"),
+        Err(err) => debug!(error = ?err, "unrecognized server message, ignored"),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::future::ready;
+    use std::collections::VecDeque;
+    use std::future::{pending, ready};
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
@@ -236,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn backoff_normalizes_floor_and_cap() {
+    fn backoff_doubles_up_to_the_cap_and_resets_to_the_initial() {
         let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_millis(350));
         assert_eq!(backoff.current(), Duration::from_millis(100));
         backoff.advance();
@@ -247,7 +338,10 @@ mod tests {
         assert_eq!(backoff.current(), Duration::from_millis(350));
         backoff.reset();
         assert_eq!(backoff.current(), Duration::from_millis(100));
+    }
 
+    #[test]
+    fn backoff_below_the_floor_is_raised_to_it_and_cannot_grow_past_the_cap() {
         let mut below_floor = Backoff::new(Duration::from_millis(1), Duration::from_millis(10));
         assert_eq!(below_floor.current(), RECONNECT_FLOOR);
         below_floor.advance();
@@ -292,6 +386,211 @@ mod tests {
         fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
             Poll::Pending
         }
+    }
+
+    /// A peer that speaks: yields a scripted sequence of inbound frames, then
+    /// pends forever like `StalledLink`. `stalling_sends` additionally freezes
+    /// the outbound half, so the two directions can be tested against each
+    /// other rather than only one at a time.
+    struct ScriptedLink {
+        frames: VecDeque<Result<Message, WsError>>,
+        send_stalls: bool,
+        ends_after_script: bool,
+    }
+
+    impl ScriptedLink {
+        fn new(frames: Vec<Result<Message, WsError>>) -> Self {
+            Self {
+                frames: frames.into(),
+                send_stalls: false,
+                ends_after_script: false,
+            }
+        }
+
+        fn stalling_sends(mut self) -> Self {
+            self.send_stalls = true;
+            self
+        }
+
+        /// The socket goes away rather than pending: the stream ends with `None`
+        /// once the script is exhausted, no close frame.
+        fn ending(mut self) -> Self {
+            self.ends_after_script = true;
+            self
+        }
+
+        fn sink_state(&self) -> Poll<Result<(), WsError>> {
+            if self.send_stalls {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    impl Stream for ScriptedLink {
+        type Item = Result<Message, WsError>;
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            match self.frames.pop_front() {
+                Some(frame) => Poll::Ready(Some(frame)),
+                None if self.ends_after_script => Poll::Ready(None),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl Sink<Message> for ScriptedLink {
+        type Error = WsError;
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            self.sink_state()
+        }
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), WsError> {
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            self.sink_state()
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            self.sink_state()
+        }
+    }
+
+    /// The inbound half of `pump` with nothing outbound in flight: the returned
+    /// outcome plus every event the connection produced.
+    async fn pump_inbound(link: ScriptedLink) -> (Outcome, Vec<UplinkEvent>) {
+        let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        let (event_tx, mut event_rx) = mpsc::channel::<UplinkEvent>(8);
+
+        let outcome = pump(link, &mut raw_rx, &event_tx).await;
+
+        drop(event_tx);
+        drop(raw_tx);
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+        (outcome, events)
+    }
+
+    fn disconnect_reason(outcome: Outcome) -> String {
+        match outcome {
+            Outcome::Disconnected(reason) => reason,
+            Outcome::Shutdown => panic!("expected Disconnected, got Shutdown"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_text_shop_message_reaches_the_session_decoded() {
+        let (outcome, events) = pump_inbound(ScriptedLink::new(vec![
+            Ok(Message::text(
+                r#"{"type":"shop","merchant":"Secret Shop","slots":[]}"#,
+            )),
+            Ok(Message::Close(None)),
+        ]))
+        .await;
+
+        assert!(disconnect_reason(outcome).contains("closed"));
+        let [UplinkEvent::Message(ServerMessage::Shop(snapshot))] = &events[..] else {
+            panic!("expected exactly one decoded Shop, got {events:?}");
+        };
+        assert_eq!(snapshot.merchant.as_deref(), Some("Secret Shop"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_binary_message_is_decoded_the_same_way_as_text() {
+        let (_outcome, events) = pump_inbound(ScriptedLink::new(vec![
+            Ok(Message::binary(br#"{"type":"ack"}"#.to_vec())),
+            Ok(Message::Close(None)),
+        ]))
+        .await;
+
+        assert!(matches!(
+            &events[..],
+            [UplinkEvent::Message(ServerMessage::Ack)]
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn undecodable_payload_and_control_frames_are_dropped_without_ending_the_connection() {
+        let (outcome, events) = pump_inbound(ScriptedLink::new(vec![
+            Ok(Message::text("not json")),
+            Ok(Message::Ping(Vec::new().into())),
+            Ok(Message::Pong(Vec::new().into())),
+            Ok(Message::Close(None)),
+        ]))
+        .await;
+
+        // The drop-and-continue policy: nothing forwarded, and the connection
+        // survives to the close frame rather than being torn down.
+        assert!(events.is_empty(), "unexpected events: {events:?}");
+        assert!(disconnect_reason(outcome).contains("closed"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_message_type_is_reported_and_still_forwarded() {
+        let (_outcome, events) = pump_inbound(ScriptedLink::new(vec![
+            Ok(Message::text(r#"{"type":"telemetry","whatever":1}"#)),
+            Ok(Message::Close(None)),
+        ]))
+        .await;
+
+        // Forward compatibility is preserved (the message is not an error), but
+        // it is no longer silent — see `forward`.
+        assert!(matches!(
+            &events[..],
+            [UplinkEvent::Message(ServerMessage::Unknown)]
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_close_frame_ends_the_connection_for_the_reconnect_cycle() {
+        let (outcome, events) =
+            pump_inbound(ScriptedLink::new(vec![Ok(Message::Close(None))])).await;
+        assert_eq!(disconnect_reason(outcome), "peer closed the connection");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_ends_without_a_close_frame_is_also_a_disconnect() {
+        let (outcome, _events) = pump_inbound(ScriptedLink::new(Vec::new()).ending()).await;
+        assert_eq!(disconnect_reason(outcome), "server stream ended");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_error_names_itself_in_the_disconnect_reason() {
+        let (outcome, _events) =
+            pump_inbound(ScriptedLink::new(vec![Err(WsError::AttackAttempt)])).await;
+        let reason = disconnect_reason(outcome);
+        assert!(reason.starts_with("read error"), "reason was {reason:?}");
+        assert!(reason.contains("Attack attempt"), "reason was {reason:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_inbound_message_lands_while_the_send_half_is_stalled() {
+        let budget = PipelineBudget::with_test_limits(64, 64, 64, 64);
+        let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(4);
+        let (event_tx, mut event_rx) = mpsc::channel::<UplinkEvent>(4);
+        raw_tx
+            .send(budget.admit_outbound_for_test(vec![1, 2, 3]))
+            .await
+            .unwrap();
+
+        // The peer has a shop for us and a frozen receive window: the read half
+        // must not wait out `SEND_TIMEOUT` behind the write half.
+        let link = ScriptedLink::new(vec![Ok(Message::text(r#"{"type":"ack"}"#))]).stalling_sends();
+        let mut pumping = std::pin::pin!(pump(link, &mut raw_rx, &event_tx));
+
+        tokio::select! {
+            _ = &mut pumping => panic!("the stalled send must not have completed yet"),
+            event = event_rx.recv() => assert!(matches!(
+                event,
+                Some(UplinkEvent::Message(ServerMessage::Ack))
+            )),
+        }
+
+        // And the write half still gives up on its own schedule.
+        assert_eq!(disconnect_reason(pumping.await), "send stalled");
+        assert_eq!(budget.snapshot().current_total, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -453,8 +752,54 @@ mod tests {
         assert_eq!(budget.snapshot().current_outbound, 3);
 
         let outcome = pump(StalledLink, &mut raw_rx, &event_tx).await;
-        assert!(matches!(outcome, Outcome::Disconnected));
+        assert_eq!(disconnect_reason(outcome), "send stalled");
         assert_eq!(budget.snapshot().current_total, 0);
         assert!(budget.snapshot().high_water_total <= 64);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_retries_after_a_handshake_that_never_completes() {
+        let (raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        let (event_tx, mut event_rx) = mpsc::channel::<UplinkEvent>(4);
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let recorded_attempts = Arc::clone(&attempts);
+        let started = tokio::time::Instant::now();
+
+        // A connector that opens and never finishes: without CONNECT_TIMEOUT the
+        // task parks here forever, emitting no LinkDown and never retrying.
+        let task = tokio::spawn(run_with_connector(
+            "ws://test.invalid".to_owned(),
+            raw_rx,
+            event_tx,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            move |_url| {
+                recorded_attempts
+                    .lock()
+                    .unwrap()
+                    .push(tokio::time::Instant::now().duration_since(started));
+                pending::<Result<StalledLink, WsError>>()
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(*attempts.lock().unwrap(), [Duration::ZERO]);
+
+        tokio::time::advance(CONNECT_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(UplinkEvent::LinkDown(reason)) if reason == "handshake stalled"
+        ));
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            [Duration::ZERO, CONNECT_TIMEOUT + Duration::from_millis(100)]
+        );
+
+        drop(raw_tx);
+        task.await.unwrap();
     }
 }

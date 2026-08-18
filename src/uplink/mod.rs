@@ -14,7 +14,10 @@ pub use websocket::run;
 pub enum UplinkEvent {
     /// A decoded server message.
     Message(protocol::ServerMessage),
-    /// The link failed or dropped; reported once per outage, not per retry.
+    /// The link failed or dropped; reported once per outage, not per retry. The
+    /// reason becomes a journal line, which is mirrored into the log file the
+    /// player is asked to send us — so it must never carry the server URL, whose
+    /// userinfo and query can hold a credential.
     LinkDown(String),
     /// The link came back after a reported outage.
     LinkUp,
