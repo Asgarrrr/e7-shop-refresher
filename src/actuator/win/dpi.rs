@@ -71,6 +71,19 @@ fn awareness_verdict(awareness: DPI_AWARENESS) -> Result<(), SurfaceError> {
 /// undocumented choice, verified nowhere. A compatibility shim, a
 /// `__COMPAT_LAYER` variable or a future winit is enough to change that choice.
 ///
+/// The winit half of that is now settled somewhere this function cannot reach:
+/// `build.rs` declares `dpiAwareness = permonitorv2, permonitor` in the embedded
+/// application manifest, which the loader applies *before any code runs*, so the
+/// value is the product's rather than a dependency's. Measured on the built exe:
+/// awareness is already per-monitor at process entry, and every later setter —
+/// ours, winit's v2 attempt and its v1 fallback — fails with
+/// `ERROR_ACCESS_DENIED` without changing it. The setter below therefore still
+/// always fails in the GUI build, but now because *we* got there first.
+///
+/// What the manifest cannot outrank, and why this check stays: a `__COMPAT_LAYER`
+/// shim is applied over it. `__COMPAT_LAYER=DPIUNAWARE` on a manifested build was
+/// measured landing at `unaware` — the exact case the refusal below names.
+///
 /// So the answer comes from reading the context back, not from the setter: on the
 /// success path because a set value can still be re-read, and on the failure path
 /// because that is the only way to learn *whose* value won. A mis-aimed click is
@@ -99,10 +112,11 @@ pub(super) fn ensure_dpi_awareness() -> Result<(), SurfaceError> {
         // `GetLastError` is per-thread and *any* later call may overwrite it.
         // Neither getter is documented to set it,
         // which is exactly why reading it after them was not safe to rely on —
-        // "not documented to write the slot" is not "documented not to". On the
-        // shipped GUI build winit has already set the awareness, so this branch
-        // fires on every launch and this value is the difference between a
-        // reproducible bug report and "the clicks miss sometimes".
+        // "not documented to write the slot" is not "documented not to". The
+        // embedded manifest has already set the awareness on *every* build of
+        // this exe, so this branch fires on every launch and this value is the
+        // difference between a reproducible bug report and "the clicks miss
+        // sometimes".
         let set_error = (set == 0).then(std::io::Error::last_os_error);
         // One Win32 call per block, so each `// SAFETY:` answers for exactly the
         // call above it.
