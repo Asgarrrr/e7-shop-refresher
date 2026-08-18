@@ -9,16 +9,18 @@ buys matched items via click emulation.
 ## How it works
 
 ```
-WinDivert SNIFF ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket ─▶ server
-   (passive)                        (ordered/dedup)                  ▲         │
-                                                              snapshots ◀──────┘
+Npcap tap ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket ─▶ server
+ (passive)                   (ordered/dedup)                  ▲         │
+                                                       snapshots ◀──────┘
 ```
 
-- **Capture**: WinDivert in `SNIFF` + `RECV_ONLY` mode yields a *copy* of the
-  game-port TCP packets; the originals continue on their way intact. `SNIFF`
-  is what makes the tap a copy rather than a diversion, and `RECV_ONLY` makes
-  the handle physically incapable of sending — nothing can be injected or
-  modified, by this code or any later addition to it.
+- **Capture**: an Npcap read-only tap on every network adapter yields a *copy*
+  of the game-port TCP packets; the originals continue on their way intact. The
+  tool is never a proxy and never owns the game's socket — nothing can be
+  injected, dropped or rewritten, by this code or by any later addition to it,
+  because a capture handle physically cannot send. The kernel-side filter is
+  fixed (`tcp and port 3333`, built from `game_port`), so no other traffic on
+  the machine is even copied.
 - **Reassembly**: captured segments (possibly out of order or retransmitted) are
   recomposed into an ordered byte stream, per connection.
 - **Forwarding**: the raw server → client stream is sent as-is to the analysis
@@ -43,147 +45,88 @@ The relay starts **idle** (nothing is captured or forwarded): press **Start**
 in the window (or type `start` in the console) when opening the shop to arm
 the session, **Stop** when done.
 
-## What gets installed on your machine — read this before launching
+## What you need to install, and why the app asks for administrator
 
-Capture needs to see packets before Windows hands them to the game, and the
-only supported way to do that is a kernel-mode driver. **WinDivert** is that
-driver, and loading a driver needs administrator rights. Being upfront about
-all of it:
+Two things are worth being upfront about before you launch it.
 
-- **A signed kernel driver is registered as a Windows service.** On the first
-  capture, `WinDivert.dll` registers `WinDivert64.sys` (WinDivert 2.2.2, signed
-  by its author, Basil) as a kernel service named `WinDivert` and starts it. It
-  is registered with start type **disabled** and marked for deletion, so it
-  never starts on its own and never comes back at boot — it only ever runs
-  because this tool asked for it. Check for yourself:
+### You install Npcap, once. We ship no driver.
 
-  ```powershell
-  sc.exe qc WinDivert      # START_TYPE : 4  DISABLED
-  sc.exe query WinDivert   # RUNNING only while a capture handle is open
-  ```
+Capture needs to see the game's packets, and on Windows that means a packet
+capture driver. **We do not ship one.** Nothing is embedded in the exe, nothing
+is extracted, no service is registered by this tool. Instead the app uses
+**Npcap** — the standard Windows packet-capture library, the one Wireshark
+installs — which you install yourself:
 
-  The driver can stay resident for a while after the tool exits, until Windows
-  drops the last kernel reference; it is gone after a reboot in any case.
-- **Administrator rights are required for that one step, and only that one
-  step.** The app itself runs as you, with no special rights: its manifest says
-  `asInvoker`, so double-clicking the exe opens the window with no prompt at
-  all. When capture starts, it launches a *second* process of the same exe with
-  the `runas` verb — that is the UAC prompt you see — and that second process is
-  the only thing that ever holds administrator rights.
+1. Download it from **https://npcap.com** and run the installer.
+2. **Keep the default options.** In particular:
+   - Leave *"Restrict Npcap driver's access to Administrators"* **unchecked**
+     (that is the default). The app works either way, but unchecking it is what
+     keeps the capture itself unprivileged.
+   - Leave *"Support raw 802.11 traffic (and monitor mode)"* **unchecked** (also
+     the default). Some other capture tools ask you to enable it; this one does
+     not need it, and it does not help here. On a normal install Npcap already
+     hands out ordinary Ethernet framing on Wi-Fi — measured on this project's
+     Wi-Fi adapter: 82 packets captured, 82 parsed, 0 rejected.
+3. That is all. No reboot, and nothing to configure in this app.
 
-  What that elevated process does is deliberately almost nothing: it opens the
-  WinDivert handle, receives packets, and writes them down a private pipe to the
-  app. It parses no packet, reads no configuration file, opens no network
-  connection, and has no window. Everything that used to make elevation
-  uncomfortable — the TOML parser, the window, the TLS uplink, and above all the
-  TCP reassembly that chews on unauthenticated bytes off the wire — now runs as
-  you, at ordinary integrity, where a bug in it is a bug in a normal program.
-  Earlier versions ran that entire list as administrator for the whole session.
+If Npcap is missing, the app still starts and tells you so with a message naming
+the download page — it does not crash and it does not fail silently.
 
-  Two consequences worth knowing:
+**What leaves your machine**: only the reassembled game-port byte stream, sent
+over TLS to the configured `server_url`. Nothing else on the network is read,
+and nothing is uploaded about your machine.
 
-  - Task Manager shows **two** `arkyve-refresh-shop` processes while capture is
-    running, and its *Elevated* column marks only one of them. Closing the
-    window ends both, within a second, whether or not any traffic is flowing.
-  - Do **not** right-click → *Run as administrator* (older versions of this file
-    told you to). It still works, but then the app is already elevated, no
-    prompt appears, and the separation above quietly evaporates — the log says
-    so in as many words when it happens.
-- **The mode is `SNIFF` + `RECV_ONLY`.** The driver gives the tool a *copy* of
-  matching packets and the originals travel on untouched; the handle cannot
-  send, so nothing is injected, dropped or rewritten. The filter is fixed — TCP
-  with source port `game_port` (3333), and nothing else — so no other traffic on
-  the machine is even copied. It is no longer configurable, on purpose: it is
-  the one string the unprivileged side would otherwise hand to a kernel driver
-  to compile.
-- **Some antivirus products flag WinDivert as *riskware* / *hacktool***
-  (`HackTool:Win32/WinDivert`, `RiskWare.WinDivert`, and similar). This is a
-  category judgement, not a detection of malicious behaviour: WinDivert is a
-  legitimate, widely used, signed packet-capture library, and the same driver is
-  bundled with plenty of ordinary VPN and firewall tools. **Expect an alert on
-  first launch**, and expect to have to allow it. If you would rather not, do
-  not run this tool.
-- **What leaves your machine**: only the reassembled game-port byte stream, sent
-  over TLS to the configured `server_url`. Nothing else on the network is read,
-  and nothing is uploaded about your machine.
+### The app asks for administrator — not to capture, but to click
 
-The tool is never a proxy and never owns the game's socket. Closing it releases
-the handle and the driver; the game's TCP connection continues normally.
+Windows shows a UAC prompt when you launch the exe. That is **not** for the
+capture side, which needs no privilege of its own. It is for the clicking.
+
+Epic Seven is launched by STOVE, and STOVE runs as administrator. Windows will
+not let an ordinary program send mouse clicks to a window belonging to an
+administrator program — it refuses them silently, with no error the program can
+even see. Since this tool's whole job is to click Refresh and Buy in the game
+window, it has to run at the level the game does. There is no fix from the
+game's side: STOVE is the launcher Epic Seven ships with, and it always
+elevates.
+
+So **approve the prompt**, or the refresh loop will do nothing at all. (An
+earlier version of this file told you the exact opposite. It was written when
+capture needed a kernel driver and clicking was an afterthought; both halves of
+that are now the other way round.)
 
 ## Distribution — a single exe
 
-You ship **`arkyve-refresh-shop.exe` alone**. Both WinDivert runtime files ride
-inside it (`include_bytes!`) and are self-extracted on first launch into
-`%LOCALAPPDATA%\arkyve-refresh-shop\runtime\` — **nothing lands beside the exe**,
-so it runs cleanly from the Desktop:
+You ship **`arkyve-refresh-shop.exe` alone**. It embeds nothing, extracts
+nothing, and writes nothing beside itself, so it runs cleanly from the Desktop.
+The only files it ever creates are its config under `%APPDATA%` and its logs and
+crash log under `%LOCALAPPDATA%` (see *Troubleshooting*).
 
-- **`WinDivert.dll`** (the official prebuilt library, vendored under
-  `vendor/windivert/`) is **delay-loaded**: its import binds on the first
-  WinDivert call, *after* the exe has extracted it and `LoadLibrary`'d it by full
-  path from the app-data dir. Without delay-load the Windows loader would demand
-  the DLL at process start — before any extraction could run — and abort with
-  "WinDivert.dll not found".
-- **`WinDivert64.sys`** (the signed kernel driver) is loaded by the DLL from that
-  same directory. Windows loads a driver only from a file on disk, never from
-  memory, so *some* file is unavoidable — but it stays in the hidden app-data
-  dir, not in the user's face.
+`wpcap.dll` — Npcap's library — is resolved **at runtime**, by plain name and
+then by full path in `C:\Windows\System32\Npcap\`. It is deliberately not linked
+at build time: a linked import would make Windows demand the DLL before `main`
+runs, so the exe would die in the loader, with no message at all, on every
+machine without Npcap. Resolved by hand, "Npcap is not installed" is just a line
+in the window's journal.
 
-Each file is written only when missing or different, through a temp file and an
-atomic rename, and re-verified byte for byte immediately before it is loaded: a
-runtime file that exists but does not match the embedded copy is refused rather
-than loaded into an elevated process. If extraction fails outright the app stops
-with a message naming the file — it never falls back to whatever happens to be
-on disk.
-
-The `runtime\` leaf is its own directory on purpose. It is locked down to
-administrators and SYSTEM so that no non-elevated process can plant a file where
-an elevated one is about to load a kernel driver from — and that lock is
-inheritable, so it must not sit on `%LOCALAPPDATA%\arkyve-refresh-shop\` itself,
-which also holds `logs\` and `crash.log` and has to stay writable without
-administrator rights. Versions that extracted into the root are migrated
-automatically on the first elevated launch (permissions restored, stale files
-removed); that one run's log file is lost, and the next run's log says so.
-
-> **If you type someone else's administrator credentials at the prompt** — a
-> standard Windows account approving UAC with an admin account's password,
-> rather than clicking Yes as an admin yourself — the two processes then run as
-> two different users, and `%LOCALAPPDATA%` means two different folders. The
-> extracted `runtime\` (and the broker's own `crash.log`) land under the
-> **administrator's** profile, while the window's config, logs and crash log
-> stay under **yours**. For the config that is an improvement: `config.toml` is
-> now read from the profile of the person actually editing it, which the old
-> fully-elevated build did not do. It is worth knowing before you go looking for
-> a file that is not where you expect.
-
-> **Delay-load needs a proper import lib.** The official release ships a "long"
-> `WinDivert.lib` that `/DELAYLOAD` silently ignores (`LNK4199`). We regenerated
-> it as an MSVC **short-import** lib from `vendor/windivert/WinDivert.def`
-> (`lib.exe /DEF`). If you ever re-vendor it, run `cargo clean -p windivert-sys`
-> — that crate copies the lib into its `OUT_DIR` and won't notice an in-place
-> change.
-
-> **Why not static?** `WINDIVERT_STATIC` compiles WinDivert's C from source and
-> links it into the exe; that object corrupts the **release** build's stack-guard
-> probing and the exe overflows its stack at startup (debug is unaffected). The
-> official prebuilt DLL is a correct build, so we link against it instead — see
-> `.cargo/config.toml`. Verify with
-> `dumpbin /dependents target\release\arkyve-refresh-shop.exe`: `WinDivert.dll`
-> must appear under *delay load dependencies*, and nowhere else.
-
-> **License:** WinDivert is LGPL. The DLL is extracted (re-materialized as a file
-> the user can replace with their own build) and its license is `vendor/windivert/LICENSE`
-> — keep the license available in any redistribution.
+> **Upgrading from a version that used WinDivert?** Those builds extracted
+> `WinDivert.dll`, `WinDivert64.sys` and a licence file into
+> `%LOCALAPPDATA%\arkyve-refresh-shop\`, and locked that folder down to
+> administrators — which also made `logs\` unwritable for anything unelevated.
+> The first launch of this version deletes those files and restores the folder's
+> normal permissions by itself. There is nothing to do, and nothing to uninstall:
+> the WinDivert *service*, if it is still registered, was registered disabled and
+> marked for deletion and is gone after a reboot.
 
 ## Requirements
 
-- **End user**: Windows x64. Just the exe — double-click it. It carries an
-  `asInvoker` manifest and runs as you: **no prompt at launch**. The UAC prompt
-  appears when capture starts, for the separate helper process that opens the
-  driver (see *What gets installed on your machine*). Never "Run as
-  administrator" — that removes the separation rather than helping. It
-  self-extracts its runtime to `%LOCALAPPDATA%` on first run.
+- **End user**: Windows x64, plus **Npcap** installed once with default options
+  (see above). Then just the exe — double-click it and approve the UAC prompt.
+  The exe carries a `requireAdministrator` manifest, so the prompt appears at
+  launch, every launch; it is what lets the tool click in the game's window.
 - **Build machine**: Rust >= 1.92 and the MSVC toolchain (`link.exe`). No C
-  compiler needed — the DLL is prebuilt.
+  compiler and no SDK: `wpcap.dll` is resolved at runtime, so the build needs
+  nothing from Npcap and CI compiles and tests this on runners that do not have
+  it installed.
 
 ## Build
 
@@ -201,13 +144,10 @@ just verify
 
 It checks formatting plus the platform-independent Clippy and test lanes. On
 Windows, `just backends` adds the two Windows-only lanes: the capture backend on
-its own, and the shipped default features (`windivert-backend,gui,actuator`),
-each both linted and tested. CI repeats all of it on Rust 1.92.0 and current
-stable, then builds the default-feature Windows release on stable.
-
-WinDivert is linked **dynamically** against `vendor/windivert/` (set by
-`WINDIVERT_PATH` in `.cargo/config.toml`), never statically — see *Why not
-static?* above.
+its own, and the shipped default features (`pcap-backend,gui,actuator`), each
+both linted and tested. CI repeats all of it on Rust 1.92.0 and current stable,
+then builds the default-feature Windows release on stable and checks that the
+`requireAdministrator` manifest is still embedded in it.
 
 ### Capture backend
 
@@ -215,16 +155,21 @@ One backend sits behind the `PacketSource` abstraction:
 
 | Feature | Layer it reads | Needs | Status |
 |---------|----------------|-------|--------|
-| `windivert-backend` | IP packets | Kernel driver + admin | **Default.** Indifferent to the adapter — works on WiFi. |
+| `pcap-backend` | IP packets (link header stripped per adapter) | Npcap installed by the user | **Default.** Every adapter at once — works on Wi-Fi, survives a Wi-Fi/Ethernet switch. |
 
-Reading IP-layer copies is what makes it adapter-independent: a NIC-level tap
-hands out link-layer frames, which on a WiFi adapter are 802.11 and are not
-decoded here. Without the feature, the pipeline still builds and tests and
-capture fails with a clear message instead of panicking:
+Every adapter is opened rather than one being chosen, which removes every
+"which interface carries the game?" heuristic; the kernel-side BPF filter means
+an idle adapter costs a parked thread and nothing per packet. Without the
+feature, the pipeline still builds and tests, and capture fails with a clear
+message instead of panicking:
 
 ```sh
 cargo test --no-default-features
 ```
+
+Why Npcap and not a driver of our own — including the two measured claims that
+overturned the previous decision — is in
+[`docs/capture-backend-choice.md`](docs/capture-backend-choice.md).
 
 ## Configuration
 
@@ -245,8 +190,8 @@ leave it untouched. Delete it to regenerate the example on the next launch.
 | `server_url` | `wss://ingest.arkyve.dev/refresh-shop` | Analysis server |
 | `forward.server_to_client` | `true` | Forward responses (shop contents) |
 | `forward.client_to_server` | `false` | Forward requests (context) |
-| `capture.buffer_size` | — | **Retired.** Still parsed so older files keep loading; ignored (the buffer is fixed at the driver's maximum) |
-| `capture.filter` | — | **Retired.** Still parsed so older files keep loading; ignored (the filter is a constant in the elevated helper) |
+| `capture.buffer_size` | — | **Retired.** Still parsed so older files keep loading; ignored (the backend sizes its own buffer) |
+| `capture.filter` | — | **Retired.** Still parsed so older files keep loading; ignored (the backend builds its own filter from `game_port`) |
 | `[filter]` | matches everything | Item interest criteria (kinds, sets, substats, price) |
 | `[limits]` | no limits | Session stop limits (refreshes, crystals, matches, duration) |
 | `[actuator]` | live | `dry_run = true` journals planned clicks without sending input |
@@ -254,11 +199,11 @@ leave it untouched. Delete it to regenerate the example on the next launch.
 ## Running
 
 ```sh
-cargo run --release   # plain shell, no elevation; opens the window (default features)
+cargo run --release   # opens the window (default features)
 ```
 
-The window opens straight away; Windows asks for consent once, when the capture
-helper is launched.
+Windows asks for consent at launch — see *why the app asks for administrator*
+above — and the window opens straight after.
 
 Control from the window: one contextual Start/Stop button in the status bar,
 filter & limits editors under the Setup tab. Close the window to quit.
@@ -267,7 +212,7 @@ Console-only build (no window; `start`/`stop`/`[Enter]` on stdin, `Ctrl+C`
 quits):
 
 ```sh
-cargo run --release --no-default-features --features windivert-backend
+cargo run --release --no-default-features --features pcap-backend
 ```
 
 ## Troubleshooting
@@ -291,24 +236,28 @@ system temp directory.
 Reading it yourself:
 
 - `arkyve-refresh-shop starting` missing → the app never got to run; check that
-  no antivirus quarantined the exe or the extracted `WinDivert.dll` /
-  `WinDivert64.sys`. (The app no longer needs a UAC prompt to reach this line —
-  the prompt comes later, for the capture helper.)
-- No `WinDivert capture open` line → the driver never loaded. Either the UAC
-  prompt for the capture helper was dismissed (the banner says so), or the
-  extraction into `%LOCALAPPDATA%\arkyve-refresh-shop\runtime\` failed — the
-  error that follows names the file. The helper has no log file of its own: what
-  it knows travels back over the pipe and lands in the lines above. If it died
-  before that, look for its `crash.log`, which is under the profile of the
-  account that approved the prompt.
-- `WinDivert capture open` but no `first server-to-client segment admitted` →
-  the tap is running and the game server's traffic never matched. Check the
-  `filter=` value on that same line against the port the game actually uses.
+  no antivirus quarantined the exe, and that the UAC prompt at launch was
+  approved rather than dismissed.
+- `wpcap.dll loaded` missing → Npcap is not installed, or its driver is not
+  running. The error that follows says which, and names https://npcap.com. If it
+  says Npcap enumerated no capture device at all on a machine that clearly has
+  one, the driver is not running; reinstalling Npcap with default options is the
+  fix.
+- `adapter opened and filtered` on no adapter at all → every adapter was
+  refused, and the error lists each one with its reason. An install that ticked
+  *"Restrict Npcap driver's access to Administrators"* is the usual cause, and
+  the app names that case explicitly.
+- Adapters open but no `first server-to-client segment admitted` → the tap is
+  running and the game server's traffic never matched. Check `game_port` against
+  the port the game actually uses.
 - No `capture progress` line for a whole session → nothing is reaching the
   pipeline on `game_port`; same causes as above. Set
-  `RUST_LOG=arkyve_refresh_shop=debug` to get the `WinDivert capture funnel`
-  line, which separates "no packet was ever delivered" from "packets arrived
-  and the parser rejected them".
+  `RUST_LOG=arkyve_refresh_shop=debug` to get the `capture funnel` line, which
+  separates "no packet was ever delivered" from "packets arrived and the parser
+  rejected them".
+- `the capture driver dropped packets` → the kernel ring overflowed; the byte
+  stream has a hole and the session resyncs by itself. Frequent enough to be
+  noticeable means the machine could not keep up with the capture.
 - `session heartbeat` lines with a growing `since_last_shop_s` → the pipeline
   is alive but no shop is arriving; compare `gate_armed` (is the watch armed?)
   with the `server link down` lines (is the server reachable?).

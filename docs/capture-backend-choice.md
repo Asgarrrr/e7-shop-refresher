@@ -1,41 +1,93 @@
-# Why the capture backend is WinDivert, and not PktMon
+# Why the capture backend is Npcap, and why a driver of our own was the wrong answer
 
-Status: decided, 2026-08-18. Supersedes the PktMon migration attempted the day before.
+Status: decided, 2026-08-18. Supersedes two earlier decisions recorded in this
+same file: the PktMon migration attempted on 2026-08-16, and the WinDivert
+decision written on 2026-08-17 to close the question for good. It did not close
+it. Both of that version's load-bearing arguments were disproved by measurement
+the next day, which is why this is a rewrite and not an amendment.
 
 ## Decision
 
-The relay captures game traffic through **WinDivert**, opened in
-`sniff` + `recv_only` mode at the **network (IP) layer**.
+The relay captures game traffic through **Npcap**, opened read-only on **every
+adapter**, one handle and one kernel-side BPF filter (`tcp and port 3333`) each.
+Each capture thread strips its own adapter's link header, so what reaches the
+pipeline is an IP packet — the same shape the previous backend delivered, from a
+process with no special privilege.
+
+`wpcap.dll` is resolved at **runtime** through `libloading`, never linked. A
+static link would make the build need the Npcap SDK and — worse — would kill the
+shipped exe *in the Windows loader, before `main`*, on any machine without Npcap
+installed. Loaded by hand, "Npcap is not installed" is an ordinary error message
+naming the download page.
+
+We ship **no driver and embed nothing**. The player installs Npcap once, from
+https://npcap.com, with default options.
+
+## What the previous version of this document got wrong
+
+Both arguments it used to reject Npcap were wrong, and each was wrong in a way
+worth naming, because the same mistake is easy to make again.
+
+### 1. It compared the wrong number
+
+> *"That is the whole reason the backend is ~400 lines instead of ~2 300."*
+
+The backend was ~400 lines. The **cost of the backend** was 3 274:
+
+| File | Lines | What it was for |
+| --- | ---: | --- |
+| `src/capture/windivert.rs` | 845 | The tap itself, plus embedding, extraction, byte re-verification, DLL preload and DACL hardening of the extraction directory |
+| `src/capture/elevate.rs` | 849 | Launching a second copy of the exe with the `runas` verb, and the pipe client |
+| `src/broker.rs` | 1 041 | The elevated process: argv validators, pipe server, watchdog on the UI process |
+| `src/capture/pipe.rs` | 539 | The frame protocol between the two |
+| **Total** | **3 274** | plus a second process, a UAC prompt, and a delay-load link argument |
+
+None of that was accidental complexity to be refactored away. Every line existed
+because a kernel driver's handle had to be held by *something*, and holding it in
+the process that also parses unauthenticated bytes off the wire was not
+acceptable. The driver did not cost 400 lines. It cost an architecture.
+
+The rule the earlier note stated for PktMon applies to its own decision: compare
+what a choice *actually requires end to end*, not the module you would write to
+front it.
+
+### 2. It asserted that Npcap hits the 802.11 wall. It does not.
+
+> *"its installer asks users to enable 'Support raw 802.11 traffic', which is the
+> same wall, solved by paying a driver to normalise it."*
+
+False, and backwards. Npcap's **default** installation binds above the Windows
+Wi-Fi stack (NWIFI) and hands out **fake Ethernet** headers: the 802.11 framing
+is already normalised, which is exactly what this pipeline needs. The "Support
+raw 802.11 traffic" checkbox *creates* 802.11 framing — it switches the adapter
+into a mode that reports real radio headers — so enabling it would have caused
+the wall the note feared, not removed it.
+
+That option exists for a different job: capturing traffic from **another
+device**. Fribbels' Epic 7 Optimizer asks for it because it supports capturing an
+emulator or a phone tethered to the PC's hotspot, where the PC is not the
+endpoint. This tool captures the PC's own traffic, and never needs it.
+
+Measured here, on the machine this runs on:
+
+- Intel Wi-Fi 6 AX201, default Npcap install, `AdminOnly = 0`
+- Link type reported: **`DLT_EN10MB`** (Ethernet), not 802.11
+- 82 packets matched the filter, **82 parsed, 0 unparsed**
+- Largest single capture: **48 870 bytes** — RSC coalescing, 32× the MTU, which
+  is why the snaplen is 262 144 and not the wire MTU
+- Whole pipeline verified from an **unelevated** process: capture → reassembly →
+  uplink → analysis server → decoded shop snapshot → refresh job
+
+The lesson is narrower than "measure things". The claim was inherited from
+another project's install instructions and reasoned about by analogy with
+PktMon's failure, which had genuinely been an 802.11 problem. A checkbox in
+someone else's installer is not evidence about your own configuration.
+
+## The PktMon post-mortem, which still stands
 
 A migration to **PktMon** — the in-box Windows Packet Monitor API — was
 implemented, debugged through four successive failures, and removed. It never
-captured a single shop payload. This note exists so that nobody, human or
-agent, reopens "we could drop the kernel driver" without first reading why it
-did not work.
-
-## The motivation was a false premise
-
-WinDivert was abandoned because a release build died with a stack overflow,
-attributed to the crate. It was not the crate.
-
-`WINDIVERT_STATIC` was **never enabled in the committed configuration**:
-`windivert-sys` has `default = []` and only compiles the vendored C sources
-under its `static` feature. The overflow came from an experiment with that
-feature, not from the build that shipped. Verified after the fact: the release
-binary's import table lists `WinDivert.dll` in the **delay-load** section only,
-`OUT_DIR` contains no compiled objects, and the windowed release binary runs
-without producing a crash log.
-
-So roughly 2 300 lines of unsafe FFI were written to work around a bug that was
-not there. The reflex that would have prevented it: **reproduce the failure on
-the clean, committed configuration before concluding that the dependency is at
-fault.**
-
-A CI step now fails the build if `WinDivert.dll` ever stops being delay-loaded —
-a static import compiles fine but makes every launch die with "WinDivert.dll not
-found", which no compile-time check would catch.
-
-## Why PktMon could not do the job
+captured a single shop payload.
 
 Every wall was a direct consequence of what PktMon is *for*. It is an
 **observability tracer** built to answer "at which layer was my packet dropped?".
@@ -53,59 +105,117 @@ bindings, and undocumented field lengths in
 `PACKETMONITOR_DATA_SOURCE_SPECIFICATION`, which makes that struct unreadable
 from Rust without guessing offsets.
 
-**WinDivert avoids all four by construction.** It hooks the Windows Filtering
-Platform at a single point, at the IP layer: each packet arrives once, already
-stripped of its link framing, whatever the medium — Ethernet, Wi-Fi, VPN. That
-is the whole reason the backend is ~400 lines instead of ~2 300.
+**Npcap avoids all four**, and for the same structural reason WinDivert did: one
+tap, one delivery per packet, framing normalised by the driver rather than by us.
 
 ## The transferable rule
 
 > When replacing a component, ask whether the replacement is *designed for* the
 > use case or merely *capable of* it. Observability tools optimise for
 > completeness and attribution — show me everything, everywhere, labelled.
-> Interception tools optimise for singularity and position — give me this, once,
+> Capture tools optimise for singularity and position — give me this, once,
 > here. Swapping one for the other means fighting the design on every axis.
+
+## The false premise that started all of it
+
+WinDivert was abandoned for PktMon because a release build died with a stack
+overflow, attributed to the crate. It was not the crate.
+
+`WINDIVERT_STATIC` was **never enabled in the committed configuration**:
+`windivert-sys` has `default = []` and only compiles the vendored C sources
+under its `static` feature. The overflow came from an experiment with that
+feature, not from the build that shipped. Verified after the fact: the release
+binary's import table listed `WinDivert.dll` in the delay-load section only,
+`OUT_DIR` contained no compiled objects, and the windowed release binary ran
+without producing a crash log.
+
+So roughly 2 300 lines of unsafe FFI were written to work around a bug that was
+not there, and the backend was then rebuilt on the dependency that had been
+blamed. The reflex that would have prevented it: **reproduce the failure on the
+clean, committed configuration before concluding that the dependency is at
+fault.**
 
 ## Alternatives evaluated
 
-**Raw socket, `SIO_RCVALL`.** Attractive on paper: no driver, no service, no
-persistent state, and it delivers IP packets, so it escapes the 802.11 problem
-entirely. Measured on the target machine: the socket arms on Wi-Fi in both
-`RCVALL_ON` and `RCVALL_IPLEVEL` — Wi-Fi is *not* a blocker, contrary to common
-claims, because `RCVALL_IPLEVEL` works above NDIS and needs no promiscuous mode.
-But over ~60 000 packets it delivered **1 114 outbound TCP packets and zero
-inbound TCP**, while inbound UDP flowed freely. This project lives entirely on
-inbound. Documented sources suggest a Windows Firewall inbound rule lifts the
-restriction; that was never confirmed, and the inbound-UDP observation weakens
-the explanation. It would also require a persistent firewall rule, which erodes
-the "installs nothing" argument that motivated the idea. Rejected as unproven.
+**Raw socket, `SIO_RCVALL`.** Attractive on paper: no install of any kind, no
+service, no persistent state, and it delivers IP packets, so it escapes the
+802.11 question entirely. Measured on the target machine: the socket arms on
+Wi-Fi in both `RCVALL_ON` and `RCVALL_IPLEVEL` — Wi-Fi is *not* a blocker,
+contrary to common claims, because `RCVALL_IPLEVEL` works above NDIS and needs no
+promiscuous mode. But over ~60 000 packets it delivered **1 114 outbound TCP
+packets and zero inbound TCP**, while inbound UDP flowed freely. This project
+lives entirely on inbound. Documented sources suggest a Windows Firewall inbound
+rule lifts the restriction; that was never confirmed, and the inbound-UDP
+observation weakens the explanation. It would also require a persistent firewall
+rule, which erodes the "installs nothing" argument that motivated the idea.
+Rejected as unproven. It remains the only candidate that would beat Npcap on
+install footprint.
 
-**Npcap via the `pcap` crate.** The smallest backend of all (~100–150 lines, BPF
-filter `tcp and port 3333`, kernel-side filtering, link framing normalised).
-This is what Fribbels' Epic 7 Optimizer does through scapy — and its installer
-asks users to enable "Support raw 802.11 traffic", which is the same wall,
-solved by paying a driver to normalise it. Rejected only because it needs a
-**separate** user install; kept as the fallback if WinDivert becomes untenable.
-Npcap has a better reputation than WinDivert with security software, and its
-installer can restrict access to administrators.
+**A local relay (proxy) the game connects through.** Never evaluated in the
+earlier note, and it should have been, because it is the obvious answer for
+anyone who has done this on a platform with a proxy setting. Rejected on what it
+would make this tool *be*: a relay owns the game's socket. Read-only observation
+becomes a man-in-the-middle by construction — every packet passes through our
+code before reaching the game, so a bug, a stall or a crash in it is a bug, a
+stall or a crash in the player's game session, and the README's promise that the
+game's traffic is never altered stops being structurally true. Getting the game
+to connect through it is its own problem: Epic Seven has no proxy setting, so the
+only lever is a `hosts` entry, which is machine-wide, needs administrator rights
+once to write, is policed by Defender's "tampering" heuristics, and **fails
+closed** — a stale line left behind by a crash breaks the game until someone
+edits a file they have never opened.
+
+**In-process hooking (inject into the game and read the buffers).** Also never
+evaluated. Rejected outright, and not on difficulty. Epic Seven ships Wellbia
+**XIGNCODE3 / UNCHEATER**, whose `xhunter1.sys` kernel driver exists precisely to
+detect foreign code inside the game process. Beyond the practical outcome — a
+ban — this is a categorical line the rest of the design respects: observing a
+copy of traffic the network hands us is not the same act as writing into another
+process's memory, and no amount of care makes it the same act.
+
+**PktMon.** See above.
+
+**WinDivert.** The previous decision. It works, and it is genuinely elegant at
+the tap: one WFP hook at the IP layer, no link framing, no adapter selection. It
+is rejected on everything around the tap — a third-party signed kernel driver
+shipped by us, registered as a service, flagged as riskware by several antivirus
+products, requiring elevation and therefore requiring the whole broker
+architecture above. Npcap gets IP-layer packets with none of it.
 
 ## Accepted trade-off
 
-WinDivert installs a signed kernel driver as a service and requires elevation.
-Several antivirus products classify it as riskware, because the library can also
-divert, modify and reinject traffic. This relay uses none of that: the handle is
-opened `sniff` + `recv_only`, so packets are copied, never altered, dropped or
-reinjected — which is what backs the README's promise that the game's traffic is
-untouched. The `README` states plainly what is installed and why, so players
-learn it before an antivirus prompt rather than after.
+**Npcap must be installed by the user, and that cost does not go away.** It is a
+separate download, a separate installer, a reboot-free but non-trivial step
+between a player and a working tool, and it is the single strongest argument
+anyone can make against this decision. It is accepted because the alternative was
+not "no install" — it was "we install a kernel driver for you, silently, and your
+antivirus tells you about it".
+
+Two secondary points, both measured rather than assumed:
+
+- The default install is what is needed. No option has to be changed, and in
+  particular "Support raw 802.11 traffic" must be left **off**.
+- Npcap's installer offers to restrict its driver to administrators
+  (`AdminOnly`). Off by default, and the backend reads that registry value so it
+  can tell "restricted to administrators" apart from "this machine has no
+  adapters" instead of reporting an empty device list. The app happens to run
+  elevated anyway — for the actuator, see `build.rs` — so a machine that did tick
+  it still works.
 
 ## What would reopen this
 
-- WinDivert being blocked outright by Windows or by common antivirus policy.
-- A confirmed Windows Firewall rule making inbound TCP reach `SIO_RCVALL` —
-  that would be strictly better than a kernel driver, and the probe used to
-  measure this is easy to rebuild.
-- A PktMon revision exposing a documented single-tap capture mode at the IP
-  layer. As of Windows 11 26200, no such mode exists.
+- **Npcap becoming unavailable or unacceptable**: dropped from distribution,
+  broken by a Windows release, or classified as unwanted software by mainstream
+  antivirus the way WinDivert is.
+- **A confirmed Windows Firewall rule making inbound TCP reach `SIO_RCVALL`.**
+  That would be strictly better on install footprint than any driver, and the
+  probe used to measure it is easy to rebuild.
+- **A PktMon revision exposing a documented single-tap capture mode at the IP
+  layer.** As of Windows 11 26200, no such mode exists.
+- **Evidence that the per-adapter fan-out does not scale** on a machine with many
+  virtual adapters. Opening all of them buys the removal of every adapter
+  heuristic; if it ever costs more than that, adapter selection comes back, not a
+  different backend.
 
-Anything else is re-treading this note.
+Reopening it because Npcap "needs an install" is not a new argument. That is the
+trade-off, stated above, deliberately.
