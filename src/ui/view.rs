@@ -108,7 +108,7 @@ pub(super) fn view_state(controller: &Controller) -> ViewState {
         status_hint,
         status_kind: controller.status(),
         progress: controller.progress(),
-        limits: controller.limits().clone(),
+        limits: *controller.limits(),
         crystal_balance: controller.refresh_meta().map(|meta| meta.crystal_balance),
         gold_balance: controller.gold_balance(),
         has_snapshot: snapshot.is_some(),
@@ -164,7 +164,7 @@ mod tests {
                 ..ShopItem::default()
             },
         ];
-        ctrl.handle(Event::Snapshot {
+        let _ = ctrl.handle(Event::Snapshot {
             snapshot: shop(slots),
             now_ms: 0,
         });
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn view_state_flags_checklist_rows_as_wanted() {
         let mut ctrl = controller();
-        ctrl.handle(Event::Start { now_ms: 0 });
+        let _ = ctrl.handle(Event::Start { now_ms: 0 });
         // Default filter matches both; only the trackable id enters the
         // checklist — the id-0 sentinel row must never read as wanted.
         let slots = vec![
@@ -189,7 +189,7 @@ mod tests {
                 ..ShopItem::default()
             },
         ];
-        ctrl.handle(Event::Snapshot {
+        let _ = ctrl.handle(Event::Snapshot {
             snapshot: shop(slots),
             now_ms: 1,
         });
@@ -208,7 +208,7 @@ mod tests {
             }),
             ..ShopItem::default()
         }];
-        ctrl.handle(Event::Snapshot {
+        let _ = ctrl.handle(Event::Snapshot {
             snapshot: shop(slots),
             now_ms: 0,
         });
@@ -226,7 +226,7 @@ mod tests {
                 cost: 3,
             }),
         };
-        ctrl.handle(Event::Snapshot {
+        let _ = ctrl.handle(Event::Snapshot {
             snapshot,
             now_ms: 0,
         });
@@ -239,7 +239,7 @@ mod tests {
         // The controller keeps its enforced estimate across snapshots that
         // omit meta; the display must show that, not the raw snapshot.
         let mut ctrl = controller();
-        ctrl.handle(Event::Snapshot {
+        let _ = ctrl.handle(Event::Snapshot {
             snapshot: ShopSnapshot {
                 merchant: None,
                 slots: vec![ShopItem::default()],
@@ -250,7 +250,7 @@ mod tests {
             },
             now_ms: 0,
         });
-        ctrl.handle(Event::Snapshot {
+        let _ = ctrl.handle(Event::Snapshot {
             snapshot: shop(vec![ShopItem::default()]),
             now_ms: 1,
         });
@@ -262,7 +262,7 @@ mod tests {
         // `Start` discards a stale balance; the display must not resurrect it
         // from the stored snapshot.
         let mut ctrl = controller();
-        ctrl.handle(Event::Snapshot {
+        let _ = ctrl.handle(Event::Snapshot {
             snapshot: ShopSnapshot {
                 merchant: None,
                 slots: vec![ShopItem::default()],
@@ -273,7 +273,7 @@ mod tests {
             },
             now_ms: 0,
         });
-        ctrl.handle(Event::Start { now_ms: 1 });
+        let _ = ctrl.handle(Event::Start { now_ms: 1 });
         assert_eq!(view_state(&ctrl).crystal_balance, None);
     }
 
@@ -281,7 +281,7 @@ mod tests {
     fn view_state_surfaces_gold_balance_from_a_purchase() {
         let mut ctrl = controller();
         assert_eq!(view_state(&ctrl).gold_balance, None);
-        ctrl.handle(Event::Purchase {
+        let _ = ctrl.handle(Event::Purchase {
             item: 42,
             gold: Some(1_204_000),
             now_ms: 0,
@@ -292,8 +292,8 @@ mod tests {
     #[test]
     fn view_state_reports_stop_reason_when_stopped() {
         let mut ctrl = controller();
-        ctrl.handle(Event::Start { now_ms: 0 });
-        ctrl.handle(Event::Stop);
+        let _ = ctrl.handle(Event::Start { now_ms: 0 });
+        let _ = ctrl.handle(Event::Stop);
         let view = view_state(&ctrl);
         assert_eq!(view.status_word, "Stopped");
         assert_eq!(view.status_kind, Status::Stopped(StopReason::PlayerStopped));
@@ -312,7 +312,7 @@ mod tests {
             ..ShopItem::default()
         };
         let expected = format_item(&item, 0);
-        ctrl.handle(Event::Snapshot {
+        let _ = ctrl.handle(Event::Snapshot {
             snapshot: shop(vec![item]),
             now_ms: 0,
         });
@@ -327,7 +327,7 @@ mod tests {
         // absent snapshot) must read empty, not panic.
         let mut ctrl = controller();
         assert_eq!(slot_detail(&ctrl, 0), "");
-        ctrl.handle(Event::Snapshot {
+        let _ = ctrl.handle(Event::Snapshot {
             snapshot: shop(vec![ShopItem::default()]),
             now_ms: 0,
         });

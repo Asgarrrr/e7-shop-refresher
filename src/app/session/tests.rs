@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::actuator::SnapshotEpoch;
-use crate::domain::control::{Limits, StopReason};
+use crate::domain::control::{Limits, StopReason, past_rung};
 use crate::domain::filter::Filter;
 use crate::domain::shop::{ItemKind, PurchaseLimit, ShopItem, ShopSnapshot};
 
@@ -172,7 +172,7 @@ async fn actuator_failure_latch_halts_with_the_clicker_label() {
     let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
     let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
     let (_error_tx, error_rx) = mpsc::channel::<String>(1);
-    gate.request_halt(crate::watch::HaltSource::ActuatorFailed);
+    gate.request_halt(HaltSource::ActuatorFailed);
     drop(message_tx);
     session_loop(
         &controller,
@@ -186,7 +186,7 @@ async fn actuator_failure_latch_halts_with_the_clicker_label() {
     )
     .await;
 
-    let lines = journal.entries();
+    let lines = journal.to_entries();
     assert!(
         lines
             .iter()
@@ -221,7 +221,7 @@ async fn saturated_command_queue_cannot_drop_an_actuator_halt() {
         .expect("fill the bounded command queue");
     let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
     let (_error_tx, error_rx) = mpsc::channel::<String>(1);
-    gate.request_halt(crate::watch::HaltSource::ActuatorFailed);
+    gate.request_halt(HaltSource::ActuatorFailed);
     assert!(!gate.is_enabled(), "the safety cutoff is synchronous");
     drop(message_tx);
 
@@ -244,7 +244,7 @@ async fn saturated_command_queue_cannot_drop_an_actuator_halt() {
     assert!(!gate.is_enabled());
     assert!(
         journal
-            .entries()
+            .to_entries()
             .iter()
             .any(|line| { line.text.contains("clicker failed") })
     );
@@ -260,7 +260,7 @@ fn queued_start_cannot_rearm_before_pending_halt_is_applied() {
     ));
     let (command_tx, mut command_rx) = mpsc::channel::<Command>(1);
     command_tx.try_send(Command::Start).unwrap();
-    gate.request_halt(crate::watch::HaltSource::ActuatorFailed);
+    gate.request_halt(HaltSource::ActuatorFailed);
 
     let queued = command_rx.try_recv().expect("queued Start");
     handle_command(&controller, &gate, &off(), queued, 0);
@@ -302,7 +302,7 @@ async fn uplink_outage_and_recovery_reach_the_journal() {
     )
     .await;
 
-    let entries = journal.entries();
+    let entries = journal.to_entries();
     assert!(
         entries
             .iter()
@@ -351,7 +351,7 @@ async fn fatal_failure_reaches_journal_gate_and_caller() {
     assert_eq!(failure.as_deref(), Some("uplink task panicked"));
     assert!(
         journal
-            .entries()
+            .to_entries()
             .iter()
             .any(|line| line.text.contains("session aborted") && line.text.contains("uplink"))
     );
@@ -384,7 +384,7 @@ async fn session_loop_exit_leaves_never_armed_controller_idle() {
     assert_eq!(controller.lock().unwrap().status(), Status::Idle);
     assert!(
         journal
-            .entries()
+            .to_entries()
             .iter()
             .all(|line| !line.text.contains("stopped"))
     );
@@ -544,13 +544,7 @@ fn set_limits_updates_controller() {
         max_refreshes: Some(5),
         ..Limits::default()
     };
-    let lines = handle_command(
-        &controller,
-        &gate,
-        &off(),
-        Command::SetLimits(limits.clone()),
-        0,
-    );
+    let lines = handle_command(&controller, &gate, &off(), Command::SetLimits(limits), 0);
     assert!(lines.iter().any(|line| line.contains("limits updated")));
     assert_eq!(controller.lock().unwrap().limits(), &limits);
 }
@@ -587,7 +581,7 @@ fn journal_receives_command_lines() {
         Limits::default(),
     ));
     on_command(&controller, &gate, &journal, &off(), Command::Start, 1_000);
-    let entries = journal.entries();
+    let entries = journal.to_entries();
     assert!(entries.iter().any(|line| line.text.contains("watching")));
 }
 
@@ -916,7 +910,7 @@ fn shop_jobs_carry_open_then_refresh_pre_waits_and_epochs() {
     assert_eq!(second.epoch, plan::Epoch(2));
     assert!(
         journal
-            .entries()
+            .to_entries()
             .iter()
             .any(|line| line.text.contains("refresh clicked"))
     );
@@ -988,7 +982,7 @@ fn buy_job_clicks_only_trackable_targets() {
     let job = jobs.try_recv().expect("buy job");
     // Scroll-to-top + one buy/confirm pair — nothing for the id-0 slot.
     assert_eq!(job.steps.len(), 3);
-    let entries = journal.entries();
+    let entries = journal.to_entries();
     assert!(
         entries
             .iter()
@@ -1017,7 +1011,7 @@ fn off_actuator_keeps_advice_and_submits_nothing() {
     );
     assert!(
         journal
-            .entries()
+            .to_entries()
             .iter()
             .any(|line| line.text.contains("refresh the shop now"))
     );
@@ -1048,7 +1042,7 @@ fn dry_run_wording_marks_planned_actions() {
         ServerMessage::Shop(hit),
         2,
     );
-    let entries = journal.entries();
+    let entries = journal.to_entries();
     assert!(
         entries
             .iter()
@@ -1102,7 +1096,7 @@ fn dead_stock_match_keeps_refreshing_without_clicks() {
     let job = jobs.try_recv().expect("refresh job");
     assert_eq!(job.steps.len(), 2); // refresh + confirm — no buy clicks
     assert!(jobs.try_recv().is_err());
-    let entries = journal.entries();
+    let entries = journal.to_entries();
     assert!(entries.iter().any(|line| line.text.contains("MATCH")));
     assert!(!entries.iter().any(|line| line.text.contains("buying slot")));
 }
@@ -1132,7 +1126,7 @@ fn full_job_queue_journals_the_drop() {
     );
     assert!(
         journal
-            .entries()
+            .to_entries()
             .iter()
             .any(|line| line.text.contains("queue full"))
     );
@@ -1160,7 +1154,7 @@ fn a_gone_executor_is_journaled_as_gone_not_as_a_full_queue() {
         ServerMessage::Shop(dud_shop(10)),
         1,
     );
-    let lines = journal.entries();
+    let lines = journal.to_entries();
     assert!(
         lines
             .iter()
@@ -1204,13 +1198,15 @@ fn watchdog_confirm_retry_submits_one_click_at_current_epoch() {
         &gate,
         &journal,
         &actuator,
-        Event::Tick { now_ms: 10_001 },
-        10_001,
+        Event::Tick {
+            now_ms: past_rung(1),
+        },
+        past_rung(1),
     );
     let retry = jobs.try_recv().expect("confirm retry job");
     assert_eq!(retry.steps.len(), 1);
     assert_eq!(retry.epoch, plan::Epoch(1));
-    assert!(journal.entries().iter().any(|line| {
+    assert!(journal.to_entries().iter().any(|line| {
         line.text
             .contains("no shop after refresh — re-clicking confirm")
     }));
@@ -1236,8 +1232,10 @@ fn watchdog_refresh_reissue_uses_recovery_pre_wait() {
         &gate,
         &journal,
         &actuator,
-        Event::Tick { now_ms: 10_001 },
-        10_001,
+        Event::Tick {
+            now_ms: past_rung(1),
+        },
+        past_rung(1),
     );
     jobs.try_recv().expect("confirm retry job");
     dispatch(
@@ -1245,8 +1243,10 @@ fn watchdog_refresh_reissue_uses_recovery_pre_wait() {
         &gate,
         &journal,
         &actuator,
-        Event::Tick { now_ms: 20_001 },
-        20_001,
+        Event::Tick {
+            now_ms: past_rung(2),
+        },
+        past_rung(2),
     );
     let reissue = jobs.try_recv().expect("re-issued refresh job");
     // Full refresh sequence, but into an idle game: dispatch margin only.
@@ -1255,7 +1255,7 @@ fn watchdog_refresh_reissue_uses_recovery_pre_wait() {
     assert_eq!(reissue.epoch, plan::Epoch(1));
     assert!(
         journal
-            .entries()
+            .to_entries()
             .iter()
             .any(|line| line.text.contains("re-issuing the refresh"))
     );
@@ -1325,7 +1325,7 @@ fn watchdog_buy_reissue_clicks_only_outstanding_rows() {
     assert_eq!(reissue.steps.len(), 3);
     // Only the lines after the re-issue marker: the initial buy job
     // legitimately clicked both slots.
-    let entries = journal.entries();
+    let entries = journal.to_entries();
     let reissued_at = entries
         .iter()
         .position(|line| line.text.contains("re-issuing buys"))
@@ -1373,8 +1373,10 @@ fn watchdog_buy_reissue_without_clickable_rows_journals_the_gap() {
         &gate,
         &journal,
         &actuator,
-        Event::Tick { now_ms: 10_001 },
-        10_001,
+        Event::Tick {
+            now_ms: past_rung(1),
+        },
+        past_rung(1),
     );
     jobs.try_recv().expect("confirm retry job");
     // The re-issue rung finds nothing clickable: no job, but the journal
@@ -1384,11 +1386,13 @@ fn watchdog_buy_reissue_without_clickable_rows_journals_the_gap() {
         &gate,
         &journal,
         &actuator,
-        Event::Tick { now_ms: 20_001 },
-        20_001,
+        Event::Tick {
+            now_ms: past_rung(2),
+        },
+        past_rung(2),
     );
     assert!(jobs.try_recv().is_err(), "no job for row-less targets");
-    let entries = journal.entries();
+    let entries = journal.to_entries();
     assert!(
         entries
             .iter()
@@ -1414,7 +1418,7 @@ fn unresponsive_halt_reaches_the_journal() {
         ServerMessage::Shop(dud_shop(10)),
         1,
     );
-    for now in [10_001, 20_001, 30_001] {
+    for now in [past_rung(1), past_rung(2), past_rung(3)] {
         dispatch(
             &controller,
             &gate,
@@ -1431,7 +1435,7 @@ fn unresponsive_halt_reaches_the_journal() {
     assert!(!gate.is_enabled());
     assert!(
         journal
-            .entries()
+            .to_entries()
             .iter()
             .any(|line| line.text.contains("no response from the game"))
     );

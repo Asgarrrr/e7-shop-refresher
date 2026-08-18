@@ -122,12 +122,12 @@ async fn run_with_connector<C, S>(
     // The player only hears transitions: the first failure reports the outage,
     // each retry stays a tracing detail, recovery reports once.
     let mut outage_reported = false;
-    // `url` is never a log field. It is `Config::server_url` verbatim, and
-    // `Config::validate` accepts any `wss://` URL without inspecting userinfo
-    // or query — either can carry a credential, and the log file is what the
-    // README asks the player to send us, under an explicit promise that it
-    // contains neither. The redacted form is written once at startup by
-    // `app::redacted_server_url`; there is exactly one server per process, so
+    // `url` is never a log field. It is `Config::server_url`'s dial string
+    // verbatim, userinfo and query intact — either can carry a credential, and
+    // the log file is what the README asks the player to send us, under an
+    // explicit promise that it contains neither. The redacted form is written
+    // once at startup, from `config::ServerUrl::redacted`, the only spelling of
+    // this URL that may be logged; there is exactly one server per process, so
     // these lines only need to say *which attempt*, which is also what makes
     // the 1st reconnect legible from the 40th.
     let mut attempt: u64 = 0;
@@ -320,7 +320,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::*;
-    use crate::stream::PipelineBudget;
+    use crate::stream::{BudgetLimits, PipelineBudget};
 
     fn chunk(bytes: Vec<u8>) -> BudgetedChunk {
         PipelineBudget::new().admit_outbound_for_test(bytes)
@@ -567,7 +567,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_inbound_message_lands_while_the_send_half_is_stalled() {
-        let budget = PipelineBudget::with_test_limits(64, 64, 64, 64);
+        let budget = PipelineBudget::with_test_limits(BudgetLimits {
+            global: 64,
+            capture: 64,
+            reassembly: 64,
+            outbound: 64,
+        });
         let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(4);
         let (event_tx, mut event_rx) = mpsc::channel::<UplinkEvent>(4);
         raw_tx
@@ -622,7 +627,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn backoff_drain_releases_all_outbound_bytes() {
-        let budget = PipelineBudget::with_test_limits(128, 128, 128, 128);
+        let budget = PipelineBudget::with_test_limits(BudgetLimits {
+            global: 128,
+            capture: 128,
+            reassembly: 128,
+            outbound: 128,
+        });
         let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(4);
         raw_tx
             .send(budget.admit_outbound_for_test(vec![1, 2, 3]))
@@ -742,7 +752,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stalled_send_releases_outbound_bytes_after_timeout() {
-        let budget = PipelineBudget::with_test_limits(64, 64, 64, 64);
+        let budget = PipelineBudget::with_test_limits(BudgetLimits {
+            global: 64,
+            capture: 64,
+            reassembly: 64,
+            outbound: 64,
+        });
         let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(4);
         let (event_tx, _event_rx) = mpsc::channel::<UplinkEvent>(4);
         raw_tx

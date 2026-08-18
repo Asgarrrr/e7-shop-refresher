@@ -112,9 +112,9 @@ impl ShopApp {
         // retune).
         let editor = {
             let ctrl = lock_ignoring_poison(&handles.controller);
-            EditorState::new(ctrl.filter().clone(), ctrl.limits().clone(), timings)
+            EditorState::new(ctrl.filter().clone(), *ctrl.limits(), timings)
         };
-        let journal_cache = handles.journal.entries();
+        let journal_cache = handles.journal.to_entries();
         let journal_generation = handles.journal.generation();
         Self {
             handles,
@@ -141,7 +141,7 @@ impl eframe::App for ShopApp {
         };
         let generation = self.handles.journal.generation();
         if generation != self.journal_generation {
-            self.journal_cache = self.handles.journal.entries();
+            self.journal_cache = self.handles.journal.to_entries();
             self.journal_generation = generation;
         }
         let outcome = lock_ignoring_poison(&self.error).clone();
@@ -259,9 +259,10 @@ impl eframe::App for ShopApp {
                 sections = %labels,
                 "config.toml not saved"
             );
-            self.handles
-                .journal
-                .push(&[format!("config.toml not saved ({labels}): {err}")]);
+            self.handles.journal.push(&[format!(
+                "config.toml not saved ({labels}): {}",
+                err.report()
+            )]);
         }
     }
 }
@@ -346,7 +347,7 @@ fn persisted_sections(commands: &[Command]) -> Vec<config::persist::Section> {
         .iter()
         .filter_map(|command| match command {
             Command::SetFilter(filter) => Some(config::persist::Section::Filter(filter.clone())),
-            Command::SetLimits(limits) => Some(config::persist::Section::Limits(limits.clone())),
+            Command::SetLimits(limits) => Some(config::persist::Section::Limits(*limits)),
             Command::SetTimings(timings) => Some(config::persist::Section::Timings(*timings)),
             Command::Start | Command::Stop | Command::Toggle => None,
         })
@@ -471,7 +472,7 @@ mod tests {
 
     fn captured_view() -> ViewState {
         let mut controller = Controller::new(Filter::default(), Limits::default());
-        controller.handle(Event::Snapshot {
+        let _ = controller.handle(Event::Snapshot {
             snapshot: ShopSnapshot {
                 merchant: None,
                 slots: vec![ShopItem::default()],
@@ -484,15 +485,12 @@ mod tests {
 
     #[test]
     fn only_setup_commands_become_persisted_sections() {
-        let commands = vec![
-            Command::Start,
-            Command::SetLimits(crate::domain::control::Limits::default()),
-        ];
+        let commands = vec![Command::Start, Command::SetLimits(Limits::default())];
         let sections = persisted_sections(&commands);
         // Start is not persisted; the limits edit is.
         assert_eq!(
             sections,
-            vec![crate::config::persist::Section::Limits(Limits::default())]
+            vec![config::persist::Section::Limits(Limits::default())]
         );
         // …and the failure report names it by its Setup section title.
         assert_eq!(section_labels(&sections), "Stop");
@@ -527,10 +525,7 @@ mod tests {
         assert!(deliver_command(&handles, Command::Stop));
 
         assert!(!handles.gate.is_enabled());
-        assert_eq!(
-            handles.gate.halt_requested().await,
-            HaltSource::PlayerStopped
-        );
+        assert_eq!(handles.gate.next_halt().await, HaltSource::PlayerStopped);
     }
 
     #[test]
@@ -539,11 +534,11 @@ mod tests {
         // saturated queue refuses must reach the player, not vanish.
         let (_session, handles) = session_handles();
         fill_command_queue(&handles);
-        let before = handles.journal.entries().len();
+        let before = handles.journal.to_entries().len();
 
         assert!(!deliver_command(&handles, Command::Start));
 
-        let entries = handles.journal.entries();
+        let entries = handles.journal.to_entries();
         assert_eq!(entries.len(), before + 1);
         let line = &entries.last().expect("a journaled line").text;
         assert!(line.contains("command dropped"), "unexpected line: {line}");
@@ -642,7 +637,7 @@ mod tests {
         // A tolerated degraded shop message (slots dropped by lenient
         // decoding) counts as captured: mid-session onboarding would lie.
         let mut controller = Controller::new(Filter::default(), Limits::default());
-        controller.handle(Event::Snapshot {
+        let _ = controller.handle(Event::Snapshot {
             snapshot: ShopSnapshot {
                 merchant: None,
                 slots: vec![],

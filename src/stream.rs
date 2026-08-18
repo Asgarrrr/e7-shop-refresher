@@ -62,12 +62,16 @@ enum Stage {
     Outbound,
 }
 
+/// Per-stage byte quotas. `pub(crate)` only so the test-only
+/// `PipelineBudget::with_test_limits` can be *named* by the two sibling test
+/// suites that override the production constants; nothing outside this module
+/// can build a budget from it on a production path.
 #[derive(Clone, Copy)]
-struct BudgetLimits {
-    global: usize,
-    capture: usize,
-    reassembly: usize,
-    outbound: usize,
+pub(crate) struct BudgetLimits {
+    pub(crate) global: usize,
+    pub(crate) capture: usize,
+    pub(crate) reassembly: usize,
+    pub(crate) outbound: usize,
 }
 
 #[derive(Default)]
@@ -136,19 +140,15 @@ impl PipelineBudget {
         }))
     }
 
+    /// Test-only escape from the production constants.
+    ///
+    /// Takes the named struct rather than four positional `usize`s: these are
+    /// the seams that pin the byte-budget guarantees, and four same-typed
+    /// arguments in a row mean a silently swapped pair reads as a passing test
+    /// of a budget nobody meant to describe.
     #[cfg(test)]
-    pub(crate) fn with_test_limits(
-        global: usize,
-        capture: usize,
-        reassembly: usize,
-        outbound: usize,
-    ) -> Self {
-        Self::with_limits(BudgetLimits {
-            global,
-            capture,
-            reassembly,
-            outbound,
-        })
+    pub(crate) fn with_test_limits(limits: BudgetLimits) -> Self {
+        Self::with_limits(limits)
     }
 
     /// Reserves capture-stage bytes for `segment`'s payload and takes ownership

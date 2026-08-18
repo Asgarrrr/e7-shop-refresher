@@ -301,7 +301,7 @@ pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
     let gate = WatchGate::new(false);
     let journal = EventLog::default();
     let (command_tx, command_rx) = mpsc::channel::<Command>(COMMAND_QUEUE);
-    let mut controller = Controller::new(config.filter.clone(), config.limits.clone());
+    let mut controller = Controller::new(config.filter.clone(), config.limits);
     if actuator_mode(&config) == Mode::Live {
         // Only real clicking gets watchdog deadlines: Off is player-paced
         // advice and DryRun never produces wire feedback — a deadline would
@@ -333,17 +333,6 @@ pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
         shutdown: shutdown.clone(),
     };
     (session, handles, shutdown)
-}
-
-/// The URL reduced to `scheme://host[:port]` — neither userinfo nor query,
-/// which can carry a credential and must never reach a log the player is
-/// asked to send us. `Config::validate` accepts any `wss://` URL without
-/// inspecting either, so the redaction lives here rather than at parse time.
-fn redacted_server_url(url: &str) -> String {
-    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    format!("{scheme}://{host}")
 }
 
 /// Live clicking unless the config asks for a dry run.
@@ -445,7 +434,11 @@ impl Session {
             "uplink",
             &fatal_tx,
             crate::uplink::run(
-                config.server_url.clone(),
+                // The dial string, taken out of the proof deliberately:
+                // `uplink::run` still takes a `String`. Widening it to
+                // `ServerUrl` is `obs-001`'s remaining half, which wants the
+                // redacted form in there too.
+                config.server_url.as_str().to_owned(),
                 raw_rx,
                 message_tx,
                 config.reconnect_initial(),
@@ -509,7 +502,9 @@ impl Session {
         drop(fatal_tx);
 
         info!(
-            server = %redacted_server_url(&config.server_url),
+            // Spelled out rather than left to `Display` (which redacts too), so
+            // an auditor reading log sites sees the redaction at the site.
+            server = config.server_url.redacted(),
             "relay started — idle, `start` arms the watch"
         );
         print_controls();
@@ -752,7 +747,7 @@ pub async fn supervise(
             "session ended — restart the app to reconnect".to_owned(),
             false,
         ),
-        Some(Ok(Err(err))) => (format!("session error: {err}"), true),
+        Some(Ok(Err(err))) => (format!("session error: {}", err.report()), true),
         Some(Err(panic)) => (format!("session crashed: {panic}"), true),
         // Unreachable: the set holds exactly the task spawned above. Reported as
         // a failure rather than panicked on — this is the function whose whole
@@ -1327,6 +1322,7 @@ mod tests {
     use super::*;
     use crate::capture::FlowKey;
     use crate::domain::control::Status;
+    use crate::stream::BudgetLimits;
 
     fn initial_anchor_segment(seq: u32, payload: &[u8]) -> Segment {
         initial_anchor_segment_in(
@@ -1355,7 +1351,7 @@ mod tests {
     }
 
     impl PacketSource for EnableOnFirstSegment {
-        fn next_segment(&mut self) -> crate::Result<Segment> {
+        fn next_segment(&mut self) -> Result<Segment> {
             if let Some(segment) = self.segment.take() {
                 self.gate.set(true);
                 return Ok(segment);
@@ -1373,7 +1369,7 @@ mod tests {
     }
 
     impl PacketSource for LosingSource {
-        fn next_segment(&mut self) -> crate::Result<Segment> {
+        fn next_segment(&mut self) -> Result<Segment> {
             self.segment
                 .take()
                 .ok_or_else(|| crate::Error::Capture("characterization complete".to_owned()))
@@ -1399,7 +1395,7 @@ mod tests {
     }
 
     impl PacketSource for BlockingSource {
-        fn next_segment(&mut self) -> crate::Result<Segment> {
+        fn next_segment(&mut self) -> Result<Segment> {
             let (lock, wake) = &*self.state;
             let mut state = lock.lock().expect("blocking capture mutex poisoned");
             state.entered = true;
@@ -1421,7 +1417,7 @@ mod tests {
     }
 
     impl CaptureStop for BlockingStop {
-        fn stop(&mut self) -> crate::Result<()> {
+        fn stop(&mut self) -> Result<()> {
             let (lock, wake) = &*self.state;
             let mut state = lock.lock().expect("blocking capture mutex poisoned");
             state.stopped = true;
@@ -1433,7 +1429,7 @@ mod tests {
     struct NoopStop;
 
     impl CaptureStop for NoopStop {
-        fn stop(&mut self) -> crate::Result<()> {
+        fn stop(&mut self) -> Result<()> {
             Ok(())
         }
     }
@@ -1441,7 +1437,7 @@ mod tests {
     struct ImmediateErrorSource(&'static str);
 
     impl PacketSource for ImmediateErrorSource {
-        fn next_segment(&mut self) -> crate::Result<Segment> {
+        fn next_segment(&mut self) -> Result<Segment> {
             Err(crate::Error::Capture(self.0.to_owned()))
         }
     }
@@ -1526,7 +1522,12 @@ mod tests {
 
     #[test]
     fn capture_pressure_counts_bytes_and_queues_one_resync() {
-        let budget = PipelineBudget::with_test_limits(8, 8, 8, 8);
+        let budget = PipelineBudget::with_test_limits(BudgetLimits {
+            global: 8,
+            capture: 8,
+            reassembly: 8,
+            outbound: 8,
+        });
         let pressure = PressureResync::default();
         let (tx, mut rx) = mpsc::channel(512);
         for _ in 0..512 {
@@ -1558,7 +1559,12 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_outbound_never_exceeds_pipeline_budget() {
-        let budget = PipelineBudget::with_test_limits(128, 128, 128, 64);
+        let budget = PipelineBudget::with_test_limits(BudgetLimits {
+            global: 128,
+            capture: 128,
+            reassembly: 128,
+            outbound: 64,
+        });
         let mut reassembler = Reassembler::new();
         let mut chunks = match reassembler.push_budgeted(
             budget
@@ -1604,7 +1610,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn steady_pending_pressure_rearms_the_initial_anchor_window() {
-        let budget = PipelineBudget::with_test_limits(256, 256, 8, 256);
+        let budget = PipelineBudget::with_test_limits(BudgetLimits {
+            global: 256,
+            capture: 256,
+            reassembly: 8,
+            outbound: 256,
+        });
         let (event_tx, event_rx) = mpsc::channel(8);
         let (raw_tx, mut raw_rx) = mpsc::channel(8);
         let task = tokio::spawn(reassemble_loop_with_pressure(
@@ -2350,7 +2361,7 @@ mod tests {
         let (_session, handles, _shutdown) = setup(Config::default());
         assert_eq!(handles.controller.lock().unwrap().status(), Status::Idle);
         assert!(!handles.gate.is_enabled());
-        assert!(handles.journal.entries().is_empty());
+        assert!(handles.journal.to_entries().is_empty());
         // The command channel is wired before the fallible pipeline runs.
         handles
             .commands
@@ -2364,7 +2375,7 @@ mod tests {
     #[test]
     fn setup_enables_recovery_only_when_live() {
         let (_session, handles, _shutdown) = setup(Config::default());
-        assert!(!handles.controller.lock().unwrap().recovery_enabled());
+        assert!(!handles.controller.lock().unwrap().is_recovery_enabled());
     }
 
     /// Live clicking arms the watchdog; a dry run produces no wire feedback
@@ -2373,15 +2384,15 @@ mod tests {
     #[test]
     fn setup_enables_recovery_only_when_live() {
         let (_session, handles, _shutdown) = setup(Config::default());
-        assert!(handles.controller.lock().unwrap().recovery_enabled());
+        assert!(handles.controller.lock().unwrap().is_recovery_enabled());
 
         let mut config = Config::default();
         config.actuator.dry_run = true;
         let (_session, handles, _shutdown) = setup(config);
-        assert!(!handles.controller.lock().unwrap().recovery_enabled());
+        assert!(!handles.controller.lock().unwrap().is_recovery_enabled());
     }
 
-    async fn panicking_session() -> crate::Result<()> {
+    async fn panicking_session() -> Result<()> {
         panic!("boom")
     }
 
@@ -2431,25 +2442,9 @@ mod tests {
         assert!(outcome.contains("session ended"));
     }
 
-    /// A logged URL is a URL the player is asked to send us: userinfo and
-    /// query string must never survive it.
-    #[test]
-    fn redacted_server_url_keeps_only_scheme_and_host() {
-        assert_eq!(
-            redacted_server_url("wss://ingest.arkyve.dev/refresh-shop"),
-            "wss://ingest.arkyve.dev"
-        );
-        assert_eq!(
-            redacted_server_url("wss://token:secret@ingest.arkyve.dev:8443/path?key=abc"),
-            "wss://ingest.arkyve.dev:8443"
-        );
-        assert_eq!(
-            redacted_server_url("ws://127.0.0.1:9000/?key=abc#frag"),
-            "ws://127.0.0.1:9000"
-        );
-        // Not a URL at all: nothing to leak, nothing to invent.
-        assert_eq!(redacted_server_url("garbage"), "://garbage");
-    }
+    // The redaction this module used to own now lives in `config::ServerUrl`,
+    // with the userinfo-bypass tests it always had; the duplicate here (and its
+    // `redacted_server_url_keeps_only_scheme_and_host` test) is gone.
 
     #[test]
     fn parse_command_maps_aliases() {

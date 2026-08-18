@@ -257,8 +257,8 @@ mod tests {
 
         let mut armed = Controller::new(Filter::matching_default_items(), Limits::default());
         assert_eq!(status_summary(&armed), ("Idle", Some("ready to start")));
-        armed.handle(Event::Start { now_ms: 0 });
-        armed.handle(Event::Stop);
+        let _ = armed.handle(Event::Start { now_ms: 0 });
+        let _ = armed.handle(Event::Stop);
         // Stopped: the clause is the reason, not a redundant "(Start re-arms)".
         assert_eq!(status_summary(&armed), ("Stopped", Some("player stopped")));
     }
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(status_label(&ctrl), "Idle — define a filter first");
 
         let mut armed = Controller::new(Filter::matching_default_items(), Limits::default());
-        armed.handle(Event::Start { now_ms: 0 });
+        let _ = armed.handle(Event::Start { now_ms: 0 });
         assert_eq!(status_label(&armed), "Watching");
     }
 }

@@ -1,14 +1,24 @@
 //! Unified error type for the relay.
 //!
-//! **The convention in this file: `Display` carries everything.** Every message
-//! is self-contained — the variants that also expose a cause through
-//! `#[source]`/`#[from]` interpolate it into their own text as well, so a bare
-//! `{err}` at a report site never loses the reason. That is deliberate and it is
-//! what the two report sites rely on (`fatal` in `src/main.rs`, `app::supervise`),
-//! neither of which walks `source()`. A new variant that carries a `#[source]`
-//! must therefore interpolate it too, or its cause disappears everywhere at once.
-//! `#[source]` stays on top of that for programmatic inspection (`matches!` on the
-//! chain, and a future `{err:#}` reporter).
+//! **The convention in this file: `Display` is this error's own layer, and the
+//! cause is reached through [`std::error::Error::source`].** No message
+//! interpolates its own `#[source]`, so nothing double-prints, and
+//! [`Error::report`] — the one spelling a report site should use — walks the
+//! chain and joins it.
+//!
+//! It used to be the other way round: each message inlined its cause so that a
+//! bare `{err}` never lost it. That worked only as long as every author
+//! remembered, and it made `#[source]` decorative — a variant added with a
+//! `#[source]` and no interpolation would lose its cause everywhere at once,
+//! silently, which is precisely the trap the convention was meant to close. With
+//! the reporter doing the walking, a new `#[source]` variant is correct by
+//! default and `Error::ConfigRead`'s path finally pays off in the crash log too.
+//!
+//! Every player-facing report site therefore says `err.report()`, not `{err}`:
+//! `main`'s two `fatal`/`eprintln!` arms, `app::supervise`, `ui::App`'s
+//! "config.toml not saved" journal line, and `RetiredKeys::NotRewritten`. A
+//! `tracing` field spelled `error = ?err` is unaffected — `Debug` on a
+//! `thiserror` enum prints the nested source structurally.
 //!
 //! The two TOML payloads are boxed: `toml::de::Error` and `toml_edit::TomlError`
 //! are 88 bytes each and can only ever be built once, at startup, while `Error`
@@ -28,7 +38,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Every way the relay can fail, from the config loader to the capture backend.
 ///
-/// See the module header for the `Display`-carries-everything convention.
+/// See the module header: `Display` is one layer, [`Error::report`] is the chain.
 #[derive(Debug, Error)]
 pub enum Error {
     /// A value parsed fine but breaks an invariant `Config::validate` enforces.
@@ -38,7 +48,7 @@ pub enum Error {
     /// `config.toml` is not valid TOML, or does not match `Config`'s shape
     /// (unknown key, wrong type, out-of-range integer). Boxed: see the module
     /// header.
-    #[error("configuration parse: {0}")]
+    #[error("config.toml is not valid")]
     ConfigParse(#[source] Box<toml::de::Error>),
 
     /// The config file exists but could not be read (locked, permission
@@ -46,7 +56,7 @@ pub enum Error {
     /// defaults — so this never covers `NotFound`. The path is carried because
     /// the file lives out of the way in `%APPDATA%`: a bare
     /// "Access is denied. (os error 5)" would leave the player nothing to fix.
-    #[error("could not read {}: {source}", path.display())]
+    #[error("could not read {}", path.display())]
     ConfigRead {
         path: PathBuf,
         #[source]
@@ -58,7 +68,7 @@ pub enum Error {
     /// same reason as [`Error::ConfigRead`]: a read-only or antivirus-locked
     /// `config.toml` silently discards every Setup change, and the banner has
     /// to be able to name the file.
-    #[error("could not write {}: {source}", path.display())]
+    #[error("could not write {}", path.display())]
     ConfigWrite {
         path: PathBuf,
         #[source]
@@ -70,14 +80,14 @@ pub enum Error {
     /// as the source type rather than a `String`: `toml_edit::TomlError`
     /// carries the offending span, which is the whole point of reporting it.
     /// Boxed: see the module header.
-    #[error("config re-parse: {0}")]
+    #[error("config.toml could not be re-parsed to be edited")]
     ConfigReparse(#[source] Box<toml_edit::TomlError>),
 
     /// A managed section could not be serialized back to TOML. Distinct from
     /// [`Error::ConfigReparse`] on purpose — flattened to one string the two
     /// were indistinguishable in the banner, though only one of them is the
     /// player's fault.
-    #[error("config serialize: {0}")]
+    #[error("a config section could not be serialized")]
     ConfigSerialize(#[from] toml_edit::ser::Error),
 
     /// The capture backend refused or failed: names the Win32 call or the
@@ -89,12 +99,41 @@ pub enum Error {
     /// already names which one, so it renders as-is.
     #[error("{0}")]
     Fatal(String),
+}
 
-    /// A filesystem or OS call failed somewhere that carries no path of its own.
-    /// Prefer [`Error::ConfigRead`]/[`Error::ConfigWrite`] whenever a path is
-    /// known — this variant is the context-free fallback.
-    #[error("i/o: {0}")]
-    Io(#[from] std::io::Error),
+// There is deliberately no context-free `Io(#[from] std::io::Error)` variant above.
+// It had exactly one reachable producer — a blanket `?` on
+// `std::thread::Builder::spawn` in `app::spawn_capture_with_budget` — and that
+// site now says what it was doing (`Error::Capture("starting the capture thread:
+// …")`), because "i/o: The system cannot find the file specified." is a message no
+// player can act on. A `#[from] std::io::Error` is what makes that outcome the
+// *default* for every future `?`: it converts silently, at any depth, and the path
+// or call that failed is gone by the time anyone reads it.
+// `ConfigRead`/`ConfigWrite` carry a path; anything else should name its operation
+// the way `Capture` does. Re-adding this variant would re-open that door.
+
+impl Error {
+    /// This error and every cause behind it, joined with `": "` — the spelling
+    /// every player-facing report site uses instead of a bare `{err}`.
+    ///
+    /// Walks [`std::error::Error::source`], so it picks up the layer a variant's
+    /// own `Display` deliberately leaves out: `could not write
+    /// C:\Users\…\config.toml: Access is denied. (os error 5)` is the path (which
+    /// only this crate knows) followed by the reason (which only the OS knows).
+    /// A variant with no `#[source]` reports exactly its own message.
+    #[must_use]
+    pub fn report(&self) -> String {
+        let mut out = self.to_string();
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(self);
+        while let Some(err) = cause {
+            // Boxed payloads are already `Deref`ed by `source()`, so this reads
+            // the real `toml` error, not a `Box`'s (identical) rendering.
+            out.push_str(": ");
+            out.push_str(&err.to_string());
+            cause = err.source();
+        }
+        out
+    }
 }
 
 // Hand-written rather than `#[from]`: `#[from] Box<T>` would generate
@@ -127,3 +166,58 @@ const _: () = assert!(
     size_of::<Error>() <= 48,
     "Error is the E of every Result in the crate, including the capture loop's — box a large variant instead of growing it"
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_appends_the_cause_that_display_no_longer_inlines() {
+        let err = Error::ConfigWrite {
+            path: PathBuf::from("C:/Users/x/config.toml"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        // One layer each, and neither repeated: this is the whole point of
+        // dropping `{source}` from the message.
+        let displayed = err.to_string();
+        assert_eq!(displayed, "could not write C:/Users/x/config.toml");
+        let reported = err.report();
+        assert!(
+            reported.starts_with(&format!("{displayed}: ")),
+            "{reported}"
+        );
+        assert!(
+            reported
+                .contains(&std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string()),
+            "{reported}"
+        );
+    }
+
+    #[test]
+    fn report_of_a_sourceless_variant_is_just_its_message() {
+        let err = Error::Capture("no adapter".to_owned());
+        assert_eq!(err.report(), err.to_string());
+        assert_eq!(err.report(), "network capture: no adapter");
+    }
+
+    /// The trap the convention closes: a `#[source]` whose message does *not*
+    /// interpolate it is now the correct shape, not a silent loss.
+    #[test]
+    fn no_variants_display_repeats_its_own_source() {
+        let source = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let text = source.to_string();
+        for err in [
+            Error::ConfigRead {
+                path: PathBuf::from("p"),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+            Error::ConfigWrite {
+                path: PathBuf::from("p"),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+        ] {
+            assert!(!err.to_string().contains(&text), "{err}");
+            assert_eq!(err.report().matches(text.as_str()).count(), 1, "{err:?}");
+        }
+    }
+}

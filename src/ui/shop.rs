@@ -195,7 +195,7 @@ mod tests {
 
     fn captured(slots: Vec<ShopItem>) -> (Controller, ViewState) {
         let mut ctrl = Controller::new(Filter::default(), Limits::default());
-        ctrl.handle(Event::Snapshot {
+        let _ = ctrl.handle(Event::Snapshot {
             snapshot: ShopSnapshot {
                 merchant: None,
                 slots,

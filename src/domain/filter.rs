@@ -16,8 +16,8 @@ use crate::domain::shop::{ItemKind, ShopItem};
 const GRADE_MIN: u8 = 2;
 const GRADE_MAX: u8 = 4;
 
-/// Player criteria, all ANDed; an empty `Vec` or `None` field does not
-/// constrain, so a default `Filter` matches every available item.
+/// Player criteria, combined with a logical AND; an empty `Vec` or `None` field
+/// does not constrain, so a default `Filter` matches every available item.
 ///
 /// Missing data is handled asymmetrically on purpose: `max_price` is
 /// fail-closed (an unknown price never satisfies a cap), while sold-out is

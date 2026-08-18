@@ -458,10 +458,10 @@ mod tests {
         let gate = WatchGate::new(true);
         fail(&journal, &gate, "window gone");
         assert!(!gate.is_enabled());
-        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
         assert!(
             journal
-                .entries()
+                .to_entries()
                 .iter()
                 .any(|l| l.text.contains("window gone"))
         );
@@ -676,7 +676,7 @@ mod tests {
         run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         assert!(events.lock().unwrap().is_empty());
         // Dropped, but never silently: the submit side promised a click.
-        assert!(journal.entries().iter().any(|line| {
+        assert!(journal.to_entries().iter().any(|line| {
             line.text
                 .contains("the shop changed — dropped planned clicks")
         }));
@@ -700,7 +700,7 @@ mod tests {
         let journal = rig.journal.clone();
         run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         assert!(events.lock().unwrap().is_empty());
-        assert!(journal.entries().iter().any(|line| {
+        assert!(journal.to_entries().iter().any(|line| {
             line.text
                 .contains("the watch is off — dropped planned clicks")
         }));
@@ -731,7 +731,7 @@ mod tests {
         assert_eq!(*releases.lock().unwrap(), 1);
         assert!(
             journal
-                .entries()
+                .to_entries()
                 .iter()
                 .any(|line| line.text.contains("aborted remaining clicks"))
         );
@@ -758,7 +758,7 @@ mod tests {
         run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
         assert_eq!(events.lock().unwrap().len(), 1);
         assert_eq!(*releases.lock().unwrap(), 1);
-        assert!(journal.entries().iter().any(|line| {
+        assert!(journal.to_entries().iter().any(|line| {
             line.text
                 .contains("the shop changed — aborted remaining clicks")
         }));
@@ -793,9 +793,9 @@ mod tests {
         .expect("the executor must keep draining after a fatal acquire, then end on EOF");
         assert!(events.lock().unwrap().is_empty());
         assert!(!gate.is_enabled());
-        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
         assert_eq!(*releases.lock().unwrap(), 0, "acquire engaged nothing");
-        assert!(journal.entries().iter().any(|line| {
+        assert!(journal.to_entries().iter().any(|line| {
             line.text
                 .contains("actuator: game window not found — stopping the loop")
         }));
@@ -841,7 +841,7 @@ mod tests {
         assert!(events.lock().unwrap().is_empty(), "nothing may be clicked");
         assert!(!gate.is_enabled());
         let line = journal
-            .entries()
+            .to_entries()
             .into_iter()
             .find(|line| line.text.contains("stopping the loop"))
             .expect("the halt must be journaled");
@@ -892,9 +892,9 @@ mod tests {
         .expect("a fatal input must end the job, then the loop ends on EOF");
         assert!(events.lock().unwrap().is_empty());
         assert!(!gate.is_enabled());
-        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
         assert_eq!(*releases.lock().unwrap(), 1);
-        assert!(journal.entries().iter().any(|line| {
+        assert!(journal.to_entries().iter().any(|line| {
             line.text
                 .contains("could not raise the input shield — stopping the loop")
         }));
@@ -946,11 +946,11 @@ mod tests {
         .expect("a fatal mid-job input must drop the queued work, then end on EOF");
         assert_eq!(events.lock().unwrap().len(), 3);
         assert!(!gate.is_enabled());
-        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
         // Only the first job ever acquired: the queued one was refused before
         // the surface was touched.
         assert_eq!(*releases.lock().unwrap(), 1);
-        let lines = journal.entries();
+        let lines = journal.to_entries();
         assert_eq!(
             lines
                 .iter()
@@ -1006,7 +1006,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
         assert!(!gate.is_enabled());
         assert!(
             events.lock().unwrap().is_empty(),
@@ -1048,7 +1048,7 @@ mod tests {
         assert!(gate.is_enabled(), "the recovered job must not re-halt");
         assert_eq!(
             journal
-                .entries()
+                .to_entries()
                 .iter()
                 .filter(|line| line.text.contains("stopping the loop"))
                 .count(),
@@ -1085,7 +1085,7 @@ mod tests {
         assert_eq!(events.lock().unwrap().len(), 3);
         assert!(gate.is_enabled(), "no halt for a recoverable abort");
         assert_eq!(*releases.lock().unwrap(), 1);
-        assert!(journal.entries().iter().any(|line| {
+        assert!(journal.to_entries().iter().any(|line| {
             line.text
                 .contains("the game window moved or resized mid-job — aborted remaining clicks")
         }));
@@ -1164,7 +1164,7 @@ mod tests {
         assert!(events.lock().unwrap().is_empty());
         assert!(gate.is_enabled());
         assert_eq!(*releases.lock().unwrap(), 1);
-        assert!(journal.entries().iter().any(|line| {
+        assert!(journal.to_entries().iter().any(|line| {
             line.text
                 .contains("degenerate client area 0×0 — aborted remaining clicks")
         }));
@@ -1236,11 +1236,11 @@ mod tests {
         .expect("a fatal coordinate conversion must end the job, then the loop ends on EOF");
         assert!(events.lock().unwrap().is_empty());
         assert!(!gate.is_enabled());
-        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
         assert_eq!(*releases.lock().unwrap(), 1);
         assert!(
             journal
-                .entries()
+                .to_entries()
                 .iter()
                 .any(|line| line.text.contains("narrower than 16:9"))
         );
@@ -1265,7 +1265,7 @@ mod tests {
         run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, true).await;
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(*releases.lock().unwrap(), 1);
-        let lines = journal.entries();
+        let lines = journal.to_entries();
         assert_eq!(
             lines
                 .iter()

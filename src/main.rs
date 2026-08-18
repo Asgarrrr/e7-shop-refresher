@@ -97,15 +97,16 @@ fn main() -> ExitCode {
                 "invalid configuration"
             );
             return fatal(format!(
-                "Invalid configuration: {err}\n\nFix {} and restart.",
+                "Invalid configuration: {}\n\nFix {} and restart.",
+                err.report(),
                 config_path.display()
             ));
         }
     };
     strip_and_report_retired_keys(&config, &config_path);
-    // No `server_url` here: it can carry a credential (see
-    // `app::redacted_server_url`), and this file is what the player is asked
-    // to send us.
+    // No `server_url` here: it can carry a credential, and this file is what the
+    // player is asked to send us. `app::run` logs the redacted form once, through
+    // `config::ServerUrl::redacted`.
     tracing::info!(
         dry_run = config.actuator.dry_run,
         game_port = config.game_port,
@@ -155,7 +156,7 @@ fn run_mode(runtime: tokio::runtime::Runtime, config: Config, _config_path: Path
         Ok(()) => exit_code(true, false),
         Err(err) => {
             tracing::error!(error = ?err, "the session ended with a fatal error");
-            eprintln!("Fatal error: {err}");
+            eprintln!("Fatal error: {}", err.report());
             exit_code(true, true)
         }
     }

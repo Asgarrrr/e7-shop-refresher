@@ -61,7 +61,7 @@ mod tests {
         serde_json::from_str(json).expect("message should parse")
     }
 
-    fn shop(json: &str) -> crate::domain::shop::ShopSnapshot {
+    fn shop(json: &str) -> ShopSnapshot {
         let message = parse(json);
         let ServerMessage::Shop(snapshot) = message else {
             panic!("expected Shop, got {message:?}");

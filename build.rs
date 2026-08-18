@@ -32,7 +32,7 @@
 //! and fell back to an inert stdout.
 //!
 //! An earlier design split the app into an unelevated UI plus an elevated
-//! WinDivert broker so that only the driver handle ran with the token. It was
+//! `WinDivert` broker so that only the driver handle ran with the token. It was
 //! abandoned on the measurement above, not on taste: it solved a problem the
 //! actuator has anyway, and the Npcap tap removed the only reason the split
 //! existed.

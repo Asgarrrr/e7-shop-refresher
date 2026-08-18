@@ -270,12 +270,17 @@ fn ensure_dpi_awareness() -> Result<(), SurfaceError> {
         // inferred from this return.
         let set =
             unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-        // SAFETY: neither call takes a pointer or a handle. The context is an
-        // opaque Win32 token passed straight back to the second call, which is
-        // its only documented consumer and answers `DPI_AWARENESS_INVALID` for
-        // anything it does not recognize.
-        let awareness =
-            unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) };
+        // One Win32 call per block, so each `// SAFETY:` answers for exactly the
+        // call above it.
+        //
+        // SAFETY: takes no argument, returns an opaque process-global token, and
+        // borrows nothing.
+        let context = unsafe { GetThreadDpiAwarenessContext() };
+        // SAFETY: `context` is the token the previous call just produced, and
+        // this is its only documented consumer; it takes no pointer and no
+        // handle, and answers `DPI_AWARENESS_INVALID` for anything it does not
+        // recognize.
+        let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(context) };
         let verdict = awareness_verdict(awareness);
         if set == 0 {
             // Whoever set it first won: winit in the GUI build, or a shim.
@@ -1805,7 +1810,7 @@ mod tests {
         assert_ne!(GAME_HWND, OTHER_HWND);
     }
 
-    /// Handles are read in hex everywhere else (Spy++, WinDbg, a bug report), so
+    /// Handles are read in hex everywhere else (Spy++, `WinDbg`, a bug report), so
     /// wrapping the integer must not cost `{:#x}` — and `Debug`, which is what a
     /// failing assertion prints, uses it.
     #[test]

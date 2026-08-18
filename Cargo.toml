@@ -50,6 +50,19 @@ actuator = []
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [] } # 0 — every cfg string matches a declared feature
 trivial_casts = "warn"                               # 0
+# `size_of`/`align_of` and friends joined the prelude in 1.80, so `std::mem::` in
+# front of them is noise that reads as a different function. Measured across
+# `--all-targets --all-features`, test harness included, which is where 21 of the
+# original 22 sites were.
+unused_qualifications = "warn" # 0
+# A `pub` item that no path outside the crate can reach is a claim the module
+# graph contradicts. Enabled *instead of* `clippy::redundant_pub_crate`, not
+# beside it: for the 15 `pub(crate)` items inside the private `mod render` and
+# `mod pcap`, `redundant_pub_crate`'s only suggestion is `pub` — and taking it
+# makes all 15 fire here instead (verified by applying it). The two lints have no
+# common fixed point for a private module, and of the pair this is the one that
+# catches a real error rather than a spelling.
+unreachable_pub = "warn" # 0
 
 [lints.clippy]
 # Whole groups. `priority = -1` so an individually named lint can override one.
@@ -62,6 +75,16 @@ perf = { level = "warn", priority = -1 }        # 0
 # and every `unsafe` block in it already carries a real `// SAFETY:`. New unsafe
 # arrives with every Win32 call added, so turn the convention into a check.
 undocumented_unsafe_blocks = "warn" # 0
+# The other half of that convention: a `// SAFETY:` above a block holding several
+# Win32 calls answers for whichever one the reader guesses. One call per block
+# makes the comment and the operation line up.
+multiple_unsafe_ops_per_block = "warn" # 0
+# Two nursery lints, named individually — the whole group is 121 sites and argued
+# down in `docs/tech-debt/25-lint.md`. Both are at 0 and both caught something
+# real on the way there. Nursery means a future clippy may widen them; if one
+# starts producing false positives, demote that line rather than the group.
+redundant_clone = "warn"     # 0
+format_push_string = "warn"  # 0
 # Zero in the test harness too, unlike `unwrap_used`/`panic` above.
 todo = "warn"           # 0
 unimplemented = "warn"  # 0

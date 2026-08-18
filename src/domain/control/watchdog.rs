@@ -10,6 +10,33 @@ use super::{Action, BuyTarget, Controller, Recovery, StopReason};
 const EXPECT_SNAPSHOT_MS: u64 = 10_000;
 const EXPECT_PURCHASE_MS: u64 = 10_000;
 
+/// One millisecond past the ladder's rung-`rung` deadline; `rung` counts from 1
+/// (first timeout), through 2 (re-issue), to 3 (honest halt).
+///
+/// Test-only, and it lives *here* rather than in either test module because two
+/// suites need it: `control::tests` and `app::session::tests` both used to spell
+/// these deadlines `10_001` / `20_001` / `30_001` — 30-odd bare literals whose
+/// only tie to the window above was arithmetic in the reader's head, in a file
+/// where every sibling tuning value is named. A change to the window now moves
+/// every tick with it.
+///
+/// Every escalation re-grants a *full* window rather than shortening it, which is
+/// what makes the rungs exact multiples.
+#[cfg(test)]
+pub(crate) const fn past_rung(rung: u64) -> u64 {
+    rung * EXPECT_SNAPSHOT_MS + 1
+}
+
+// `past_rung` collapses the two windows into one number, which is honest only
+// while they are equal. They are separate constants because they answer to
+// different evidence (a shop response vs. a purchase echo), so this is the check
+// that the collapse stays true rather than an assumption.
+#[cfg(test)]
+const _: () = assert!(
+    EXPECT_SNAPSHOT_MS == EXPECT_PURCHASE_MS,
+    "past_rung() assumes one window length — give the tests a second helper if these ever differ"
+);
+
 /// The wire proof owed after an issued action: a snapshot for a refresh,
 /// purchase echoes for buys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

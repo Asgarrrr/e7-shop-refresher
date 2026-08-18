@@ -17,6 +17,11 @@ use crate::error::Result;
 /// TCP port of the Epic Seven game server (`msg://`).
 pub const DEFAULT_GAME_PORT: u16 = 3333;
 
+/// The hosted analysis server, used when `config.toml` sets no `server_url`.
+/// Named because [`Config::default`] has to push it through
+/// [`ServerUrl::parse`] and the `expect` there needs something to point at.
+const DEFAULT_SERVER_URL: &str = "wss://ingest.arkyve.dev/refresh-shop";
+
 /// Smallest effective delay between server connection attempts.
 pub(crate) const RECONNECT_FLOOR: Duration = Duration::from_millis(100);
 
@@ -39,7 +44,7 @@ pub(crate) const RECONNECT_FLOOR: Duration = Duration::from_millis(100);
 /// validated at all.
 const MAX_TIMING_MS: u64 = 60_000;
 
-#[derive(Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// TCP port of the game server, remote side.
@@ -47,13 +52,13 @@ pub struct Config {
 
     /// Analysis server URL (`ws://` or `wss://`).
     ///
-    /// Checked by [`ServerUrl::parse`] on the load path, which is the only path
-    /// that checks it. It is still a `String` because the two consumers outside
-    /// this module take one; making the field a [`ServerUrl`] is what would stop
-    /// a `Config` built any other way — a struct literal, a mutated
-    /// `Config::default()`, a future GUI field — from reaching the uplink
-    /// unchecked.
-    pub server_url: String,
+    /// A [`ServerUrl`], not a `String`, so the cleartext rule is enforced by the
+    /// type rather than by `Config::validate` remembering to call it: a `Config`
+    /// built any other way — a struct literal, a mutated `Config::default()`, a
+    /// future GUI field — cannot carry an unchecked URL to the uplink. It is
+    /// also why this struct can derive `Debug` again: `ServerUrl`'s own `Debug`
+    /// prints the redacted form.
+    pub server_url: ServerUrl,
 
     /// Vestigial; see [`ForwardConfig`].
     pub forward: ForwardConfig,
@@ -76,43 +81,14 @@ pub struct Config {
     pub actuator: ActuatorConfig,
 }
 
-/// Hand-written so `server_url` cannot reach the log through this type.
-///
-/// A `wss://` URL may carry a `user:pass@` credential, and `Config` is exactly
-/// the kind of value that ends up in a startup line or an `#[instrument]`
-/// argument list. Nothing formats a `Config` today; the whole point is that the
-/// next thing to do so is safe by default, because the promise in `README.md`
-/// ("the log never contains the server URL's credentials") is currently kept by
-/// remembering to call a helper.
-///
-/// Destructured rather than read field-by-field off `self`: adding a field to
-/// `Config` is then a compile error here until it is listed, which is the one
-/// real hazard of a hand-written `Debug`. Becomes a plain derive again once the
-/// field is a [`ServerUrl`], whose own `Debug` redacts.
-impl fmt::Debug for Config {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            game_port,
-            server_url,
-            forward,
-            reconnect,
-            capture,
-            filter,
-            limits,
-            actuator,
-        } = self;
-        f.debug_struct("Config")
-            .field("game_port", game_port)
-            .field("server_url", &redacted_authority(server_url))
-            .field("forward", forward)
-            .field("reconnect", reconnect)
-            .field("capture", capture)
-            .field("filter", filter)
-            .field("limits", limits)
-            .field("actuator", actuator)
-            .finish()
-    }
-}
+// `Config`'s `Debug` is a plain derive, and safely so: `server_url` is a
+// `ServerUrl`, whose own `Debug` prints `scheme://host[:port]` and nothing
+// else. A `wss://` URL may carry a `user:pass@` credential, and `Config` is
+// exactly the kind of value that ends up in a startup line or an
+// `#[instrument]` argument list — so the promise in `README.md` ("the log never
+// contains the server URL's credentials") is kept by the type, not by
+// remembering to call a helper. This was a hand-written impl for exactly one
+// release, while the field was still a `String`.
 
 /// Vestigial. Both keys are parsed and both are ignored.
 ///
@@ -242,7 +218,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             game_port: DEFAULT_GAME_PORT,
-            server_url: "wss://ingest.arkyve.dev/refresh-shop".to_owned(),
+            // Through the one gate, like every other `ServerUrl`: the `expect`
+            // is the invariant, and a literal that stopped satisfying the
+            // cleartext rule would fail every test that builds a default.
+            server_url: ServerUrl::parse(DEFAULT_SERVER_URL)
+                .expect("the built-in default server_url must satisfy the cleartext rule"),
             forward: ForwardConfig::default(),
             reconnect: ReconnectConfig::default(),
             capture: CaptureConfig::default(),
@@ -321,10 +301,11 @@ fn authority_of(rest: &str) -> &str {
 /// `scheme://host[:port]` — userinfo, path, query and fragment all gone. The
 /// only form of a server URL that may be written to a log or a journal line.
 ///
-/// Deliberately lenient rather than fallible: it is also what `Config`'s `Debug`
-/// prints for a `server_url` that has *not* been through [`ServerUrl::parse`],
-/// so it has to reduce garbage instead of refusing it (`"garbage"` becomes
-/// `"://garbage"`, which is unmistakably not a URL and still carries no secret).
+/// Deliberately lenient rather than fallible: it runs *after* the scheme check
+/// inside [`ServerUrl::parse`] and only has to split an authority off text the
+/// caller already accepted, so refusing would mean two ways to fail one parse.
+/// Garbage reduces rather than errors (`"garbage"` becomes `"://garbage"`, which
+/// is unmistakably not a URL and still carries no secret).
 fn redacted_authority(url: &str) -> String {
     let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
     format!("{scheme}://{}", authority_of(rest))
@@ -364,15 +345,19 @@ fn is_loopback_host(host: &str) -> bool {
 /// It also carries the redacted `scheme://host[:port]` form, because the same
 /// split that defeats `ws://127.0.0.1@evil.com` is the one that keeps a
 /// `user:pass@` credential out of the log the player is asked to send us. Those
-/// two were written twice — here and in `app::redacted_server_url` — and only
-/// this copy had the userinfo tests, so the next parsing subtlety had to be
-/// found twice.
+/// two used to be written twice — here and in `app::redacted_server_url`, now
+/// deleted — and only this copy had the userinfo tests, so the next parsing
+/// subtlety had to be found twice.
 ///
 /// `Debug` and `Display` print the redacted form **only**, so no `?url`, `%url`
 /// or `#[instrument]` argument list can put a credential in the log. The dial
 /// string — what the WebSocket client is actually given — comes out through
 /// [`ServerUrl::as_str`] and nowhere else.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// `Deserialize` goes through [`ServerUrl::parse`] via `#[serde(try_from =
+/// "String")]`, so a `config.toml` cannot produce one that has not been checked.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
 pub struct ServerUrl {
     dial: String,
     redacted: String,
@@ -568,17 +553,12 @@ impl Config {
         if self.game_port == 0 {
             return Err(crate::Error::Config("game_port cannot be 0".into()));
         }
-        // `server_url` receives the reassembled game stream, which can carry
-        // session tokens: require TLS (`wss://`) unless the host is loopback,
-        // where cleartext (`ws://`) never leaves the machine. Parsed rather than
-        // spot-checked, so that the rule and the authority split it needs have
-        // one implementation — `ServerUrl` — instead of one here and one in the
-        // log redactor.
-        //
-        // The parsed value is dropped because the field is still a `String`;
-        // storing it is what would extend the proof to a `Config` that did not
-        // come from disk. See the field.
-        ServerUrl::parse(&self.server_url)?;
+        // No `server_url` clause here, deliberately. It receives the reassembled
+        // game stream, which can carry session tokens, so it must be TLS
+        // (`wss://`) unless the host is loopback — and that rule is now carried
+        // by the field's type: a `ServerUrl` exists only if `ServerUrl::parse`
+        // accepted it, on the load path *and* in a struct literal. Re-checking
+        // it here would be a second implementation of a proof we already hold.
         // `ItemKind` is wire-tolerant (`serde(other)` -> Unknown), which in a
         // config file would let a typo silently match nothing: reject it here.
         if self.filter.kinds.contains(&ItemKind::Unknown) {
@@ -1073,71 +1053,54 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Builds a default `Config` with `server_url` overwritten, so `validate`
-    /// reaches the scheme check with nothing else able to fail first.
-    fn config_with_url(server_url: &str) -> Config {
-        Config {
-            server_url: server_url.to_owned(),
-            ..Config::default()
-        }
-    }
+    // The cleartext-rule tests below used to build a whole `Config` with the URL
+    // overwritten and call `validate()`. They now call `ServerUrl::parse`
+    // directly, because that *is* the load path: the field's type is the check,
+    // and `Config::validate` has no `server_url` clause left to reach. Every
+    // input is unchanged, including the two userinfo bypasses.
 
     #[test]
     fn wss_is_accepted() {
-        assert!(
-            config_with_url("wss://ingest.arkyve.dev/refresh-shop")
-                .validate()
-                .is_ok()
-        );
+        assert!(ServerUrl::parse("wss://ingest.arkyve.dev/refresh-shop").is_ok());
     }
 
     #[test]
     fn ws_loopback_ipv4_accepted() {
-        assert!(
-            config_with_url("ws://127.0.0.1:3001/refresh-shop")
-                .validate()
-                .is_ok()
-        );
+        assert!(ServerUrl::parse("ws://127.0.0.1:3001/refresh-shop").is_ok());
     }
 
     #[test]
     fn ws_localhost_accepted() {
-        assert!(config_with_url("ws://localhost:3001/x").validate().is_ok());
+        assert!(ServerUrl::parse("ws://localhost:3001/x").is_ok());
     }
 
     #[test]
     fn ws_ipv6_loopback_accepted() {
-        assert!(config_with_url("ws://[::1]:3001/x").validate().is_ok());
+        assert!(ServerUrl::parse("ws://[::1]:3001/x").is_ok());
     }
 
     #[test]
     fn ws_remote_host_rejected() {
-        let err = config_with_url("ws://ingest.arkyve.dev/x")
-            .validate()
-            .unwrap_err();
+        let err = ServerUrl::parse("ws://ingest.arkyve.dev/x").unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
     }
 
     #[test]
     fn ws_example_com_rejected() {
         // Done-criteria spot check: a non-loopback ws:// host is refused.
-        let err = config_with_url("ws://example.com/x")
-            .validate()
-            .unwrap_err();
+        let err = ServerUrl::parse("ws://example.com/x").unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
     }
 
     #[test]
     fn non_ws_scheme_rejected() {
-        let err = config_with_url("http://example.com")
-            .validate()
-            .unwrap_err();
+        let err = ServerUrl::parse("http://example.com").unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
     }
 
     #[test]
     fn empty_still_rejected() {
-        let err = config_with_url("").validate().unwrap_err();
+        let err = ServerUrl::parse("").unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
     }
 
@@ -1145,18 +1108,14 @@ mod tests {
     fn ws_userinfo_loopback_is_rejected() {
         // The loopback text sits in the userinfo; the real host (evil.com) is
         // remote, so this must be refused — not accepted as loopback.
-        let err = config_with_url("ws://127.0.0.1:3001@evil.com/refresh-shop")
-            .validate()
-            .unwrap_err();
+        let err = ServerUrl::parse("ws://127.0.0.1:3001@evil.com/refresh-shop").unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
     }
 
     #[test]
     fn ws_bare_userinfo_loopback_is_rejected() {
         // The same bypass without a port in the userinfo.
-        let err = config_with_url("ws://localhost@evil.com/x")
-            .validate()
-            .unwrap_err();
+        let err = ServerUrl::parse("ws://localhost@evil.com/x").unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
     }
 
@@ -1198,7 +1157,7 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(&path, text).expect("seed the example");
         assert_eq!(
-            crate::config::persist::strip_retired_keys(&path).expect("must not fail"),
+            persist::strip_retired_keys(&path).expect("must not fail"),
             None,
             "a fresh install must have nothing to strip"
         );
@@ -1230,7 +1189,7 @@ mod tests {
             )))
         }
 
-        fn path(&self) -> &std::path::Path {
+        fn path(&self) -> &Path {
             &self.0
         }
 
@@ -1275,7 +1234,7 @@ mod tests {
             &path,
             &[
                 Section::Filter(filter.clone()),
-                Section::Limits(limits.clone()),
+                Section::Limits(limits),
                 Section::Timings(timings),
             ],
         )
@@ -1313,7 +1272,7 @@ mod tests {
         assert!(before.capture.retired_keys().is_some());
         assert!(before.forward.retired_keys().is_some());
 
-        let removed = crate::config::persist::strip_retired_keys(&path)
+        let removed = persist::strip_retired_keys(&path)
             .expect("the rewrite must succeed on a writable file")
             .expect("both keys were set, so it must have rewritten");
         assert_eq!(removed, "capture.buffer_size, forward.server_to_client");
@@ -1332,7 +1291,7 @@ mod tests {
 
         // Idempotent: the second launch finds nothing and writes nothing.
         assert_eq!(
-            crate::config::persist::strip_retired_keys(&path).expect("must not fail"),
+            persist::strip_retired_keys(&path).expect("must not fail"),
             None
         );
         assert_eq!(
@@ -1354,7 +1313,7 @@ mod tests {
         std::fs::write(&path, original).expect("seed the original");
         std::fs::create_dir(path.with_extension("toml.tmp")).expect("squat the temp path");
 
-        let error = crate::config::persist::strip_retired_keys(&path)
+        let error = persist::strip_retired_keys(&path)
             .expect_err("the temp write cannot succeed onto a directory");
         assert!(
             matches!(error, crate::Error::ConfigWrite { .. }),
@@ -1382,7 +1341,7 @@ mod tests {
         // not a startup-time error report.
         let dir = TempDir::new("strip-missing");
         assert_eq!(
-            crate::config::persist::strip_retired_keys(dir.join("config.toml"))
+            persist::strip_retired_keys(dir.join("config.toml"))
                 .expect("a missing file is not an error"),
             None
         );
@@ -1465,26 +1424,18 @@ mod tests {
     fn an_uppercase_wss_scheme_is_accepted() {
         // URL schemes are case-insensitive; an uppercase scheme must not be
         // rejected when the WebSocket client would accept it.
-        assert!(
-            config_with_url("WSS://ingest.arkyve.dev/refresh-shop")
-                .validate()
-                .is_ok()
-        );
+        assert!(ServerUrl::parse("WSS://ingest.arkyve.dev/refresh-shop").is_ok());
     }
 
     #[test]
     fn an_uppercase_ws_scheme_to_loopback_is_accepted() {
-        assert!(config_with_url("WS://127.0.0.1:3001/x").validate().is_ok());
+        assert!(ServerUrl::parse("WS://127.0.0.1:3001/x").is_ok());
     }
 
     #[test]
     fn an_uppercase_ws_userinfo_bypass_is_still_rejected() {
         // The case-insensitive match must not become a way around the host check.
-        assert!(
-            config_with_url("WS://127.0.0.1@evil.com/x")
-                .validate()
-                .is_err()
-        );
+        assert!(ServerUrl::parse("WS://127.0.0.1@evil.com/x").is_err());
     }
 
     #[test]
@@ -1549,14 +1500,18 @@ mod tests {
     }
 
     #[test]
-    fn a_configs_debug_redacts_the_server_url_it_has_not_parsed() {
+    fn a_configs_debug_redacts_the_server_url() {
         // `Config` is exactly the kind of value that ends up in a startup line.
-        // The field is still a bare `String`, so the redaction has to work on
-        // whatever is in it — including a value that never went through
-        // `validate` at all.
+        // Its `Debug` is a plain derive again now that the field is a
+        // `ServerUrl`; this test is what says the derive is still safe, i.e. that
+        // the redaction is reached *through* the field and not re-implemented.
         let rendered = format!(
             "{:?}",
-            config_with_url("wss://token:secret@host:8443/p?k=v")
+            Config {
+                server_url: ServerUrl::parse("wss://token:secret@host:8443/p?k=v")
+                    .expect("wss is accepted whatever the authority carries"),
+                ..Config::default()
+            }
         );
         assert!(!rendered.contains("secret"), "{rendered}");
         assert!(rendered.contains("wss://host:8443"), "{rendered}");

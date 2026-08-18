@@ -174,7 +174,7 @@ mod tests {
 
     fn watching_view() -> ViewState {
         let mut controller = Controller::new(Filter::matching_default_items(), Limits::default());
-        controller.handle(Event::Start { now_ms: 0 });
+        let _ = controller.handle(Event::Start { now_ms: 0 });
         view_state(&controller)
     }
 
@@ -227,7 +227,7 @@ mod tests {
             ..Limits::default()
         };
         let mut controller = Controller::new(Filter::matching_default_items(), limits);
-        controller.handle(Event::Start { now_ms: 0 });
+        let _ = controller.handle(Event::Start { now_ms: 0 });
         let armed = view_state(&controller);
         let armed_bar = Harness::new_ui(|ui| {
             let _ = render_status_bar(ui, &armed, None, true);
@@ -241,8 +241,8 @@ mod tests {
         // Stopped: the final totals survive the stop (an auto-stop is exactly
         // when the player wants to read them).
         let mut controller = Controller::new(Filter::matching_default_items(), Limits::default());
-        controller.handle(Event::Start { now_ms: 0 });
-        controller.handle(Event::Stop);
+        let _ = controller.handle(Event::Start { now_ms: 0 });
+        let _ = controller.handle(Event::Stop);
         let stopped = view_state(&controller);
         let stopped_bar = Harness::new_ui(|ui| {
             let _ = render_status_bar(ui, &stopped, None, true);

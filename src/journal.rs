@@ -113,7 +113,7 @@ impl EventLog {
             return;
         }
         let at_ms = self.now_ms();
-        // Poison-tolerant like `entries`: `emit` is called from the session
+        // Poison-tolerant like `to_entries`: `emit` is called from the session
         // loop, the actuator executor and the watchdog, so panicking here
         // after one poisoning would cascade across tasks and freeze the very
         // history the GUI is meant to still show.
@@ -141,9 +141,14 @@ impl EventLog {
         self.generation.load(Ordering::Relaxed)
     }
 
+    /// Deep-copies the whole ring — up to [`JOURNAL_CAP`] `LogLine`s, each with
+    /// its own `String` allocation. The `to_` prefix is the warning: this is not
+    /// a getter, and calling it per frame is what made the GUI grow
+    /// [`EventLog::generation`] and a cache in front of it.
+    ///
     /// Poison-tolerant: the GUI reads this after a session panic and must
     /// still show the history that led there.
-    pub fn entries(&self) -> Vec<LogLine> {
+    pub fn to_entries(&self) -> Vec<LogLine> {
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -163,7 +168,7 @@ mod tests {
         for i in 0..(JOURNAL_CAP + 100) {
             journal.push(&[format!("line {i}")]);
         }
-        let entries = journal.entries();
+        let entries = journal.to_entries();
         assert_eq!(entries.len(), JOURNAL_CAP);
         assert_eq!(entries.first().unwrap().text, "line 100");
         assert_eq!(
@@ -176,7 +181,7 @@ mod tests {
     fn empty_push_is_ignored() {
         let journal = EventLog::default();
         journal.push(&[]);
-        assert!(journal.entries().is_empty());
+        assert!(journal.to_entries().is_empty());
         assert_eq!(journal.generation(), 0);
     }
 
@@ -186,7 +191,7 @@ mod tests {
         journal.push(&["first".to_owned()]);
         std::thread::sleep(std::time::Duration::from_millis(30));
         journal.push(&["second".to_owned()]);
-        let entries = journal.entries();
+        let entries = journal.to_entries();
         assert!(entries[0].at_ms < 5_000, "first stamp sits near the epoch");
         assert!(
             entries[1].at_ms > entries[0].at_ms,
@@ -208,7 +213,7 @@ mod tests {
             journal.emit_at(level, &[format!("{level}")]);
         }
         let texts: Vec<String> = journal
-            .entries()
+            .to_entries()
             .into_iter()
             .map(|line| line.text)
             .collect();

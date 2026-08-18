@@ -387,7 +387,7 @@ fn set_table(parent: &mut Table, key: &str, mut new: Table) {
 /// Absent → a fresh implicit table (so a new file grows only
 /// `[actuator.timings]`, no bare `[actuator]` header). Authored inline
 /// (`actuator = { .. }`) → promoted to a header table in place so its other
-/// keys (dry_run/backend) survive the splice. Already a header table → left as
+/// keys (`dry_run`/`backend`) survive the splice. Already a header table → left as
 /// is, its keys preserved.
 fn set_nested_table(parent: &mut Table, outer: &str, inner: &str, new: Table) {
     if let Some(inline) = parent.get(outer).and_then(Item::as_inline_table).cloned() {
@@ -489,7 +489,7 @@ names = [\"old_name\"]
             "",
             &[
                 Section::Filter(filter.clone()),
-                Section::Limits(limits.clone()),
+                Section::Limits(limits),
                 Section::Timings(timings),
             ],
         )

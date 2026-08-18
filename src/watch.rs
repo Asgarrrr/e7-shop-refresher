@@ -145,8 +145,14 @@ impl WatchGate {
         self.inner.halt_notify.notify_one();
     }
 
-    /// Waits for a pending cause without consuming it.
-    pub async fn halt_requested(&self) -> HaltSource {
+    /// Waits — indefinitely — for a pending cause, and returns it *without*
+    /// consuming it; [`WatchGate::acknowledge_halt`] is what clears it.
+    ///
+    /// The name says `next_`, not `is_`, because this is not a predicate: it is
+    /// the first `biased` arm of the session `select!` and it parks the loop
+    /// until a halt exists. Reading it as a cheap `bool` is how a caller ends up
+    /// awaiting a halt where it meant to test for one.
+    pub async fn next_halt(&self) -> HaltSource {
         loop {
             if let Some(source) = HaltSource::lowest_in(self.inner.state.load(Ordering::Relaxed)) {
                 return source;
@@ -193,7 +199,7 @@ mod tests {
         let gate = WatchGate::new(true);
         gate.request_halt(HaltSource::PlayerStopped);
 
-        assert_eq!(gate.halt_requested().await, HaltSource::PlayerStopped);
+        assert_eq!(gate.next_halt().await, HaltSource::PlayerStopped);
     }
 
     #[tokio::test]
@@ -202,11 +208,11 @@ mod tests {
         gate.request_halt(HaltSource::PlayerStopped);
         gate.request_halt(HaltSource::ActuatorFailed);
 
-        assert_eq!(gate.halt_requested().await, HaltSource::PlayerStopped);
+        assert_eq!(gate.next_halt().await, HaltSource::PlayerStopped);
         gate.acknowledge_halt(HaltSource::PlayerStopped);
 
         gate.request_halt(HaltSource::ActuatorFailed);
-        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
     }
 
     #[tokio::test]
@@ -216,13 +222,13 @@ mod tests {
         // The player stops; the actuator fails fatally while the session loop
         // is still dispatching that stop.
         gate.request_halt(HaltSource::PlayerStopped);
-        assert_eq!(gate.halt_requested().await, HaltSource::PlayerStopped);
+        assert_eq!(gate.next_halt().await, HaltSource::PlayerStopped);
         gate.request_halt(HaltSource::ActuatorFailed);
         gate.acknowledge_halt(HaltSource::PlayerStopped);
 
         // The failure must still reach the controller, and must keep the gate
         // from re-arming until it does.
-        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
         gate.set(true);
         assert!(!gate.is_enabled());
 
@@ -250,12 +256,12 @@ mod tests {
         gate.request_halt(HaltSource::PlayerStopped);
 
         gate.acknowledge_halt(HaltSource::ActuatorFailed);
-        assert_eq!(gate.halt_requested().await, HaltSource::PlayerStopped);
+        assert_eq!(gate.next_halt().await, HaltSource::PlayerStopped);
 
         gate.acknowledge_halt(HaltSource::PlayerStopped);
         gate.request_halt(HaltSource::ActuatorFailed);
         gate.acknowledge_halt(HaltSource::PlayerStopped);
-        assert_eq!(gate.halt_requested().await, HaltSource::ActuatorFailed);
+        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
     }
 
     /// The one test in this module that is not sequential, and the only shape

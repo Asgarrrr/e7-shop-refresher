@@ -119,7 +119,7 @@ pub(super) async fn session_loop(
         }
         tokio::select! {
             biased;
-            source = gate.halt_requested() => {
+            source = gate.next_halt() => {
                 let event = match source {
                     HaltSource::PlayerStopped => Event::Stop,
                     HaltSource::ActuatorFailed => Event::ActuatorFailed,

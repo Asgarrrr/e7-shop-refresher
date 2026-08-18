@@ -11,6 +11,13 @@ mod dedup;
 mod tests;
 mod watchdog;
 
+// Re-exported for `app::session`'s test suite, which drives the same recovery
+// ladder from the outside and would otherwise re-spell its deadlines as
+// literals. `watchdog` itself stays private: only the derived deadline escapes,
+// never the two windows it is derived from.
+#[cfg(test)]
+pub(crate) use watchdog::past_rung;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -47,7 +54,10 @@ pub enum Recovery {
 ///
 /// Deserialized from the config file's `[limits]` section; unknown keys are
 /// rejected because a misspelled limit is a limit that never triggers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+/// `Copy` because it is four `Option`s of plain integers (40 bytes, no
+/// allocation): the GUI passes it around per frame and a `.clone()` there was
+/// only ever noise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_refreshes: Option<u32>,
@@ -279,7 +289,7 @@ pub struct Controller {
     /// two hold the same value whenever both are set.
     bought_fingerprint: Option<Fingerprint>,
     /// Watchdog armed. Only ever true for live actuation: Off is
-    /// player-paced advice and DryRun never yields wire feedback — deadlines
+    /// player-paced advice and `DryRun` never yields wire feedback — deadlines
     /// would self-halt both.
     recovery: bool,
     /// The proof the watchdog currently waits on; `None` = quiet.
@@ -319,7 +329,7 @@ impl Controller {
     }
 
     /// Whether the recovery watchdog is armed (set once at wiring time).
-    pub fn recovery_enabled(&self) -> bool {
+    pub fn is_recovery_enabled(&self) -> bool {
         self.recovery
     }
 
@@ -368,6 +378,11 @@ impl Controller {
         self.gold_balance
     }
 
+    /// The returned actions **are** the decision; the state mutation alone is
+    /// not the output. `clippy::must_use_candidate` structurally cannot flag a
+    /// `&mut self` method, so this attribute is the only thing that will ever
+    /// catch a dropped refresh or a dropped buy.
+    #[must_use = "these actions are the decision — dropping them loses the refresh or the buy"]
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::Start { now_ms } => self.on_start(now_ms),

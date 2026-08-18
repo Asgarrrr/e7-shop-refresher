@@ -341,7 +341,7 @@ impl RetiredKeys {
             // them costs a log line, never a startup.
             Err(err) => Self::NotRewritten {
                 keys: still_set,
-                error: err.to_string(),
+                error: err.report(),
             },
         }
     }

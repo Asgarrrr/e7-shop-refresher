@@ -52,7 +52,7 @@ impl EditorState {
     pub(super) fn new(filter: Filter, limits: Limits, timings: Timings) -> Self {
         Self {
             applied_filter: filter.clone(),
-            applied_limits: limits.clone(),
+            applied_limits: limits,
             applied_timings: timings,
             filter,
             limits,
@@ -77,7 +77,7 @@ impl EditorState {
         for command in delivered {
             match command {
                 Command::SetFilter(filter) => self.applied_filter = filter.clone(),
-                Command::SetLimits(limits) => self.applied_limits = limits.clone(),
+                Command::SetLimits(limits) => self.applied_limits = *limits,
                 Command::SetTimings(timings) => self.applied_timings = *timings,
                 Command::Start | Command::Stop | Command::Toggle => {}
             }
@@ -704,7 +704,7 @@ pub(super) fn commit_row(
                     commands.push(Command::SetFilter(editor.filter.clone()));
                 }
                 if dirty_limits {
-                    commands.push(Command::SetLimits(editor.limits.clone()));
+                    commands.push(Command::SetLimits(editor.limits));
                 }
                 if dirty_timings {
                     commands.push(Command::SetTimings(editor.timings));
