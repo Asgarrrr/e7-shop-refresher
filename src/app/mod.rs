@@ -116,17 +116,41 @@ enum Resync {
 
 impl Resync {
     /// Decodes a value this type itself wrote. [`PressureResync`] is the only
-    /// writer and every store goes through `Self as u8`, so the fallback is
-    /// unreachable rather than lenient — spelled out loudly instead of silently
-    /// defaulting to `Ack`, which would drop a resync marker.
+    /// writer and every store goes through `Self as u8`, so the fallback cannot
+    /// be reached today — but this runs once per captured packet on the capture
+    /// thread, which `spawn_capture_with_budget` wraps in `catch_unwind`, so a
+    /// panic here would cost a player the whole session for a developer's
+    /// mistake. It therefore follows the same policy `stream.rs` writes down for
+    /// `pending_after_release`: a conservative value plus a named report, with
+    /// the fail-fast kept in `debug_assert!` where an abort costs a stack trace
+    /// rather than a session.
+    ///
+    /// `Pending` is the conservative choice, not `Ack`: it keeps segments
+    /// blocked and a marker owed, where `Ack` would *drop* a resync marker and
+    /// leave reassembly anchored on bytes that never arrived.
     fn from_u8(value: u8) -> Self {
         match value {
             0 => Self::Ack,
             1 => Self::Pending,
             2 => Self::Enqueued,
-            other => unreachable!("PressureResync holds only its own discriminants, saw {other}"),
+            other => {
+                report_unknown_resync(other);
+                Self::Pending
+            }
         }
     }
+}
+
+/// The impossible branch of [`Resync::from_u8`], kept out of a body that runs
+/// once per captured packet.
+#[cold]
+#[inline(never)]
+fn report_unknown_resync(value: u8) {
+    error!(
+        value,
+        "unknown pressure-resync discriminant; holding the marker pending"
+    );
+    debug_assert!(false, "PressureResync holds only its own discriminants");
 }
 
 /// Lossless single-producer pressure marker protocol. A full metadata queue
@@ -1172,18 +1196,25 @@ fn capture_loop_budgeted(
                     );
                 }
             }
-            Err(mpsc::error::TrySendError::Full(CaptureEvent::Budgeted(segment))) => {
-                budget.record_drop(segment.capacity());
+            // Matched on the error, not on the variant inside it. Destructuring
+            // `Full(CaptureEvent::Budgeted(segment))` here to read
+            // `segment.capacity()` left a second `Full(_)` arm that could only
+            // ever be `unreachable!` — a panic macro on the per-packet path of a
+            // thread wrapped in `catch_unwind`, i.e. a dead session for an
+            // impossibility. `capacity` is the same number: it is this segment's
+            // payload capacity, taken above, and `admit_capture` charges the
+            // lease exactly that (`BudgetedSegment::capacity` == `lease.bytes`).
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                budget.record_drop(capacity);
                 if pressure_resync.request(&budget) {
                     report_metadata_queue_full(&budget);
                 }
-                drop(segment);
+                // Explicit: the lease inside releases the reserved bytes as it
+                // goes, and it must go before the retry below asks for space.
+                drop(event);
                 pressure_resync.try_enqueue(&tx);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => break,
-            Err(mpsc::error::TrySendError::Full(_)) => unreachable!(
-                "try_send returns the value that was sent, always CaptureEvent::Budgeted"
-            ),
         }
     }
 }
@@ -1249,16 +1280,15 @@ async fn input_loop(
                 }
             }
             line = lines.next_line() => match line {
-                Ok(Some(line)) => match parse_command(&line) {
-                    Some(command) => {
+                Ok(Some(line)) => match line.parse::<Command>() {
+                    Ok(command) => {
                         if commands.send(command).await.is_err() {
                             break; // session loop gone.
                         }
                     }
-                    None => journal.emit(&[format!(
-                        ">> unknown command: {:?} (start, stop, enter = toggle)",
-                        line.trim()
-                    )]),
+                    // The wording is `ParseCommandError`'s, not this site's: it
+                    // lists the aliases, so it belongs next to the alias table.
+                    Err(err) => journal.emit(&[format!(">> {err}")]),
                 },
                 Ok(None) | Err(_) => break,
             },
@@ -1266,12 +1296,42 @@ async fn input_loop(
     }
 }
 
-fn parse_command(line: &str) -> Option<Command> {
-    match line.trim().to_ascii_lowercase().as_str() {
-        "" | "t" | "toggle" => Some(Command::Toggle),
-        "on" | "start" => Some(Command::Start),
-        "off" | "stop" => Some(Command::Stop),
-        _ => None,
+/// A line that names no command, carrying the trimmed input so the message can
+/// quote it.
+///
+/// Its `Display` is the whole point: the alias list used to be spelled out at
+/// the one call site instead of beside the table it describes, so the two could
+/// drift apart silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseCommandError(String);
+
+impl std::fmt::Display for ParseCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown command: {:?} (start, stop, enter = toggle)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ParseCommandError {}
+
+/// Parses the *typeable* subset of [`Command`]. The three `Set*` variants carry
+/// live retune payloads (a [`Filter`], [`Limits`], [`plan::Timings`]) that no
+/// console line can express, and the GUI constructs those directly — which the
+/// missing arms below document better than a private helper could.
+impl std::str::FromStr for Command {
+    type Err = ParseCommandError;
+
+    fn from_str(line: &str) -> std::result::Result<Self, Self::Err> {
+        let trimmed = line.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "" | "t" | "toggle" => Ok(Self::Toggle),
+            "on" | "start" => Ok(Self::Start),
+            "off" | "stop" => Ok(Self::Stop),
+            _ => Err(ParseCommandError(trimmed.to_owned())),
+        }
     }
 }
 
@@ -2450,28 +2510,41 @@ mod tests {
 
     #[test]
     fn parse_command_maps_aliases() {
-        assert_eq!(parse_command("start"), Some(Command::Start));
-        assert_eq!(parse_command("on"), Some(Command::Start));
-        assert_eq!(parse_command("stop"), Some(Command::Stop));
-        assert_eq!(parse_command("off"), Some(Command::Stop));
-        assert_eq!(parse_command("toggle"), Some(Command::Toggle));
-        assert_eq!(parse_command("t"), Some(Command::Toggle));
-        assert_eq!(parse_command(""), Some(Command::Toggle));
+        assert_eq!("start".parse(), Ok(Command::Start));
+        assert_eq!("on".parse(), Ok(Command::Start));
+        assert_eq!("stop".parse(), Ok(Command::Stop));
+        assert_eq!("off".parse(), Ok(Command::Stop));
+        assert_eq!("toggle".parse(), Ok(Command::Toggle));
+        assert_eq!("t".parse(), Ok(Command::Toggle));
+        assert_eq!("".parse(), Ok(Command::Toggle));
     }
 
     #[test]
     fn parse_command_trims_and_ignores_case() {
-        assert_eq!(parse_command("  START \t"), Some(Command::Start));
-        assert_eq!(parse_command("Stop"), Some(Command::Stop));
+        assert_eq!("  START \t".parse(), Ok(Command::Start));
+        assert_eq!("Stop".parse(), Ok(Command::Stop));
     }
 
     #[test]
     fn parse_command_rejects_unknown() {
-        assert_eq!(parse_command("refresh"), None);
-        assert_eq!(parse_command("sta rt"), None);
+        assert!("refresh".parse::<Command>().is_err());
+        assert!("sta rt".parse::<Command>().is_err());
         // The skip command is gone: buying (or a fresh shop) is the only
         // way out of a pause.
-        assert_eq!(parse_command("resume"), None);
-        assert_eq!(parse_command("r"), None);
+        assert!("resume".parse::<Command>().is_err());
+        assert!("r".parse::<Command>().is_err());
+    }
+
+    /// The alias list travels with the error, so the journal line the player
+    /// reads cannot drift from the table that produced it.
+    #[test]
+    fn parse_command_error_quotes_the_trimmed_input_and_lists_the_aliases() {
+        let err = "  Refresh \t"
+            .parse::<Command>()
+            .expect_err("not a command");
+        assert_eq!(
+            err.to_string(),
+            "unknown command: \"Refresh\" (start, stop, enter = toggle)"
+        );
     }
 }

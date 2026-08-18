@@ -1000,6 +1000,59 @@ fn buy_job_clicks_only_trackable_targets() {
 }
 
 #[test]
+fn buy_job_names_the_slot_it_cannot_click_and_still_clicks_the_rest() {
+    let gate = WatchGate::new(true);
+    let journal = EventLog::default();
+    let (actuator, mut jobs) = recording(Mode::Live);
+    let controller = armed();
+    // Seven slots: the first and the last match and are trackable, the five
+    // between them do not match. Slot 7 sits past the six clickable rows, so
+    // the batch is mixed — one row to click, one refusal to report. Losing the
+    // refusal is exactly the silence `Slot::row` was introduced to end.
+    let mut slots = vec![ShopItem {
+        id: Some(cid(42)),
+        ..ShopItem::default()
+    }];
+    slots.extend((0..5).map(|_| ShopItem {
+        kind: ItemKind::Equipment,
+        ..ShopItem::default()
+    }));
+    slots.push(ShopItem {
+        id: Some(cid(43)),
+        ..ShopItem::default()
+    });
+    on_message(
+        &controller,
+        &gate,
+        &journal,
+        &actuator,
+        ServerMessage::Shop(ShopSnapshot {
+            merchant: None,
+            slots,
+            refresh: None,
+        }),
+        1,
+    );
+    let job = jobs.try_recv().expect("buy job for the clickable slot");
+    // Scroll-to-top + one buy/confirm pair: only slot 1 is reachable.
+    assert_eq!(job.steps.len(), 3);
+    let entries = journal.to_entries();
+    assert!(
+        entries
+            .iter()
+            .any(|line| line.text.contains("buying slot 1"))
+    );
+    assert!(
+        entries.iter().any(|line| {
+            line.text
+                .contains("slot 7 is outside the six clickable rows")
+        }),
+        "the refused slot must be named, not dropped: {:?}",
+        entries.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn off_actuator_keeps_advice_and_submits_nothing() {
     let gate = WatchGate::new(true);
     let journal = EventLog::default();

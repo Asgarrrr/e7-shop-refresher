@@ -9,12 +9,16 @@ use super::view::{SlotRow, ViewState};
 /// The Shop tab: the slot table, or the welcome screen while nothing is
 /// captured yet.
 ///
+/// `rows` is borrowed from the shell's cache rather than carried in `view`,
+/// because it is re-derived only when the shop moves — see `view::SlotRows`.
+///
 /// `detail` yields one row's full console line for the hover tooltip. It is a
 /// callback rather than a `SlotRow` field because egui only asks for the row
 /// under the pointer — see `view::slot_detail`.
 pub(super) fn render_shop_tab(
     ui: &mut egui::Ui,
     view: &ViewState,
+    rows: &[SlotRow],
     detail: &dyn Fn(usize) -> String,
 ) {
     // Keyed on "no capture yet", not empty rows: a tolerated slotless
@@ -23,13 +27,13 @@ pub(super) fn render_shop_tab(
         super::content_inset(ui, render_quick_start);
         return;
     }
-    if view.rows.is_empty() {
+    if rows.is_empty() {
         super::content_inset(ui, |ui| {
             ui.weak("the last shop message carried no slots — re-open the shop in game");
         });
         return;
     }
-    shop_table(ui, &view.rows, detail);
+    shop_table(ui, rows, detail);
 }
 
 /// The slot table, Linear-style: quiet uppercase header over a hairline rule,
@@ -88,6 +92,16 @@ fn shop_table(ui: &mut egui::Ui, rows: &[SlotRow], detail: &dyn Fn(usize) -> Str
         // widget the pointer is over, so the item line is formatted for the one
         // hovered row instead of all six on every frame.
         response.on_hover_ui(|ui| {
+            // The one thing `on_hover_text` does that `on_hover_ui` does not,
+            // and it is not cosmetic: a tooltip `Area` is sized on its first
+            // pass and then caches that size (egui's own note on
+            // `Area::default_width`, filed as emilk/egui#5167). Each row's
+            // tooltip carries its own id, so a slot first hovered while its
+            // line was short ("slot 3 · Equipment") would keep that width when
+            // the next roll fills the same slot with name, set, grade, price,
+            // substats and limit — and wrap or squeeze it. Setting the max
+            // width per hover restores the bound egui applies for us.
+            ui.set_max_width(ui.spacing().tooltip_width);
             ui.label(detail(index));
         });
     }
@@ -186,14 +200,14 @@ mod tests {
     use crate::domain::filter::Filter;
     use crate::domain::shop::{ShopItem, ShopSnapshot};
 
-    use super::super::view::{ViewState, slot_detail, view_state};
+    use super::super::view::{SlotRows, ViewState, slot_detail, view_state};
     use super::*;
 
     fn idle_view() -> ViewState {
         view_state(&Controller::new(Filter::default(), Limits::default()))
     }
 
-    fn captured(slots: Vec<ShopItem>) -> (Controller, ViewState) {
+    fn captured(slots: Vec<ShopItem>) -> (Controller, ViewState, SlotRows) {
         let mut ctrl = Controller::new(Filter::default(), Limits::default());
         let _ = ctrl.handle(Event::Snapshot {
             snapshot: ShopSnapshot {
@@ -204,7 +218,9 @@ mod tests {
             now_ms: 0,
         });
         let view = view_state(&ctrl);
-        (ctrl, view)
+        let mut rows = SlotRows::default();
+        rows.sync(&ctrl);
+        (ctrl, view, rows)
     }
 
     /// The tooltip source the live shell builds from the controller lock; no
@@ -216,27 +232,27 @@ mod tests {
     #[test]
     fn quick_start_shows_before_any_capture() {
         let view = idle_view();
-        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view, &|_| String::new()));
+        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view, &[], &|_| String::new()));
         harness.get_by_label("QUICK START");
     }
 
     #[test]
     fn table_replaces_quick_start_once_a_shop_is_captured() {
-        let (ctrl, view) = captured(vec![ShopItem {
+        let (ctrl, view, rows) = captured(vec![ShopItem {
             slot: 3,
             ..ShopItem::default()
         }]);
         let detail = details(&ctrl);
-        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view, &detail));
+        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view, rows.rows(), &detail));
         assert!(harness.query_by_label("QUICK START").is_none());
         harness.get_by_label("SLOT");
     }
 
     #[test]
     fn slotless_snapshot_shows_the_reopen_hint_not_quick_start() {
-        let (ctrl, view) = captured(vec![]);
+        let (ctrl, view, rows) = captured(vec![]);
         let detail = details(&ctrl);
-        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view, &detail));
+        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view, rows.rows(), &detail));
         assert!(harness.query_by_label("QUICK START").is_none());
         harness.get_by_label("the last shop message carried no slots — re-open the shop in game");
     }

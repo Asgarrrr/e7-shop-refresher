@@ -11,7 +11,7 @@ use crate::actuator::plan::{self, Trigger};
 use crate::actuator::{ActuatorHandle, Mode, SubmitError};
 use crate::domain::control::{Action, BuyTarget, Controller, Event, Recovery, Status};
 use crate::journal::EventLog;
-use crate::render::{describe, format_item, refusal, render_shop, status_label};
+use crate::render::{format_item, refusal_label, render_shop, status_label, stop_reason_label};
 use crate::uplink::UplinkEvent;
 use crate::uplink::protocol::{PurchaseNotice, ServerMessage};
 use crate::watch::{HaltSource, WatchGate};
@@ -506,8 +506,12 @@ fn apply(
             Action::Recover(recovery) => {
                 submit_recovery(&mut lines, controller, actuator, recovery, now_ms);
             }
-            Action::Halt(reason) => lines.push(format!(">> stopped: {}", describe(*reason))),
-            Action::Refused(reason) => lines.push(format!(">> refused: {}", refusal(*reason))),
+            Action::Halt(reason) => {
+                lines.push(format!(">> stopped: {}", stop_reason_label(*reason)));
+            }
+            Action::Refused(reason) => {
+                lines.push(format!(">> refused: {}", refusal_label(*reason)));
+            }
         }
     }
     gate.set(matches!(
@@ -667,12 +671,24 @@ fn submit_buys(
     // exists only on the far side of `Slot::row`, so the `&rows` handed to
     // `buy_job` below cannot be a list of slot numbers — that used to compile,
     // and it clicked the wrong item's Buy button with the player's gold behind
-    // it. A slot outside the six rows is refused here, still named.
-    let rows: Vec<plan::Row> = targets
-        .iter()
-        .filter(|target| target.id.is_some())
-        .filter_map(|target| plan::Slot::new(target.slot).row())
-        .collect();
+    // it.
+    //
+    // A slot outside the six rows is refused here, and *named* — the loop, not a
+    // `filter_map`, is what makes the second half of that true. A `filter_map`
+    // would be the same silence as the `row <= MAX_ROW` filter that used to live
+    // inside `buy_job`, only moved one frame up; the reason for moving it was
+    // that the caller can say which slot was refused, so the caller says it. One
+    // good slot beside one out-of-range slot must not lose the latter.
+    let mut rows: Vec<plan::Row> = Vec::with_capacity(targets.len());
+    for target in targets.iter().filter(|target| target.id.is_some()) {
+        let slot = target.slot;
+        match plan::Slot::new(slot).row() {
+            Some(row) => rows.push(row),
+            None => lines.push(format!(
+                ">> actuator: slot {slot} is outside the six clickable rows — not clicked"
+            )),
+        }
+    }
     if rows.is_empty() {
         // Normal buys go quiet here (untrackable matches are advice-only),
         // but a watchdog re-issue just announced itself and must not end

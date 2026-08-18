@@ -91,7 +91,7 @@ pub(crate) fn status_summary(controller: &Controller) -> (&'static str, Option<&
             ("Paused", Some("buy, then refresh"))
         }
         Status::Paused => ("Paused", Some("buy — auto-resumes")),
-        Status::Stopped(reason) => ("Stopped", Some(describe(reason))),
+        Status::Stopped(reason) => ("Stopped", Some(stop_reason_label(reason))),
     }
 }
 
@@ -103,7 +103,11 @@ pub(crate) fn status_label(controller: &Controller) -> String {
     }
 }
 
-pub(crate) fn refusal(reason: RefusalReason) -> &'static str {
+/// Why the domain refused to arm, in the player's words. Named for what it
+/// returns, like its `*_label` siblings above: it is imported bare into
+/// `session/mod.rs`, where a lone `refusal` would also read as
+/// `Action::Refused`'s payload or as `pcap`'s unrelated `Refusal`.
+pub(crate) fn refusal_label(reason: RefusalReason) -> &'static str {
     match reason {
         RefusalReason::UnrestrictedFilter => {
             "define at least one filter criterion — an empty filter matches everything"
@@ -111,7 +115,9 @@ pub(crate) fn refusal(reason: RefusalReason) -> &'static str {
     }
 }
 
-pub(crate) fn describe(reason: StopReason) -> &'static str {
+/// Why a hunt stopped, in the player's words — the clause `status_summary` puts
+/// beside "Stopped", and the line the journal reports a halt with.
+pub(crate) fn stop_reason_label(reason: StopReason) -> &'static str {
     match reason {
         StopReason::PlayerStopped => "player stopped",
         StopReason::SessionEnded => "session ended",

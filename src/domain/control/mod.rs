@@ -72,8 +72,8 @@ pub struct Limits {
 }
 
 /// Why a hunt stopped. Every variant is player-facing (rendered by
-/// `render::describe`), so the label must stay honest about *who* stopped it:
-/// the player, a machine fault, or a limit the player set.
+/// `render::stop_reason_label`), so the label must stay honest about *who*
+/// stopped it: the player, a machine fault, or a limit the player set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     PlayerStopped,

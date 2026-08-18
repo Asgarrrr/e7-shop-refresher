@@ -150,15 +150,15 @@ fn hunt_summary(filter: &Filter) -> String {
     let mut parts: Vec<String> = Vec::new();
     for name in &filter.names {
         // Reuse the haul's wire→label map so a hunted token reads "Covenant",
-        // not "ticketrare_name"; an unknown id shows verbatim.
-        let mut label = name.clone();
-        for (wire, headliner) in crate::render::HAUL_HEADLINERS {
-            if name == wire {
-                label = headliner.to_owned();
-                break;
-            }
-        }
-        parts.push(label);
+        // not "ticketrare_name"; an unknown id shows verbatim. Which of the two
+        // wins is decided before anything is allocated: the common case is a
+        // quick-added headliner, and that used to clone the wire id only to drop
+        // it on the next line.
+        let label = crate::render::HAUL_HEADLINERS
+            .iter()
+            .find(|(wire, _)| name == wire)
+            .map_or(name.as_str(), |(_, headliner)| *headliner);
+        parts.push(label.to_owned());
     }
     for kind in &filter.kinds {
         parts.push(kind_label(*kind).to_owned());

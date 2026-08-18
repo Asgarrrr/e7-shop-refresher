@@ -28,7 +28,7 @@ use crate::journal::LogLine;
 use crate::watch::HaltSource;
 
 use editor::EditorState;
-use view::{ViewState, slot_detail, view_state};
+use view::{SlotRow, SlotRows, ViewState, slot_detail, view_state};
 
 /// Where the session's terminal outcome lands (fatal error, crash, or clean
 /// end): written once by the spawn wrapper in `main`, shown as a banner.
@@ -92,6 +92,10 @@ pub struct ShopApp {
     /// journal grows at human pace, repaints at display rate.
     journal_cache: Vec<LogLine>,
     journal_generation: u64,
+    /// The slot table's rows, under the same rule as `journal_cache` above and
+    /// for the same reason: a shop rolls over every few seconds, the window
+    /// repaints far more often than that. See [`SlotRows`].
+    slots: SlotRows,
     /// The journal is secondary; it starts collapsed to its title bar so the
     /// shop table owns the height, and expands on a click.
     journal_open: bool,
@@ -110,9 +114,16 @@ impl ShopApp {
         // the criteria actually running. Timings aren't domain state, so their
         // seed is the startup config value (the running value before any
         // retune).
-        let editor = {
+        let (editor, slots) = {
             let ctrl = lock_ignoring_poison(&handles.controller);
-            EditorState::new(ctrl.filter().clone(), *ctrl.limits(), timings)
+            let mut slots = SlotRows::default();
+            // Seeded here for the same reason `journal_cache` is: the first
+            // frame then finds both caches current and rebuilds neither.
+            slots.sync(&ctrl);
+            (
+                EditorState::new(ctrl.filter().clone(), *ctrl.limits(), timings),
+                slots,
+            )
         };
         let journal_cache = handles.journal.to_entries();
         let journal_generation = handles.journal.generation();
@@ -124,6 +135,7 @@ impl ShopApp {
             tab: Tab::Shop,
             journal_cache,
             journal_generation,
+            slots,
             journal_open: false,
         }
     }
@@ -135,8 +147,14 @@ impl eframe::App for ShopApp {
         // human pace; 4 Hz keeps the window fresh without coupling app.rs to
         // egui.
         ui.ctx().request_repaint_after(Duration::from_millis(250));
+        // One short hold for both: the projection reads `Copy` state only, and
+        // the rows are re-derived inside it *only* if the shop or the checklist
+        // moved. That lock is the one the session loop takes to turn a captured
+        // shop into a click job, so what a repaint costs it is the whole point —
+        // see `view::SlotRows`.
         let view = {
             let ctrl = lock_ignoring_poison(&self.handles.controller);
+            self.slots.sync(&ctrl);
             view_state(&ctrl)
         };
         let generation = self.handles.journal.generation();
@@ -213,12 +231,14 @@ impl eframe::App for ShopApp {
         // per row inside the frame's own lock hold (see `view::slot_detail`).
         let controller = &self.handles.controller;
         let detail = |index: usize| slot_detail(&lock_ignoring_poison(controller), index);
+        let rows = self.slots.rows();
         let applied = egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::ZERO))
             .show(ui, |ui| {
                 render_tab_content(
                     ui,
                     &view,
+                    rows,
                     self.tab,
                     &mut self.editor,
                     session_alive,
@@ -386,6 +406,7 @@ fn section_labels(sections: &[config::persist::Section]) -> String {
 fn render_tab_content(
     ui: &mut egui::Ui,
     view: &ViewState,
+    rows: &[SlotRow],
     tab: Tab,
     editor: &mut EditorState,
     session_alive: bool,
@@ -398,7 +419,7 @@ fn render_tab_content(
             egui::ScrollArea::vertical()
                 .id_salt("tab-shop")
                 .auto_shrink([false, false])
-                .show(ui, |ui| shop::render_shop_tab(ui, view, detail));
+                .show(ui, |ui| shop::render_shop_tab(ui, view, rows, detail));
             Vec::new()
         }
         Tab::Setup => render_setup_tab(ui, editor, session_alive),
@@ -465,6 +486,7 @@ mod tests {
     fn render_center(
         ui: &mut egui::Ui,
         view: &ViewState,
+        rows: &[SlotRow],
         tab: &mut Tab,
         editor: &mut EditorState,
         session_alive: bool,
@@ -472,15 +494,24 @@ mod tests {
         render_tabs(ui, tab);
         // No test here hovers a row, so the tooltip source is never called;
         // `view::tests` covers what the live shell passes in its place.
-        render_tab_content(ui, view, *tab, editor, session_alive, &|_| String::new())
+        render_tab_content(ui, view, rows, *tab, editor, session_alive, &|_| {
+            String::new()
+        })
     }
 
-    fn idle_view() -> ViewState {
-        let controller = Controller::new(Filter::default(), Limits::default());
-        view_state(&controller)
+    /// One frame's projection, exactly as `ShopApp::ui` takes it: the cheap
+    /// state and the gated rows, from one borrow of the controller.
+    fn project(controller: &Controller) -> (ViewState, SlotRows) {
+        let mut slots = SlotRows::default();
+        slots.sync(controller);
+        (view_state(controller), slots)
     }
 
-    fn captured_view() -> ViewState {
+    fn idle_view() -> (ViewState, SlotRows) {
+        project(&Controller::new(Filter::default(), Limits::default()))
+    }
+
+    fn captured_view() -> (ViewState, SlotRows) {
         let mut controller = Controller::new(Filter::default(), Limits::default());
         let _ = controller.handle(Event::Snapshot {
             snapshot: ShopSnapshot {
@@ -490,7 +521,7 @@ mod tests {
             },
             now_ms: 0,
         });
-        view_state(&controller)
+        project(&controller)
     }
 
     #[test]
@@ -592,11 +623,11 @@ mod tests {
 
     #[test]
     fn shop_tab_hides_the_editors() {
-        let view = idle_view();
+        let (view, slots) = idle_view();
         let mut tab = Tab::Shop;
         let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
         let harness = Harness::new_ui(|ui| {
-            render_center(ui, &view, &mut tab, &mut editor, true);
+            render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
         });
         // The Hunt section header and the single Apply live only on the Setup tab.
         assert!(harness.query_by_label("Hunt").is_none());
@@ -605,11 +636,11 @@ mod tests {
 
     #[test]
     fn setup_tab_reveals_the_editors() {
-        let view = idle_view();
+        let (view, slots) = idle_view();
         let mut tab = Tab::Shop;
         let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
         let mut harness = Harness::new_ui(|ui| {
-            render_center(ui, &view, &mut tab, &mut editor, true);
+            render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
         });
         harness.get_by_label("Setup").click();
         harness.run();
@@ -622,22 +653,22 @@ mod tests {
 
     #[test]
     fn empty_shop_tab_shows_the_quick_start() {
-        let view = idle_view();
+        let (view, slots) = idle_view();
         let mut tab = Tab::Shop;
         let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
         let harness = Harness::new_ui(|ui| {
-            render_center(ui, &view, &mut tab, &mut editor, true);
+            render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
         });
         harness.get_by_label("QUICK START");
     }
 
     #[test]
     fn captured_shop_replaces_the_quick_start() {
-        let view = captured_view();
+        let (view, slots) = captured_view();
         let mut tab = Tab::Shop;
         let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
         let harness = Harness::new_ui(|ui| {
-            render_center(ui, &view, &mut tab, &mut editor, true);
+            render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
         });
         assert!(harness.query_by_label("QUICK START").is_none());
     }
@@ -655,11 +686,11 @@ mod tests {
             },
             now_ms: 0,
         });
-        let view = view_state(&controller);
+        let (view, slots) = project(&controller);
         let mut tab = Tab::Shop;
         let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
         let harness = Harness::new_ui(|ui| {
-            render_center(ui, &view, &mut tab, &mut editor, true);
+            render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
         });
         assert!(harness.query_by_label("QUICK START").is_none());
     }
