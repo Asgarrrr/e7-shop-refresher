@@ -17,7 +17,8 @@
 //! once a half-stream delivered 2 GiB: the distance would exceed `i32` range
 //! and every later segment would look like an already-delivered retransmission.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +35,25 @@ pub(crate) const PIPELINE_GLOBAL_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const CAPTURE_STAGE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const REASSEMBLY_STAGE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const OUTBOUND_STAGE_BYTES: usize = 8 * 1024 * 1024;
+
+// These four numbers are the only defence against unbounded memory on a capture
+// path that runs for hours, and they are what a later tuning pass edits by hand.
+// On the production path their relation is pure arithmetic over constants, so it
+// is checked here rather than on the player's machine — `with_limits` keeps the
+// runtime asserts because `with_test_limits` passes arbitrary values. The two
+// caps declared further down are part of the same relation and are named here
+// deliberately; item order is irrelevant inside a `const` block.
+const _: () = {
+    assert!(CAPTURE_STAGE_BYTES <= PIPELINE_GLOBAL_BYTES);
+    assert!(REASSEMBLY_STAGE_BYTES <= PIPELINE_GLOBAL_BYTES);
+    assert!(OUTBOUND_STAGE_BYTES <= PIPELINE_GLOBAL_BYTES);
+    // The per-stream pending cap must fit the global reassembly quota, or it is
+    // dead code: the stage limit trips first, every time.
+    assert!(MAX_PENDING_BYTES <= REASSEMBLY_STAGE_BYTES);
+    // A burst is held in the capture stage while it buffers, so a burst cap
+    // above that quota could never fill.
+    assert!(INITIAL_ANCHOR_MAX_BYTES <= CAPTURE_STAGE_BYTES);
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stage {
@@ -94,6 +114,14 @@ impl PipelineBudget {
         })
     }
 
+    /// Builds a budget from explicit per-stage quotas.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any stage quota exceeds the global one: a stage that can never
+    /// fill is a silent hole in the memory guard, not a conservative setting.
+    /// The production constants are proved at compile time above; this catches
+    /// the `with_test_limits` path, which passes arbitrary values.
     fn with_limits(limits: BudgetLimits) -> Self {
         assert!(limits.capture <= limits.global);
         assert!(limits.reassembly <= limits.global);
@@ -123,6 +151,15 @@ impl PipelineBudget {
         })
     }
 
+    /// Reserves capture-stage bytes for `segment`'s payload and takes ownership
+    /// of it, pairing the buffer with the lease that will give the bytes back.
+    ///
+    /// # Errors
+    ///
+    /// The `Err` payload is not a description of a failure: it is `segment`
+    /// itself, handed back unmodified, because the global or capture-stage quota
+    /// is full. The caller owns it again and decides what happens next — drop it
+    /// and record the drop, or retry once a lease elsewhere releases.
     pub(crate) fn admit_capture(&self, segment: Segment) -> Result<BudgetedSegment, Segment> {
         let bytes = segment.payload.capacity();
         if !self.reserve_new(Stage::Capture, bytes) {
@@ -193,15 +230,7 @@ impl PipelineBudget {
         let mut usage = self.0.usage.lock().unwrap_or_else(|err| err.into_inner());
         let current = stage_bytes(&usage, stage);
         if usage.total < bytes || current < bytes {
-            error!(
-                stage = ?stage,
-                released_bytes = bytes,
-                total_bytes = usage.total,
-                stage_bytes = current,
-                "pipeline accounting underflow; saturating the release"
-            );
-            debug_assert!(usage.total >= bytes, "pipeline total accounting underflow");
-            debug_assert!(current >= bytes, "pipeline stage accounting underflow");
+            report_release_underflow(stage, bytes, usage.total, current);
         }
         usage.total = usage.total.saturating_sub(bytes);
         *stage_bytes_mut(&mut usage, stage) = current.saturating_sub(bytes);
@@ -275,6 +304,23 @@ impl PipelineBudget {
     }
 }
 
+/// The rare branch of [`PipelineBudget::release`], kept out of a body that runs
+/// once per released payload. See `release`'s comment for why this reports and
+/// saturates instead of asserting in shipped builds.
+#[cold]
+#[inline(never)]
+fn report_release_underflow(stage: Stage, bytes: usize, total: usize, current: usize) {
+    error!(
+        stage = ?stage,
+        released_bytes = bytes,
+        total_bytes = total,
+        stage_bytes = current,
+        "pipeline accounting underflow; saturating the release"
+    );
+    debug_assert!(total >= bytes, "pipeline total accounting underflow");
+    debug_assert!(current >= bytes, "pipeline stage accounting underflow");
+}
+
 fn stage_bytes(usage: &Usage, stage: Stage) -> usize {
     match stage {
         Stage::Capture => usage.capture,
@@ -339,6 +385,16 @@ impl BudgetedChunk {
         self.lease.budget.record_drop(self.lease.bytes);
     }
 
+    /// Moves this chunk's lease from the reassembly stage to the outbound one,
+    /// waiting until a release makes room.
+    ///
+    /// # Errors
+    ///
+    /// The `Err` payload is this chunk, handed back untouched, and only ever
+    /// because it is larger than the entire outbound quota — a wait that could
+    /// never succeed. Every transient shortage is awaited instead, so `Err`
+    /// means "never", not "not yet"; the caller owns the chunk again and must
+    /// drop it (recording the drop) rather than retry.
     pub(crate) async fn retag_outbound(mut self) -> Result<Self, Self> {
         if self.capacity() > self.lease.budget.stage_limit(Stage::Outbound) {
             return Err(self);
@@ -400,13 +456,13 @@ impl BudgetedSegment {
     }
 }
 
-impl Deref for BudgetedSegment {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.payload()
-    }
-}
+// No `Deref<Target = [u8]>` here, unlike `BudgetedChunk` above: a segment is a
+// captured TCP record (flow, seq, syn, payload), not a transparent wrapper around
+// bytes, and surfacing `len()`/`is_empty()`/`first()` on it would read as
+// properties of the segment. Payload reads go through `payload()`. The pair is
+// also a trap worth not building: `BudgetedChunk::capacity()` reports the *lease*
+// size while `len()` reports the current buffer length, and `HalfStream::absorb`
+// shrinks the latter without the former.
 
 // Size canaries for the per-packet types. Every captured packet becomes one of
 // these, and a
@@ -418,9 +474,9 @@ impl Deref for BudgetedSegment {
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     // 24 (Vec) + 24 (PayloadLease: Arc + usize + Stage) = 48.
-    assert!(std::mem::size_of::<BudgetedChunk>() == 48);
+    assert!(size_of::<BudgetedChunk>() == 48);
     // 64 (FlowKey) + 48 (BudgetedChunk) + 4 (seq) + 1 (syn), padded to 120.
-    assert!(std::mem::size_of::<BudgetedSegment>() == 120);
+    assert!(size_of::<BudgetedSegment>() == 120);
 };
 
 /// Cap on the number of tracked streams. One armed game connection needs one;
@@ -462,6 +518,16 @@ impl InitialBurst {
                 .is_none_or(|bytes| bytes > INITIAL_ANCHOR_MAX_BYTES)
     }
 
+    /// Admits `segment` into the burst.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the segment would exceed either burst cap. That is a caller
+    /// contract, not a runtime condition: check [`Self::would_exceed`] first and
+    /// flush the burst instead. The assert is deliberate — silently accepting
+    /// the segment would let one post-resync burst grow past the 256 KiB /
+    /// 128-segment bound the whole anchor decision is predicated on, and the
+    /// caller that skipped the check is the bug.
     pub(crate) fn push(&mut self, segment: BudgetedSegment) {
         assert!(
             !self.would_exceed(&segment),
@@ -498,35 +564,35 @@ impl InitialBurst {
         for segment in self.segments {
             flows.entry(segment.flow).or_default().push(segment);
         }
-        let mut flows: HashMap<_, VecDeque<BudgetedSegment>> = flows
-            .into_iter()
-            .map(|(key, mut segments)| {
-                // A valid TCP receive window spans less than the signed
-                // sequence half-space; the byte cap bounds memory, not sequence
-                // gaps. Select an origin first so wrap sorting has a transitive
-                // key under that TCP invariant.
-                let origin = segments
-                    .iter()
-                    .map(segment_data_seq)
-                    .reduce(|earliest, candidate| {
-                        if seq_diff(candidate, earliest) < 0 {
-                            candidate
-                        } else {
-                            earliest
-                        }
-                    })
-                    .expect("a burst flow is never empty");
-                segments.sort_by_key(|segment| seq_diff(segment_data_seq(segment), origin));
-                (key, segments.into())
-            })
-            .collect();
+        for segments in flows.values_mut() {
+            // A valid TCP receive window spans less than the signed sequence
+            // half-space; the byte cap bounds memory, not sequence gaps. Select
+            // an origin first so wrap sorting has a transitive key under that
+            // TCP invariant.
+            let origin = segments
+                .iter()
+                .map(segment_data_seq)
+                .reduce(|earliest, candidate| {
+                    if seq_diff(candidate, earliest) < 0 {
+                        candidate
+                    } else {
+                        earliest
+                    }
+                })
+                .expect("a burst flow is never empty");
+            segments.sort_by_key(|segment| seq_diff(segment_data_seq(segment), origin));
+            // Sorted in place and reversed so the replay below can `pop` from the
+            // back: a second, differently-typed map purely to gain `pop_front`
+            // would re-hash every key for a container change.
+            segments.reverse();
+        }
 
         slots
             .into_iter()
             .map(|key| {
                 flows
                     .get_mut(&key)
-                    .and_then(VecDeque::pop_front)
+                    .and_then(Vec::pop)
                     .expect("every burst slot has one segment")
             })
             .collect()
@@ -546,13 +612,19 @@ impl Reassembler {
         Self::default()
     }
 
-    /// Integrates a segment and returns the newly contiguous (ordered) bytes.
+    /// Integrates a segment, returning the bytes that became contiguous.
     ///
-    /// Returns an empty vector when the segment is a duplicate, partially fills
-    /// a gap, or still waits on a missing segment. FIN is not modelled: a
-    /// stream is never torn down, so a segment reordered ahead of a gap
-    /// (a FIN-flagged one included) keeps its buffered payload until the gap
-    /// fills.
+    /// [`ReassemblyOutcome::Chunks`] may be empty: the segment was a duplicate,
+    /// partially filled a gap, or still waits on a missing predecessor. FIN is
+    /// not modelled — a stream is never torn down, so a segment reordered ahead
+    /// of a gap (a FIN-flagged one included) keeps its buffered payload until the
+    /// gap fills.
+    ///
+    /// [`ReassemblyOutcome::Pressure`] is *not* "nothing yet": the pending-byte
+    /// quota was exhausted, **every** tracked flow's anchor and buffer have
+    /// already been cleared, and this segment was dropped and counted. The caller
+    /// must re-anchor (`AnchorState::AwaitingFirst`) rather than wait for a gap
+    /// fill that can never arrive — waiting freezes the half-stream for good.
     pub(crate) fn push_budgeted(&mut self, segment: BudgetedSegment) -> ReassemblyOutcome {
         let key = segment.flow;
         let dropped_capacity = segment.capacity();
@@ -586,17 +658,7 @@ impl Reassembler {
                 // state, not additional captured packets.
                 budget.record_drop(dropped_capacity);
                 budget.record_resync();
-                let stats = budget.snapshot();
-                warn!(
-                    current_total = stats.current_total,
-                    capture_bytes = stats.current_capture,
-                    pending_bytes = stats.current_reassembly,
-                    outbound_bytes = stats.current_outbound,
-                    dropped_segments = stats.dropped_segments,
-                    dropped_bytes = stats.dropped_bytes,
-                    resyncs = stats.resyncs,
-                    "reassembly pending-byte pressure; state cleared for a fresh anchor"
-                );
+                warn_reassembly_pressure(&budget);
                 ReassemblyOutcome::Pressure
             }
         }
@@ -693,7 +755,16 @@ impl HalfStream {
         let expected_seq = self.expected_seq();
         let offset = self.next_off + seq_diff(data_seq, expected_seq);
 
-        let mut out = Vec::new();
+        // One exact slot rather than `Vec::new()`: the in-order case — the whole
+        // point of the path — carries a single chunk, and for a 48-byte element
+        // the first `push` on an empty `Vec` jumps straight to capacity 4, so it
+        // was allocating 192 bytes per packet to hold 48. More than one chunk
+        // only happens when `drain` flushes a filled gap, which grows from here.
+        // The trade is stated plainly: the cases that deliver *nothing* (a
+        // retransmission, a segment buffered behind a gap, a bare SYN) now
+        // allocate one slot where `Vec::new()` allocated none. They are the rare
+        // ones — `capture::ip` already drops empty non-SYN payloads upstream.
+        let mut out = Vec::with_capacity(1);
         if !self.absorb(offset, payload, &mut out) {
             return HalfOutcome::Pressure;
         }
@@ -724,11 +795,7 @@ impl HalfStream {
         // test below false, and drop the segment — freezing this half-stream
         // for good with no panic, no log and no metric.
         let Ok(already) = usize::try_from(self.next_off - offset) else {
-            error!(
-                next_off = self.next_off,
-                offset, "reassembly invariant violated"
-            );
-            debug_assert!(offset <= self.next_off, "absorb offset exceeds next_off");
+            report_absorb_invariant(self.next_off, offset);
             // Same observable behaviour as the retransmission case below:
             // deliver nothing, but do not claim pressure — a spurious `false`
             // here would clear every anchor of every flow.
@@ -746,30 +813,41 @@ impl HalfStream {
     }
 
     fn buffer_future(&mut self, offset: i64, mut payload: BudgetedChunk) -> bool {
-        // Keep only the largest segment seen at a given offset.
-        if self
-            .pending
-            .get(&offset)
-            .is_some_and(|old| old.as_slice().len() >= payload.as_slice().len())
-        {
-            return true;
-        }
-
-        if let Some(old) = self.pending.remove(&offset) {
-            self.pending_bytes -= old.capacity();
-            drop(old);
-        }
         let capacity = payload.capacity();
-        if self
-            .pending_bytes
-            .checked_add(capacity)
-            .is_none_or(|bytes| bytes > MAX_PENDING_BYTES)
-            || !payload.try_retag_pending()
-        {
-            return false;
+        // One probe of the key instead of `get` + `remove` + `insert`. Beyond the
+        // two saved `O(log n)` walks, the `entry` form is what makes the ordering
+        // below safe: a displaced chunk is only uncounted *and* removed once the
+        // new one has cleared the quota, so a rejection can never leave the map
+        // and `pending_bytes` disagreeing. The old shape relied on `false`
+        // propagating to `HalfOutcome::Pressure`, which wipes every stream anyway.
+        match self.pending.entry(offset) {
+            Entry::Occupied(mut slot) => {
+                // Keep only the largest segment seen at a given offset.
+                if slot.get().as_slice().len() >= payload.as_slice().len() {
+                    return true;
+                }
+                let held = pending_after_release(self.pending_bytes, slot.get().capacity());
+                let Some(total) = fits_pending(held, capacity) else {
+                    return false;
+                };
+                if !payload.try_retag_pending() {
+                    return false;
+                }
+                self.pending_bytes = total;
+                // Returns the displaced chunk, whose lease releases as it drops.
+                drop(slot.insert(payload));
+            }
+            Entry::Vacant(slot) => {
+                let Some(total) = fits_pending(self.pending_bytes, capacity) else {
+                    return false;
+                };
+                if !payload.try_retag_pending() {
+                    return false;
+                }
+                self.pending_bytes = total;
+                slot.insert(payload);
+            }
         }
-        self.pending_bytes += capacity;
-        self.pending.insert(offset, payload);
         true
     }
 
@@ -780,7 +858,7 @@ impl HalfStream {
                 break; // gap still present.
             }
             let (offset, payload) = self.pending.pop_first().expect("peeked above");
-            self.pending_bytes -= payload.capacity();
+            self.pending_bytes = pending_after_release(self.pending_bytes, payload.capacity());
             if !self.absorb(offset, payload, out) {
                 return false;
             }
@@ -802,13 +880,90 @@ impl HalfStream {
     }
 }
 
+/// Whether `bytes` more pending bytes still fit `held`, and the new total if so.
+///
+/// The `None` arm folds overflow and over-quota together: both mean "do not
+/// buffer this", and neither may be expressed as a wrapping add on a counter fed
+/// by wire-supplied payload lengths.
+fn fits_pending(held: usize, bytes: usize) -> Option<usize> {
+    held.checked_add(bytes)
+        .filter(|total| *total <= MAX_PENDING_BYTES)
+}
+
+/// Takes a displaced chunk's charge back off a stream's pending total.
+///
+/// The per-stream twin of [`PipelineBudget::release`], and defensive for the same
+/// reason spelled out there: every caller holds the invariant today (a chunk's
+/// charge is `lease.bytes`, which never drifts when `absorb` trims the buffer,
+/// and both call sites have just taken the entry out of `pending`), but a bare
+/// subtraction fails badly in *both* profiles if that ever stops being true. It
+/// wraps to ~1.8e19 wherever overflow checks are off, which makes
+/// [`fits_pending`] refuse every out-of-order segment forever — permanent silent
+/// resync churn, visible to the player only as a shop that stops updating — and
+/// panics inside the reassembly task wherever they are on, which `catch_unwind`
+/// turns into a dead session. Saturating plus a named log is diagnosable; a
+/// `debug_assert!` keeps the fail-fast where an abort costs a developer a stack
+/// trace rather than a player a session.
+fn pending_after_release(pending_bytes: usize, released: usize) -> usize {
+    if pending_bytes < released {
+        report_pending_underflow(pending_bytes, released);
+    }
+    pending_bytes.saturating_sub(released)
+}
+
+#[cold]
+#[inline(never)]
+fn report_pending_underflow(pending_bytes: usize, released: usize) {
+    error!(
+        pending_bytes,
+        released, "pending accounting underflow; saturating the release"
+    );
+    debug_assert!(
+        pending_bytes >= released,
+        "pending stream accounting underflow"
+    );
+}
+
+/// The rare branch of [`HalfStream::absorb`]'s offset invariant, kept out of a
+/// body that runs once per captured segment.
+#[cold]
+#[inline(never)]
+fn report_absorb_invariant(next_off: i64, offset: i64) {
+    error!(next_off, offset, "reassembly invariant violated");
+    debug_assert!(offset <= next_off, "absorb offset exceeds next_off");
+}
+
+/// The rare branch of [`Reassembler::push_budgeted`]'s pressure arm: taking the
+/// budget mutex for a snapshot and building seven fields belongs off the
+/// per-packet path.
+#[cold]
+#[inline(never)]
+fn warn_reassembly_pressure(budget: &PipelineBudget) {
+    let stats = budget.snapshot();
+    warn!(
+        current_total = stats.current_total,
+        capture_bytes = stats.current_capture,
+        pending_bytes = stats.current_reassembly,
+        outbound_bytes = stats.current_outbound,
+        dropped_segments = stats.dropped_segments,
+        dropped_bytes = stats.dropped_bytes,
+        resyncs = stats.resyncs,
+        "reassembly pending-byte pressure; state cleared for a fresh anchor"
+    );
+}
+
 enum HalfOutcome {
     Chunks(Vec<BudgetedChunk>),
     Pressure,
 }
 
+/// What [`Reassembler::push_budgeted`] did with a segment.
 pub(crate) enum ReassemblyOutcome {
+    /// The bytes that became contiguous, in order. Empty is normal: a duplicate,
+    /// a partial gap fill, or a segment still waiting on a predecessor.
     Chunks(Vec<BudgetedChunk>),
+    /// The pending-byte quota was exhausted: every flow's state has been cleared
+    /// and the caller must re-anchor. Not a "nothing yet".
     Pressure,
 }
 
@@ -831,7 +986,7 @@ fn segment_data_seq(segment: &BudgetedSegment) -> u32 {
 }
 
 /// Signed distance `a - b` over the circular sequence-number space.
-fn seq_diff(a: u32, b: u32) -> i64 {
+const fn seq_diff(a: u32, b: u32) -> i64 {
     (a.wrapping_sub(b) as i32) as i64
 }
 
