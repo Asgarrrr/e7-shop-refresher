@@ -61,6 +61,13 @@ const FUNNEL_LOG_EVERY: u64 = 500;
 /// individually plausible as the reason a healthy-looking session yields
 /// nothing. `delivered` staying at zero is itself the headline result: the
 /// filter matched no traffic at all.
+///
+/// Its two halves now sit on either side of [`WinDivertSource::recv_packet`]:
+/// `delivered` / `oversized` are counted by the raw receive, `unparsed` /
+/// `admitted` / `server_to_client` by the parsing wrapper layered on top of it.
+/// They deliberately stay in one struct, and one log line, until the unelevated
+/// pipe-backed source is wired in and the parsing half has somewhere else to
+/// live — splitting the struct before then would only split the line.
 #[derive(Default)]
 struct Funnel {
     delivered: u64,
@@ -72,9 +79,11 @@ struct Funnel {
 
 impl Funnel {
     /// Emits the funnel on the first delivered packet, then once per
-    /// `FUNNEL_LOG_EVERY`. Called on every path out of the loop body, including
-    /// the admitted one, so the periodic line is anchored on packets delivered
-    /// rather than on packets discarded.
+    /// `FUNNEL_LOG_EVERY`. Called on every path that finishes with a delivered
+    /// packet — the oversized skip, the unparsed skip, and the admitted return
+    /// — so the periodic line is anchored on packets delivered rather than on
+    /// packets discarded, and so every line reports a settled verdict on the
+    /// packet that triggered it.
     fn report(&self) {
         if self.delivered != 1 && !self.delivered.is_multiple_of(FUNNEL_LOG_EVERY) {
             return;
@@ -180,13 +189,64 @@ impl WinDivertSource {
             stop,
         ))
     }
-}
 
-impl PacketSource for WinDivertSource {
-    fn next_segment(&mut self) -> Result<Segment> {
+    /// Blocks until the driver delivers the next matching packet, then hands
+    /// back its raw IP bytes. Parses nothing, and must never start to.
+    ///
+    /// This is a privilege boundary, not an internal convenience, and that is
+    /// the only reason it is separate from [`PacketSource::next_segment`]. The
+    /// elevated capture broker owns the WinDivert handle — opening it is the
+    /// one step on this path that genuinely requires administrator rights — but
+    /// it must not *interpret* a single byte the handle gives it: `parse_segment`
+    /// is the code that chews on unauthenticated, attacker-shaped input off the
+    /// wire, and it belongs on the unelevated side of the pipe, at the far end
+    /// of these bytes. Until this method existed the only way to receive from a
+    /// `WinDivertSource` was `next_segment`, which parses as an inseparable part
+    /// of receiving; a broker built on that would have dragged the parser back
+    /// up into the administrator process and silently undone the whole point of
+    /// the split. So: raw receive here, parsing layered strictly on top of it,
+    /// and nothing in between.
+    ///
+    /// The returned slice borrows the receive buffer and is only valid until the
+    /// next receive. That is the honest shape of these bytes, and the reason
+    /// this hands back a borrow rather than a length for the caller to re-slice
+    /// with: the buffer is never cleared between packets, so a stale or
+    /// hand-computed length would quietly read the tail of an older, longer
+    /// packet instead of failing.
+    ///
+    /// Returns only when a packet arrives, when [`WinDivertStop`] releases the
+    /// blocked receive, or on a handle error. Declared `pub` rather than
+    /// `pub(crate)` for the same reason as the frame helpers in
+    /// [`super`]: this crate is a lib plus a bin, so only an item reachable from
+    /// the crate root escapes `dead_code`, and every lane builds with
+    /// `-D warnings` while the broker — its sole external caller — does not
+    /// exist yet.
+    pub fn recv_packet(&mut self) -> Result<&[u8]> {
+        // Split across two functions so the retry loop never holds a borrow of
+        // the buffer across an iteration: returning `&self.buffer[..]` from
+        // inside the loop would stretch that borrow over the whole function
+        // under NLL and collide with the next iteration's `recv`. A plain
+        // `usize` crosses that boundary instead, and the slicing happens once,
+        // here. `recv` fills the buffer from offset zero and reports how many
+        // bytes it wrote, so this is exactly the packet it just delivered.
+        let len = self.recv_packet_len()?;
+        Ok(&self.buffer[..len])
+    }
+
+    /// The receive loop behind [`WinDivertSource::recv_packet`]: returns the
+    /// length of the packet now sitting at the front of `self.buffer`.
+    fn recv_packet_len(&mut self) -> Result<usize> {
         loop {
-            let packet = match self.handle.recv(&mut self.buffer) {
-                Ok(packet) => packet,
+            match self.handle.recv(&mut self.buffer) {
+                Ok(packet) => {
+                    let len = packet.data.len();
+                    self.funnel.delivered += 1;
+                    // No `report()` here on purpose. The funnel line for a
+                    // delivered packet is emitted downstream, once its parse
+                    // verdict is known, so that every counter in a given line
+                    // describes the same set of packets.
+                    return Ok(len);
+                }
                 // The driver already dropped this copy: skipping one packet
                 // leaves a reassembly gap, while propagating would kill the
                 // capture for the rest of the session.
@@ -195,16 +255,31 @@ impl PacketSource for WinDivertSource {
                     self.funnel.oversized += 1;
                     self.funnel.report();
                     warn!("packet larger than the capture buffer — skipped");
-                    continue;
                 }
                 Err(err) => return Err(Error::Capture(format!("recv: {err}"))),
-            };
-            self.funnel.delivered += 1;
+            }
+        }
+    }
+}
 
+/// The parsing half of the source: a thin wrapper that receives raw bytes with
+/// [`WinDivertSource::recv_packet`] and turns them into a [`Segment`]. Every
+/// line of it is work the elevated broker deliberately does not do — it moves
+/// wholesale to the unelevated side once the pipe-backed source replaces this
+/// one there.
+impl PacketSource for WinDivertSource {
+    fn next_segment(&mut self) -> Result<Segment> {
+        loop {
+            // Read out before the receive: the bytes `recv_packet` returns
+            // borrow `*self`, so reading any field of the source while they are
+            // still live — including this `Copy` one — would be a second borrow.
+            let game_port = self.game_port;
             // WinDivert's network layer delivers whole IP packets, so there is
             // no link-layer framing to decode and nothing about the adapter
             // (Ethernet, WiFi, VPN) reaches this parser.
-            let Some(segment) = parse_segment(&packet.data[..], self.game_port) else {
+            let parsed = parse_segment(self.recv_packet()?, game_port);
+
+            let Some(segment) = parsed else {
                 self.funnel.unparsed += 1;
                 self.funnel.report();
                 continue;
