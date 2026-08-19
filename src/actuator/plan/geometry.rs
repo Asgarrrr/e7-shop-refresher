@@ -317,37 +317,104 @@ impl std::fmt::Display for ScreenError {
 /// # Ok::<(), ScreenError>(())
 /// ```
 pub fn to_screen(rect: ClientRect, point: DesignPoint) -> Result<(i32, i32), ScreenError> {
-    if rect.is_degenerate() {
-        return Err(ScreenError::DegenerateRect {
-            width: rect.width,
-            height: rect.height,
-        });
+    Ok(Viewport::of(rect)?.place(point))
+}
+
+/// A window that has been proved mappable, and the three numbers that proof
+/// produced. Every term in [`to_screen`] that depends on the *window* rather
+/// than on the point resolves here, once.
+///
+/// The split exists for the executor, not for arithmetic. Both [`ScreenError`]s
+/// are properties of the rect alone, so asking them per step asked the same
+/// question of the same unchanging value up to eight times per job — and the
+/// only place the executor could ask was inside its step loop, *after* the first
+/// `sleep(step.wait_ms)`. A minimized window therefore paid a full step delay,
+/// up to 61 s with a configured range, before abandoning a job that could never
+/// have landed a click. Resolved once at `acquire` time, the refusal is
+/// immediate and the per-step map cannot fail at all.
+///
+/// This does not weaken the mid-job case the executor used to be credited with
+/// catching here: the rect is measured once by `acquire` and never re-read by
+/// the loop, so a window minimized *during* a job was never visible to this
+/// conversion. That is the backends' `validate_target`, which re-reads the rect
+/// before every input and answers `Recoverable`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Viewport {
+    /// Client-area origin in screen pixels, straight off the rect.
+    left: i32,
+    top: i32,
+    /// Design pixels → physical pixels.
+    scale: f32,
+    /// Width of the 16:9-or-wider view in design pixels, which is what the
+    /// `Right` and `Center` anchors measure against.
+    view_w: f32,
+    /// Pillarbox: half the client width the view does not cover.
+    off_x: f32,
+}
+
+impl Viewport {
+    /// Resolves the window-dependent half of the design → screen transform.
+    ///
+    /// # Errors
+    ///
+    /// The same two verdicts, for the same reasons, as [`to_screen`] — which is
+    /// now a thin wrapper over this and [`place`](Viewport::place).
+    pub fn of(rect: ClientRect) -> Result<Self, ScreenError> {
+        if rect.is_degenerate() {
+            return Err(ScreenError::DegenerateRect {
+                width: rect.width,
+                height: rect.height,
+            });
+        }
+        let (cw, ch) = (rect.width as f32, rect.height as f32);
+        let aspect = cw / ch;
+        if aspect + 1e-3 < DESIGN_W / DESIGN_H {
+            return Err(ScreenError::TooNarrow { aspect });
+        }
+        let scale = ch / DESIGN_H;
+        let view_w = DESIGN_H * aspect.min(MAX_ASPECT);
+        Ok(Self {
+            left: rect.left,
+            top: rect.top,
+            scale,
+            view_w,
+            off_x: (cw - view_w * scale) / 2.0,
+        })
     }
-    let (cw, ch) = (rect.width as f32, rect.height as f32);
-    let aspect = cw / ch;
-    if aspect + 1e-3 < DESIGN_W / DESIGN_H {
-        return Err(ScreenError::TooNarrow { aspect });
+
+    /// One design point in the resolved window. Infallible by construction:
+    /// the only two ways this transform has no answer are refused by
+    /// [`of`](Viewport::of), and nothing between the two calls can reintroduce
+    /// them — `self` carries no borrow of the world.
+    #[must_use]
+    pub fn place(self, point: DesignPoint) -> (i32, i32) {
+        let Self {
+            left,
+            top,
+            scale: s,
+            view_w,
+            off_x,
+        } = self;
+        let x = match point.anchor {
+            Anchor::Left => point.x,
+            Anchor::Right => view_w - (DESIGN_W - point.x),
+            Anchor::Center => view_w / 2.0 + (point.x - DESIGN_W / 2.0),
+        };
+        // `as` from float to int saturates at the bounds but maps `NaN` to 0 —
+        // which here would be a click at the top-left corner of the *screen*,
+        // outside the game window, silently. It cannot happen: `of`'s
+        // `is_degenerate` rejects `height <= 0`, so `ch >= 1.0` and neither `s`
+        // nor `aspect` can be a `0.0 / 0.0`, and every other term is a finite
+        // design constant or a rect field. That argument is why the refusal has
+        // to stay in the constructor: it is what makes this function total. The
+        // saturation itself is the wanted behaviour for the remaining extreme —
+        // an absurd rect clamps to `i32` bounds, and `pack_point` then refuses
+        // the coordinate rather than masking it back inside the window. The same
+        // reasoning is written out at `win::move_cursor`'s clamp.
+        let px = (left as f32 + off_x + x * s).round() as i32;
+        let py = (top as f32 + point.y * s).round() as i32;
+        (px, py)
     }
-    let s = ch / DESIGN_H;
-    let view_w = DESIGN_H * aspect.min(MAX_ASPECT);
-    let off_x = (cw - view_w * s) / 2.0;
-    let x = match point.anchor {
-        Anchor::Left => point.x,
-        Anchor::Right => view_w - (DESIGN_W - point.x),
-        Anchor::Center => view_w / 2.0 + (point.x - DESIGN_W / 2.0),
-    };
-    // `as` from float to int saturates at the bounds but maps `NaN` to 0 — which
-    // here would be a click at the top-left corner of the *screen*, outside the
-    // game window, silently. It cannot happen: `is_degenerate` above rejects
-    // `height <= 0`, so `ch >= 1.0` and neither `s` nor `aspect` can be a `0.0 /
-    // 0.0`, and every other term is a finite design constant or a rect field. The
-    // saturation itself is the wanted behaviour for the remaining extreme — an
-    // absurd rect clamps to `i32` bounds, and `pack_point` then refuses the
-    // coordinate rather than masking it back inside the window. The same
-    // reasoning is written out at `win::move_cursor`'s clamp.
-    let px = (rect.left as f32 + off_x + x * s).round() as i32;
-    let py = (rect.top as f32 + point.y * s).round() as i32;
-    Ok((px, py))
 }
 
 #[cfg(test)]

@@ -407,31 +407,42 @@ pub async fn run_executor(
             }
         };
         let mut surface = SurfaceJobGuard::new(&mut surface, window);
+        // Built here, between the guard and the first sleep, because both of its
+        // refusals are properties of the rect `acquire` just measured — nothing
+        // in the loop re-reads it, so asking per step asked an unchanging
+        // question after having already waited out a step delay. A minimized
+        // window used to burn 1.18 s, or up to 61 s with a configured range,
+        // before abandoning a job that could never land a click. After the
+        // guard, not before it: a successful `acquire` owes a `release` whatever
+        // the rect turns out to be.
+        let viewport = match plan::Viewport::of(rect) {
+            Ok(viewport) => viewport,
+            // A minimized window acquires with an empty client area, and the
+            // next `acquire` reads a fresh one: recoverable, so drop this job
+            // and let the watchdog's retry heal it. The classification is the
+            // converter's `ScreenError`, not a `rect.width <= 0` test spelled
+            // out again here.
+            Err(error @ ScreenError::DegenerateRect { .. }) => {
+                abort(&journal, &error.to_string());
+                continue;
+            }
+            // Nothing the loop can heal: the player has to widen the window.
+            // Abandon the job, keep the task — the guard releases as this
+            // iteration unwinds.
+            Err(error @ ScreenError::TooNarrow { .. }) => {
+                fail(&journal, &gate, &error.to_string());
+                continue;
+            }
+        };
         for step in &job.steps {
             tokio::time::sleep(Duration::from_millis(step.wait_ms)).await;
             if let Some(reason) = drop_reason(&job, &epoch, &gate) {
                 abort(&journal, reason);
                 break;
             }
-            let at = match plan::to_screen(rect, step.input.at()) {
-                Ok(at) => at,
-                // A minimized window acquires with an empty client area: same
-                // fault as minimized mid-job, same recoverable abort. This used
-                // to be a second copy of the degenerate-rect test run before the
-                // loop, purely because a `String` error could not be matched on;
-                // the classification now lives where the policy is.
-                Err(error @ ScreenError::DegenerateRect { .. }) => {
-                    abort(&journal, &error.to_string());
-                    break;
-                }
-                // Nothing the loop can heal: the player has to widen the window.
-                // Abandon the remaining steps, keep the task — the guard still
-                // releases on the way out of this iteration.
-                Err(error @ ScreenError::TooNarrow { .. }) => {
-                    fail(&journal, &gate, &error.to_string());
-                    break;
-                }
-            };
+            // Total: the two ways this transform has no answer were both settled
+            // above, before a single millisecond was spent.
+            let at = viewport.place(step.input.at());
             let delivered = match step.input {
                 Input::Click { press_ms, .. } => {
                     if dry_run {
@@ -1366,6 +1377,60 @@ mod tests {
             line.text
                 .contains("degenerate client area 0×0 — aborted remaining clicks")
         }));
+    }
+
+    /// What the two verdict tests around this one do not pin: *when* the refusal
+    /// lands. Both `ScreenError`s are properties of the rect `acquire` measured,
+    /// so the answer is knowable before the job's first delay — but the only
+    /// place the conversion ran was inside the step loop, one
+    /// `sleep(step.wait_ms)` in. A minimized window paid that delay in full
+    /// (1.18 s on the default timings, up to 61 s with a configured range) to
+    /// reach a conclusion that was already true when the rect was read.
+    ///
+    /// Virtual time makes the cost exact rather than approximate: paused, the
+    /// runtime auto-advances only over an awaited `sleep`, so a zero elapsed is
+    /// proof that no step delay was waited out at all.
+    #[tokio::test(start_paused = true)]
+    async fn an_unmappable_window_is_refused_before_the_first_step_delay() {
+        for rect in [
+            // Minimized: recoverable, one job dropped.
+            ClientRect {
+                left: 0,
+                top: 0,
+                width: 0,
+                height: 0,
+            },
+            // Narrower than 16:9: fatal, the watch halts.
+            ClientRect {
+                left: 0,
+                top: 0,
+                width: 1280,
+                height: 800,
+            },
+        ] {
+            let rig = rig();
+            let (surface, events) = FakeSurface::new(Ok(rect));
+            rig.job_tx
+                .send(plan::buy_job(
+                    Trigger::ShopOpened,
+                    Timings::default(),
+                    Epoch(0),
+                    &[plan::Row::new(0).expect("row 0 is one of the six")],
+                    42,
+                ))
+                .await
+                .unwrap();
+            drop(rig.job_tx);
+            let started = tokio::time::Instant::now();
+            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "{rect:?} was unmappable before the job started; waiting a step delay to say so \
+                 buys nothing"
+            );
+            assert!(events.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test(start_paused = true)]

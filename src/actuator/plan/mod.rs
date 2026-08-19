@@ -7,8 +7,9 @@
 //! The four submodules are the layers the file already had, in dependency order
 //! — each one reads the ones above it and none of them reaches back down:
 //!
-//! - [`geometry`] — *where*: the design space, the zones, `Slot`/`Row`, and
-//!   `to_screen`. Depends on nothing.
+//! - [`geometry`] — *where*: the design space, the zones, `Slot`/`Row`, and the
+//!   design→screen transform (`Viewport`, and `to_screen` over it). Depends on
+//!   nothing.
 //! - [`jitter`] — the one deterministic stream, and the salt that keeps its two
 //!   consumers from interfering. Its own module precisely because both of the
 //!   next two draw from it and neither owns it.
@@ -28,7 +29,7 @@ mod timings;
 
 pub use geometry::{
     Anchor, CONFIRM_BUY, CONFIRM_REFRESH, ClientRect, DesignPoint, MAX_ASPECT, REFRESH, Row,
-    ScreenError, Slot, Zone, buy_zone, to_screen,
+    ScreenError, Slot, Viewport, Zone, buy_zone, to_screen,
 };
 pub use jitter::Jitter;
 pub use jobs::{Epoch, Input, Job, TimedStep, buy_job, confirm_retry_job, refresh_job};
