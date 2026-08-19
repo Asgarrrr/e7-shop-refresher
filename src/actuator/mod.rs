@@ -980,6 +980,51 @@ mod tests {
         }));
     }
 
+    /// The sibling arm of the one above, three lines apart in the source and
+    /// the opposite verdict: an `acquire` that fails *recoverably* — the window
+    /// vanished between two jobs — must drop the job and leave the watch armed
+    /// so the watchdog's retry can heal it. Delete this and a mis-edit that
+    /// routes it through `fail` turns a transient blip into a stopped hunt that
+    /// blames the actuator; nothing else executes that arm
+    /// (`executor_aborts_without_halt_on_a_minimized_acquire` acquires *fine*
+    /// and is classified later, by `ScreenError::DegenerateRect`).
+    #[tokio::test(start_paused = true)]
+    async fn executor_aborts_without_halt_when_acquire_fails_recoverably() {
+        let rig = rig();
+        let (surface, events) = FakeSurface::new(Err(SurfaceError::Recoverable(
+            "game window vanished".to_owned(),
+        )));
+        let releases = surface.releases.clone();
+        rig.job_tx
+            .send(plan::refresh_job(
+                Trigger::Refreshed,
+                Timings::default(),
+                Epoch(0),
+                1,
+            ))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        let journal = rig.journal.clone();
+        let gate = rig.gate.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
+        )
+        .await
+        .expect("a recoverable acquire must end the job, then the loop ends on EOF");
+        assert!(events.lock().unwrap().is_empty());
+        assert!(
+            gate.is_enabled(),
+            "a transient blip must not halt the watch"
+        );
+        assert_eq!(*releases.lock().unwrap(), 0, "acquire engaged nothing");
+        assert!(journal.to_entries().iter().any(|line| {
+            line.text
+                .contains("actuator: game window vanished — aborted remaining clicks")
+        }));
+    }
+
     /// The preflight's verdict has to *reach the player*, not just exist.
     ///
     /// `win::preflight_refusal` is what `Surface::acquire` answers when the game
@@ -1451,6 +1496,43 @@ mod tests {
                 .filter(|line| line.text.contains("dry-run: click"))
                 .count(),
             2
+        );
+    }
+
+    /// The other half of "dry run must not touch the game": the test above
+    /// submits a `refresh_job`, which is two clicks and no scroll, so the
+    /// `Input::Scroll` arm of the dry-run branch was proved by nothing. A
+    /// bottom-group row is what plans scrolls — one to the top, one to the
+    /// bottom — and dry run is what a cautious player turns on first.
+    #[tokio::test(start_paused = true)]
+    async fn executor_dry_run_journals_a_scroll_without_touching_the_surface() {
+        let rig = rig();
+        let (surface, events) = FakeSurface::new(design_rect());
+        let releases = surface.releases.clone();
+        rig.job_tx
+            .send(plan::buy_job(
+                Trigger::ShopOpened,
+                Timings::default(),
+                Epoch(0),
+                // First row past `LAST_TOP_ROW`, which is `plan`-private here.
+                &[plan::Row::new(4).expect("row 4 is one of the six")],
+                42,
+            ))
+            .await
+            .unwrap();
+        drop(rig.job_tx);
+        let journal = rig.journal.clone();
+        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, true).await;
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(*releases.lock().unwrap(), 1);
+        let lines = journal.to_entries();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.text.contains("dry-run: scroll"))
+                .count(),
+            2,
+            "scroll to the top, then to the bottom group"
         );
     }
 

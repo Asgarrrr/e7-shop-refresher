@@ -175,6 +175,48 @@ mod tests {
         }
     }
 
+    /// The three builders once their fixed arguments are bound.
+    type Build = fn(Timings, u64) -> Job;
+
+    /// Both properties below belong to the `Jitter::new(seed ^
+    /// DELAY_SEED_SALT)` line all three builders share, so they are stated once
+    /// over this table instead of three times over.
+    fn builders() -> [(&'static str, Build); 3] {
+        [
+            ("confirm_retry_job", |timings, seed| {
+                confirm_retry_job(CONFIRM_BUY, timings, Epoch(5), seed)
+            }),
+            ("refresh_job", |timings, seed| {
+                refresh_job(Trigger::Refreshed, timings, Epoch(3), seed)
+            }),
+            ("buy_job", |timings, seed| {
+                buy_job(
+                    Trigger::ShopOpened,
+                    timings,
+                    Epoch(9),
+                    &[row(0), row(4)],
+                    seed,
+                )
+            }),
+        ]
+    }
+
+    /// Every range wide: a point range returns `min_ms` without touching the
+    /// jitter, which would leave the delay seed unobservable.
+    fn wide_ranges() -> Timings {
+        let wide = range(0, MAX_TIMING_MS);
+        Timings {
+            shop_opened: wide,
+            refreshed: wide,
+            purchase_resumed: wide,
+            recovery: wide,
+            confirm_refresh_modal: wide,
+            buy_modal: wide,
+            between_buys: wide,
+            scroll_settle: wide,
+        }
+    }
+
     fn scroll_notches(step: &TimedStep) -> i32 {
         match step.input {
             Input::Scroll { notches, .. } => notches,
@@ -355,6 +397,47 @@ mod tests {
         };
         let job = confirm_retry_job(CONFIRM_REFRESH, timings, Epoch(5), 42);
         assert_eq!(job.steps[0].wait_ms, 400 + 250);
+    }
+
+    #[test]
+    fn every_builder_maps_distinct_seeds_to_distinct_delay_streams() {
+        // What the salt buys is a bijection: two sessions never share a click
+        // rhythm. The probe seeds are picked so both ways of losing it show. The
+        // salt has no bit below bit 12, so a masking salt sends *every* seed
+        // under 4096 to one stream — 42 against 43 catches that. A setting salt
+        // cannot see a bit it already sets, and bit 12 is one of them — 42
+        // against 42 | 0x1000 catches that. Small seeds alone miss the second,
+        // large ones alone miss the first.
+        let seeds = [42_u64, 43, 42 | 0x1000];
+        let timings = wide_ranges();
+        for (name, build) in builders() {
+            let probes = seeds.map(|seed| (seed, build(timings, seed).steps[0].wait_ms));
+            for (i, &(seed_a, wait_a)) in probes.iter().enumerate() {
+                for &(seed_b, wait_b) in &probes[i + 1..] {
+                    assert_ne!(
+                        wait_a, wait_b,
+                        "{name}: seeds {seed_a} and {seed_b} share a delay stream"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_builder_lets_the_timings_move_an_input() {
+        // The other half of the contract: the waits are drawn from a stream of
+        // their own, so widening every range leaves positions and press holds
+        // byte-identical. `extra_ranges_add_a_bounded_draw_on_top_of_the_baselines`
+        // says this of `refresh_job`; the two builders that spend money had no
+        // such test.
+        for (name, build) in builders() {
+            let salted = build(wide_ranges(), 42);
+            let baseline = build(Timings::default(), 42);
+            assert_eq!(salted.steps.len(), baseline.steps.len(), "{name}");
+            for (step, base) in salted.steps.iter().zip(&baseline.steps) {
+                assert_eq!(step.input, base.input, "{name} moved an input");
+            }
+        }
     }
 
     #[test]

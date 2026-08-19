@@ -514,6 +514,9 @@ mod tests {
         frames: VecDeque<Result<Message, WsError>>,
         send_stalls: bool,
         ends_after_script: bool,
+        /// Every frame the writer handed to the sink, shared so a test can read
+        /// it while `pump` still owns the link.
+        sent: Arc<Mutex<Vec<Message>>>,
     }
 
     impl ScriptedLink {
@@ -522,7 +525,12 @@ mod tests {
                 frames: frames.into(),
                 send_stalls: false,
                 ends_after_script: false,
+                sent: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn sent(&self) -> Arc<Mutex<Vec<Message>>> {
+            Arc::clone(&self.sent)
         }
 
         fn stalling_sends(mut self) -> Self {
@@ -562,7 +570,8 @@ mod tests {
         fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
             self.sink_state()
         }
-        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), WsError> {
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), WsError> {
+            self.sent.lock().unwrap().push(item);
             Ok(())
         }
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
@@ -589,6 +598,15 @@ mod tests {
             events.push(event);
         }
         (outcome, events)
+    }
+
+    /// The next event, or a failure. A test that waits on an event its producer
+    /// no longer emits would otherwise park forever under `start_paused`, and a
+    /// hang proves nothing.
+    async fn next_event(events: &mut mpsc::Receiver<UplinkEvent>) -> Option<UplinkEvent> {
+        tokio::time::timeout(Duration::from_secs(60), events.recv())
+            .await
+            .expect("an event was expected and none arrived")
     }
 
     fn disconnect_reason(outcome: Outcome) -> String {
@@ -877,6 +895,106 @@ mod tests {
             event_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
         ));
+    }
+
+    /// Joins the two halves of the outage protocol. `run_with_connector` is the
+    /// only producer of `LinkDown`/`LinkUp`, and those are what suspend and
+    /// re-grant the recovery watchdog. Delete either send and every controller
+    /// test still passes, while a session that survived one outage sits with its
+    /// watchdog suspended forever: no escalation, no honest halt.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_reports_the_outage_and_its_end() {
+        // Held on purpose: a closed outbound channel ends the loop before the
+        // second dial, which would pass the LinkDown half for the wrong reason.
+        let (_raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        let (event_tx, mut event_rx) = mpsc::channel::<UplinkEvent>(4);
+        let (stop_tx, stop_rx) = no_shutdown();
+        let dials = Arc::new(Mutex::new(0_u32));
+        let counted = Arc::clone(&dials);
+
+        let task = tokio::spawn(run_with_connector(
+            test_url(),
+            raw_rx,
+            event_tx,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            stop_rx,
+            move |_url| {
+                let dial = {
+                    let mut count = counted.lock().unwrap();
+                    *count += 1;
+                    *count
+                };
+                // First dial: a peer that hangs up. Second: one that connects and
+                // stays quiet, so the loop settles after reporting recovery.
+                let link = if dial == 1 {
+                    ScriptedLink::new(vec![Ok(Message::Close(None))])
+                } else {
+                    ScriptedLink::new(Vec::new()).stalling_sends()
+                };
+                ready(Ok::<_, WsError>(link))
+            },
+        ));
+
+        // Bounded, not a bare `recv().await`: a producer that stops emitting has
+        // to fail this test, and under paused time a missing event is a hang.
+        let outage = next_event(&mut event_rx).await;
+        assert!(
+            matches!(&outage, Some(UplinkEvent::LinkDown(reason)) if reason.contains("closed")),
+            "expected the outage to be reported, got {outage:?}"
+        );
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let recovery = next_event(&mut event_rx).await;
+        assert!(
+            matches!(recovery, Some(UplinkEvent::LinkUp)),
+            "expected the outage's end to be reported, got {recovery:?}"
+        );
+        assert_eq!(*dials.lock().unwrap(), 2, "the outage ended on a redial");
+
+        stop_tx.send(true).expect("the receiver is in the task");
+        task.await.unwrap();
+    }
+
+    /// The success path of the writer: the chunk's bytes reach the wire, and the
+    /// iteration keeps none of its budget lease. A refactor that retained the
+    /// lease — batching sends, parking chunks for a retry — leaks the whole
+    /// outbound quota over a session until reassembly stalls, and the stalled-send
+    /// test would not notice: there the lease is released by the error path.
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_send_returns_its_budget() {
+        let budget = PipelineBudget::with_test_limits(BudgetLimits {
+            global: 64,
+            capture: 64,
+            reassembly: 64,
+            outbound: 64,
+        });
+        // Held open: the writer must park on an empty channel after the send, so
+        // the budget is read while the connection is still alive.
+        let (raw_tx, mut raw_rx) = mpsc::channel::<BudgetedChunk>(4);
+        let (event_tx, _event_rx) = mpsc::channel::<UplinkEvent>(4);
+        raw_tx
+            .send(budget.admit_outbound_for_test(vec![1, 2, 3]))
+            .await
+            .unwrap();
+        assert_eq!(budget.snapshot().current_outbound, 3);
+
+        let link = ScriptedLink::new(Vec::new());
+        let sent = link.sent();
+        let (_stop_tx, mut stop_rx) = no_shutdown();
+        let mut pumping = std::pin::pin!(pump(link, &mut raw_rx, &event_tx, &mut stop_rx));
+
+        tokio::select! {
+            _ = &mut pumping => panic!("the connection must still be open"),
+            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+
+        let frames = sent.lock().unwrap();
+        let [Message::Binary(payload)] = &frames[..] else {
+            panic!("expected exactly one binary frame, got {frames:?}");
+        };
+        assert_eq!(payload.as_ref(), &[1, 2, 3]);
+        assert_eq!(budget.snapshot().current_total, 0);
     }
 
     #[tokio::test(start_paused = true)]

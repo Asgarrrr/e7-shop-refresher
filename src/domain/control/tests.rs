@@ -1112,6 +1112,31 @@ fn balance_equal_to_cost_still_affords_one_refresh() {
 }
 
 #[test]
+fn a_budget_that_divides_by_the_cost_is_fully_spent() {
+    // The other boundary of the same policy: the look-ahead gate is `>`, not
+    // `>=`, so a budget the cost divides exactly is spent to the last crystal
+    // instead of leaving the player's last refresh unbought.
+    let mut ctrl = started(Limits {
+        max_spend: Some(xtl(6)),
+        ..Limits::default()
+    });
+    assert_eq!(
+        ctrl.handle(snap(dud_shop(Some(meta(100, 3))), 1)),
+        vec![Action::Refresh]
+    );
+    assert_eq!(
+        ctrl.handle(snap(dud_shop(Some(meta(97, 3))), 2)),
+        vec![Action::Refresh],
+        "spent 3 + cost 3 reaches the ceiling of 6 without crossing it"
+    );
+    assert_eq!(ctrl.progress().spent, xtl(6));
+    assert_eq!(
+        ctrl.handle(snap(dud_shop(Some(meta(94, 3))), 3)),
+        vec![Action::Halt(StopReason::MaxSpend)]
+    );
+}
+
+#[test]
 fn stop_reason_priority_order() {
     // Table-driven so a failure names the pair that broke: this pins the
     // *ordering* of `stop_reason`'s clauses, which is exactly the kind of thing
@@ -1322,6 +1347,22 @@ fn timeout_fires_via_tick_while_paused() {
     let actions = ctrl.handle(Event::Tick { now_ms: 1_000 });
     assert_eq!(actions, vec![Action::Halt(StopReason::Timeout)]);
     assert_eq!(ctrl.status(), Status::Stopped(StopReason::Timeout));
+}
+
+#[test]
+fn an_elapsed_duration_halts_at_the_refresh_gate() {
+    // The deadline is checked in two places, and this is the copy that guards
+    // the emission point: without it a snapshot (or a buy echo) landing after
+    // the deadline pays for one more refresh before the next tick stops it.
+    let mut ctrl = started(Limits {
+        max_duration_ms: Some(1_000),
+        ..Limits::default()
+    });
+    assert_eq!(
+        ctrl.handle(snap(dud_shop(None), 1_000)),
+        vec![Action::Halt(StopReason::Timeout)]
+    );
+    assert_eq!(ctrl.progress().refreshes, 0);
 }
 
 #[test]
