@@ -219,7 +219,7 @@ fn run_mode(
     let gate = handles.gate.clone();
     // The handle is kept, not discarded: it is both the join point for the
     // teardown below and the reason a panic in this wrapper cannot vanish.
-    let mut session_task = runtime.spawn(async move {
+    let session_task = runtime.spawn(async move {
         // app::supervise catches a session panic (it must land in the banner,
         // not vanish with a discarded JoinHandle) and forces the gate off.
         let (outcome, session_failed) = app::supervise(session.run(), gate).await;
@@ -259,36 +259,22 @@ fn run_mode(
     // mid-flight, leaving an orphaned live capture session on every
     // launch/close cycle.
     shutdown.request();
-    let joined = runtime.block_on(async {
-        // `&mut session_task`, not `session_task`: `timeout` takes its future
-        // by value, so handing over the `JoinHandle` would *detach* the task
-        // on the timeout arm rather than cancel it, and the next line
-        // (`shutdown_background`) would leak blocking threads — exactly the
-        // outcome the warning below describes. `JoinHandle` is
-        // `Unpin + Future`, so a borrow is a valid branch; aborting turns
-        // that accident into the intended path.
-        let outcome = tokio::time::timeout(TEARDOWN_GRACE, &mut session_task).await;
-        if outcome.is_err() {
-            session_task.abort();
-            // Drain the cancellation so the task is really gone before the
-            // runtime is dropped.
-            let _ = session_task.await;
-        }
-        outcome
-    });
-    if joined.is_err() {
-        tracing::warn!(
-            grace_s = TEARDOWN_GRACE.as_secs(),
-            "session teardown timed out; the task was aborted, and a capture session may briefly outlive the process"
-        );
-    }
+    // A session the process had to abandon is a failed session, so this verdict
+    // joins the flag rather than only reaching the log: the wait, the abort and
+    // the wording live in `lib.rs` beside the exit-code contract they feed,
+    // which is also the only place `--lib` tests can reach them.
+    let abandoned = runtime.block_on(arkyve_refresh_shop::teardown_failed(
+        session_task,
+        TEARDOWN_GRACE,
+    ));
     // Still not a plain drop, and still last: `tokio::io::stdin` parks a
     // blocking thread, so dropping the runtime would hang window close
     // until the player presses Enter — true of skipping the *runtime* drop
     // only, never of the cooperative teardown above.
     runtime.shutdown_background();
+    let session_failed = failed.load(Ordering::Relaxed) || abandoned;
     match result {
-        Ok(()) => exit_code(true, failed.load(Ordering::Relaxed)),
+        Ok(()) => exit_code(true, session_failed),
         Err(err) => {
             // `eframe::run_native` fails for real, common reasons — no GL
             // context, a stale display driver, an RDP session, a headless
@@ -297,7 +283,7 @@ fn run_mode(
             // the player sees a double-clicked exe do nothing.
             tracing::error!(error = %err, "the application window could not be created");
             eprintln!("GUI error: {err}");
-            exit_code(false, failed.load(Ordering::Relaxed))
+            exit_code(false, session_failed)
         }
     }
 }

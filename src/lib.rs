@@ -70,6 +70,7 @@ pub const APP_DIR: &str = "arkyve-refresh-shop";
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 /// Location of the config file. The app owns this file (the GUI's Setup/Apply
 /// writes it); the player isn't expected to hand-edit it, so it lives out of
@@ -421,9 +422,57 @@ pub fn fatal(message: String) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Waits out a session task the closing window has already asked to stop, and
+/// answers the half of [`exit_code`]'s contract the window cannot see: did the
+/// session actually finish, or did the process have to walk away from it.
+///
+/// Both failures it reports are sessions that did not end on their own terms,
+/// and neither can reach the `session_failed` flag `app::supervise` sets —
+/// that flag is written *by* the task, and in both of these the task is what
+/// broke. A teardown past `grace` is aborted mid-unwind, so a live capture
+/// session can briefly outlive the process; a task that panicked where
+/// `app::supervise` could not catch it (its wrapper, not the session inside)
+/// never wrote an outcome anywhere, which is the residual risk the wrapper's own
+/// comment in `main` names. Reported here rather than at the call site because
+/// the call site had a `warn!` and no return value, so a run that had to be
+/// killed on the way out still exited `SUCCESS` — the exact case the contract
+/// below says is a failure.
+///
+/// `&mut task`, not `task`: `timeout` takes its future by value, so handing over
+/// the `JoinHandle` would *detach* the task on the timeout arm rather than
+/// cancel it, and the caller's `shutdown_background` would then leak blocking
+/// threads — exactly the outcome the warning describes. `JoinHandle` is
+/// `Unpin + Future`, so a borrow is a valid branch; aborting turns that accident
+/// into the intended path.
+pub async fn teardown_failed(mut task: tokio::task::JoinHandle<()>, grace: Duration) -> bool {
+    match tokio::time::timeout(grace, &mut task).await {
+        Ok(Ok(())) => false,
+        Ok(Err(err)) => {
+            tracing::error!(
+                error = %err,
+                "the session task did not return; its outcome reached neither the banner nor the failed flag"
+            );
+            true
+        }
+        Err(_) => {
+            task.abort();
+            // Drain the cancellation so the task is really gone before the
+            // runtime is dropped.
+            let _ = task.await;
+            tracing::warn!(
+                grace_s = grace.as_secs(),
+                "session teardown timed out; the task was aborted, and a capture session may briefly outlive the process"
+            );
+            true
+        }
+    }
+}
+
 /// The exit-code contract, in one place because scripts and smoke checks read
 /// it: success needs *both* a window that closed cleanly and a session that did
-/// not die. A dead session is a failure even when the window closed cleanly.
+/// not die. A dead session is a failure even when the window closed cleanly —
+/// including one that had to be aborted, which is what [`teardown_failed`]
+/// folds into `session_failed`.
 #[must_use]
 pub fn exit_code(window_closed_cleanly: bool, session_failed: bool) -> ExitCode {
     if window_closed_cleanly && !session_failed {
@@ -584,5 +633,41 @@ mod tests {
                 "window_closed_cleanly={window} session_failed={failed}"
             );
         }
+    }
+
+    /// The three teardowns the closing window can meet, and which of them the
+    /// exit code has to call a failure. The middle two are why this function
+    /// returns anything at all: both used to be a `warn!` the caller dropped on
+    /// the floor, so a session the process gave up on exited `SUCCESS` and
+    /// contradicted the contract tested above.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_the_process_had_to_abandon_is_not_a_success() {
+        let grace = Duration::from_secs(3);
+
+        let clean = tokio::spawn(async {});
+        assert!(
+            !teardown_failed(clean, grace).await,
+            "a task that returned owes the exit code nothing"
+        );
+
+        // Never finishes: the grace expires and the task is aborted mid-unwind,
+        // which is the case that leaves a capture session behind.
+        let hung = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let started = tokio::time::Instant::now();
+        assert!(teardown_failed(hung, grace).await);
+        assert!(
+            started.elapsed() >= grace,
+            "the abort must come after the grace, not instead of it"
+        );
+
+        // `app::supervise` catches a panic in the *session*; a panic in the
+        // wrapper around it lands here as a `JoinError` and writes neither the
+        // banner nor the failed flag.
+        let panicked = tokio::spawn(async {
+            panic!("the wrapper itself died");
+        });
+        assert!(teardown_failed(panicked, grace).await);
     }
 }
