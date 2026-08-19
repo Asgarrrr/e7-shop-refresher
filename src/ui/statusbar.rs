@@ -38,67 +38,78 @@ fn split_help_url(text: &str) -> Option<(&str, &str, &str)> {
     Some((&text[..start], &rest[..len], &rest[len..]))
 }
 
-/// The error line, with any URL in it turned into something clickable.
+/// Strips the error-taxonomy prefixes a player has no use for.
 ///
-/// A URL that ends in `.exe` becomes a **button** rather than a link. The
-/// difference is not decoration: a 90-character address rendered inline is what
-/// made this banner six lines of red that nobody finishes, and "Download" is
-/// what the player is actually being asked to do. Anything else stays a plain
-/// hyperlink showing its address, because for a documentation page the address
-/// *is* the information.
+/// The banner receives `session error: network capture: Npcap is missing…`:
+/// `app::supervise` adds the first, `Error::Capture`'s `Display` the second.
+/// Both are right in a log file and noise on screen — they name which layer
+/// failed to someone who cannot act on either. Degrades gracefully: if either
+/// string is ever reworded the prefix simply survives on screen, which is what
+/// the banner did before.
+fn without_error_prefixes(text: &str) -> &str {
+    let mut rest = text;
+    for prefix in ["session error: ", "network capture: "] {
+        rest = rest.strip_prefix(prefix).unwrap_or(rest);
+    }
+    rest
+}
+
+/// The error banner: one sentence, then an action row under it.
 ///
-/// `horizontal_wrapped` so the parts still flow as one sentence at the panel's
-/// width.
+/// Stacked rather than inline. A URL could be spliced into a flowing sentence
+/// because a link reads as a word; a stateful button cannot, and doing it
+/// anyway produced a banner where `Restart now` sat mid-clause with the rest of
+/// the sentence continuing past it — still instructing the player to restart
+/// the app the button was offering to restart.
+///
+/// So [`split_help_url`]'s three parts become three rows: what happened, what to
+/// press, and the detail that follows. Only the first is drawn in the error
+/// colour; the trailing hint is faint, because it is guidance rather than a
+/// fault.
 fn error_banner(ui: &mut egui::Ui, text: &str, fetcher: &Fetcher) {
+    let text = without_error_prefixes(text);
     let color = ui.visuals().error_fg_color;
-    if split_help_url(text).is_none() {
+    let Some((headline, url, hint)) = split_help_url(text) else {
         ui.colored_label(color, text);
         return;
+    };
+    // Only an installer earns the stacked layout and the action row. Any other
+    // address stays a link inside the sentence, because for a page the address
+    // *is* the information — and because a documentation URL must never end up
+    // under a button offering to download and run it.
+    if !url.to_ascii_lowercase().ends_with(".exe") {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.colored_label(color, headline);
+            ui.hyperlink_to(url, url);
+            ui.colored_label(color, hint);
+        });
+        return;
     }
-    ui.horizontal_wrapped(|ui| {
-        // Item spacing would otherwise open a gap inside a sentence that was one
-        // string a moment ago; the button gets its own padding back.
-        ui.spacing_mut().item_spacing.x = 0.0;
-        // Every URL, not just the first. The shipped Npcap message carries one,
-        // but a banner that handles only the first address and leaves the rest
-        // flat is worse than one that handles none: the flat ones read as the
-        // unimportant ones.
-        let mut rest = text;
-        while let Some((before, url, after)) = split_help_url(rest) {
-            ui.colored_label(color, before.trim_end());
-            if url.to_ascii_lowercase().ends_with(".exe") {
-                ui.add_space(theme::SP_XS);
-                install_button(ui, url, fetcher);
-                ui.add_space(theme::SP_XS);
-            } else {
-                ui.hyperlink_to(url, url);
-            }
-            rest = after;
-        }
-        ui.colored_label(color, rest.trim_start());
+    ui.vertical(|ui| {
+        ui.colored_label(color, headline.trim());
+        ui.add_space(theme::SP_SM);
+        install_row(ui, url, hint.trim(), fetcher);
     });
 }
 
-/// The `Download` button and whatever the fetch is currently doing.
+/// The action row: one button, and beside it whatever the player needs to know
+/// next.
 ///
-/// The label carries the state rather than a separate spinner or line: the
-/// banner is one wrapped sentence and a second moving element in it would be
-/// noise. While a fetch is in flight the button is disabled, so a second click
-/// cannot start a second worker — [`Fetcher::start`] refuses that anyway, and
-/// this makes the refusal visible instead of silent.
-fn install_button(ui: &mut egui::Ui, url: &str, fetcher: &Fetcher) {
-    match fetcher.progress() {
+/// The label carries the state instead of a separate spinner: the row is small
+/// and a second moving element in it would be noise. A fetch in flight disables
+/// the button, so a second click cannot start a second worker —
+/// [`Fetcher::start`] refuses that anyway, and this makes the refusal visible
+/// rather than silent.
+fn install_row(ui: &mut egui::Ui, url: &str, hint: &str, fetcher: &Fetcher) {
+    ui.horizontal_wrapped(|ui| match fetcher.progress() {
         Progress::Fetching => {
             ui.add_enabled(false, egui::Button::new("Downloading…"));
-            ui.ctx().request_repaint_after(REPAINT_WHILE_FETCHING);
         }
         Progress::Checking => {
             ui.add_enabled(false, egui::Button::new("Checking…"));
-            ui.ctx().request_repaint_after(REPAINT_WHILE_FETCHING);
         }
         Progress::Launched => {
-            ui.colored_label(ui.visuals().warn_fg_color, "installer opened — finish it,");
-            ui.add_space(theme::SP_XS);
             // The relaunch is one click rather than "close this and open it
             // again": the tap is opened once, inside the session that already
             // died, so a fresh process is what picks Npcap up. See
@@ -115,29 +126,37 @@ fn install_button(ui: &mut egui::Ui, url: &str, fetcher: &Fetcher) {
                     Err(err) => fetcher.fail(format!("could not restart: {err}")),
                 }
             }
+            ui.add_space(theme::SP_SM);
+            ui.colored_label(theme::INK_MUTED, "once the Npcap setup is finished");
         }
         Progress::Failed(reason) => {
             // The retry stays available: the common failures here are transient
             // (a proxy, a captive portal, a dropped connection), and a dead end
             // is what this whole feature exists to remove.
-            if ui
-                .button("Retry download")
-                .on_hover_text(reason.clone())
-                .clicked()
-            {
+            if ui.button("Retry download").clicked() {
                 fetcher.start();
             }
-            ui.colored_label(ui.visuals().error_fg_color, format!(" — {reason}"));
+            ui.add_space(theme::SP_SM);
+            ui.colored_label(ui.visuals().error_fg_color, reason);
         }
         Progress::Idle => {
             if ui
-                .button("Download")
-                .on_hover_text(format!("{url}\nverified before it is run"))
+                .button("Download Npcap")
+                .on_hover_text(format!(
+                    "{url}\nchecked against a pinned hash before it runs"
+                ))
                 .clicked()
             {
                 fetcher.start();
             }
+            if !hint.is_empty() {
+                ui.add_space(theme::SP_SM);
+                ui.colored_label(theme::INK_FAINT, hint);
+            }
         }
+    });
+    if matches!(fetcher.progress(), Progress::Fetching | Progress::Checking) {
+        ui.ctx().request_repaint_after(REPAINT_WHILE_FETCHING);
     }
 }
 
@@ -331,17 +350,17 @@ mod tests {
     /// as a literal rather than imported: `INSTALL_HINT` lives behind
     /// `cfg(all(windows, feature = "pcap-backend"))` and this test runs on every
     /// lane. Only the structure is asserted, so the wording can move.
-    const NPCAP_ERROR: &str = "session error: network capture: install Npcap from \
-         https://npcap.com/#download and leave \"Restrict Npcap driver's access to \
-         Administrators\" UNCHECKED. (wpcap.dll could not be loaded: wpcap.dll: \
-         LoadLibraryExW failed)";
+    const NPCAP_ERROR: &str = "session error: network capture: Npcap is missing, and the capture needs it. https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe Keep the installer's defaults, then restart this app.";
 
     #[test]
     fn split_help_url_finds_the_address_inside_a_sentence() {
         let (before, url, after) = split_help_url(NPCAP_ERROR).expect("the hint carries a URL");
-        assert!(before.ends_with("install Npcap from "));
-        assert_eq!(url, "https://npcap.com/#download");
-        assert!(after.starts_with(" and leave"));
+        assert!(before.ends_with("the capture needs it. "), "got: {before}");
+        assert_eq!(
+            url,
+            "https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe"
+        );
+        assert!(after.starts_with(" Keep the"), "got: {after}");
         // Reassembling must give back the original: the banner renders these
         // three pieces and nothing else, so a lost character is a lost word.
         assert_eq!(format!("{before}{url}{after}"), NPCAP_ERROR);
@@ -355,17 +374,21 @@ mod tests {
         assert!(split_help_url("see http://example.invalid/x").is_none());
     }
 
+    /// A message whose address is *not* an installer keeps the old inline shape,
+    /// address and all. Only an `.exe` gets the action row — a documentation
+    /// link must never sit under a button offering to download and run it.
     #[test]
-    fn the_banner_links_every_url_not_just_the_first() {
+    fn a_documentation_url_stays_an_inline_link() {
         let view = idle_view();
-        let two = "install Npcap from https://npcap.com/#download (if that page is slow, \
-                   the same signed installer is at \
-                   https://dev-libs.wireshark.org/windows/packages/Npcap/ ), then restart";
+        let doc = "capture refused: see https://npcap.com/#download for the driver";
         let harness = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &view, Some(two), true, &Fetcher::new());
+            let _ = render_status_bar(ui, &view, Some(doc), true, &Fetcher::new());
         });
         harness.get_by_label("https://npcap.com/#download");
-        harness.get_by_label("https://dev-libs.wireshark.org/windows/packages/Npcap/");
+        assert!(
+            harness.query_by_label("Download Npcap").is_none(),
+            "a doc page must not get the installer button"
+        );
     }
 
     #[test]
@@ -377,14 +400,27 @@ mod tests {
     }
 
     #[test]
+    fn the_taxonomy_prefixes_are_stripped_before_the_player_sees_them() {
+        assert_eq!(
+            without_error_prefixes("session error: network capture: Npcap is missing."),
+            "Npcap is missing."
+        );
+        // Unrecognised text survives untouched rather than being trimmed by guess.
+        assert_eq!(
+            without_error_prefixes("the game window vanished"),
+            "the game window vanished"
+        );
+    }
+
+    #[test]
     fn the_npcap_banner_offers_the_download_as_a_link() {
         let view = idle_view();
         let harness = Harness::new_ui(|ui| {
             let _ = render_status_bar(ui, &view, Some(NPCAP_ERROR), true, &Fetcher::new());
         });
-        // The address is its own widget, so it is clickable rather than a run of
-        // characters to be selected out of a 270-character line.
-        harness.get_by_label("https://npcap.com/#download");
+        // The action is a button; the address is its hover text, not a run of
+        // characters to be selected out of the sentence.
+        harness.get_by_label("Download Npcap");
     }
 
     /// The shipped message points at an `.exe`, and that one becomes a button
@@ -399,7 +435,7 @@ mod tests {
         let harness = Harness::new_ui(|ui| {
             let _ = render_status_bar(ui, &view, Some(msg), true, &Fetcher::new());
         });
-        harness.get_by_label("Download");
+        harness.get_by_label("Download Npcap");
         // The address itself is not on screen; it is the button's hover text.
         assert!(
             harness
@@ -414,11 +450,17 @@ mod tests {
     #[test]
     fn an_error_without_a_url_still_renders() {
         let view = idle_view();
-        let plain = "session error: the game window vanished";
         let harness = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &view, Some(plain), true, &Fetcher::new());
+            let _ = render_status_bar(
+                ui,
+                &view,
+                Some("session error: the game window vanished"),
+                true,
+                &Fetcher::new(),
+            );
         });
-        harness.get_by_label(plain);
+        // Shown without the taxonomy prefix the player cannot act on.
+        harness.get_by_label("the game window vanished");
     }
 
     #[test]
