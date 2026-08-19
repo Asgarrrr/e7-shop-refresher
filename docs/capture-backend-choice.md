@@ -150,6 +150,48 @@ fidelity, from Rust?* That is unexplored — the earlier migration went through 
 capped API instead — and it is the only thing between this project and capture
 with no install of any kind.
 
+### Answered the same day: yes on one adapter, no with a VPN
+
+A throwaway ETW consumer was written (Rust, `windows-sys` only, no new
+dependency) and measured against a 20 000 000-byte ground truth.
+
+**On a single-adapter machine it is excellent.** A plain `StartTraceW` +
+`EnableTraceEx2` session on the provider, consumed with `ProcessTrace`, reached
+**100.2 % of ground truth**, carried a **46 794-byte** frame with no
+`ERROR_INSUFFICIENT_BUFFER`, parsed 100 % of frames, and reported zero lost
+events. It beat `pktmon.exe`'s own numbers. Event 1001's layout is
+`u32 MiniportIfIndex | u32 LowerIfIndex | u32 FragmentSize | u8 Fragment[] | 16
+zero bytes`, measured rather than assumed. The medium keyword (`Native802.11` vs
+`Ethernet802.3`) selects the parser before a byte is touched.
+
+**Turn a VPN on and it collapses to 0.0 %.** Same probe, same ground truth: 5
+inbound TCP frames totalling 72 bytes, against 18 384 inbound UDP frames. The
+download went through the tunnel, so the physical adapter carried only encrypted
+UDP, and **the VPN's virtual adapter never appeared in the session at all** —
+one `(miniport 5, lower 5)` pair, the Wi-Fi card, and nothing else.
+
+**So wall #1 is real, and the paragraph above was wrong to imply otherwise.**
+"Enabling the provider is attaching the data source" held only because that
+machine had one adapter and nothing else needed attaching. With two, the
+constraint/data-source split this document described from the start is exactly
+what bites. Recorded here rather than silently amended, because the earlier
+reading was published and acted on.
+
+Letting `pktmon.exe` do the attaching and consuming *its* realtime session as a
+second reader does work under the VPN — **100.7 % of ground truth**, with the
+tunnel's inner addresses (`10.2.0.2`) visible. It is rejected anyway, on what it
+would rest on: PktMon's own event 160 carries an undocumented layout, and the
+probe located the IPv4 header by scanning the blob for something that looked like
+one. That is not a foundation for a pipeline that spends a player's gold, and it
+would also mean spawning and supervising a CLI for the life of every session.
+`LogBuffersLost` was 133 rather than 0 in that run.
+
+**Conclusion: Npcap stays**, and the reason is now specific rather than general.
+It is not that driverless capture is impossible — it demonstrably is possible,
+at full fidelity, with no install. It is that the driverless path is blind
+exactly where this product's users are most likely to be: behind a region VPN,
+which is routine for gacha players.
+
 ## The transferable rule
 
 > When replacing a component, ask whether the replacement is *designed for* the
@@ -283,15 +325,16 @@ Two secondary points, both measured rather than assumed:
   hypothesis should establish a ground truth first (download a known byte count
   and compare), because packet counts alone made this look like a quiet network
   twice.
-- **A working direct consumer of `Microsoft-Windows-NDIS-PacketCapture`.** This
-  replaces the older "a PktMon revision exposing a single-tap IP-layer mode",
-  which was the wrong thing to wait for: the 2026-08-19 amendment shows the
-  stream already carries inbound TCP payload in realtime, so what is missing is
-  our side of it, not Microsoft's. Whoever takes it needs an ETW session in Rust
-  (`windows-sys` already carries the APIs), 802.11/LLC-SNAP framing in
-  `link.rs`'s idiom, and a duplication filter equivalent to `--comp nics`. Build
-  it behind a feature flag beside Npcap and compare on one live session before
-  choosing; do not replace the working backend on a probe.
+- **A documented way to attach an arbitrary adapter to an ETW
+  `NDIS-PacketCapture` session.** This is the whole of what is missing, and it is
+  now a precise ask rather than a direction. The consumer side is solved and
+  measured (100.2 % of ground truth, 46 KB frames, loss reporting, 100 % parse);
+  what is not solved is making a VPN or other virtual adapter emit into a session
+  we created, which `pktmon.exe` manages and a plain `EnableTraceEx2` does not.
+  If that ever becomes documented, the backend is roughly 750 lines against
+  ~1 100 of Npcap-specific code deleted, with no new dependency. Build it behind
+  a feature flag beside Npcap and compare on one live session — with a VPN
+  running — before choosing.
 - **Evidence that the per-adapter fan-out does not scale** on a machine with many
   virtual adapters. Opening all of them buys the removal of every adapter
   heuristic; if it ever costs more than that, adapter selection comes back, not a
