@@ -1253,6 +1253,46 @@ fn wire_cost_overrides_the_constant() {
 }
 
 #[test]
+fn a_wire_cost_of_zero_falls_back_to_the_constant() {
+    // A zero is the one cost that switches both money gates off at once, so it
+    // is refused rather than believed. Budget 7 with the constant 3: two
+    // refreshes fit, a third would cross — the same schedule as the no-meta
+    // test above, which is the point.
+    let mut ctrl = started(Limits {
+        max_spend: Some(xtl(7)),
+        ..Limits::default()
+    });
+    assert_eq!(
+        ctrl.handle(snap(dud_shop(Some(meta(95, 0))), 1)),
+        vec![Action::Refresh]
+    );
+    assert_eq!(
+        ctrl.handle(snap(dud_shop(Some(meta(95, 0))), 2)),
+        vec![Action::Refresh]
+    );
+    assert_eq!(
+        ctrl.progress().spent,
+        xtl(6),
+        "spend must accumulate, or max_spend is unreachable"
+    );
+    assert_eq!(
+        ctrl.handle(snap(dud_shop(Some(meta(95, 0))), 3)),
+        vec![Action::Halt(StopReason::MaxSpend)]
+    );
+}
+
+#[test]
+fn a_wire_cost_of_zero_still_reaches_out_of_funds() {
+    // The other half: `stop_reason` compares the balance against the floored
+    // cost, not against the wire's zero — otherwise `balance < 0` is never true
+    // and the loop refreshes on an empty wallet forever.
+    let mut ctrl = started(Limits::default());
+    let actions = ctrl.handle(snap(dud_shop(Some(meta(2, 0))), 1));
+    assert_eq!(actions, vec![Action::Halt(StopReason::OutOfFunds)]);
+    assert_eq!(ctrl.progress().refreshes, 0);
+}
+
+#[test]
 fn matches_found_increments_by_matched_len() {
     let mut ctrl = started(Limits::default());
     let two_hits = shop(&[Equipment, Token, Equipment, Token, Token, Token], None);

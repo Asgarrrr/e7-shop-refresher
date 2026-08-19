@@ -705,9 +705,26 @@ impl Controller {
     /// Spend tracking never waits for a snapshot that carries meta. Internal:
     /// no view reads it since the top bar dropped the cost readout — re-expose
     /// it when the Stats tab needs it again.
+    ///
+    /// A wire-sent **zero** is refused and the constant used instead. Zero is
+    /// the one value that does not merely mis-state the price, it switches
+    /// both money gates off at once: `stop_reason`'s out-of-funds test becomes
+    /// `balance < 0`, never true, and `spent` stops accumulating, so
+    /// `max_spend` is never reached either. A player whose only limit is
+    /// `max_spend` would get an unbounded loop spending crystals they really
+    /// paid for, against that field's own promise of a hard ceiling. Any other
+    /// cost is believed, as the constant's doc says.
+    ///
+    /// The floor is the constant and not `1`, because the question a zero
+    /// leaves open is "what does a refresh cost", and the answer this crate
+    /// has is 3. If free refreshes ever become a real mechanic, the cost of
+    /// this line is a spurious `MaxSpend` — it stops rather than spends, which
+    /// is the direction to be wrong in.
     fn refresh_cost(&self) -> Crystals {
-        self.refresh_meta
-            .map_or(REFRESH_COST_CRYSTALS, |meta| meta.cost)
+        match self.refresh_meta {
+            Some(meta) if meta.cost > Crystals::new(0) => meta.cost,
+            _ => REFRESH_COST_CRYSTALS,
+        }
     }
 
     fn halt(&mut self, reason: StopReason) -> Vec<Action> {
@@ -724,8 +741,13 @@ impl Controller {
 
     /// Checked before every refresh; the order below is the priority order.
     fn stop_reason(&self, now_ms: u64) -> Option<StopReason> {
+        // `refresh_cost()`, not `meta.cost`: the two must answer the same
+        // number or the floor above buys nothing. Debiting 3 per refresh in
+        // `emit_refresh` while comparing the balance against a wire-sent 0
+        // here would leave out-of-funds unreachable on exactly the message the
+        // floor exists for.
         if let Some(meta) = self.refresh_meta
-            && meta.crystal_balance < meta.cost
+            && meta.crystal_balance < self.refresh_cost()
         {
             return Some(StopReason::OutOfFunds);
         }
