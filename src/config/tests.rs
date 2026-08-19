@@ -11,6 +11,7 @@ use super::*;
 // Only the tests name a kind now: the `[filter] kinds` rule moved into
 // `filter::hunt_kinds`, at the boundary where the ambiguity actually is.
 use crate::domain::shop::ItemKind;
+use crate::domain::shop::{Crystals, Gold};
 
 fn parse_and_validate(text: &str) -> Result<Config> {
     let config: Config = toml::from_str(text)?;
@@ -247,7 +248,7 @@ fn full_filter_and_limits_sections_parse() {
     );
     assert_eq!(config.filter.sets, vec!["set_speed", "set_counter"]);
     assert_eq!(config.filter.min_substats, Some(3));
-    assert_eq!(config.filter.max_price, Some(300_000));
+    assert_eq!(config.filter.max_price, Some(Gold::new(300_000)));
     assert!(config.filter.include_sold_out);
     assert_eq!(config.filter.required_substats.len(), 2);
     assert_eq!(config.filter.required_substats[0].name, "speed");
@@ -256,7 +257,7 @@ fn full_filter_and_limits_sections_parse() {
     assert_eq!(config.filter.required_substats[1].min, None);
 
     assert_eq!(config.limits.max_refreshes, Some(100));
-    assert_eq!(config.limits.max_spend, Some(300));
+    assert_eq!(config.limits.max_spend, Some(Crystals::new(300)));
     assert_eq!(config.limits.max_matches, Some(5));
     assert_eq!(config.limits.max_duration_ms, Some(3_600_000));
 }
@@ -309,7 +310,7 @@ fn partial_sections_leave_other_fields_default() {
     .expect("config should parse");
     assert_eq!(config.filter.min_substats, Some(4));
     assert!(config.filter.kinds.is_empty());
-    assert_eq!(config.limits.max_spend, Some(50));
+    assert_eq!(config.limits.max_spend, Some(Crystals::new(50)));
     assert_eq!(config.limits.max_refreshes, None);
 }
 
@@ -605,7 +606,7 @@ fn save_then_load_round_trips_the_edited_sections_through_disk() {
     };
     let limits = Limits {
         max_refreshes: Some(10),
-        max_spend: Some(30),
+        max_spend: Some(Crystals::new(30)),
         ..Limits::default()
     };
     let timings = Timings {

@@ -416,6 +416,7 @@ mod tests {
     use super::*;
     use crate::domain::control::Limits;
     use crate::domain::filter::Filter;
+    use crate::domain::shop::Crystals;
 
     fn hunt_filter() -> Filter {
         Filter {
@@ -480,7 +481,7 @@ names = [\"old_name\"]
         let filter = hunt_filter();
         let limits = Limits {
             max_refreshes: Some(10),
-            max_spend: Some(30),
+            max_spend: Some(Crystals::new(30)),
             ..Limits::default()
         };
         let timings = Timings {

@@ -37,9 +37,19 @@ pub(crate) fn kind_label(kind: ItemKind) -> &'static str {
 }
 
 /// Thousands-grouped decimal (`1234567` -> `1,234,567`); the stdlib has no
-/// locale-free grouping to lean on. Shared by the status-bar balances, the
-/// slot table's prices, and the console item line so every number reads the
-/// same.
+/// locale-free grouping to lean on.
+///
+/// The single number formatter, and since the currency pass it is reached only
+/// through `Display for Gold` and `Display for Crystals`, never at a print site.
+/// It used to be called by hand at each of the four places that show an amount,
+/// and the fourth — the journal's `>> bought: … 250000 gold left` — forgot,
+/// which is how a run showed `250000` and `250,000` in the same window. This
+/// doc's old claim that every number reads the same is true now because there is
+/// nowhere left to forget.
+///
+/// It stays a free `u32` function rather than moving onto the currencies: the
+/// grouping rule is a display concern this module owns, and keeping it here is
+/// what lets both currencies share one copy of it.
 pub(crate) fn grouped(n: u32) -> String {
     // Digits are extracted least-significant-first into a fixed buffer —
     // `u32::MAX` is ten digits, so it always fits — rather than through
@@ -67,12 +77,25 @@ pub(crate) fn grouped(n: u32) -> String {
     out
 }
 
-/// A grouped balance/price, or an em-dash while the value is unknown. The one
-/// `Option<u32>` readout shared by the status-bar balance tiles and the slot
-/// table's price column, so an absent value reads the same in both.
+/// An amount, or an em-dash while it is unknown. The one absent-value policy
+/// shared by the status-bar balance tiles and the slot table's price column, so
+/// "the server has not said" reads the same in both.
+///
+/// Generic over `Display` and no longer over `u32` specifically: the grouping is
+/// the currency's own rendering now (`impl Display for Gold`/`Crystals`), and
+/// this function is left with exactly one job — the em-dash. Renamed from
+/// `grouped_or_dash` to say so, because a name promising grouping over a
+/// parameter that no longer guarantees it is worse than no promise.
+///
+/// A sealed `Amount` trait implemented only for the two currencies was
+/// considered, so that nothing else could be passed. Rejected: it would be a
+/// name whose entire body is empty, adding no check the call sites do not
+/// already have — every one of them reads a typed field straight out of the
+/// domain, and the status bar's two balance tiles are additionally bound to
+/// their currency by `ui::statusbar`'s per-ledger tile helpers.
 #[cfg(feature = "gui")]
-pub(crate) fn grouped_or_dash(value: Option<u32>) -> String {
-    value.map_or_else(|| "—".to_owned(), grouped)
+pub(crate) fn amount_or_dash(value: Option<impl std::fmt::Display>) -> String {
+    value.map_or_else(|| "—".to_owned(), |amount| amount.to_string())
 }
 
 /// The state word (title-cased for display) and an optional clause, split so
@@ -171,7 +194,10 @@ pub(crate) fn format_item(item: &ShopItem, index: usize) -> String {
         let _ = write!(line, " · grade {grade}");
     }
     if let Some(price) = item.price {
-        let _ = write!(line, " · {} gold", grouped(price));
+        // `{price}`, not `grouped(price)`: a gold amount groups itself now, so
+        // this line cannot drift from the table's price column the way the
+        // journal's "bought" line had.
+        let _ = write!(line, " · {price} gold");
     }
     if !item.substats.is_empty() {
         line.push_str(" · [");

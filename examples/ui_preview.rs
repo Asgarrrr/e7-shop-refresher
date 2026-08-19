@@ -22,7 +22,7 @@ use arkyve_refresh_shop::app::{Command, SessionHandles};
 use arkyve_refresh_shop::domain::control::{Controller, Event, Limits, Status};
 use arkyve_refresh_shop::domain::filter::Filter;
 use arkyve_refresh_shop::domain::shop::{
-    CatalogId, ItemKind, PurchaseLimit, RefreshMeta, ShopItem, ShopSnapshot,
+    CatalogId, Crystals, Gold, ItemKind, PurchaseLimit, RefreshMeta, ShopItem, ShopSnapshot,
 };
 use arkyve_refresh_shop::journal::EventLog;
 use arkyve_refresh_shop::ui::{SessionErrorSlot, ShopApp};
@@ -40,7 +40,7 @@ fn mock_snapshot() -> ShopSnapshot {
         slot,
         kind,
         name: Some(name.to_owned()),
-        price: Some(price),
+        price: Some(Gold::new(price)),
         ..Default::default()
     };
     ShopSnapshot {
@@ -67,8 +67,8 @@ fn mock_snapshot() -> ShopSnapshot {
             item(203, 6, ItemKind::Hero, "Mercenary Fighter", 30_000),
         ],
         refresh: Some(RefreshMeta {
-            crystal_balance: 20_000,
-            cost: 3,
+            crystal_balance: Crystals::new(20_000),
+            cost: Crystals::new(3),
         }),
     }
 }
@@ -85,7 +85,7 @@ fn main() -> eframe::Result {
     };
     let limits = Limits {
         max_refreshes: Some(10),
-        max_spend: Some(30),
+        max_spend: Some(Crystals::new(30)),
         max_matches: Some(5),
         ..Limits::default()
     };
@@ -113,12 +113,12 @@ fn main() -> eframe::Result {
         });
         let _ = ctrl.handle(Event::Purchase {
             item: CatalogId::new(101),
-            gold: Some(300_184_000),
+            gold: Some(Gold::new(300_184_000)),
             now_ms: journal.now_ms(),
         });
         let _ = ctrl.handle(Event::Purchase {
             item: CatalogId::new(201),
-            gold: Some(300_000_000),
+            gold: Some(Gold::new(300_000_000)),
             now_ms: journal.now_ms(),
         });
         gate.set(matches!(ctrl.status(), Status::Watching | Status::Paused));
@@ -126,8 +126,8 @@ fn main() -> eframe::Result {
     journal.push(&[
         "armed — watching the Secret Shop".to_owned(),
         "shop captured · 6 slots".to_owned(),
-        "match · slot 1 · ticketrare_name · 184000 gold".to_owned(),
-        "match · slot 2 · ticketspecial_name · 280000 gold".to_owned(),
+        "match · slot 1 · ticketrare_name · 184,000 gold".to_owned(),
+        "match · slot 2 · ticketspecial_name · 280,000 gold".to_owned(),
         "bought · ticketrare_name · 300,184,000 gold left".to_owned(),
         "bought · Wondrous Potion Vial · 300,000,000 gold left".to_owned(),
     ]);

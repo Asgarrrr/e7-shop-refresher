@@ -23,13 +23,13 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::filter::Filter;
-use crate::domain::shop::{CatalogId, RefreshMeta, ShopSnapshot};
+use crate::domain::shop::{CatalogId, Crystals, Gold, RefreshMeta, ShopSnapshot};
 
 use dedup::{Fingerprint, fingerprint};
 use watchdog::Expectation;
 
 /// A refresh always costs 3 crystals (game fact); a wire-sent cost overrides.
-const REFRESH_COST_CRYSTALS: u32 = 3;
+const REFRESH_COST_CRYSTALS: Crystals = Crystals::new(3);
 
 /// A watchdog-issued retry. Deliberately distinct from bare
 /// `Refresh`/`Buy`: recovery reaches the caller from a tick, which carries
@@ -63,7 +63,13 @@ pub struct Limits {
     pub max_refreshes: Option<u32>,
     /// Crystal budget — a hard ceiling: a refresh that would cross it is
     /// never issued.
-    pub max_spend: Option<u32>,
+    ///
+    /// A [`Crystals`], which is what makes the comparison the audit filed
+    /// `type-004` against unwritable in the wrong currency: the other operand,
+    /// [`Progress::spent`], is where a gold price could once have landed.
+    /// `Crystals` is `#[serde(transparent)]` in both directions, so `config.toml`
+    /// still spells this as a bare `max_spend = 300`.
+    pub max_spend: Option<Crystals>,
     /// Matched items, cumulative — not purchases. Reached by a match, the
     /// halt waits for that match's pause to resolve: the found items are
     /// bought, then the loop stops instead of resuming.
@@ -136,8 +142,10 @@ pub enum Event {
         /// documented as its only interpreter — see [`CatalogId`].
         item: Option<CatalogId>,
         /// Gold balance after the buy — feeds the affordability planning of
-        /// the next matches.
-        gold: Option<u32>,
+        /// the next matches. `None` is "the server did not say", which fails
+        /// open; `Some(Gold::new(0))` is an empty purse and vetoes every priced
+        /// match. The two are one `Option` apart and were one `u32` apart.
+        gold: Option<Gold>,
         now_ms: u64,
     },
     FilterChanged(Filter),
@@ -205,7 +213,7 @@ pub enum RefusalReason {
 pub struct Progress {
     pub refreshes: u32,
     /// Crystals committed to refreshes.
-    pub spent: u32,
+    pub spent: Crystals,
     /// Items matched, not purchases.
     pub matches_found: u32,
 }
@@ -270,7 +278,7 @@ pub struct Controller {
     /// Last gold balance echoed by a purchase; the next matches' buys are
     /// planned against it. `None` (nothing echoed yet) restricts nothing,
     /// and `Start` forgets it — a stale balance must not veto buys.
-    gold_balance: Option<u32>,
+    gold_balance: Option<Gold>,
     last_snapshot: Option<ShopSnapshot>,
     /// Matched-but-unbought catalog ids from the last evaluated snapshot.
     checklist: Vec<CatalogId>,
@@ -377,7 +385,7 @@ impl Controller {
 
     /// Last gold balance echoed by a purchase this run, if any; `None` before
     /// the first buy and again after `Start` clears it. What a view displays.
-    pub fn gold_balance(&self) -> Option<u32> {
+    pub fn gold_balance(&self) -> Option<Gold> {
         self.gold_balance
     }
 
@@ -563,11 +571,14 @@ impl Controller {
             let already_bought = item.id.is_some_and(|id| self.bought.contains(&id));
             let in_reach = !item.is_sold_out() && affordable && !already_bought;
             if in_reach && let (Some(balance), Some(price)) = (gold, item.price) {
-                // `saturating_sub`, not `-`: both operands are wire-supplied, and
-                // `price <= balance` only holds here through `affordable` above —
-                // a non-local invariant an added `in_reach` term could break. At
-                // zero the next item simply reads unaffordable, which is the
-                // intended semantics.
+                // `Gold::saturating_sub`, not `-`: both operands are
+                // wire-supplied, and `price <= balance` only holds here through
+                // `affordable` above — a non-local invariant an added `in_reach`
+                // term could break. At zero the next item simply reads
+                // unaffordable, which is the intended semantics. `Gold` has no
+                // `Sub` impl at all, so the panicking form (release builds run
+                // with `overflow-checks = true`) is not spellable here or
+                // anywhere else.
                 gold = Some(balance.saturating_sub(price));
             }
             buyable |= in_reach;
@@ -590,7 +601,7 @@ impl Controller {
     fn on_purchase(
         &mut self,
         item: Option<CatalogId>,
-        gold: Option<u32>,
+        gold: Option<Gold>,
         now_ms: u64,
     ) -> Vec<Action> {
         if gold.is_some() {
@@ -703,7 +714,7 @@ impl Controller {
     /// Spend tracking never waits for a snapshot that carries meta. Internal:
     /// no view reads it since the top bar dropped the cost readout — re-expose
     /// it when the Stats tab needs it again.
-    fn refresh_cost(&self) -> u32 {
+    fn refresh_cost(&self) -> Crystals {
         self.refresh_meta
             .map_or(REFRESH_COST_CRYSTALS, |meta| meta.cost)
     }
@@ -733,6 +744,14 @@ impl Controller {
             return Some(StopReason::MaxRefreshes);
         }
         // Hard ceiling: also stop when the *next* refresh would cross it.
+        //
+        // This is the comparison the audit filed `type-004` against. Both
+        // operands are `Crystals` from the parse onward — `limits.max_spend` is
+        // typed and so is `progress.spent` — so a gold price cannot be weighed
+        // against this budget without writing a conversion nobody could mistake
+        // for an accident. `checked_add` and not `saturating_add`: the question
+        // is whether the *next* refresh crosses the ceiling, and a saturated
+        // `u32::MAX` would answer "over budget" for the right reason by accident.
         if let Some(max) = self.limits.max_spend
             && (self.progress.spent >= max
                 || self

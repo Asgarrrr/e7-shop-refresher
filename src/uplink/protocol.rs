@@ -4,7 +4,7 @@
 
 use serde::Deserialize;
 
-use crate::domain::shop::{CatalogId, ShopSnapshot, optional_catalog_id};
+use crate::domain::shop::{CatalogId, Gold, ShopSnapshot, optional_catalog_id};
 
 /// Downstream message from the server to the relay.
 ///
@@ -51,14 +51,20 @@ pub struct PurchaseNotice {
     pub item: Option<CatalogId>,
     /// Gold balance after the buy (not the price). Always present in
     /// practice; tolerated absent per convention.
+    ///
+    /// [`Gold`], so this balance and the crystal budget the refresh loop
+    /// enforces cannot be compared — the two ledgers were one `u32` apart until
+    /// the currency pass. No `deserialize_with` and no sentinel fold, unlike
+    /// `item` above: `"gold": 0` is a real, empty purse and must veto the next
+    /// priced buy, where an absent key must fail open. See [`Gold`].
     #[serde(default)]
-    pub gold: Option<u32>,
+    pub gold: Option<Gold>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::shop::ItemKind;
+    use crate::domain::shop::{Crystals, ItemKind};
 
     fn parse(json: &str) -> ServerMessage {
         serde_json::from_str(json).expect("message should parse")
@@ -92,7 +98,7 @@ mod tests {
             snapshot
                 .refresh
                 .map(|meta| (meta.crystal_balance, meta.cost)),
-            Some((95, 3))
+            Some((Crystals::new(95), Crystals::new(3)))
         );
         assert_eq!(snapshot.slots.len(), 1);
 
@@ -101,7 +107,7 @@ mod tests {
         assert_eq!(item.slot, 3);
         assert_eq!(item.kind, ItemKind::Equipment);
         assert_eq!(item.name.as_deref(), Some("Covenant Bookmark"));
-        assert_eq!(item.price, Some(184_000));
+        assert_eq!(item.price, Some(Gold::new(184_000)));
         assert_eq!(item.grade, Some(4));
         assert_eq!(item.set.as_deref(), Some("set_speed"));
         assert_eq!(item.substats.len(), 1);
@@ -151,9 +157,32 @@ mod tests {
             notice,
             PurchaseNotice {
                 item: CatalogId::new(102),
-                gold: Some(250_000),
+                gold: Some(Gold::new(250_000)),
             }
         );
+    }
+
+    /// The two currencies keep the wire shape they had as `u32`s: a bare
+    /// number, with `0` a real amount rather than the "absent" the `item`
+    /// sentinel spells. Pinned here because this module is the only place the
+    /// crate decodes a purchase notice off JSON, so a `deserialize_with`
+    /// wrongly copied from `item` onto `gold` — which would turn a broke player
+    /// into an unknown balance, and so authorise every buy — is caught here or
+    /// nowhere.
+    #[test]
+    fn a_zero_gold_balance_is_an_empty_purse_not_an_absent_one() {
+        let ServerMessage::Purchase(broke) = parse(r#"{"type":"purchase","item":102,"gold":0}"#)
+        else {
+            panic!("expected Purchase");
+        };
+        assert_eq!(broke.gold, Some(Gold::new(0)));
+
+        let ServerMessage::Purchase(silent) =
+            parse(r#"{"type":"purchase","item":102,"gold":null}"#)
+        else {
+            panic!("expected Purchase");
+        };
+        assert_eq!(silent.gold, None);
     }
 
     #[test]

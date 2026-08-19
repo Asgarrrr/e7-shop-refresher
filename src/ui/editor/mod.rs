@@ -31,6 +31,9 @@ use crate::domain::control::Limits;
 #[cfg(test)]
 use crate::domain::filter::SubstatReq;
 use crate::domain::filter::{Filter, HUNTABLE_KINDS};
+// The two money caps this tab edits; `currency_row` lends each one its raw
+// number for the frame the drag widget needs it.
+use crate::domain::shop::{Crystals, Gold};
 // The checkbox row reads `HUNTABLE_KINDS`; only the tests still name a kind
 // directly.
 #[cfg(test)]
@@ -217,12 +220,9 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
             ui.end_row();
             // Seeded above the covenant-bookmark price so a fresh cap still
             // matches the default hunt targets.
-            optional_value(
-                ui,
-                "max price (gold)",
-                &mut editor.filter.max_price,
-                300_000,
-            );
+            currency_row(&mut editor.filter.max_price, Gold::get, Gold::new, |cap| {
+                optional_value(ui, "max price (gold)", cap, 300_000)
+            });
             ui.end_row();
         });
     ui.add_space(theme::SP_XS);
@@ -240,7 +240,12 @@ fn stop_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     ui.weak("Stop the run at the first limit it reaches.");
     ui.add_space(theme::SP_SM);
     limit_row(ui, "refreshes", &mut editor.limits.max_refreshes, 10);
-    limit_row(ui, "crystals spent", &mut editor.limits.max_spend, 30);
+    currency_row(
+        &mut editor.limits.max_spend,
+        Crystals::get,
+        Crystals::new,
+        |cap| limit_row(ui, "crystals spent", cap, 30),
+    );
     limit_row(ui, "matches", &mut editor.limits.max_matches, 5);
     duration_row(ui, &mut editor.limits.max_duration_ms);
 }
@@ -257,6 +262,34 @@ fn arm_optional<T>(armed: bool, value: &mut Option<T>, seed: T) {
     } else {
         *value = None;
     }
+}
+
+/// Drives an optional *currency* field through the same widget every other
+/// optional criterion uses, by lending it the raw number for one frame.
+///
+/// `optional_value` and `limit_row` are generic over `egui::emath::Numeric`, and
+/// neither [`Gold`] nor [`Crystals`] implements it. That is deliberate rather
+/// than missing: `src/domain/` compiles under `--no-default-features`, where
+/// there is no egui in the graph at all, so the impl would have to pull an
+/// optional GUI dependency down into the ledger types — inverting the one edge
+/// this crate's module graph does not have — to spare two call sites a wrapper.
+/// The alternative, a `Numeric` newtype around the newtype, buys the same two
+/// call sites a type whose only purpose is to be dragged.
+///
+/// The round-trip is exact and perturbs nothing downstream: `new`/`get` are a
+/// wrapper, not a conversion, so [`commit_row`]'s deliberately bit-exact dirty
+/// check sees the value it would have seen either way, and [`arm_optional`]'s
+/// seeding is unchanged because the seed crosses as a raw number too. The
+/// scratch dies with the frame, so no unwrapped amount is storable.
+fn currency_row<T: Copy>(
+    value: &mut Option<T>,
+    get: impl Fn(T) -> u32,
+    wrap: impl Fn(u32) -> T,
+    edit: impl FnOnce(&mut Option<u32>),
+) {
+    let mut raw = value.map(get);
+    edit(&mut raw);
+    *value = raw.map(wrap);
 }
 
 /// The drag field for an armed optional criterion, floored at 1.
@@ -728,7 +761,7 @@ mod tests {
     fn render_stop_section_png() {
         let limits = Limits {
             max_refreshes: Some(49),
-            max_spend: Some(30),
+            max_spend: Some(Crystals::new(30)),
             ..Limits::default()
         };
         let mut editor = EditorState::new(named_filter(), limits, Timings::default());

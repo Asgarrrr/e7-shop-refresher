@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::domain::shop::{ItemKind, ShopItem};
+use crate::domain::shop::{Gold, ItemKind, ShopItem};
 
 /// The gear grades the game ships (`config.example.toml` documents the same
 /// closed domain). A floor outside it is a typo, and a costly one: `matches` is
@@ -56,7 +56,12 @@ pub struct Filter {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub required_substats: Vec<SubstatReq>,
     /// Inclusive gold cap; an unknown price fails it.
-    pub max_price: Option<u32>,
+    ///
+    /// A [`Gold`], so the cap and the price it is weighed against are one type
+    /// and a crystal budget cannot be written here by mistake. `Gold` is
+    /// `#[serde(transparent)]` in both directions, so `config.toml` still spells
+    /// this as a bare `max_price = 300000`.
+    pub max_price: Option<Gold>,
     /// Inclusive minimum gear grade (2, 3, or 4); an unknown grade fails it.
     /// A floor outside that domain is refused at parse time — see `GRADE_MIN`.
     #[serde(deserialize_with = "grade_floor")]
@@ -175,6 +180,11 @@ impl Filter {
         {
             return false;
         }
+        // Both operands are `Gold` from the parse onward — the field is typed,
+        // so there is no lifting call here and no `u32`-against-`u32` moment for
+        // a crystal budget to slip into. `is_none_or` is the fail-closed half the
+        // type doc promises: an item whose price the server did not send never
+        // satisfies a cap.
         if let Some(max) = self.max_price
             && item.price.is_none_or(|price| price > max)
         {
@@ -255,7 +265,7 @@ mod tests {
             slot: 1,
             kind: ItemKind::Equipment,
             name: None,
-            price: Some(240_000),
+            price: Some(Gold::new(240_000)),
             grade: Some(3),
             set: Some("set_speed".to_owned()),
             substats: vec![
@@ -445,7 +455,7 @@ mod tests {
     #[test]
     fn max_price_inclusive_boundary() {
         let filter = Filter {
-            max_price: Some(240_000),
+            max_price: Some(Gold::new(240_000)),
             ..Filter::default()
         };
         assert!(filter.matches(&equip()));
@@ -454,7 +464,7 @@ mod tests {
     #[test]
     fn max_price_above_fails() {
         let filter = Filter {
-            max_price: Some(239_999),
+            max_price: Some(Gold::new(239_999)),
             ..Filter::default()
         };
         assert!(!filter.matches(&equip()));
@@ -463,7 +473,7 @@ mod tests {
     #[test]
     fn max_price_missing_price_fails() {
         let filter = Filter {
-            max_price: Some(240_000),
+            max_price: Some(Gold::new(240_000)),
             ..Filter::default()
         };
         let mut item = equip();
@@ -683,7 +693,7 @@ mod tests {
         let filter = Filter {
             names: vec!["ticketrare_name".to_owned()],
             min_substats: Some(3),
-            max_price: Some(300_000),
+            max_price: Some(Gold::new(300_000)),
             min_grade: Some(4),
             required_substats: vec![SubstatReq {
                 name: "speed".to_owned(),
@@ -700,7 +710,7 @@ mod tests {
     fn one_failing_criterion_fails_whole() {
         // Matches the canonical filter on everything but the added price cap.
         let filter = Filter {
-            max_price: Some(1_000),
+            max_price: Some(Gold::new(1_000)),
             ..speed_filter()
         };
         assert!(!filter.matches(&equip()));

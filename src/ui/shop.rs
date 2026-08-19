@@ -86,7 +86,7 @@ fn shop_table(ui: &mut egui::Ui, rows: &[SlotRow], detail: &dyn Fn(usize) -> Str
             false,
             styled(row, row.name.as_deref().unwrap_or("—")),
         );
-        let price = crate::render::grouped_or_dash(row.price);
+        let price = crate::render::amount_or_dash(row.price);
         cell(ui, c_price, true, styled(row, price));
         // `on_hover_ui`, not `on_hover_text`: egui runs the closure only for the
         // widget the pointer is over, so the item line is formatted for the one

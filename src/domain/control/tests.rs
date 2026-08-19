@@ -13,7 +13,22 @@
 
 use super::*;
 use crate::domain::shop::ItemKind::{self, Equipment, Token};
-use crate::domain::shop::{CatalogId, PurchaseLimit, ShopItem};
+use crate::domain::shop::{CatalogId, Crystals, Gold, PurchaseLimit, ShopItem};
+
+/// A fixture crystal amount. Spelled `xtl(3)` rather than `Crystals::new(3)`
+/// so a budget assertion still reads as one line — the same shorthand `cid`
+/// gives [`CatalogId`] below, and the reason both exist: the newtypes must not
+/// cost this suite its readability, or the next author will reach for the raw
+/// number.
+const fn xtl(raw: u32) -> Crystals {
+    Crystals::new(raw)
+}
+
+/// A fixture gold amount. Separate from [`xtl`] on purpose: a test that means
+/// gold has to say gold, which is the property under test in half this file.
+const fn gold(raw: u32) -> Gold {
+    Gold::new(raw)
+}
 
 fn item(slot: u8, kind: ItemKind) -> ShopItem {
     ShopItem {
@@ -47,8 +62,8 @@ fn hit_shop(refresh: Option<RefreshMeta>) -> ShopSnapshot {
 
 fn meta(crystal_balance: u32, cost: u32) -> RefreshMeta {
     RefreshMeta {
-        crystal_balance,
-        cost,
+        crystal_balance: xtl(crystal_balance),
+        cost: xtl(cost),
     }
 }
 
@@ -98,10 +113,10 @@ fn buy_unidentified(now_ms: u64) -> Event {
     }
 }
 
-fn buy_with_gold(item: u32, gold: u32, now_ms: u64) -> Event {
+fn buy_with_gold(item: u32, balance: u32, now_ms: u64) -> Event {
     Event::Purchase {
         item: Some(cid(item)),
-        gold: Some(gold),
+        gold: Some(gold(balance)),
         now_ms,
     }
 }
@@ -196,7 +211,7 @@ fn first_snapshot_no_match_emits_single_refresh() {
     let actions = ctrl.handle(snap(dud_shop(Some(meta(100, 3))), 1));
     assert_eq!(actions, vec![Action::Refresh]);
     assert_eq!(ctrl.progress().refreshes, 1);
-    assert_eq!(ctrl.progress().spent, 3);
+    assert_eq!(ctrl.progress().spent, xtl(3));
 }
 
 #[test]
@@ -543,7 +558,7 @@ fn new_roll_makes_a_bought_id_buyable_again() {
     assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
     // Same catalog ids, changed per-roll field: a re-roll, not a re-open.
     let mut reroll = with_ids(hit_shop(None));
-    reroll.slots[0].price = Some(120_000);
+    reroll.slots[0].price = Some(gold(120_000));
     let actions = ctrl.handle(snap(reroll, 3));
     assert_eq!(
         actions,
@@ -712,7 +727,7 @@ fn same_ids_new_roll_is_evaluated() {
     // A paid re-roll can redraw the same catalog ids: a changed per-roll
     // field (here the price) makes it a new shop, not a duplicate.
     let mut reroll = with_ids(dud_shop(None));
-    reroll.slots[0].price = Some(120_000);
+    reroll.slots[0].price = Some(gold(120_000));
     assert_eq!(ctrl.handle(snap(reroll, 2)), vec![Action::Refresh]);
     assert_eq!(ctrl.progress().refreshes, 2);
 }
@@ -808,7 +823,7 @@ fn echoed_gold_blocks_unaffordable_next_match() {
     for item in &mut pricey.slots {
         item.id = item.id.map(|id| cid(id.get() + 100));
     }
-    pricey.slots[2].price = Some(184_000);
+    pricey.slots[2].price = Some(gold(184_000));
     let actions = ctrl.handle(snap(pricey, 3));
     assert_eq!(
         actions,
@@ -837,8 +852,8 @@ fn gold_debits_cumulatively_within_one_shop() {
     for item in &mut twins.slots {
         item.id = item.id.map(|id| cid(id.get() + 100));
     }
-    twins.slots[0].price = Some(184_000);
-    twins.slots[1].price = Some(184_000);
+    twins.slots[0].price = Some(gold(184_000));
+    twins.slots[1].price = Some(gold(184_000));
     let actions = ctrl.handle(snap(twins, 3));
     assert_eq!(
         actions,
@@ -856,7 +871,7 @@ fn unknown_gold_restricts_nothing() {
     // open, it never vetoes buys on ignorance.
     let mut ctrl = started(Limits::default());
     let mut priced = with_ids(hit_shop(None));
-    priced.slots[2].price = Some(999_999_999);
+    priced.slots[2].price = Some(gold(999_999_999));
     let actions = ctrl.handle(snap(priced, 1));
     assert_eq!(
         actions,
@@ -865,6 +880,45 @@ fn unknown_gold_restricts_nothing() {
         }]
     );
     assert_eq!(ctrl.status(), Status::Paused);
+}
+
+/// An empty purse is a *known* balance, and it is the asymmetry that pays for
+/// [`Gold`](crate::domain::shop::Gold) not folding `0` to `None` the way
+/// [`CatalogId`] does.
+///
+/// `unknown_gold_restricts_nothing` above pins the other half: `None` fails
+/// open. If a wire `"gold": 0` decoded to `None` — the fold `CatalogId` uses,
+/// which is the obvious thing to copy — the two would collapse into one and a
+/// broke player's shop would read as fully buyable, i.e. the tool would click
+/// Buy on every match it can see and get nothing back but watchdog escalations.
+/// The 0 and the absence have to disagree, so the test asserts both in one
+/// place.
+#[test]
+fn a_zero_gold_balance_is_known_and_vetoes_every_priced_match() {
+    let mut ctrl = started(Limits::default());
+    let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
+    // The buy drains the purse: the echo says zero, and zero is a fact.
+    let _ = ctrl.handle(buy_with_gold(102, 0, 2));
+    assert_eq!(ctrl.gold_balance(), Some(gold(0)));
+
+    let mut priced = with_ids(hit_shop(None));
+    for item in &mut priced.slots {
+        item.id = item.id.map(|id| cid(id.get() + 100));
+    }
+    priced.slots[2].price = Some(gold(1));
+    let actions = ctrl.handle(snap(priced, 3));
+    // Shown (the player may still have a stone to spend), never clicked, and
+    // the hunt goes on — the same verdict as any other unaffordable match.
+    assert_eq!(
+        actions,
+        vec![
+            Action::Buy {
+                targets: vec![target(3, None)]
+            },
+            Action::Refresh,
+        ]
+    );
+    assert!(ctrl.checklist().is_empty());
 }
 
 #[test]
@@ -897,7 +951,7 @@ fn start_forgets_the_gold_estimate() {
     let _ = ctrl.handle(Event::Stop);
     let _ = ctrl.handle(Event::Start { now_ms: 3 });
     let mut pricey = with_ids(hit_shop(None));
-    pricey.slots[2].price = Some(184_000);
+    pricey.slots[2].price = Some(gold(184_000));
     let actions = ctrl.handle(snap(pricey, 4));
     assert_eq!(
         actions,
@@ -1023,7 +1077,7 @@ fn max_refreshes_zero_blocks_first() {
 fn max_spend_is_hard_ceiling_no_overshoot() {
     // Budget 7, cost 3: two refreshes (6 spent) fit, a third would cross.
     let mut ctrl = started(Limits {
-        max_spend: Some(7),
+        max_spend: Some(xtl(7)),
         ..Limits::default()
     });
     assert_eq!(
@@ -1036,7 +1090,7 @@ fn max_spend_is_hard_ceiling_no_overshoot() {
     );
     let actions = ctrl.handle(snap(dud_shop(Some(meta(94, 3))), 3));
     assert_eq!(actions, vec![Action::Halt(StopReason::MaxSpend)]);
-    assert_eq!(ctrl.progress().spent, 6);
+    assert_eq!(ctrl.progress().spent, xtl(6));
 }
 
 #[test]
@@ -1064,7 +1118,7 @@ fn stop_reason_priority_order() {
     // that gets reordered by accident.
     let all_limits = Limits {
         max_refreshes: Some(0),
-        max_spend: Some(0),
+        max_spend: Some(xtl(0)),
         max_matches: None,
         max_duration_ms: Some(0),
     };
@@ -1083,7 +1137,7 @@ fn stop_reason_priority_order() {
         ),
         (
             Limits {
-                max_spend: Some(0),
+                max_spend: Some(xtl(0)),
                 max_duration_ms: Some(0),
                 ..Limits::default()
             },
@@ -1146,12 +1200,12 @@ fn max_spend_enforced_without_meta_via_constant_cost() {
     // Budget 7, no meta ever: the constant 3-crystal cost tracks spend
     // from the very first refresh — two fit, a third would cross.
     let mut ctrl = started(Limits {
-        max_spend: Some(7),
+        max_spend: Some(xtl(7)),
         ..Limits::default()
     });
     assert_eq!(ctrl.handle(snap(dud_shop(None), 1)), vec![Action::Refresh]);
     assert_eq!(ctrl.handle(snap(dud_shop(None), 2)), vec![Action::Refresh]);
-    assert_eq!(ctrl.progress().spent, 6);
+    assert_eq!(ctrl.progress().spent, xtl(6));
     let actions = ctrl.handle(snap(dud_shop(None), 3));
     assert_eq!(actions, vec![Action::Halt(StopReason::MaxSpend)]);
 }
@@ -1161,14 +1215,14 @@ fn wire_cost_overrides_the_constant() {
     // A server-sent cost of 5 replaces the constant: one refresh fits
     // the budget of 7, the next would cross.
     let mut ctrl = started(Limits {
-        max_spend: Some(7),
+        max_spend: Some(xtl(7)),
         ..Limits::default()
     });
     assert_eq!(
         ctrl.handle(snap(dud_shop(Some(meta(100, 5))), 1)),
         vec![Action::Refresh]
     );
-    assert_eq!(ctrl.progress().spent, 5);
+    assert_eq!(ctrl.progress().spent, xtl(5));
     let actions = ctrl.handle(snap(dud_shop(Some(meta(95, 5))), 2));
     assert_eq!(actions, vec![Action::Halt(StopReason::MaxSpend)]);
 }
@@ -1419,7 +1473,7 @@ fn snapshot_watchdog_reclicks_confirm_then_reissues_then_halts() {
         vec![Action::Recover(Recovery::Refresh)]
     );
     assert_eq!(ctrl.progress().refreshes, 2);
-    assert_eq!(ctrl.progress().spent, 6);
+    assert_eq!(ctrl.progress().spent, xtl(6));
     // Miss #3: honest halt.
     assert_eq!(
         ctrl.handle(tick(past_rung(3))),

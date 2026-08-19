@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::domain::shop::{CatalogId, ShopSnapshot, Substat};
+use crate::domain::shop::{CatalogId, Gold, ShopSnapshot, Substat};
 
 /// One slot's contribution to a snapshot's identity: the catalog id plus the
 /// per-roll fields the filter can match on — a re-roll redrawing the same
@@ -14,7 +14,7 @@ use crate::domain::shop::{CatalogId, ShopSnapshot, Substat};
 #[derive(Clone, PartialEq)]
 pub(super) struct SlotIdentity {
     id: CatalogId,
-    price: Option<u32>,
+    price: Option<Gold>,
     grade: Option<u8>,
     set: Option<String>,
     substats: Vec<Substat>,

@@ -7,7 +7,7 @@
 //! labels, so building one allocates nothing at all.
 
 use crate::domain::control::{Controller, Limits, Progress, Status};
-use crate::domain::shop::{CatalogId, ShopItem};
+use crate::domain::shop::{CatalogId, Crystals, Gold, ShopItem};
 use crate::render::{HAUL_HEADLINERS, format_item, haul_tally, kind_label, status_summary};
 
 /// Plain per-frame copy of everything the window shows *except* the slot rows;
@@ -28,10 +28,10 @@ pub(super) struct ViewState {
     /// From the controller's enforced meta (debited per advised refresh,
     /// cleared on restart) — not the raw snapshot, which can be stale. The
     /// game calls these "skystones"; the code says "crystals".
-    pub crystal_balance: Option<u32>,
+    pub crystal_balance: Option<Crystals>,
     /// Last gold balance echoed by a purchase this run; `None` before the
     /// first buy and again after `Start`.
-    pub gold_balance: Option<u32>,
+    pub gold_balance: Option<Gold>,
     /// A shop has been captured this session — even a degraded slotless one.
     /// Gates the welcome screen: an empty [`SlotRows`] alone must not resurrect
     /// it mid-session.
@@ -51,7 +51,7 @@ pub(super) struct SlotRow {
     pub slot: u8,
     pub kind: &'static str,
     pub name: Option<String>,
-    pub price: Option<u32>,
+    pub price: Option<Gold>,
     pub sold_out: bool,
     /// Matched and still to buy: the catalog id sits in the checklist.
     pub wanted: bool,
@@ -323,8 +323,8 @@ mod tests {
             merchant: Some("Secret Shop".to_owned()),
             slots: vec![ShopItem::default()],
             refresh: Some(RefreshMeta {
-                crystal_balance: 95,
-                cost: 3,
+                crystal_balance: Crystals::new(95),
+                cost: Crystals::new(3),
             }),
         };
         let _ = ctrl.handle(Event::Snapshot {
@@ -332,7 +332,7 @@ mod tests {
             now_ms: 0,
         });
         let view = view_state(&ctrl);
-        assert_eq!(view.crystal_balance, Some(95));
+        assert_eq!(view.crystal_balance, Some(Crystals::new(95)));
     }
 
     #[test]
@@ -345,8 +345,8 @@ mod tests {
                 merchant: None,
                 slots: vec![ShopItem::default()],
                 refresh: Some(RefreshMeta {
-                    crystal_balance: 95,
-                    cost: 3,
+                    crystal_balance: Crystals::new(95),
+                    cost: Crystals::new(3),
                 }),
             },
             now_ms: 0,
@@ -355,7 +355,7 @@ mod tests {
             snapshot: shop(vec![ShopItem::default()]),
             now_ms: 1,
         });
-        assert_eq!(view_state(&ctrl).crystal_balance, Some(95));
+        assert_eq!(view_state(&ctrl).crystal_balance, Some(Crystals::new(95)));
     }
 
     #[test]
@@ -368,8 +368,8 @@ mod tests {
                 merchant: None,
                 slots: vec![ShopItem::default()],
                 refresh: Some(RefreshMeta {
-                    crystal_balance: 95,
-                    cost: 3,
+                    crystal_balance: Crystals::new(95),
+                    cost: Crystals::new(3),
                 }),
             },
             now_ms: 0,
@@ -384,10 +384,10 @@ mod tests {
         assert_eq!(view_state(&ctrl).gold_balance, None);
         let _ = ctrl.handle(Event::Purchase {
             item: CatalogId::new(42),
-            gold: Some(1_204_000),
+            gold: Some(Gold::new(1_204_000)),
             now_ms: 0,
         });
-        assert_eq!(view_state(&ctrl).gold_balance, Some(1_204_000));
+        assert_eq!(view_state(&ctrl).gold_balance, Some(Gold::new(1_204_000)));
     }
 
     #[test]
@@ -409,7 +409,7 @@ mod tests {
             id: CatalogId::new(7),
             slot: 3,
             name: Some("Covenant Bookmark".to_owned()),
-            price: Some(184_000),
+            price: Some(Gold::new(184_000)),
             ..ShopItem::default()
         };
         let expected = format_item(&item, 0);
@@ -449,7 +449,7 @@ mod tests {
         let _ = ctrl.handle(Event::Snapshot {
             snapshot: shop(vec![ShopItem {
                 name: Some("Covenant Bookmark".to_owned()),
-                price: Some(184_000),
+                price: Some(Gold::new(184_000)),
                 ..ShopItem::default()
             }]),
             now_ms: 0,

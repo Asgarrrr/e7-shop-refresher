@@ -6,10 +6,11 @@ use eframe::egui;
 
 use crate::app::Command;
 use crate::domain::control::Status;
+use crate::domain::shop::{Crystals, Gold};
 
 use super::theme;
 use super::view::ViewState;
-use crate::render::grouped_or_dash;
+use crate::render::amount_or_dash;
 
 /// Top chrome: the error banner, then two rows — the status (dot + word +
 /// clause) alone on the left with the one contextual button on the right, and
@@ -78,9 +79,8 @@ pub(super) fn render_status_bar(
     // rightmost tiles off-screen. Wrapping folds them to a second line instead.
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = theme::SP_SM;
-        // "skystones" in-game; the code (whose meta feeds it) says "crystals".
-        stat_tile(ui, "Skystones", grouped_or_dash(view.crystal_balance));
-        stat_tile(ui, "Gold", grouped_or_dash(view.gold_balance));
+        skystone_tile(ui, view.crystal_balance);
+        gold_tile(ui, view.gold_balance);
         if !matches!(view.status_kind, Status::Idle) {
             // Size the divider to the tiles already laid, not a re-derived
             // guess of their height.
@@ -104,6 +104,30 @@ pub(super) fn render_status_bar(
     });
     ui.add_space(theme::SP_XS);
     clicked
+}
+
+/// The crystal balance tile. "Skystones" is the word the game uses; the code —
+/// and the `RefreshMeta` that feeds this — says crystals.
+///
+/// A function per currency rather than two `stat_tile(ui, "…", …)` calls, and
+/// that is the label↔value pairing fix the currency finding asked for. The row
+/// used to read `stat_tile(ui, "Skystones", grouped_or_dash(view.crystal_balance))`
+/// with `stat_tile(ui, "Gold", grouped_or_dash(view.gold_balance))` directly
+/// under it: two calls to the same function differing only in a string literal
+/// and which field of `view` was named, so swapping the two arguments compiled
+/// and mislabelled both balances. It falls out of the newtypes and could not
+/// have been written before them — `Option<Crystals>` and `Option<Gold>` are
+/// not interchangeable, so the label and the ledger it names are now one fact
+/// the compiler checks. The generic tiles below (Refreshes, the haul tokens) are
+/// left alone: their values are plain counts with no ledger to bind to.
+fn skystone_tile(ui: &mut egui::Ui, balance: Option<Crystals>) {
+    stat_tile(ui, "Skystones", amount_or_dash(balance));
+}
+
+/// The gold balance tile — see [`skystone_tile`] for why each currency has its
+/// own.
+fn gold_tile(ui: &mut egui::Ui, balance: Option<Gold>) {
+    stat_tile(ui, "Gold", amount_or_dash(balance));
 }
 
 /// One KPI tile: a small grey uppercase label over its value in full ink.

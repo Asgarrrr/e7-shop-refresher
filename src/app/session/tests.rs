@@ -24,7 +24,7 @@ use super::*;
 use crate::actuator::SnapshotEpoch;
 use crate::domain::control::{Limits, StopReason, past_rung};
 use crate::domain::filter::Filter;
-use crate::domain::shop::{CatalogId, ItemKind, PurchaseLimit, ShopItem, ShopSnapshot};
+use crate::domain::shop::{CatalogId, Gold, ItemKind, PurchaseLimit, ShopItem, ShopSnapshot};
 
 /// A shutdown signal nobody ever raises: the loop must exit through its own
 /// paths. The sender is dropped straight away, which the loop reads as "no
@@ -692,7 +692,7 @@ fn purchase_message_auto_resumes_controller() {
 
     let notice = PurchaseNotice {
         item: Some(cid(42)),
-        gold: Some(100),
+        gold: Some(Gold::new(100)),
     };
     on_message(
         &controller,
@@ -720,15 +720,21 @@ fn controller_with_named_item() -> Controller {
     controller
 }
 
+/// The balance is thousands-grouped here, and that is a fix, not a cosmetic
+/// drift: this line used to interpolate a bare `u32` and print `250000` while
+/// the slot table two panes over showed `250,000` for the same purse, against
+/// `render::grouped`'s own claim that every number in the app reads the same.
+/// A gold amount now groups itself (`impl Display for Gold`), so the journal
+/// cannot opt out of the convention by forgetting to call the formatter.
 #[test]
-fn purchase_line_names_item_from_snapshot() {
+fn purchase_line_names_item_from_snapshot_and_groups_the_balance() {
     let notice = PurchaseNotice {
         item: Some(cid(42)),
-        gold: Some(250_000),
+        gold: Some(Gold::new(250_000)),
     };
     assert_eq!(
         purchase_line(&controller_with_named_item(), &notice),
-        ">> bought: Reforged Sword — 250000 gold left"
+        ">> bought: Reforged Sword — 250,000 gold left"
     );
 }
 
@@ -737,7 +743,7 @@ fn purchase_line_falls_back_to_id_when_name_unknown() {
     let controller = Controller::new(Filter::default(), Limits::default());
     let notice = PurchaseNotice {
         item: Some(cid(7)),
-        gold: Some(100),
+        gold: Some(Gold::new(100)),
     };
     assert_eq!(
         purchase_line(&controller, &notice),
