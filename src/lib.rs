@@ -37,12 +37,22 @@ pub mod journal;
 #[cfg(feature = "gui")]
 pub mod install;
 pub mod migrate;
+// Ungated on purpose: `install` (gui) and `capture::pcap` (windows +
+// pcap-backend) both name the pinned Npcap build and neither can reach the
+// other, so the facts live where both can see them.
+pub mod npcap;
 mod render;
 pub mod stream;
+// The poison policy five modules used to each restate. See its header.
+pub mod sync;
 #[cfg(feature = "gui")]
 pub mod ui;
 pub mod uplink;
 pub mod watch;
+// Windows-only, and shared by two independently-gated subsystems: see the
+// module header for why one copy each was not good enough.
+#[cfg(windows)]
+pub mod wide;
 
 pub use config::Config;
 pub use error::{Error, Result};

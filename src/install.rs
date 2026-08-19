@@ -7,21 +7,12 @@
 //! player still meets Npcap's own setup window and its own licence. What this
 //! removes is the trip to a browser, a download folder and back.
 //!
-//! # Why a pinned hash rather than a signature check
-//!
-//! An elevated process that downloads and runs an executable is the shape of the
-//! thing this app is not, so the check is not optional. Authenticode verification
-//! through `WinVerifyTrust` would answer "signed by Nmap Software LLC" — but the
-//! URL already names one exact build, so the stronger and much smaller check is
-//! the bytes themselves. A signature check accepts any file that vendor ever
-//! signed; [`INSTALLER_SHA256`] accepts the one whose signature was verified by
-//! hand (`CN=Nmap Software LLC`, DigiCert-issued, valid to 2027, timestamped)
-//! and whose hash was then confirmed on a second, independent download.
-//!
-//! The usual objection to hash pinning is that it rots at every release. It does
-//! — and so does the URL beside it, which names `npcap-1.88.exe`. They rot
-//! together and are bumped together, which is what makes the pin honest rather
-//! than a hostage to fortune.
+//! Which build, from where, and against which hash are not decided here — they
+//! are [`crate::npcap`], because `capture::pcap` names the same build in the
+//! message a player without Npcap reads and cannot see this module. That file
+//! also carries the argument for pinning a hash rather than checking a
+//! signature. What is decided here is everything about *how* the file is
+//! obtained and handed to Windows.
 //!
 //! # Why the verified file is held open
 //!
@@ -53,26 +44,7 @@ use std::sync::{Arc, Mutex};
 
 use tracing::{info, warn};
 
-/// The one build this module will run. Pinned with [`INSTALLER_SHA256`]; change
-/// neither without the other.
-///
-/// Wireshark's build mirror rather than npcap.com, because npcap.com does not
-/// answer: 6–9 s to first byte, and its own installer URL failed outright at 19 s
-/// with the TLS handshake never completing. This one answers in 0.27 s.
-const INSTALLER_URL: &str = "https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe";
-
-/// SHA-256 of `npcap-1.88.exe`, measured on two independent downloads:
-/// `a2f4ec1e5ea353ff67efd24b2ebf081ba44532410fae8d5e146af0310aa4f56b`.
-const INSTALLER_SHA256: [u8; 32] = [
-    0xa2, 0xf4, 0xec, 0x1e, 0x5e, 0xa3, 0x53, 0xff, 0x67, 0xef, 0xd2, 0x4b, 0x2e, 0xbf, 0x08, 0x1b,
-    0xa4, 0x45, 0x32, 0x41, 0x0f, 0xae, 0x8d, 0x5e, 0x14, 0x6a, 0xf0, 0x31, 0x0a, 0xa4, 0xf5, 0x6b,
-];
-
-/// Expected size. Checked twice, at both ends: handed to `curl --max-filesize`
-/// so a redirect to an HTML error page cannot become an unbounded response
-/// body, and checked again on the file before it is read into memory to be
-/// hashed.
-const INSTALLER_BYTES: u64 = 1_320_424;
+use crate::npcap::{INSTALLER_BYTES, INSTALLER_SHA256, INSTALLER_URL, TEMP_INSTALLER_NAME};
 
 /// Ceiling on the download, in seconds, handed to `curl`. Generous: the measured
 /// time is under a second, and a player on hotel Wi-Fi is not a failure.
@@ -120,14 +92,13 @@ impl Fetcher {
 
     /// Current step, for the button's label.
     ///
-    /// Poison-tolerant like the rest of this crate's shared state: a panicked
-    /// worker must not take the window's error banner down with it.
+    /// Poison-tolerant like the rest of this crate's shared state ([`crate::sync`]):
+    /// a panicked worker must not take the window's error banner down with it.
+    /// The cell holds one `Progress`, replaced whole, so there is no half-written
+    /// state for a reader to catch.
     #[must_use]
     pub fn progress(&self) -> Progress {
-        self.progress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        crate::sync::lock_ignoring_poison(&self.progress).clone()
     }
 
     /// Records a failed relaunch — the one failure raised by the window rather
@@ -142,10 +113,7 @@ impl Fetcher {
     }
 
     fn set(&self, next: Progress) {
-        *self
-            .progress
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+        *crate::sync::lock_ignoring_poison(&self.progress) = next;
     }
 
     /// Starts fetch → check → launch on a worker thread, unless one is already
@@ -379,10 +347,10 @@ fn create_new_locked(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
-/// Where the download lands. One deterministic name, so a second attempt reuses
-/// or replaces it instead of littering.
+/// Where the download lands. The name is version-stamped and lives with the
+/// version — see [`TEMP_INSTALLER_NAME`].
 fn installer_path() -> PathBuf {
-    std::env::temp_dir().join("arkyve-npcap-1.88.exe")
+    std::env::temp_dir().join(TEMP_INSTALLER_NAME)
 }
 
 /// Starts a second copy of this executable, for the caller to follow with a
@@ -500,13 +468,9 @@ mod tests {
         assert_eq!(Fetcher::new().progress(), Progress::Idle);
     }
 
-    #[test]
-    fn the_pinned_hash_is_thirty_two_bytes_and_not_all_zero() {
-        // A zeroed pin would match `sha256`'s own failure return, which is how a
-        // failed hash could have read as a verified file.
-        assert_eq!(INSTALLER_SHA256.len(), 32);
-        assert!(INSTALLER_SHA256.iter().any(|b| *b != 0));
-    }
+    // The pin's own shape is asserted where the pin now lives, in `crate::npcap`
+    // — it guards `sha256`'s zeroed failure return, which is this module's, but
+    // the constant it guards is not.
 
     #[cfg(windows)]
     #[test]

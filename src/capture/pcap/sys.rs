@@ -256,31 +256,12 @@ fn system_directory() -> PathBuf {
 
 /// What to tell a player who has no Npcap at all.
 ///
-/// It points at Wireshark's build mirror rather than npcap.com, and the reason is
-/// measured: npcap.com answers in 6–9 s from here and its own installer URL
-/// failed outright at 19 s (TLS never completed), while this one answers in
-/// 0.27 s and delivers the 1.3 MB in 0.81 s. A download that does not arrive is
-/// not a source.
-///
-/// What is served there is the genuine article, checked rather than assumed:
-/// `npcap-1.88.exe` is Authenticode-signed `CN=Nmap Software LLC`,
-/// DigiCert-issued, valid to 2027, timestamped. Nothing is redistributed by us —
-/// the player fetches a vendor-signed binary, from a host that answers.
-///
-/// The version is pinned into the URL on purpose. The mirror keeps every build
-/// back to 1.78, so a pinned link cannot rot into a 404 the way a "latest"
-/// redirect can; the cost is that this line needs bumping when a newer Npcap is
-/// worth having, which is a smaller failure than a dead link in the one message
-/// a stuck player ever sees.
-///
-/// It ends on "then restart this app" because the capture source is opened once,
-/// from `Session::run`, at startup: a player who installs Npcap and comes back to
-/// the still-open window is looking at a dead session with nothing to click. The
-/// sentence is the cheap half of that fix; the expensive half is a re-probe that
-/// rebuilds the session in place, which `docs/npcap-provisioning.md` leaves open.
-pub(super) const INSTALL_HINT: &str = "Npcap is missing, and the capture needs it. \
-     https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe \
-     Keep the installer's defaults, then restart this app.";
+/// Re-exported rather than spelled here: the sentence names one exact Npcap
+/// build, the Download button in `ui::statusbar` fetches that same build from
+/// [`crate::npcap::INSTALLER_URL`], and this module cannot see `install` (it is
+/// behind `feature = "gui"`). [`crate::npcap`] carries both, and the argument
+/// for the mirror, the pinned version and the closing sentence with them.
+pub(super) use crate::npcap::INSTALL_HINT;
 
 impl Wpcap {
     pub(super) fn load() -> Result<(Self, PathBuf)> {
