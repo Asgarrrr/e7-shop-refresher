@@ -13,7 +13,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub struct ShopSnapshot {
     #[serde(default)]
     pub merchant: Option<String>,
-    #[serde(default)]
+    /// The slots on offer. Tolerant per element — see [`lenient_slots`], which
+    /// carries the argument for dropping a bad slot rather than failing the
+    /// snapshot the way this field used to.
+    #[serde(default, deserialize_with = "lenient_slots")]
     pub slots: Vec<ShopItem>,
     /// Refresh-session facts (balance, cost), grouped apart since they are
     /// not shop *contents*. Absent, the cost falls back to the game constant
@@ -355,6 +358,105 @@ where
         .collect())
 }
 
+/// Tolerant slot list: an undecodable slot is dropped, a non-array value
+/// degrades to empty — the snapshot survives either way.
+///
+/// Its own function rather than [`lenient_elements`], which its body nearly
+/// repeats, because the argument for dropping a *slot* is not the argument for
+/// dropping a substat, and because the loss worth logging here is the arity,
+/// which needs counting rather than listing.
+///
+/// # Why dropping beats the failure it replaces
+///
+/// Dropping a slot is a real loss, and a worse one than [`lenient_elements`]
+/// takes: the filter then sees five slots and calls that the shop, so a match
+/// in the sixth is missed and the loop refreshes past the item the player was
+/// hunting, with nothing on screen saying a slot went missing. What makes it
+/// the better branch is what the alternative actually was. A bare
+/// `Vec<ShopItem>` propagates an element's error up through the
+/// internally-tagged `ServerMessage`, where `#[serde(other)] Unknown` cannot
+/// catch it — that arm rescues an unknown *tag*, not a payload that failed to
+/// decode — so `websocket::forward` dropped the whole message at `debug!`. No
+/// snapshot reached the view, `last_shop_ms` never advanced, and the
+/// `Expectation` armed by the last refresh climbed the ladder to
+/// `StopReason::Unresponsive`.
+///
+/// So the choice was never one missed match against none. It was one missed
+/// match against six missed matches *and* a stopped run *and* a halt reason
+/// that sends the player to look at Epic Seven — check the window, restart the
+/// client — when what happened is that the analysis server put a `300` in a
+/// `u8`. Failing loudly is only worth something when it points at the right
+/// thing.
+///
+/// # What it costs, named rather than waved past
+///
+/// [`ShopItem::effective_slot`] falls back to the 1-based *position* when the
+/// server omits `slot`, so a shop that both omits slot numbers and ships one
+/// undecodable slot renumbers everything after the hole and the actuator
+/// clicks one row off — a wrong buy with real gold, not a missed one. That
+/// needs two independent server faults at once and `slot` is pinned by the
+/// wire fixture in `uplink::protocol`, so it is judged remote; it is written
+/// down because it is the only branch here that spends money rather than
+/// losing an opportunity.
+///
+/// Substituting a default [`ShopItem`] for the bad one — keeping the arity, so
+/// nothing renumbers — is the obvious answer to that and is worse:
+/// `dedup::fingerprint` yields `None` when any slot has no id, and a
+/// placeholder has none, so one bad scalar would switch duplicate suppression
+/// off for that roll and every re-delivery of the same shop would bill another
+/// refresh in crystals. A certain recurring spend to buy off a remote wrong
+/// click is the wrong trade.
+///
+/// # What the log and the player see
+///
+/// One `warn!` per snapshot naming the arity, not one per dropped slot: what a
+/// reader of the log file the README asks players to send needs is that the
+/// shop was six slots and five arrived, and a server stuck on a bad scalar
+/// re-sends one on every roll. `warn!` rather than the `debug!` both siblings
+/// use because this is `websocket::forward`'s dialect line's class of event —
+/// client and server disagree about the wire and the symptom is silence —
+/// while the per-slot serde errors stay at `debug!`, which the default filter
+/// still files. On screen the only trace is a gap in the slot column, and only
+/// when the survivors carry wire `slot` numbers of their own: weak evidence,
+/// but it is what a player who counts to six in the game window would have to
+/// go on.
+///
+/// A wholly non-array `slots` degrades to empty, and be clear about what that
+/// buys: `Controller::evaluate_snapshot` treats a slotless snapshot as a
+/// degraded message and returns before it disarms the expectation, so the
+/// watchdog still climbs to `Unresponsive`. The gain is diagnosis, not the
+/// session — `last_shop_ms` advances, so the heartbeat can read "server
+/// talking, payload unusable" instead of "server mute", which are exactly the
+/// two cases that line exists to separate.
+fn lenient_slots<'de, D>(de: D) -> Result<Vec<ShopItem>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let serde_json::Value::Array(values) = serde_json::Value::deserialize(de)? else {
+        tracing::warn!("tolerated a non-array shop slot list — degraded to empty");
+        return Ok(Vec::new());
+    };
+    let offered = values.len();
+    let slots: Vec<ShopItem> = values
+        .into_iter()
+        .filter_map(|value| match serde_json::from_value(value) {
+            Ok(item) => Some(item),
+            Err(error) => {
+                tracing::debug!(%error, "dropped an undecodable shop slot");
+                None
+            }
+        })
+        .collect();
+    if slots.len() != offered {
+        tracing::warn!(
+            kept = slots.len(),
+            offered,
+            "dropped undecodable shop slots — the filter will judge a short shop"
+        );
+    }
+    Ok(slots)
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ShopItem {
     /// The item's catalog id, `None` when the server omits it — ties a
@@ -615,6 +717,47 @@ mod tests {
                 .slot_by_id(CatalogId::new(999).expect("999 is not zero"))
                 .is_none()
         );
+    }
+
+    /// The failure this file's last intolerant collection used to cause. Both
+    /// payloads are shapes the server can actually emit — a slot number past
+    /// `u8::MAX` and a stringified price — and each used to abort the whole
+    /// `ShopSnapshot`, hence the whole `ServerMessage`, hence the run. See
+    /// [`lenient_slots`] for why the surviving slots are worth more than the
+    /// halt.
+    #[test]
+    fn a_bad_scalar_drops_its_slot_and_not_the_snapshot() {
+        for json in [
+            r#"{"slots":[{"id":101,"slot":1},{"id":102,"slot":300},{"id":103,"slot":3}]}"#,
+            r#"{"slots":[{"id":101,"slot":1},{"id":102,"price":"184k"},{"id":103,"slot":3}]}"#,
+        ] {
+            let snapshot = parse(json);
+            let surviving: Vec<Option<CatalogId>> =
+                snapshot.slots.iter().map(|item| item.id).collect();
+            assert_eq!(
+                surviving,
+                [CatalogId::new(101), CatalogId::new(103)],
+                "{json}"
+            );
+        }
+    }
+
+    /// The whole-collection half of the degrade, like
+    /// [`mistyped_substats_degrade_to_empty`] one level down. This one does
+    /// *not* save the session — `evaluate_snapshot` refuses a slotless
+    /// snapshot — so what it pins is that the snapshot still arrives, which is
+    /// what lets the heartbeat tell a talking server from a mute one.
+    #[test]
+    fn mistyped_slots_degrade_to_empty() {
+        for json in [
+            r#"{"slots":"corrupt"}"#,
+            r#"{"slots":5}"#,
+            r#"{"slots":{"1":{"id":101}}}"#,
+        ] {
+            assert!(parse(json).slots.is_empty(), "{json}");
+        }
+        // Absent and null keep working through the field's `default`.
+        assert!(parse("{}").slots.is_empty());
     }
 
     #[test]
