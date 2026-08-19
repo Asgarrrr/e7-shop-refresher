@@ -109,6 +109,47 @@ from Rust without guessing offsets.
 **Npcap avoids all four**, and for the same structural reason WinDivert did: one
 tap, one delivery per packet, framing normalised by the driver rather than by us.
 
+### Amendment, 2026-08-19: two of those four walls were the API, not the data
+
+Re-measured after the question was reopened, using `pktmon.exe` itself — Microsoft's
+own consumer of the same NDIS machinery, with all the attachment logic already
+correct — rather than the `PACKETMONITOR_*` API this project bound to.
+
+**The bytes are there, driverless, in realtime.** With `--pkt-size 0 --comp nics`
+and a `TCP port 443` filter, a verified 20 000 000-byte download produced **2 574
+inbound TCP events, 2 535 of them carrying payload**, in `-m real-time`. Sample
+frames read `162.159.140.220.443 > 192.168.1.17.2725 … length 1460`. This
+contradicts nothing in the table above, but it does contradict the inference
+drawn from it, that the in-box path cannot feed a capture backend.
+
+Two corrections follow.
+
+- **The 9 000-byte realtime cap is an API limit, not a data-path limit.** The
+  same realtime run carried a **48 220-byte** frame without complaint. What
+  failed with `ERROR_INSUFFICIENT_BUFFER` was the buffer the PktMon API hands its
+  callback, not the stream.
+- **48 KB coalesced frames are not an obstacle; they are the existing condition.**
+  `capture/pcap/sys.rs`'s `SNAPLEN` comment records the Npcap backend measuring
+  one of **48 870 bytes** on this same machine and sets the snaplen to 262 144 for
+  exactly that reason. The RSC behaviour the post-mortem hit is what this pipeline
+  already expects. (It also explains a discrepancy noticed during the re-run:
+  20 MB across 2 535 events is ~7.9 KB per event, which is coalescing, not loss.)
+
+Walls 1 and 2 — data-source attachment and per-component duplication — remain
+real and remain properties of that API; `--comp nics` is what narrowed the second
+here. Wall 3, 802.11 + LLC/SNAP framing on Wi-Fi, is real and unchanged: the
+frames arrive with an 802.11 header and an LLC/SNAP shim in front of the IPv4
+one. It is a parsing problem of the kind `capture/pcap/link.rs` already solves for
+Ethernet, VLAN and QinQ, and the frames self-describe (`ethertype IPv4 (0x0800)`).
+
+**What this does not establish.** No ETW consumer was written. All of the above
+was observed through `pktmon.exe`, which may use a private path. The open
+question is now narrow and worth stating precisely: *can a direct consumer of the
+`Microsoft-Windows-NDIS-PacketCapture` provider get this same stream, at this same
+fidelity, from Rust?* That is unexplored — the earlier migration went through the
+capped API instead — and it is the only thing between this project and capture
+with no install of any kind.
+
 ## The transferable rule
 
 > When replacing a component, ask whether the replacement is *designed for* the
@@ -242,8 +283,15 @@ Two secondary points, both measured rather than assumed:
   hypothesis should establish a ground truth first (download a known byte count
   and compare), because packet counts alone made this look like a quiet network
   twice.
-- **A PktMon revision exposing a documented single-tap capture mode at the IP
-  layer.** As of Windows 11 26200, no such mode exists.
+- **A working direct consumer of `Microsoft-Windows-NDIS-PacketCapture`.** This
+  replaces the older "a PktMon revision exposing a single-tap IP-layer mode",
+  which was the wrong thing to wait for: the 2026-08-19 amendment shows the
+  stream already carries inbound TCP payload in realtime, so what is missing is
+  our side of it, not Microsoft's. Whoever takes it needs an ETW session in Rust
+  (`windows-sys` already carries the APIs), 802.11/LLC-SNAP framing in
+  `link.rs`'s idiom, and a duplication filter equivalent to `--comp nics`. Build
+  it behind a feature flag beside Npcap and compare on one live session before
+  choosing; do not replace the working backend on a probe.
 - **Evidence that the per-adapter fan-out does not scale** on a machine with many
   virtual adapters. Opening all of them buys the removal of every adapter
   heuristic; if it ever costs more than that, adapter selection comes back, not a
