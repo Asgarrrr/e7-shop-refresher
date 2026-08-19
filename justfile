@@ -46,3 +46,105 @@ backends:
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked --no-default-features --features pcap-backend
     cargo test --locked
+
+# --- measurement: not gates, and deliberately not in `verify` -----------------
+#
+# `verify` and `backends` answer "is it broken?" and every lane in them is a
+# pass/fail a commit must satisfy. The two recipes below answer a different
+# question — "would the suite *notice* if it broke?" — and their output is a
+# report a human reads, not a verdict. They are kept out of `verify` for three
+# separate reasons, each of which alone would be enough:
+#
+# 1. They need tools that are not part of the toolchain (`cargo-llvm-cov`,
+#    `cargo-mutants`), so a `verify` that included them would fail on a clean
+#    checkout with an error about a missing subcommand rather than about the
+#    code. Every dependency this crate does *not* have was declined with a
+#    written argument (`docs/tech-debt/_HANDOFF.md`: no `proptest`, no
+#    `tempfile`, no `arrayvec`/`smallvec`); these two stay acceptable precisely
+#    because they are external binaries and appear in neither `Cargo.toml` nor
+#    `Cargo.lock`.
+# 2. They are slow in a way the other lanes are not. `coverage` recompiles the
+#    crate instrumented; `mutants` recompiles it *once per mutant* — measured at
+#    93 mutants for the two `plan` files and 123 for `domain/control/`, on top of
+#    a 317 s baseline build.
+# 3. Neither produces a number that should ever be a threshold. A coverage
+#    percentage turned into a gate is optimised by writing tests that execute
+#    lines without asserting anything, which is the exact defect this crate
+#    already shipped once (`const-003`'s guard test ran every line it cared about
+#    and could not fail). The percentage is a map of where to look, not a score.
+#
+# `.github/workflows/quality.yml` runs both weekly and on demand, for the same
+# reasons, and says so in its own header.
+
+# Instrumented line/region coverage on the shipped feature set
+# (`pcap-backend + gui + actuator`), because that is the binary a player runs.
+#
+# Requires `cargo install --locked cargo-llvm-cov` plus
+# `rustup component add llvm-tools-preview` — measured at v0.9.0 against this
+# crate on Windows, where it works with no crate change at all.
+#
+# Read the output knowing two things about what it counts, both measured rather
+# than assumed:
+#
+# - The inline `#[cfg(test)] mod tests { … }` block at the bottom of most files
+#   *is* counted, and it is always near 100% (test code executes itself), so a
+#   per-file percentage here flatters any file whose tests live beside it.
+#   Stripping those blocks moves the crate from 84.88% of lines to 72.80% of
+#   *production* lines; `docs/tech-debt/30-measurement.md` carries the
+#   production-only ranking that the raw table cannot give.
+# - A file that is nothing but `#[derive(Deserialize)]` shapes reports no
+#   production lines at all — `uplink/protocol.rs` is the whole file — because
+#   derive-generated code is attributed to the macro, not to the call site. Zero
+#   coverage there means "nothing to measure", not "untested".
+#
+# `--summary-only` because the per-file table is the useful artefact; add
+# `--html --open` locally when chasing one file.
+coverage:
+    cargo llvm-cov --locked --summary-only
+
+# Mutation testing on the modules where a surviving mutant costs a player money.
+#
+# This lane exists because of a defect that actually shipped. The guard test
+# written for `const-003` — the invariant "six clickable rows, the top group is
+# 0..=3", whose failure clicks the wrong item's Buy button — had six assertions
+# and every one of them was derived from the two constants it was meant to pin.
+# `LAST_TOP_ROW = 2`, `= 4` and `MAX_ROW = 7` each passed the entire suite. A
+# human caught that by reading; a mutation run catches that whole class by
+# construction, because a test that cannot fail cannot kill a mutant either.
+#
+# Requires `cargo install --locked cargo-mutants` (measured at v27.1.0 on
+# Windows against this crate: it needs no configuration file and no source
+# change, and it copies the tree to a scratch directory rather than editing the
+# working copy).
+#
+# The scope is five files, not the crate, and the exclusions are as deliberate as
+# the inclusions. In: `plan/geometry.rs` and `plan/jobs.rs` (the row/slot/scroll
+# arithmetic — a wrong row is a click on the wrong item), and all of
+# `domain/control/` (the buy decision, the stop reasons, the recovery ladder — a
+# survivor there is a limit that does not stop, a refresh that double-bills, or a
+# watchdog that halts blaming the game). Out: the Win32 backends and
+# `capture/pcap/`, whose behaviour needs a real window or a live NIC, so a
+# survivor there says something about the fixtures rather than about the code;
+# and the `ui` modules, where a mutant usually survives because no pixel changed,
+# which is not a finding worth a reader's time.
+#
+# Default features on purpose, and this one is measured rather than assumed:
+# `--no-default-features` looks cheaper and is not, because `egui_kittest` is an
+# ungated dev-dependency and every `cargo test` lane therefore builds the whole
+# egui tree anyway. What the default lane buys for that same cost is a stronger
+# verdict — running the reduced lane reported
+# `Controller::is_recovery_enabled -> false` as a survivor, and it is not one:
+# the test that kills it (`app::tests::setup_enables_recovery_only_when_live`)
+# has two `#[cfg]` bodies and only the `all(windows, feature = "actuator")` one
+# asserts `true`.
+#
+# `--timeout 120` is sixty times the ~2 s the suite takes once built. It is there
+# for the mutants that turn a bounded loop unbounded — the one way a mutant hangs
+# instead of failing — and not as a performance expectation.
+#
+# `cargo mutants` exits non-zero when a mutant survives. That is information, not
+# a failure: read `mutants.out/missed.txt` and decide per mutant whether the
+# expression was unobservable (then it is noise) or whether the test that should
+# have noticed cannot fail (then it is the thing this lane was built to find).
+mutants:
+    cargo mutants --file src/actuator/plan/geometry.rs --file src/actuator/plan/jobs.rs --file src/domain/control/mod.rs --file src/domain/control/watchdog.rs --file src/domain/control/dedup.rs --timeout 120

@@ -1,0 +1,222 @@
+name: Quality
+# The measurement lanes: how much of the crate the tests *reach* (coverage) and
+# how much of it they would *notice changing* (mutation). Both answer the
+# sentence `docs/tech-debt/README.md` ends its "Method and its limits" section
+# with — "No reviewer measured test coverage, because no CI lane does — which is
+# precisely how `test-001` survived" — and the defect that motivated the
+# mutation half is on record too: the guard test shipped for `const-003`, the one
+# pinning "six clickable rows, the top group is 0..=3", had six assertions and
+# every one of them was a tautology over the two constants it was meant to pin.
+# `LAST_TOP_ROW = 2`, `= 4` and `MAX_ROW = 7` each passed the whole suite while
+# `buy_job` planned a scroll-to-bottom for a row still at scroll-top — a click on
+# the wrong item's Buy button, with the player's gold behind it. A human found
+# that by reading. A mutation run finds that class by construction.
+#
+# **This workflow is deliberately not a required check on push or pull_request,
+# and it must not become one.** A mutation pass is minutes-to-hours of compiling
+# and its verdicts are not all real: a surviving mutant can be an unobservable
+# expression rather than a hole, and a *timeout* verdict is a property of how
+# loaded the runner was, not of the code. A gate that reddens a PR on timing
+# noise gets switched off within a month, and a switched-off gate is worse than
+# no gate — it is a gate everyone believes in. So this runs weekly and on
+# demand, and the deliverable is the uploaded report a human reads, exactly like
+# the tech-debt documents it feeds. `ci.yml` keeps the hard gates (clippy on six
+# lanes, rustfmt, rustdoc, the four test lanes, the manifest assertions); nothing
+# here duplicates them.
+on:
+  # A Monday morning, offset from `ci.yml`'s `17 4 * * 1` so the two do not
+  # contend for the same runner minute — this job is long and `ci.yml` is the
+  # one whose result someone may be waiting on.
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+# Least privilege: neither job writes anything back to the repository. Reading
+# the tree is all `actions/checkout` needs, and the reports leave as workflow
+# artifacts, which `actions/upload-artifact` handles under the job token without
+# a `contents: write` or a PAT.
+permissions:
+  contents: read
+
+# Spelled out rather than inherited. GitHub's default shell on a Windows runner
+# is not guaranteed to be PowerShell across runner images, and three steps below
+# are PowerShell (`$env:GITHUB_STEP_SUMMARY`, `Tee-Object`, the backtick line
+# continuations in the `cargo mutants` invocation) — they would fail in `cmd`
+# with an error that reads like a tooling problem instead of a shell problem.
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  coverage:
+    name: Coverage (shipped default features)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      # Pinned so a report is comparable to the last one: `cargo-llvm-cov`
+      # changes what it counts between releases (region vs. line accounting, the
+      # default filename ignores), and an unpinned tool turns "coverage moved"
+      # into a question nobody can answer.
+      CARGO_LLVM_COV_VERSION: "0.9.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # No `dtolnay/rust-toolchain` here, unlike `ci.yml`. That action exists to
+      # *choose* a toolchain, and this job does not choose one: `rust-toolchain.toml`
+      # pins 1.92.0 at the repo root and rustup installs it on the first cargo
+      # call. `ci.yml` needs the action because it runs a two-toolchain matrix and
+      # has to outrank the file with `RUSTUP_TOOLCHAIN`; a single-toolchain job
+      # that adds the action would be adding a third-party dependency to restate
+      # what the checked-in file already says.
+      - name: Add the LLVM tools the instrumentation needs
+        # `cargo llvm-cov` shells out to `llvm-profdata`/`llvm-cov` from the
+        # toolchain that compiled the crate, so the component has to be added for
+        # *that* toolchain and not for whichever one happens to be default.
+        run: rustup component add --toolchain 1.92.0 llvm-tools-preview
+
+      - name: Cache cargo-llvm-cov binary
+        id: llvm-cov-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov.exe
+          key: cargo-llvm-cov-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_LLVM_COV_VERSION }}
+
+      - name: Install pinned cargo-llvm-cov
+        if: steps.llvm-cov-cache.outputs.cache-hit != 'true'
+        # Built on current stable rather than the MSRV: this is a *tool*, not
+        # part of the product, and its own MSRV is its business. `RUSTUP_TOOLCHAIN`
+        # outranks `rust-toolchain.toml` — the same fact `ci.yml`'s `verify` job
+        # documents at length — so this one step escapes the pin and no other
+        # step does.
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: cargo install --locked cargo-llvm-cov --version "$env:CARGO_LLVM_COV_VERSION"
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2.9.2
+        with:
+          shared-key: coverage
+
+      # The shipped feature set (`pcap-backend + gui + actuator`), because that
+      # is the binary a player runs; the portable lanes are a strict subset and
+      # would report a lower number for code that does ship.
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --locked --summary-only | Tee-Object -FilePath coverage-summary.txt
+          cargo llvm-cov report --lcov --output-path coverage.lcov
+
+      # The summary in the run's own page, so reading the number costs no
+      # download. The artifact below is for the per-file work.
+      - name: Publish the summary to the run
+        if: always()
+        run: |
+          "## Coverage (default features)" >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          Get-Content coverage-summary.txt >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload the coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage
+          path: |
+            coverage-summary.txt
+            coverage.lcov
+          retention-days: 30
+
+  mutants:
+    name: Mutation (shard ${{ matrix.shard }}/4)
+    runs-on: windows-latest
+    # Generous, and it has to be: the mutation pass rebuilds the crate once per
+    # mutant. Measured locally at 216 mutants across the five files below, so a
+    # quarter of them is ~54 rebuilds per shard. The cap exists to stop a hung
+    # mutant from burning six hours, not to express an expectation — `--timeout`
+    # below is the per-mutant guard and is the one that should fire first.
+    timeout-minutes: 180
+    strategy:
+      # Every shard's result stands on its own — a shard that fails to build
+      # tells you nothing about the other three, and cancelling them would throw
+      # away the survivors they had already found.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      CARGO_MUTANTS_VERSION: "27.1.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Cache cargo-mutants binary
+        id: mutants-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cargo/bin/cargo-mutants.exe
+          key: cargo-mutants-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_MUTANTS_VERSION }}
+
+      - name: Install pinned cargo-mutants
+        if: steps.mutants-cache.outputs.cache-hit != 'true'
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: cargo install --locked cargo-mutants --version "$env:CARGO_MUTANTS_VERSION"
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2.9.2
+        with:
+          shared-key: mutants
+
+      # The scope is not "the crate": it is the five files where a surviving
+      # mutant costs a player money or wedges the loop. `plan/geometry.rs` and
+      # `plan/jobs.rs` are the row/slot/scroll arithmetic `const-003` is about —
+      # a wrong row is a click on the wrong item's Buy button. `domain/control/`
+      # is the buy decision, the stop reasons and the recovery ladder: a mutant
+      # surviving there is a limit that does not stop, a refresh that double-bills,
+      # or a watchdog that halts blaming the game. Everything else in the crate is
+      # in scope for a human's judgement, not for a weekly robot's: the Win32
+      # backends need a real window, `capture/pcap/` needs Npcap and a live NIC,
+      # and the UI modules are asserted through `egui_kittest` where a surviving
+      # mutant usually means "no pixel changed", which is not a finding.
+      #
+      # Default features on purpose. `--no-default-features` would look cheaper
+      # and is not: `egui_kittest` is an ungated dev-dependency, so `cargo test`
+      # builds the whole egui tree in every lane anyway (see `Cargo.toml`'s
+      # `[dev-dependencies]` note). What the default lane buys for that same cost
+      # is the strongest possible verdict — a mutant reported as surviving here
+      # survived *every* test the product build has.
+      #
+      # `--timeout 120`: the full suite runs in about 2 s once built, so 120 s is
+      # sixty times the honest runtime. It is there for the mutants that turn a
+      # bounded loop unbounded, which is the one way a mutant hangs rather than
+      # fails.
+      - name: Mutation-test the money modules
+        run: |
+          cargo mutants `
+            --file src/actuator/plan/geometry.rs `
+            --file src/actuator/plan/jobs.rs `
+            --file src/domain/control/mod.rs `
+            --file src/domain/control/watchdog.rs `
+            --file src/domain/control/dedup.rs `
+            --shard ${{ matrix.shard }}/4 `
+            --timeout 120 `
+            --output mutants-shard-${{ matrix.shard }}
+
+      # `if: always()`, because the interesting run is the one that just failed:
+      # `cargo mutants` exits non-zero precisely when a mutant survived, and the
+      # `missed.txt` naming it is what a reader came for.
+      - name: Report the survivors in the run summary
+        if: always()
+        run: |
+          $missed = "mutants-shard-${{ matrix.shard }}/mutants.out/missed.txt"
+          "## Mutation shard ${{ matrix.shard }}/4" >> $env:GITHUB_STEP_SUMMARY
+          if ((Test-Path $missed) -and (Get-Item $missed).Length -gt 0) {
+            "Surviving mutants — each one is either a real hole or an unobservable expression, and only a reader can tell which:" >> $env:GITHUB_STEP_SUMMARY
+            '```' >> $env:GITHUB_STEP_SUMMARY
+            Get-Content $missed >> $env:GITHUB_STEP_SUMMARY
+            '```' >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            "No surviving mutants in this shard." >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Upload the mutation report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants-shard-${{ matrix.shard }}/mutants.out
+          retention-days: 30
