@@ -198,8 +198,7 @@ mod tests {
     fn purchase_item_absent_and_the_zero_sentinel_both_read_as_no_id() {
         // The wire spells "I have no id for this buy" two ways — the key absent,
         // and the key present as `0`. Both fold to `None` at the boundary, so
-        // `on_purchase` has no sentinel left to re-derive (it used to, in
-        // contradiction of `shop::catalog_id`'s own "do not re-derive" contract).
+        // `on_purchase` has no sentinel left to re-derive.
         for json in [
             r#"{"type":"purchase"}"#,
             r#"{"type":"purchase","item":0}"#,

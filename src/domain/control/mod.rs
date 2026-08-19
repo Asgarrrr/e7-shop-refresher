@@ -64,11 +64,10 @@ pub struct Limits {
     /// Crystal budget — a hard ceiling: a refresh that would cross it is
     /// never issued.
     ///
-    /// A [`Crystals`], which is what makes the comparison the audit filed
-    /// `type-004` against unwritable in the wrong currency: the other operand,
-    /// [`Progress::spent`], is where a gold price could once have landed.
-    /// `Crystals` is `#[serde(transparent)]` in both directions, so `config.toml`
-    /// still spells this as a bare `max_spend = 300`.
+    /// Typed as [`Crystals`], not a bare integer: the comparison against
+    /// [`Progress::spent`] (see `stop_reason`) is then unwritable in the wrong
+    /// currency. `Crystals` is `#[serde(transparent)]` in both directions, so
+    /// `config.toml` still spells this as a bare `max_spend = 300`.
     pub max_spend: Option<Crystals>,
     /// Matched items, cumulative — not purchases. Reached by a match, the
     /// halt waits for that match's pause to resolve: the found items are
@@ -575,10 +574,8 @@ impl Controller {
                 // wire-supplied, and `price <= balance` only holds here through
                 // `affordable` above — a non-local invariant an added `in_reach`
                 // term could break. At zero the next item simply reads
-                // unaffordable, which is the intended semantics. `Gold` has no
-                // `Sub` impl at all, so the panicking form (release builds run
-                // with `overflow-checks = true`) is not spellable here or
-                // anywhere else.
+                // unaffordable, which is intended. `Gold` has no `Sub` impl at
+                // all, so the panicking form is not spellable here.
                 gold = Some(balance.saturating_sub(price));
             }
             buyable |= in_reach;
@@ -586,9 +583,7 @@ impl Controller {
                 slot: item.effective_slot(index),
                 // Only ids a buy can actually land on: a sold-out,
                 // unaffordable or already-bought slot may not hold the
-                // checklist open (nor be clicked). An item the server gave no
-                // id is already `None` — that used to need the sentinel test
-                // spliced in here too.
+                // checklist open (nor be clicked).
                 id: item.id.filter(|_| in_reach),
             });
         }
@@ -610,13 +605,9 @@ impl Controller {
             self.gold_balance = gold;
         }
         // Like gold, a buy is truth whatever the status: the slot is spent
-        // for the rest of the roll. There is no sentinel test left to re-derive
-        // (this line used to read `item != 0`, in contradiction of
-        // `shop::catalog_id`'s "do not re-derive" contract): an echo with no id
-        // arrives as `None` and this `if let` is the only reader.
-        // The `bought` guard also dedups a replayed echo, so a buy is counted
-        // at most once per roll (a genuine re-buy in a fresh roll clears
-        // `bought` and counts again — two items obtained).
+        // for the rest of the roll. The `bought` guard also dedups a replayed
+        // echo, so a buy is counted at most once per roll (a genuine re-buy in
+        // a fresh roll clears `bought` and counts again — two items obtained).
         if let Some(item) = item
             && !self.bought.contains(&item)
         {
@@ -745,13 +736,9 @@ impl Controller {
         }
         // Hard ceiling: also stop when the *next* refresh would cross it.
         //
-        // This is the comparison the audit filed `type-004` against. Both
-        // operands are `Crystals` from the parse onward — `limits.max_spend` is
-        // typed and so is `progress.spent` — so a gold price cannot be weighed
-        // against this budget without writing a conversion nobody could mistake
-        // for an accident. `checked_add` and not `saturating_add`: the question
-        // is whether the *next* refresh crosses the ceiling, and a saturated
-        // `u32::MAX` would answer "over budget" for the right reason by accident.
+        // `checked_add`, not `saturating_add`: the question is whether the
+        // *next* refresh crosses the ceiling, and a saturated `u32::MAX` would
+        // answer "over budget" for the right reason by accident.
         if let Some(max) = self.limits.max_spend
             && (self.progress.spent >= max
                 || self

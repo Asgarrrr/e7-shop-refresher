@@ -14,11 +14,9 @@ const EXPECT_PURCHASE_MS: u64 = 10_000;
 /// (first timeout), through 2 (re-issue), to 3 (honest halt).
 ///
 /// Test-only, and it lives *here* rather than in either test module because two
-/// suites need it: `control::tests` and `app::session::tests` both used to spell
-/// these deadlines `10_001` / `20_001` / `30_001` — 30-odd bare literals whose
-/// only tie to the window above was arithmetic in the reader's head, in a file
-/// where every sibling tuning value is named. A change to the window now moves
-/// every tick with it.
+/// suites need it (`control::tests` and `app::session::tests`): do not let
+/// either re-spell these deadlines as bare `10_001` / `20_001` / `30_001`
+/// literals — a change to the window would then move only one of them.
 ///
 /// Every escalation re-grants a *full* window rather than shortening it, which is
 /// what makes the rungs exact multiples.

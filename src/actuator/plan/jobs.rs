@@ -45,9 +45,9 @@ pub struct TimedStep {
 /// [`SnapshotEpoch::current`](crate::actuator::SnapshotEpoch::current).
 ///
 /// A newtype because every job builder below takes it *immediately before* a
-/// `seed: u64` drawn from `now_ms`, so the two used to be adjacent bare `u64`s
-/// and a transposition compiled. It would not have produced a wrong click, which
-/// is worse: the executor's first act on every job is `job.epoch !=
+/// `seed: u64` drawn from `now_ms`: two adjacent bare `u64`s would let a
+/// transposition compile. That would not produce a wrong click, which is
+/// worse: the executor's first act on every job is `job.epoch !=
 /// epoch.current()`, so a swapped pair drops *every* click forever while the
 /// journal blames the shop for changing. Only ever compared for equality —
 /// nothing here does arithmetic on a generation number.
@@ -246,9 +246,8 @@ mod tests {
 
     #[test]
     fn buy_job_orders_top_group_then_one_scroll_then_bottom_group() {
-        // Unsorted, with a duplicate. (The out-of-range row this case used to
-        // carry cannot be spelled any more — see
-        // `a_slot_outside_the_six_rows_never_becomes_a_click`.)
+        // Unsorted, with a duplicate. An out-of-range row cannot be spelled
+        // here at all — see `a_slot_outside_the_six_rows_never_becomes_a_click`.
         let job = buy_job(
             Trigger::ShopOpened,
             Timings::default(),
@@ -300,12 +299,11 @@ mod tests {
 
     #[test]
     fn a_slot_outside_the_six_rows_never_becomes_a_click() {
-        // `buy_job` used to take `&[u8]` and filter the out-of-range rows out
-        // itself, which meant a caller that passed *slot* numbers lost row 6
-        // instead of being refused. The refusal now happens one step earlier and
-        // exactly once, so there is no row left for `buy_job` to drop: slot 7 and
-        // a clamped `effective_slot` fallback (`u8::MAX`) have no row at all, and
-        // the resulting empty plan clicks nothing.
+        // Do not let `buy_job` filter out-of-range rows itself again — a caller
+        // passing *slot* numbers would silently lose row 6 instead of being
+        // refused. The refusal happens one step earlier and exactly once: slot 7
+        // and a clamped `effective_slot` fallback (`u8::MAX`) have no row at
+        // all, and the resulting empty plan clicks nothing.
         assert_eq!(Slot::new(7).row(), None);
         assert_eq!(Slot::new(u8::MAX).row(), None);
         let rows: Vec<Row> = [7, u8::MAX]

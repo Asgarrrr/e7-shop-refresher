@@ -38,16 +38,15 @@ const SHIELD_DRAIN_MS: u64 = 50;
 
 /// Why a refused `PostMessageW` is fatal or merely recoverable.
 ///
-/// `ERROR_ACCESS_DENIED` here is UIPI, and it used to be classified
-/// `Recoverable` under the text "window gone or queue full" — two causes that
-/// are both wrong for it, and a verdict that had the watchdog re-issuing clicks
-/// forever against a condition which cannot heal while the game keeps running.
-/// It is `Fatal`: acting again would be acting blind, exactly what that variant
-/// is for.
+/// `ERROR_ACCESS_DENIED` here is UIPI. Do not classify it `Recoverable` under
+/// "window gone or queue full" — both causes are wrong for it, and the watchdog
+/// would re-issue clicks forever against a condition that cannot heal while the
+/// game keeps running. It is `Fatal`: acting again would be acting blind,
+/// exactly what that variant is for.
 ///
-/// In practice the preflight at acquire catches this first and this branch is
-/// the backstop for a window whose integrity level changed *mid-job*, after the
-/// probe passed — so it names the cause in one clause and leaves the full
+/// The preflight at acquire catches this first; this branch is the backstop
+/// for a window whose integrity level changed *mid-job*, after the probe
+/// passed — so it names the cause in one clause and leaves the full
 /// explanation and the fix to [`preflight_refusal`], rather than repeating a
 /// paragraph on every click.
 ///
@@ -71,11 +70,11 @@ pub(super) fn post_refusal(error: &std::io::Error) -> SurfaceError {
 /// the game window — no focus stolen, the player keeps the mouse. The engine
 /// tracks its cursor through move messages, so every input re-asserts the
 /// [`shield`] over the game until [`release`](Surface::release).
+///
 /// Fieldless on purpose: the only thing this backend owns beyond one job is the
-/// process-global [`shield`], which its `Drop` lowers. The job-scoped
-/// `Option<Target>` it used to carry — and the `target()` guard that read it —
-/// are gone: the window is a [`Target`] the executor's guard holds and hands back
-/// to every call (`api-004`).
+/// process-global [`shield`], which its `Drop` lowers. The window travels as a
+/// [`Target`] parameter (see [`Surface`]'s "why the window is a parameter"),
+/// not a field this type keeps.
 ///
 /// Braced-empty rather than a unit struct so that `MessageSurface::default()` —
 /// how `src/app/mod.rs` spawns it, and the shape every other backend in the crate
@@ -262,11 +261,6 @@ mod tests {
     /// it can be reached two or three times over one job with no shield ever
     /// raised (an `acquire` that succeeded and a first `engage` that did not).
     /// `shield::hide` has to tolerate all of it.
-    ///
-    /// This used to also assert `surface.target.is_none()` after the calls. That
-    /// state is gone — `api-004` moved the window out of the backend — so what is
-    /// left to pin is the idempotence, which is the part that runs from a
-    /// destructor.
     #[test]
     fn message_surface_cleanup_is_idempotent_without_a_shield() {
         let mut surface = MessageSurface::default();
@@ -344,12 +338,9 @@ mod tests {
         }
     }
 
-    /// The wheel path used to mask the delta into wParam's high word with
-    /// `(delta as u32) << 16`, twelve lines below the doc comment that refuses
-    /// exactly that for coordinates. Not reachable from the crate's own
-    /// `±10` notches — which is the point: the trait boundary is what a future
-    /// caller reaches, and a truncated delta scrolls the wrong distance in the
-    /// opposite direction with every layer reporting success.
+    /// Not reachable from the crate's own `±10` notches — which is the point:
+    /// the trait boundary is what a future caller reaches, and (see
+    /// [`wheel_wparam`]'s doc) an unchecked shift would truncate silently.
     #[test]
     fn a_wheel_delta_outside_the_signed_word_is_refused_instead_of_truncated() {
         // 300 notches × 120 = 36 000, past `i16::MAX`: the old form posted

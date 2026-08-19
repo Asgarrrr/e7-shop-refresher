@@ -27,11 +27,9 @@ const CLASS_NAME: &str = "arkyve-refresh-shop-shield";
 /// backend for the process lifetime.
 static WINDOW: Mutex<Option<Hwnd>> = Mutex::new(None);
 
-// Poisoning carries no meaning here: the guarded state is a plain handle, and a
-// panic elsewhere must not turn every later click into a fatal — the promise
-// `WINDOW` makes right above. That is now the actuator-wide policy, so the lock
-// helper lives one module up (`super::lock`) instead of being a second copy of
-// it here.
+// Poisoning carries no meaning here: the guarded state is a plain handle, so a
+// panic elsewhere must not turn every later click into a fatal. That is the
+// actuator-wide policy, hence `super::lock` rather than a second copy here.
 
 /// Ensures the shield sits directly above the game, covering `rect`;
 /// `Ok(true)` means it was (re)placed — the game may still hold real moves.
@@ -111,19 +109,18 @@ pub(super) fn raise(game: Hwnd, rect: ClientRect) -> Result<bool, String> {
 
 /// Why a `SetWindowPos` refusal reads the way it does.
 ///
-/// The comment above used to concede that "UIPI refusals and dead windows are
-/// indistinguishable without it" — the error code — and then not use the
-/// distinction. It is used now, because the two want opposite things from the
-/// player: a dead window is nothing to do, an integrity-level mismatch is
-/// "restart this app as administrator" (the game cannot go the other way: Epic
-/// Seven inherits high integrity from STOVE's `requireAdministrator` launcher).
+/// UIPI refusals and dead windows want opposite advice: a dead window is
+/// nothing to do, an integrity-level mismatch is "restart this app as
+/// administrator" (the game cannot go the other way — Epic Seven inherits high
+/// integrity from STOVE's `requireAdministrator` launcher).
 ///
-/// That fix deliberately does **not** appear here. `MessageSurface::acquire`
-/// probes the window once per job and stops the loop with the full explanation
-/// (`actuator::win::preflight_refusal`) before a single click is planned, so by
-/// the time this line can fire the game has changed integrity level *mid-job* —
-/// a real case, and a rare one. Naming the cause is what this owes the log;
-/// repeating the paragraph on every click is what would bury it.
+/// The "restart as administrator" fix deliberately does **not** appear here.
+/// `MessageSurface::acquire` probes the window once per job and stops the loop
+/// with the full explanation (`actuator::win::preflight_refusal`) before a
+/// single click is planned, so by the time this line can fire the game has
+/// changed integrity level *mid-job* — a real but rare case. Naming the cause
+/// is what this owes the log; repeating the paragraph on every click would
+/// bury it.
 fn placement_refusal(action: &str, error: &std::io::Error) -> String {
     if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
         format!(
@@ -171,11 +168,9 @@ fn spawn_window() -> Result<Hwnd, String> {
     // The channel carries the verdict itself, not a bare readiness signal: a
     // successful `recv` *is* the detailed `create_window` answer, and a
     // `RecvError` — the sender dropped without sending — is exactly "the thread
-    // died during setup". The `Arc<Mutex<Option<…>>>` this replaces existed to
-    // keep a detailed failure alive if the signal never arrived, but the only
-    // window for that was between filling the slot and sending, two adjacent
-    // statements that cannot panic. One fewer lock in a module the actuator
-    // touches on every job.
+    // died during setup". Do not reintroduce an `Arc<Mutex<Option<…>>>` here to
+    // hold that failure instead: the two statements between filling the slot
+    // and sending cannot panic, so the mutex would guard nothing.
     let (tx, rx) = std::sync::mpsc::channel::<Result<Hwnd, String>>();
     let spawned = std::thread::Builder::new()
         .name("shield".to_owned())

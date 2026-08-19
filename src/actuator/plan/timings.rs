@@ -140,13 +140,10 @@ impl TryFrom<RawDelayRange> for DelayRange {
 /// private and the three ways in ([`try_new`](Self::try_new),
 /// [`ceiling`](Self::ceiling), [`set_max_ms`](Self::set_max_ms)) each enforce it,
 /// with `Deserialize` routed through `RawDelayRange` so `config.toml` is no
-/// exception. That is a change of kind, not of degree: the two rules used to live
-/// in a loop in `config::validate_timings`, so every *other* producer — a
-/// preset, a GUI drag, `persist::save` writing what the Setup tab handed it —
-/// re-derived them, absorbed them by clamping, or bypassed them. The file the
-/// GUI wrote was one missing clamp away from being a file the next launch
-/// refused, which is exactly the shape of the `kinds = ["unknown"]` checkbox that
-/// shipped and whose only cure was hand-editing the file the app owns.
+/// exception. Do not move the check back into a loop in `config::validate_timings`
+/// and let each producer (a preset, a GUI drag, `persist::save`) re-derive or
+/// bypass it — a GUI write one missing clamp away from invalid is a file the
+/// next launch refuses, recoverable only by hand-editing a file the app owns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(try_from = "RawDelayRange")]
 pub struct DelayRange {
@@ -476,13 +473,10 @@ mod tests {
 
     #[test]
     fn a_reversed_range_cannot_be_built_at_all() {
-        // This used to be `reversed_range_reads_as_its_min_point`: a reversed
-        // range was constructible, `Config::validate` refused it at the loader,
-        // and `draw` read it leniently as a fixed delay for everyone else. Now
-        // there is no "everyone else" — a GUI edit, a future preset and a
-        // `config.toml` all go through `try_new`, so the lenient reading has no
-        // input to be lenient about. The message still says what the value would
-        // have been read as, because that is what tells the player it was a typo.
+        // A GUI edit, a future preset and `config.toml` all go through
+        // `try_new`, so there is no path left that could read a reversed pair
+        // leniently as a fixed delay. The message still says what the value
+        // would have been read as, because that tells the player it was a typo.
         let err = DelayRange::try_new(600, 100).expect_err("a reversed range is not a range");
         assert_eq!(
             err,
@@ -501,11 +495,11 @@ mod tests {
 
     #[test]
     fn a_range_past_the_ceiling_cannot_be_built_and_the_ceiling_itself_can() {
-        // The `u64::MAX` case is what used to make `draw`'s modulus overflow and
-        // the editor's `baseline + max` sums wrap; ten minutes is what freezes
-        // the loop between two clicks. Both are now unrepresentable rather than
-        // refused-at-the-loader, and the inclusive bound stays usable — the
-        // ceiling exists to stop a frozen loop, not to narrow the knob.
+        // `u64::MAX` would overflow `draw`'s modulus and the editor's
+        // `baseline + max` sums; 600_000 (ten minutes) would freeze the loop
+        // between two clicks. Both are unrepresentable, and the inclusive
+        // bound stays usable — the ceiling exists to stop a frozen loop, not
+        // to narrow the knob.
         assert_eq!(
             DelayRange::try_new(0, u64::MAX),
             Err(DelayRangeError::AboveCeiling { max_ms: u64::MAX })

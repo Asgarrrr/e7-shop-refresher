@@ -6,15 +6,13 @@
 //! # Why the seam is here
 //!
 //! The two backends share no state and are selected between in `src/app/mod.rs`,
-//! so each owns a file: [`send_input`] and [`post_message`]. What stays in this
-//! root is what both of them need and neither owns — the *window*, from the four
-//! angles a backend only ever consumes: naming it ([`Hwnd`], [`Target`]),
-//! finding it ([`find_game_window`]), measuring it ([`client_rect`]), and proving
+//! so each owns a file: [`send_input`] and [`post_message`]. This root holds what
+//! both need and neither owns — the *window*: naming it ([`Hwnd`], [`Target`]),
+//! finding it ([`find_game_window`]), measuring it ([`client_rect`]), proving
 //! this process may drive it at all ([`probe_window_reachable`],
-//! [`preflight_refusal`]) — plus the two verdicts both backends have to reach
-//! *identically* ([`rect_change_error`], [`release_twice`]). [`dpi`] holds the
-//! remaining precondition, on its own because it is the one thing here that is
-//! about the process rather than about the window.
+//! [`preflight_refusal`]), and the two verdicts both backends must reach
+//! identically ([`rect_change_error`], [`release_twice`]). [`dpi`] is separate
+//! because it is a process precondition, not a window one.
 
 mod dpi;
 mod post_message;
@@ -42,26 +40,22 @@ const MOVE_SETTLE_MS: u64 = 30;
 
 /// A window handle, carried as the `isize` this module has always carried it as.
 ///
-/// The integer representation is load-bearing and documented on [`Target`]:
-/// `HWND` is a raw pointer, so a bare `HWND` in a
-/// struct would make the executor's future `!Send`. What was missing was the
-/// *type*. The handle used to be a bare `isize` travelling beside other `isize`s
-/// — most sharply in [`post`], where the LPARAM parameter has the same width and
-/// [`pack_point`], whose result feeds it, returned exactly the handle's type, so
-/// `post(lparam, WM_LBUTTONDOWN, MK_LBUTTON as usize, target.hwnd)` compiled. It
-/// would have handed a coordinate pair to `PostMessageW` as a window handle:
-/// `FALSE` + `ERROR_INVALID_WINDOW_HANDLE`, classified `Recoverable` by
-/// [`post_refusal`], after which the watchdog retries a click that can never
-/// land.
+/// The integer representation is load-bearing (see [`Target`]): `HWND` is a raw
+/// pointer, so a bare `HWND` in a struct would make the executor's future
+/// `!Send`. Before this type existed the handle was a bare `isize` travelling
+/// beside other `isize`s — in [`post`], the LPARAM parameter has the same width,
+/// and [`pack_point`]'s result (a packed coordinate pair) returned exactly the
+/// handle's type, so `post(lparam, WM_LBUTTONDOWN, MK_LBUTTON as usize,
+/// target.hwnd)` compiled and would have handed a coordinate pair to
+/// `PostMessageW` as a window handle: `FALSE` + `ERROR_INVALID_WINDOW_HANDLE`,
+/// classified `Recoverable` by [`post_refusal`], so the watchdog would retry a
+/// click that can never land. Do not go back to a bare `isize` here.
 ///
 /// `#[repr(transparent)]` states the layout the `as HWND` casts throughout this
-/// module already relied on implicitly; it adds no assumption, it writes the
-/// existing one down. Every Win32 call still receives the exact ABI type,
-/// obtained through [`Hwnd::raw`] at the call itself — the FFI boundary is
-/// unchanged.
+/// module already relied on implicitly. Every Win32 call still receives the
+/// exact ABI type, obtained through [`Hwnd::raw`] at the call itself.
 ///
-/// `Send` needs no `unsafe impl`: the inner value is an `isize`, which is what
-/// keeping it an integer was for.
+/// `Send` needs no `unsafe impl`: the inner value is an `isize`.
 ///
 /// [`post`]: post_message::post
 /// [`pack_point`]: post_message::pack_point
@@ -85,11 +79,9 @@ impl Hwnd {
     }
 }
 
-/// What `repr(transparent)` promises, stated where a change to the wrapper would
-/// break it: [`Hwnd::raw`] hands the inner integer straight to Win32 as a
-/// pointer, so the wrapper must be exactly the ABI type's width. In the style of
-/// `Timings`' and `capture`'s canaries — adding a second field is then a decision
-/// rather than a surprise.
+/// [`Hwnd::raw`] hands the inner integer straight to Win32 as a pointer, so the
+/// wrapper must stay exactly the ABI type's width; this guards that. Adding a
+/// second field is then a deliberate decision, not a silent break.
 const _: () = assert!(size_of::<Hwnd>() == size_of::<HWND>());
 
 /// Handles are conventionally read in hex, and wrapping the integer would
@@ -135,12 +127,10 @@ fn rect_change_error(observed: ClientRect) -> SurfaceError {
 /// is strictly safer than leaving the game seeing a held button. Refusal is
 /// retried exactly once, and the retry's own verdict decides which fault is
 /// reported — if the second release also fails the game is left holding the
-/// button, and *that*, not the first refusal, is the fault worth telling.
+/// button, and that, not the first refusal, is the fault worth telling.
 ///
-/// Both backends route through here. It used to be two independent
-/// implementations of the same three-state decision — 20 lines in
-/// `WinSurface::release_after_down`, 13 inline in `MessageSurface::click` — for
-/// the single most safety-critical invariant this module has.
+/// Both backends route through here rather than each implementing the same
+/// three-state decision independently.
 ///
 /// `revalidate` re-establishes the target (a no-op for a backend that has no
 /// per-event validation), `release` posts or injects the button-up, and `what`
@@ -178,15 +168,12 @@ fn release_twice(
 ///
 /// Sized up front rather than `collect()`ed: `EncodeUtf16::size_hint` reports a
 /// *lower* bound of `ceil(len / 3)`, which is what `Vec::from_iter` reserves, so
-/// the ASCII titles this is called with allocated small and then grew.
-/// `text.len() + 1` is exact for ASCII and never short: one UTF-16 unit per byte
-/// at most, plus the terminator.
+/// ASCII titles would allocate small and then grow. `text.len() + 1` is exact for
+/// ASCII and never short: one UTF-16 unit per byte at most, plus the terminator.
 ///
-/// The one *hot* caller is gone rather than made cheaper: `find_game_window` ran
-/// before every injected event and now reads the compile-time
-/// `GAME_WINDOW_TITLE_W` instead. Everything still calling this does so once per
-/// process (the shield's class name), where one exact allocation is the right
-/// shape and a `static` would only add a second spelling of the same encoding.
+/// Callers that run once per process (the shield's class name) use this
+/// directly; the hot path (`find_game_window`) reads the compile-time
+/// `GAME_WINDOW_TITLE_W` instead rather than re-encoding on every call.
 #[must_use]
 pub(super) fn wide(text: &str) -> Vec<u16> {
     let mut buffer = Vec::with_capacity(text.len() + 1);
@@ -198,18 +185,15 @@ pub(super) fn wide(text: &str) -> Vec<u16> {
 /// [`GAME_WINDOW_TITLE`] as the NUL-terminated UTF-16 `FindWindowW` wants,
 /// encoded once at compile time.
 ///
-/// `find_game_window` runs before *every* injected event —
-/// `WinSurface::validate_target` calls it, which this module's own
-/// `validation_calls()` pins at three times inside a single `click` — so a
-/// two-slot buy job used to re-encode these same ten bytes ~60 times, each time
-/// through a `Vec` that allocated short and then grew. There is nothing left to
-/// encode at run time and nothing left to allocate.
+/// `find_game_window` runs before *every* injected event — `validation_calls()`
+/// pins it at three times inside a single `click` — so encoding at run time
+/// would repeat the same allocation dozens of times per job. This has nothing
+/// left to encode or allocate at run time.
 ///
-/// The title is ASCII, hence one UTF-16 unit per byte; the `assert!` is what
-/// keeps that true. A non-ASCII character added here needs a real encoder, and
-/// this stops the build instead of silently truncating one. The last unit stays
-/// the `0` the array is initialized with — the terminator the W-suffixed call
-/// reads.
+/// The title is ASCII, hence one UTF-16 unit per byte; the `assert!` keeps that
+/// true and turns a future non-ASCII character into a build failure instead of a
+/// silent truncation. The last unit stays the `0` the array is initialized
+/// with — the terminator the W-suffixed call reads.
 static GAME_WINDOW_TITLE_W: [u16; GAME_WINDOW_TITLE.len() + 1] = {
     let bytes = GAME_WINDOW_TITLE.as_bytes();
     let mut units = [0u16; GAME_WINDOW_TITLE.len() + 1];
@@ -287,45 +271,42 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
 /// Epic Seven always runs at *high* integrity: players launch it through
 /// `STOVE.exe`, whose manifest declares `requireAdministrator`, and the game
 /// inherits the level from its launcher (measured on a real install:
-/// `EpicSeven.exe` high). UIPI then refuses input from any process below that
-/// level, so if this app is not itself elevated its window is out of reach and
-/// every backend fails — but neither fails in a way that names the cause:
+/// `EpicSeven.exe` high). UIPI refuses input from any process below that level,
+/// so an unelevated instance of this app cannot reach the window, and neither
+/// backend fails in a way that names the cause:
 ///
 /// - The default `Message` backend gets `ERROR_ACCESS_DENIED` from the shield's
-///   `SetWindowPos`, which used to be reported as "the window is gone or its
-///   queue is full" and retried forever.
+///   `SetWindowPos`, previously reported as "the window is gone or its queue is
+///   full" and retried forever.
 /// - The `Input` backend fails **silently**. `SendInput` is documented as
 ///   "neither `GetLastError` nor the return value will indicate the failure was
 ///   caused by UIPI blocking": it reports one event injected, the executor
-///   reports success, and nothing whatsoever moves in the game. No per-call
-///   error classification anywhere can see that, which is why the diagnosis has
-///   to be a preflight rather than a better error message.
+///   reports success, and nothing moves in the game. No per-call error
+///   classification can see that, so the diagnosis has to be a preflight.
 ///
-/// The exe is manifested `requireAdministrator` (see `build.rs`) precisely so
-/// that the normal run is *not* the failing one, which makes this probe a safety
-/// net rather than the everyday path. It stays because the net still catches
-/// real cases — an elevation the player declined on a build whose manifest did
-/// not force it, a `-gnu` or hand-linked binary carrying no manifest, a
-/// debugger launching this process at medium integrity, or STOVE changing what
-/// it does — and because in every one of them the alternative is not an error
-/// but a silence: clicks reported as delivered, nothing moving on screen.
+/// The exe is manifested `requireAdministrator` (see `build.rs`) so the normal
+/// run is not the failing one; this probe is a safety net for the cases that
+/// still slip through — a declined elevation on a build without the forced
+/// manifest, a `-gnu` or hand-linked binary carrying none, a debugger launching
+/// this process at medium integrity, or STOVE changing what it does. In each,
+/// the alternative is not an error but a silence: clicks reported as delivered,
+/// nothing moving on screen.
 ///
-/// # Why a no-op `SetWindowPos`, and emphatically *not* `PostMessageW(WM_NULL)`
+/// # Why a no-op `SetWindowPos`, not `PostMessageW(WM_NULL)`
 ///
-/// `WM_NULL` is the obvious probe and it does not work: it is on UIPI's default
-/// allow-list, so a medium-integrity process posting it to a high-integrity
-/// window gets `TRUE` back. Measured on Windows 11 26200 — a medium-integrity
-/// prober against a high-integrity window answered `TRUE` for `WM_NULL` and
-/// `FALSE` + `ERROR_ACCESS_DENIED` for `WM_MOUSEMOVE`, `WM_LBUTTONDOWN`,
-/// `WM_MOUSEWHEEL` (the three this backend actually posts), `WM_USER`, `WM_APP`
-/// and every form of `SetWindowPos`. A `WM_NULL` probe would therefore have
-/// passed in exactly the situation it was written to catch.
+/// `WM_NULL` does not work: it is on UIPI's default allow-list. Measured on
+/// Windows 11 26200 — a medium-integrity prober against a high-integrity window
+/// answered `TRUE` for `WM_NULL` and `FALSE` + `ERROR_ACCESS_DENIED` for
+/// `WM_MOUSEMOVE`, `WM_LBUTTONDOWN`, `WM_MOUSEWHEEL` (the three this backend
+/// actually posts), `WM_USER`, `WM_APP` and every form of `SetWindowPos`. A
+/// `WM_NULL` probe would have passed in exactly the situation it was written to
+/// catch.
 ///
 /// `SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE` asks Win32 to
-/// change nothing at all: no geometry, no Z-order, no focus. It is inert on a
-/// window we *can* reach — unlike a synthetic mouse message, which would nudge
-/// the game's own cursor tracking — and it is refused on one we cannot, through
-/// the very same gate `shield::raise` hits a moment later.
+/// change nothing: no geometry, no Z-order, no focus — inert on a window we can
+/// reach, unlike a synthetic mouse message which would nudge the game's own
+/// cursor tracking, and refused on one we cannot through the same gate
+/// `shield::raise` hits a moment later.
 fn probe_window_reachable(hwnd: HWND) -> std::io::Result<()> {
     // SAFETY: `hwnd` is the handle `find_game_window` just returned; a window
     // that died in between is reported as FALSE rather than faulting. The null
@@ -354,28 +335,22 @@ fn probe_window_reachable(hwnd: HWND) -> std::io::Result<()> {
 /// The verdict a refused preflight produces, and the one line the player gets.
 ///
 /// Fatal, not recoverable: an integrity-level mismatch cannot heal while both
-/// processes keep running, so retrying is a loop that never terminates and never
-/// explains itself. The executor's `fail` puts this text in the journal as
-/// `>> actuator: <this> — stopping the loop`, at acquire time, *before* the
-/// first click — which is the whole difference from the per-click message this
-/// replaces, one the player only ever read after the executor had already given
-/// up for good.
+/// processes keep running, so retrying loops forever without explaining itself.
+/// The executor's `fail` puts this text in the journal at acquire time, before
+/// the first click, instead of after the executor has already given up.
 ///
 /// The refusal itself is the signal: the branch below only picks wording. The
 /// code was measured to be `ERROR_ACCESS_DENIED` for a UIPI-blocked window (see
 /// [`probe_window_reachable`]) but Microsoft does not document it, so a future
 /// Windows answering something else must still stop the loop and still point at
-/// the likely cause rather than fall through to a raw Win32 dump.
+/// the likely cause.
 ///
-/// # The advice has to be one the player can actually carry out
-///
-/// This line used to end in "relaunch Epic Seven without administrator rights",
-/// and that is impossible: Epic Seven is started by `STOVE.exe`, which declares
-/// `requireAdministrator` in its own manifest, so a player using the normal
-/// launcher has no unelevated way to run the game. The side that can change is
-/// *this* app — it ships manifested `requireAdministrator` for exactly this
-/// reason — so the fix names restarting it as administrator, which is a thing a
-/// player can do, and the acceptable UAC prompt they may have dismissed.
+/// Do not tell the player to "relaunch Epic Seven without administrator
+/// rights" — that is impossible. Epic Seven is started by `STOVE.exe`, which
+/// declares `requireAdministrator` in its own manifest, so a player using the
+/// normal launcher has no unelevated way to run the game. The side that can
+/// change is this app, which is why the advice is to restart *it* as
+/// administrator.
 pub(super) fn preflight_refusal(error: &std::io::Error) -> SurfaceError {
     let cause = if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
         "the game window runs at a higher integrity level than this app, so Windows refuses every \
@@ -392,16 +367,13 @@ pub(super) fn preflight_refusal(error: &std::io::Error) -> SurfaceError {
 
 /// One acquired game window: the handle, and the client area that was measured on
 /// it. This is [`Surface::Window`] for both Windows backends — the value
-/// `acquire` hands out and every later call hands back, which is what makes
-/// "input without an acquire" unrepresentable rather than merely refused.
-///
-/// The handle rides as an integer inside [`Hwnd`] rather than as a bare `HWND`
-/// because `HWND` is a raw pointer, and a raw pointer in here would make the
-/// executor's future `!Send` and unspawnable.
+/// `acquire` hands out and every later call hands back, making "input without
+/// an acquire" unrepresentable rather than merely refused.
 ///
 /// `pub` only so the two `impl Surface` blocks — one per backend module — do not
-/// name a private type in a public associated type (`private_interfaces`). Opaque
-/// either way: every field and every method is private to this module tree.
+/// name a private type in a public associated type (`private_interfaces`).
+/// Opaque either way: every field and every method is private to this module
+/// tree.
 ///
 /// [`Surface::Window`]: super::Surface::Window
 #[derive(Clone, Copy)]
@@ -411,11 +383,10 @@ pub struct Target {
     rect: ClientRect,
 }
 
-/// The fixtures below are `pub(super)` rather than private because they name the
-/// *shared* things — the two handles, the client rect they were measured on, and
-/// the two `GetLastError` values the whole UIPI story rests on — and both backend
-/// test modules present them. Duplicating a fixture would be duplicating the
-/// measurement it records.
+/// `pub(super)` rather than private: both backend test modules use these shared
+/// fixtures — the two handles, the client rect they were measured on, and the
+/// `GetLastError` values the UIPI story rests on — and duplicating a fixture
+/// would duplicate the measurement it records.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,13 +423,10 @@ mod tests {
             panic!("a window this process cannot drive is not something to retry");
         };
         assert!(reason.contains("higher integrity level"), "{reason}");
-        // The cause is named, and named correctly: the game is elevated because
-        // its launcher demands it.
         assert!(reason.contains("STOVE launcher"), "{reason}");
         assert!(reason.contains("restart it as administrator"), "{reason}");
-        // The advice the measurement disproved: STOVE is manifested
-        // `requireAdministrator`, so no player can start Epic Seven unelevated
-        // through it. Telling them to try is worse than saying nothing.
+        // STOVE is manifested `requireAdministrator`, so no player can start
+        // Epic Seven unelevated through it — this advice must never appear.
         assert!(!reason.contains("without administrator rights"), "{reason}");
     }
 

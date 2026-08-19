@@ -25,10 +25,6 @@ use plan::{Epoch, Input, Job, ScreenError, Timings};
 /// not turn every later click into a fatal, and none of the state guarded here
 /// can be left half-written (`Timings` is `Copy` and copied straight out; the
 /// shield's slot is a plain handle).
-///
-/// The alternative — `.expect("… mutex poisoned")` — used to be the two loudest
-/// exceptions to that policy in the crate, on a `pub` API of a windowed build
-/// where a panic is the one failure the player cannot read.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -121,10 +117,9 @@ impl ActuatorHandle {
     /// The extra waits to bake into the next job, copied out from under the
     /// lock (never held across a plan build).
     ///
-    /// Poison-tolerant, like every other lock in the crate: `Timings` is `Copy`
-    /// and copied straight out, so a panic elsewhere can have left nothing
-    /// half-written, and this is called while building *every* queued job —
-    /// panicking here would take the session down over an unrelated fault.
+    /// Poison-tolerant (see [`lock`]): this is called while building *every*
+    /// queued job, and panicking here would take the session down over an
+    /// unrelated fault.
     #[must_use]
     pub fn timings(&self) -> Timings {
         *lock(&self.timings)
@@ -144,7 +139,7 @@ impl ActuatorHandle {
 /// next tick clears on its own, while a closed channel means nobody is at the
 /// other end and no amount of waiting will help. Journaling the first when it
 /// is really the second sends the player looking for a slow actuator that does
-/// not exist — that mistake already cost one full investigation.
+/// not exist.
 ///
 /// The `Display` texts are the neutral one-liners a log or a crash chain wants.
 /// The journal deliberately says something longer and different at each of the
@@ -193,24 +188,22 @@ pub enum SurfaceError {
 ///
 /// # Why the window is a parameter rather than a field
 ///
-/// "Clicking needs a successful [`acquire`](Surface::acquire) first" used to be
-/// prose, enforced at run time in *three* separate places: an
-/// `Option<Target>` field and a `target()` guard inside each of the two Windows
-/// backends, each answering the same hand-written fatal, plus an
-/// `.expect("active surface job guard")` in the executor's own guard. Three
-/// defensive checks for one invariant is three places to get the next backend
-/// wrong — and the backends' copies were a *second*, unsynchronized copy of state
-/// the executor already owns, since it takes the [`plan::ClientRect`] out of
-/// `acquire` and carries it through the whole job anyway.
+/// This invariant (`api-004`) used to be enforced at run time in three separate
+/// places: an `Option<Target>` field and a `target()` guard inside each Windows
+/// backend, plus an `.expect("active surface job guard")` in the executor's own
+/// guard — three chances to get the next backend wrong, and the backends' own
+/// copies duplicated state the executor already owned (it takes the
+/// [`plan::ClientRect`] out of `acquire` and carries it through the whole job
+/// anyway).
 ///
-/// So `acquire` hands back a [`Window`](Surface::Window) — opaque, backend-owned,
-/// whatever the backend needs to act (the Win32 backends put the `HWND` and the
-/// measured client rect in it) — and every input method takes one. There is no
-/// state to forget to set, no guard to forget to write, and "input without an
-/// acquire" is not a value that can be built. What stays fail-closed is
-/// everything the *world* can break: the window died, moved, or refuses input.
-/// That is what [`SurfaceError`] is for, and the backends still re-verify on
-/// every single event.
+/// Instead `acquire` hands back a [`Window`](Surface::Window) — opaque,
+/// backend-owned, whatever the backend needs to act (the Win32 backends put the
+/// `HWND` and the measured client rect in it) — and every input method takes
+/// one. There is no state to forget to set, no guard to forget to write, and
+/// "input without an acquire" is not a value that can be built. What stays
+/// fail-closed is everything the *world* can break: the window died, moved, or
+/// refuses input. That is what [`SurfaceError`] is for, and the backends still
+/// re-verify on every single event.
 pub trait Surface {
     /// A backend's proof that it acquired the game window, and everything it
     /// needs to act on it.
@@ -303,12 +296,10 @@ fn blocking<T>(call: impl FnOnce() -> T) -> T {
 /// acquired.
 ///
 /// Both fields are plain values rather than `Option`s: the guard is built only on
-/// `acquire`'s `Ok` path, so an inactive guard is not a state it has. That is
-/// what removes the `.expect("active surface job guard")` the two input methods
-/// used to open with — a third runtime check of the same "acquired first"
-/// invariant the backends each checked once (`api-004`). Idempotence of the
-/// release is a `bool`, which is the only thing the `Option` was actually
-/// tracking.
+/// `acquire`'s `Ok` path, so an inactive guard is not a state it has (see
+/// [`Surface`]'s "why the window is a parameter" for the `api-004` invariant
+/// this removes the last runtime check of). Idempotence of the release is a
+/// `bool`, which is the only thing the `Option` was actually tracking.
 struct SurfaceJobGuard<'a, S: Surface> {
     surface: &'a mut S,
     window: S::Window,
@@ -378,15 +369,12 @@ impl<S: Surface> Drop for SurfaceJobGuard<'_, S> {
 ///
 /// The task has to survive because it is spawned exactly once per session and
 /// nothing respawns it. Returning would drop the job receiver, and every later
-/// submit would then fail against a channel nobody reads — while `Start` from
-/// `Status::Stopped` happily re-arms the gate and the whole session goes on
-/// *looking* alive. Staying in the loop is what lets the player act on the halt
-/// at all: they fix the cause the message names — bring the game back, restore
-/// the window — press Start, the next job re-runs `acquire`, the preflight
-/// re-probes, and the actuator recovers with no process restart. (The UIPI
-/// halt is the one exception whose fix *is* a restart of this app, since the
-/// integrity level is fixed at process start; the recovery path still has to
-/// exist for every other cause.)
+/// submit would then fail against a channel nobody reads, even though `Start`
+/// from `Status::Stopped` re-arms the gate and the session looks alive. Staying
+/// in the loop is what lets the player act on the halt: fix the cause, press
+/// Start, the next job re-runs `acquire`, and the actuator recovers with no
+/// process restart. (The UIPI halt is the one exception whose fix *is*
+/// restarting this app, since the integrity level is fixed at process start.)
 pub async fn run_executor(
     mut surface: impl Surface,
     mut jobs: mpsc::Receiver<Job>,
@@ -557,14 +545,9 @@ mod tests {
         );
     }
 
-    /// The two loudest exceptions to the crate's poison policy used to be here.
-    ///
     /// `apply()` reaches `actuator.timings()` while holding the controller guard,
-    /// so a panic under the timings lock poisoned that one too — and from then on
-    /// every dispatch panicked and the session died for good. Nothing guarded
-    /// here can be half-written (`Timings` is `Copy` and copied straight out), so
-    /// degrading is unconditionally safe and is what the journal, the view and
-    /// the stream budget all already do.
+    /// so without [`lock`]'s poison tolerance a panic under the timings lock
+    /// would poison that one too and every later dispatch would panic.
     #[test]
     fn a_poisoned_timings_mutex_still_serves_reads_and_writes() {
         let timings = Arc::new(Mutex::new(Timings::default()));
@@ -590,10 +573,8 @@ mod tests {
         assert_eq!(handle.timings(), retuned);
     }
 
-    /// The whole point of the flavor probe: `block_in_place` panics off the
-    /// multi-thread runtime, and both other contexts are real — the executor
-    /// tests below run current-thread (paused clock), the guard tests run
-    /// with no runtime at all.
+    /// Exercises the `block_in_place` arm of [`blocking`]; the other two
+    /// contexts it must also tolerate are covered below.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocking_offloads_on_the_multi_thread_runtime() {
         assert_eq!(blocking(|| 7), 7);
@@ -757,10 +738,9 @@ mod tests {
         assert_eq!(*releases.lock().unwrap(), 1);
     }
 
-    /// What replaced the three runtime "did you acquire first?" checks
-    /// (`api-004`): the window travels from `acquire` through every input to the
-    /// release, and the executor cannot route a stale one because it does not keep
-    /// one.
+    /// Proves the `api-004` fix (see [`Surface`]): the window travels from
+    /// `acquire` through every input to the release, and the executor cannot
+    /// route a stale one because it does not keep one.
     ///
     /// Two jobs run back to back against one surface, each minting its own
     /// window. Job 1 is aborted by a recoverable refusal on its second input, so
@@ -1191,12 +1171,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_re_armed_watch_acts_again_after_a_fatal_without_a_process_restart() {
-        // The whole reason the fatal paths stopped returning.
-        //
-        // The player is told to fix the cause and press Start again. That
-        // advice is only true if the executor task outlived the halt: it is
-        // spawned once per session, so a `return` here would leave the re-armed
-        // session submitting into a channel nobody reads.
+        // Proves [`run_executor`]'s task-survives-a-fatal invariant end to end:
+        // re-arm, then a second job must still be served with no restart.
         let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         // One-shot, like the shield refusing to raise against an elevated

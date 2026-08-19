@@ -47,9 +47,8 @@ enum InputEvent {
     Wheel(i32),
 }
 
-/// The process-global input calls used by [`WinSurface`]. Keeping the Win32
-/// boundary behind this trait lets the event-order tests prove that validation
-/// happens before injection without ever touching the real cursor or focus.
+/// The process-global input calls used by [`WinSurface`] (see the module docs
+/// for why this trait exists).
 trait InputDriver: Send {
     fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError>;
     /// The preflight probe of [`probe_window_reachable`], raw.
@@ -715,18 +714,12 @@ mod tests {
         assert_eq!(sent_events(&state), vec![InputEvent::Move((30, 40))]);
     }
 
-    // `release_clears_target_and_actions_fail_closed` used to sit here, and its
-    // twin `message_surface_input_without_acquire_is_fatal_not_a_panic` in what
-    // is now `post_message`'s test module. Both asserted that an input attempted
-    // after `release` — or with no `acquire` at all — answered
-    // `SurfaceError::Fatal` rather than panicking.
-    // Neither is a state either backend can be in any more: there is no
-    // `Option<Target>` to be `None`, so the call cannot be written without a
-    // `Target` to present (`api-004`). Deleted rather than weakened — a test for
-    // an unrepresentable state is a test of nothing — and what it was really
-    // guarding, that the executor never routes a window a job did not acquire, is
-    // now pinned in `actuator::mod`'s
-    // `every_input_and_the_release_see_the_window_that_job_acquired`.
+    // Do not re-add a test for "input after release, or with no acquire at
+    // all, is Fatal not a panic" (it used to live here and in `post_message`'s
+    // test module): since `api-004` there is no `Option<Target>` to be `None`,
+    // so the call cannot be written without a `Target` to present — the state
+    // is unrepresentable, not merely untested. What it guarded is now pinned in
+    // `actuator::mod`'s `every_input_and_the_release_see_the_window_that_job_acquired`.
 
     #[test]
     fn send_refusal_before_left_down_never_synthesizes_left_up() {

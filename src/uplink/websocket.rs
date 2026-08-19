@@ -91,8 +91,7 @@ enum Outcome {
 ///   comes out through [`ServerUrl::as_str`] at the one place that dials, and
 ///   every log line in this module gets the redacted form through the type's own
 ///   `Display`, so no `%url` here can put a credential in the file the README
-///   asks the player to send us. This used to be the raw dial string, and two
-///   lines interpolated it.
+///   asks the player to send us.
 /// - `outbound`: raw byte batches to send (closing it stops the loop).
 /// - `inbound`: decoded messages received from the server.
 /// - `shutdown`: the session-wide stop signal. Raced against every window this
@@ -1105,10 +1104,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_stop_ends_the_backoff_wait_instead_of_sitting_it_out() {
-        // The longest window of the three, and the one nothing else covered: the
-        // backoff drain waits `backoff.current()`, which climbs to
-        // `reconnect.max_ms`. A stop one tick into it used to wait the whole delay
-        // out before the loop even looked at the signal again.
+        // The longest window of the three, and the one nothing else covered:
+        // the backoff drain waits `backoff.current()`, which climbs to
+        // `reconnect.max_ms` (see `drain_until`'s doc).
         let (_raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(1);
         let (event_tx, _event_rx) = mpsc::channel::<UplinkEvent>(4);
         let (stop_tx, stop_rx) = no_shutdown();

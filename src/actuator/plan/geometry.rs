@@ -24,11 +24,11 @@ const MAX_ROW: u8 = 5;
 /// strategy.
 pub(super) const LAST_TOP_ROW: u8 = 3;
 /// `MAX_ROW` and `LAST_TOP_ROW` are two halves of one fact ("six rows, the
-/// first four reachable at scroll-top"), and they used to be bare `<= 5` / `> 3`
-/// literals at three sites with nothing tying them together — a shop row count
-/// changed in one place only would have planned a scroll-to-bottom for a row
-/// still sitting at the top, i.e. a click on the wrong item with real gold
-/// behind it. Editing either alone now stops the build here.
+/// first four reachable at scroll-top"). Do not let them drift back into bare
+/// `<= 5` / `> 3` literals at separate sites: a shop row count changed in one
+/// place only would plan a scroll-to-bottom for a row still at the top, i.e. a
+/// click on the wrong item with real gold behind it. Editing either alone now
+/// stops the build here.
 const _: () = assert!(LAST_TOP_ROW < MAX_ROW);
 
 /// How an element rides a non-16:9 window: HUD elements anchor to a content
@@ -237,10 +237,9 @@ impl ClientRect {
     /// window reads back as, so it is the recoverable case everywhere: the next
     /// `acquire()` re-reads a fresh rect and the watchdog's retry self-heals it.
     ///
-    /// The single definition matters: this test used to be spelled out four
-    /// times (here, in the executor's post-`acquire` guard, and once per Win32
-    /// backend), and the only thing stopping a transient minimize from halting
-    /// the watch was that one of those copies ran first.
+    /// The single definition matters: do not re-spell this test at a call
+    /// site — every caller (the executor's post-`acquire` guard, each Win32
+    /// backend) must agree on it, or a transient minimize can halt the watch.
     #[must_use]
     pub const fn is_degenerate(self) -> bool {
         self.width <= 0 || self.height <= 0
@@ -529,20 +528,14 @@ mod tests {
     /// The three properties `to_screen` is *defined* by, over a deliberate
     /// lattice of window shapes rather than five hand-picked resolutions.
     ///
-    /// This is where `20-test.md`'s `test-007` asked for `proptest`, and it is
-    /// declined here on the merits rather than skipped. `to_screen` is piecewise
-    /// linear: within a branch nothing surprising can happen between two sample
-    /// points, so all of its interesting behaviour is at the boundaries — exactly
-    /// 16:9, exactly the aspect cap, the anchor extremes, the design-space edges.
-    /// A lattice hits every one of those *deliberately* and deterministically;
-    /// 256 uniform random rects hit them by luck, in exchange for eight test-only
-    /// crates on nine `--locked` lanes and a `proptest-regressions/` file this
-    /// repository has no convention for. The generator would also have to
-    /// construct at-least-16:9 rects by the same arithmetic the function under
-    /// test uses, which is the failure mode the report itself warns about
-    /// elsewhere ("a generator would mostly restate the implementation").
-    ///
-    /// What is *not* declined is the coverage: 1 152 cases here against the five
+    /// Do not replace this with `proptest` (asked for by `20-test.md`'s
+    /// `test-007`): `to_screen` is piecewise linear, so all its interesting
+    /// behaviour is at the boundaries — exactly 16:9, exactly the aspect cap,
+    /// the anchor extremes, the design-space edges — and a lattice hits every
+    /// one of those deliberately where random rects would hit them by luck, for
+    /// the cost of test-only crates on every `--locked` lane. A generator would
+    /// also have to construct at-least-16:9 rects with the same arithmetic the
+    /// function under test uses. Coverage here is 1 152 cases against the five
     /// resolutions above, and the properties are stated rather than sampled.
     #[test]
     fn to_screen_maps_every_shape_inside_the_client_area() {

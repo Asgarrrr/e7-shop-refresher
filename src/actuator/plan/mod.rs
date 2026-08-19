@@ -47,15 +47,14 @@ mod fixtures {
     use super::{DelayRange, DesignPoint, Row, Zone};
 
     /// A row the type system accepts, for the tests that plan clicks. Panics on
-    /// an out-of-range index, which is the whole point of [`Row`]: the fixture
-    /// cannot smuggle in a row `buy_job` used to drop silently.
+    /// an out-of-range index — the fixture must not smuggle in a row [`Row`]
+    /// itself would refuse.
     pub(super) fn row(index: u8) -> Row {
         Row::new(index).expect("the fixture must name a real row")
     }
 
-    /// A range the type accepts. Panics on a reversed or over-ceiling pair,
-    /// which is the whole point of [`DelayRange::try_new`]: a fixture cannot
-    /// smuggle in a range the loader would have refused.
+    /// A range the type accepts. Panics on a reversed or over-ceiling pair, for
+    /// the same reason as [`row`].
     pub(super) fn range(min_ms: u64, max_ms: u64) -> DelayRange {
         DelayRange::try_new(min_ms, max_ms).expect("the fixture range must be valid")
     }
