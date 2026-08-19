@@ -26,12 +26,12 @@ on:
 # workflow gets whatever the repository's default is — historically
 # read-and-write on every scope, and still write today for any repo whose
 # setting was never changed — which every third-party action in every job then
-# runs with. Nothing here writes to the repo: the two jobs check out, compile,
-# test and read the dependency graph, so `contents: read` is the whole
-# requirement and the rest (packages, issues, pull-requests, id-token,
+# runs with. Nothing here writes to the repo: the three jobs check out, compile,
+# test, read the dependency graph and read public commits, so `contents: read` is
+# the whole requirement and the rest (packages, issues, pull-requests, id-token,
 # attestations, …) are implicitly set to `none` the moment any scope is named.
 #
-# Declared once at workflow level rather than per job because both jobs need
+# Declared once at workflow level rather than per job because all three need
 # exactly the same thing; the release workflow does the opposite — `{}` at the
 # top and a scope list per job — because there the two jobs genuinely differ.
 permissions:
@@ -223,8 +223,18 @@ jobs:
       # Worth keeping as the argument for pinning by SHA *and* verifying the
       # pin. A 40-hex string is unreadable by eye, so a copy-paste from the
       # wrong line is invisible in review and indistinguishable from a correct
-      # pin until a resolver is asked. That is the job `.github/dependabot.yml`
-      # now does continuously.
+      # pin until a resolver is asked.
+      #
+      # `.github/dependabot.yml` was credited with doing that check
+      # continuously, and it does not: its `github-actions` ecosystem is a
+      # version-*bump* bot on a `monthly` schedule, and an unresolvable SHA is an
+      # entry it cannot place and skips — no pull request, no failed check,
+      # nothing on a branch. The evidence is that `quality.yml` shipped the same
+      # class of defect the following day, with a SHA in no repository at all in
+      # both its `Swatinem/rust-cache` pins. What Dependabot gives is a monthly
+      # grouped bump, which is worth having and is not a gate. The `action-pins`
+      # job below is the gate: it asks a resolver, per distinct pin, on every
+      # push.
       - name: Cache cargo-deny binary
         id: cargo-deny-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -266,3 +276,70 @@ jobs:
 
       - name: Check dependency licenses, bans, and sources
         run: cargo deny --all-features --locked check bans licenses sources
+
+  action-pins:
+    name: Action pins resolve
+    runs-on: ubuntu-24.04
+    # The gate the comment in `dependency-policy` above was crediting to
+    # Dependabot. A SHA pin has one failure mode that review cannot see and no
+    # other job here would catch until a runner refused to start the step: the
+    # 40 hex characters name a commit that does not exist in the repository they
+    # are attached to. It has happened twice on this branch — `actions/cache`
+    # pinned to `actions/checkout`'s v4 head, then both of `quality.yml`'s
+    # `Swatinem/rust-cache` pins to a SHA in no repository — and in both cases
+    # the job holding the bad pin was one that had never run yet, so "CI is
+    # green" said nothing about it.
+    #
+    # Deliberately the cheapest job in the file: no toolchain, no cargo, no
+    # cache, no build. One `GET /repos/:owner/:repo/commits/:sha` per *distinct*
+    # pin, which is six requests today for eight `uses:` lines. That is what
+    # makes it affordable on every push, and running on every push is the whole
+    # point — a pin is wrong the moment it is typed, not a month later when a bot
+    # next looks.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Every pinned action SHA resolves in its own repository
+        env:
+          # Repo-scoped, and enough: these are public repositories, and the read
+          # is a commit lookup. Named explicitly because `gh` refuses to guess.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          status=0
+          # `<owner>/<repo> <sha>` pairs, deduplicated: the same pin repeated
+          # across four jobs is one question, and the dedup is what keeps this
+          # job's cost proportional to the pins rather than to the steps.
+          grep -hoE '\buses: *[A-Za-z0-9._-]+/[A-Za-z0-9._-]+@[0-9a-fA-F]{40}' \
+            .github/workflows/*.yml \
+            | sed -E 's/^uses: *//' | tr '@' ' ' | sort -u > pins.txt
+          # A check that silently matches nothing is worse than no check: if the
+          # pinning convention or this pattern ever drift apart, fail loudly
+          # instead of reporting a clean run over an empty list.
+          if [ ! -s pins.txt ]; then
+            echo "::error::no SHA-pinned actions matched — this check has stopped checking anything"
+            exit 1
+          fi
+          while read -r repo sha; do
+            if gh api "repos/$repo/commits/$sha" --jq .sha > /dev/null 2>&1; then
+              echo "ok       $repo@$sha"
+            else
+              echo "::error::$repo@$sha does not name a commit in $repo"
+              status=1
+            fi
+          done < pins.txt
+          # The other half of a pin's readability, and the half Dependabot needs:
+          # a SHA carries no version, so the trailing `# <tag>` is the only thing
+          # that says whether the pin is a month or three years behind. Without
+          # it a pin is correct and unbumpable — see this file's header.
+          #
+          # `[[:space:]]*$` rather than ` *$`: the class includes `\r`, and this
+          # repository is developed on Windows. With a bare space the check still
+          # passes on a CRLF working tree while silently matching nothing, which
+          # is the failure the empty-list guard above exists to refuse.
+          if grep -nE '\buses: *[A-Za-z0-9._-]+/[A-Za-z0-9._-]+@[0-9a-fA-F]{40}[[:space:]]*$' \
+              .github/workflows/*.yml; then
+            echo "::error::the pins listed above carry no '# <tag>' comment"
+            status=1
+          fi
+          exit $status

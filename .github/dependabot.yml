@@ -8,12 +8,17 @@ version: 2
 # Without this file the pins are still correct and still unauditable in
 # practice.
 #
-# It is also the mechanism that would have caught the defect this posture was
-# introduced over: `ci.yml`'s two `actions/cache` steps were pinned to a SHA
-# belonging to `actions/checkout`, which does not exist in `actions/cache` at
-# all, so the dependency-policy job failed at step setup rather than running.
-# Dependabot resolves each pin against its own repository and cannot carry a
-# mismatch like that forward silently.
+# What it is *not* is a check on the pins. This file used to claim it would have
+# caught the defect the posture was introduced over — `ci.yml`'s two
+# `actions/cache` steps pinned to a SHA belonging to `actions/checkout` — on the
+# grounds that Dependabot resolves each pin against its own repository. It does
+# resolve, but only to work out which version a pin is on so it can offer a
+# newer one: an unresolvable SHA is an entry it cannot place and skips, on a
+# monthly schedule, with no pull request and nothing red. The same class of
+# defect reached `quality.yml` the following day, which is the measurement that
+# settles it. Asserting that a pin resolves is `ci.yml`'s `action-pins` job, on
+# every push; this file is for keeping the pins current, which is a different
+# job and still worth doing.
 updates:
   # GitHub Actions only. `cargo` is deliberately **not** an ecosystem here, and
   # the reason is the one this repository applies to every gate: a gate that
