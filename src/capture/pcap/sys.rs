@@ -251,8 +251,15 @@ impl Wpcap {
             };
             return Ok((resolved, path));
         }
+        // Action first, diagnostics last. This string is the whole of what a
+        // player without Npcap ever sees, and it reaches them through
+        // `SessionErrorSlot` into a non-selectable label in a 500 px window:
+        // with the two candidate paths and their OS error text in front, the
+        // download URL sat past 300 characters, off the end of what anyone
+        // reads. The paths still matter when Npcap *is* installed and the load
+        // failed anyway, so they stay — behind the sentence that fixes it.
         Err(Error::Capture(format!(
-            "could not load wpcap.dll ({}) — {INSTALL_HINT}",
+            "{INSTALL_HINT}. (wpcap.dll could not be loaded: {})",
             failures.join("; ")
         )))
     }

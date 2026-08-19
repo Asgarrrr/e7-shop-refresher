@@ -334,10 +334,14 @@ struct Refusal {
 fn no_usable_device_error(devices: &[String], refused: &[Refusal]) -> Error {
     if npcap_admin_only().is_some_and(|value| value != 0) {
         return Error::Capture(
+            // No "or run this app elevated": the shipped exe carries a
+            // `requireAdministrator` manifest, so a player reading this has
+            // already approved a UAC prompt and has nothing left to raise.
+            // That half of the advice dates from the unelevated-capture probe
+            // and pointed at a non-fix. Reinstalling is the only lever.
             "Npcap is installed but its driver is restricted to administrators \
              (HKLM\\SYSTEM\\CurrentControlSet\\Services\\npcap\\Parameters\\AdminOnly is set): \
-             reinstall it with \"Restrict Npcap driver's access to Administrators\" unchecked, \
-             or run this app elevated"
+             reinstall Npcap with \"Restrict Npcap driver's access to Administrators\" unchecked"
                 .to_owned(),
         );
     }
