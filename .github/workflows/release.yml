@@ -28,11 +28,27 @@ on:
   # its first execution is also its first publication, and a typo in it is a
   # broken release rather than a red run. `workflow_dispatch` executes the whole
   # path (build, manifest assertion, checksum) and stops before the two steps
-  # that have side effects outside this run, which are gated on the ref actually
-  # being a tag. Nothing is uploaded on a dispatch: the point is to prove the
-  # path runs, and the exe it produces is one `ci.yml` already builds on every
-  # push, so keeping it would mean pinning another action to hand back a
-  # duplicate.
+  # that have side effects outside this run, which are gated on the run having
+  # been triggered by a push. Nothing is uploaded on a dispatch: the point is to
+  # prove the path runs, and the exe it produces is one `ci.yml` already builds
+  # on every push, so keeping it would mean pinning another action to hand back
+  # a duplicate.
+  #
+  # Those guards used to read `startsWith(github.ref, 'refs/tags/')`, and that
+  # sentence above was false while they did. A dispatch is not confined to a
+  # branch: the Run-workflow dropdown lists tags too, and the REST form
+  # documents `ref` as "a branch or tag name", so dispatching against `v0.7.2`
+  # — a tag this repository already has on the remote — sets `github.ref` to
+  # `refs/tags/v0.7.2` and turns every "is this a tag?" test in the file true.
+  # The dry run would then have done the two things it exists to avoid doing:
+  # written a permanent public Sigstore entry, and created a real release page
+  # with the exe and its checksum on it. `--verify-tag` is no backstop there,
+  # because the tag it checks for is the one the run was dispatched from.
+  #
+  # `github.event_name == 'push'` is the question that was meant. It needs no
+  # second ref test to be exact: the `push` trigger above already admits only
+  # `v[0-9]+.[0-9]+.[0-9]+`, so a push run is a release tag by construction, and
+  # a dispatch is a dry run whatever ref it was aimed at.
   workflow_dispatch:
 
 # Nothing by default, then per job, because unlike `ci.yml` the two jobs here
@@ -266,8 +282,15 @@ jobs:
       # elevation changes with it — `uiAccess='true'` requires an
       # Authenticode-signed image in a secure location, and it is currently
       # ruled out on exactly that ground.
+      #
+      # Gated on the event rather than on the shape of the ref, for the reason
+      # argued at the top of the file. Of the two side-effecting steps this is
+      # the one with no undo: the transparency log is public and append-only, so
+      # a dry run that reached it would have left a signed, permanent statement
+      # about an artifact nobody meant to publish, and no later step failing
+      # could take that back.
       - name: Attest build provenance
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: target/release/arkyve-refresh-shop.exe
@@ -292,9 +315,14 @@ jobs:
       # that does need substituting is done explicitly by `.Replace` below.
       #
       # `--verify-tag` so a run somehow reaching this step without the tag
-      # existing on the remote fails rather than quietly creating one.
+      # existing on the remote fails rather than quietly creating one. Note what
+      # it is not: it does not distinguish a release from a dry run, because a
+      # dispatch aimed at a tag satisfies it by definition — the tag is on the
+      # remote, that is where the run came from. The gate is `github.event_name`
+      # for that reason; `--verify-tag` guards the tag's existence, never the
+      # run's intent.
       - name: Publish the release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -390,7 +418,13 @@ jobs:
           $exe = "target\release\arkyve-refresh-shop.exe"
           $hash = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLower()
           $size = (Get-Item $exe).Length
-          $tagged = "${{ startsWith(github.ref, 'refs/tags/') }}"
+          # The same expression the two steps above are gated on, and it has to
+          # stay the same expression: this row is the run's own account of
+          # whether it published, and the failure it guards against is a dry run
+          # whose summary says it shipped. It read `startsWith(github.ref,
+          # 'refs/tags/')` while they did, which on a tag dispatch was both a
+          # true statement and the wrong answer.
+          $published = "${{ github.event_name == 'push' }}"
           @(
             "| | |",
             "|---|---|",
@@ -399,5 +433,5 @@ jobs:
             "| toolchain | ``$env:RUSTUP_TOOLCHAIN`` on ``$env:RUNNER_OS`` (windows-2025) |",
             "| sha256 | ``$hash`` |",
             "| size | $size bytes |",
-            "| published | $tagged |"
+            "| published | $published |"
           ) | Add-Content -Path $env:GITHUB_STEP_SUMMARY

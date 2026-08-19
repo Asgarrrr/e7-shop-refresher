@@ -91,7 +91,32 @@ jobs:
           RUSTUP_TOOLCHAIN: stable
         run: cargo install --locked cargo-llvm-cov --version "$env:CARGO_LLVM_COV_VERSION"
 
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2.9.2
+      # Both `Swatinem/rust-cache` pins in this file — this one and the
+      # `mutants` job's — read `49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c`, which
+      # is not a commit in that repository at all: `GET
+      # /repos/Swatinem/rust-cache/commits/49a0bdc7…` answers 422, "No commit
+      # found for SHA", while the SHA `ci.yml` has always used for the same
+      # `# v2.9.2` label answers 200 and is exactly what the `v2.9.2` tag
+      # dereferences to. A `uses:` that will not resolve fails during step
+      # setup, before the step does any work of its own, so both jobs here would
+      # have installed their tool, then died — coverage without a number,
+      # mutation without a report.
+      #
+      # "Would have", not "was": this file has never been pushed, so nothing has
+      # executed it yet. That is luck rather than process, and worth saying
+      # because of what would have hidden it if it had shipped: the header above
+      # is right that this workflow must not be a required check, but the same
+      # decision means a red weekly run is red on a page nobody opens. `ci.yml`
+      # fails in front of a pull request; this one fails into the void, so its
+      # pins get *less* review than the gated file's while needing more.
+      #
+      # This is the second copy-paste of a foreign 40-hex string into a `uses:`
+      # in two days — `ci.yml`'s `cargo-deny` step documents the first, where
+      # `actions/checkout`'s head landed in an `actions/cache` pin. One
+      # occurrence is a slip; two is the argument that a SHA is unreadable by
+      # eye and that pinning is only half a practice without asking a resolver
+      # whether the pin exists.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: coverage
 
@@ -138,7 +163,32 @@ jobs:
       # away the survivors they had already found.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        # Zero-based, because `cargo mutants --shard k/n` is: k is an index, not
+        # an ordinal, and the tool rejects `k >= n` outright — `--shard 4/4`
+        # exits with "invalid value '4/4' for '--shard <SHARD>': shard k must be
+        # less than n" (reproduced against the pinned 27.1.0 below; `--list
+        # --shard 0/4 … 3/4` partitions the mutant set exactly, with 0/4 holding
+        # the first quarter).
+        #
+        # This read `[1, 2, 3, 4]`, which is wrong in both directions at once
+        # and only one of them is loud: shard 0 — a quarter of the mutants,
+        # `geometry.rs` first in the list — was evaluated by no job at all,
+        # while the fourth job died in argument parsing. What makes it worth
+        # this many lines is how it would have *looked*. `fail-fast: false`
+        # keeps the three survivors running, the summary step is `if: always()`,
+        # and three shards reporting "No surviving mutants in this shard" is a
+        # run that reads like a clean bill of health for the money modules while
+        # a quarter of them was never mutated and another quarter never ran. A
+        # green-looking coverage claim that is silently three-quarters of a
+        # measurement is the same failure mode this whole workflow exists to
+        # answer — the tautological `const-003` guard test in the header, which
+        # also passed while asserting nothing.
+        #
+        # It cannot be caught locally either: the justfile's `mutants` recipe
+        # passes no `--shard`, so a maintainer's run covers everything and says
+        # nothing about how CI splits it. Changing this list means re-reading
+        # cargo-mutants' argument, not just counting to four.
+        shard: [0, 1, 2, 3]
     env:
       CARGO_MUTANTS_VERSION: "27.1.0"
     steps:
@@ -157,7 +207,9 @@ jobs:
           RUSTUP_TOOLCHAIN: stable
         run: cargo install --locked cargo-mutants --version "$env:CARGO_MUTANTS_VERSION"
 
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2.9.2
+      # Same SHA as the `coverage` job, and for the reason argued there: the
+      # string both jobs used to carry does not exist in `Swatinem/rust-cache`.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: mutants
 
