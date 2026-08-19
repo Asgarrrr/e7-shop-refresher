@@ -135,6 +135,15 @@ impl Surface for MessageSurface {
         Ok((target, rect))
     }
 
+    /// Word for word `acquire`, and deliberately so: this backend posts to a
+    /// window it never pulls forward, and the shield is raised per input by
+    /// `engage`, not here. There is nothing for a dry run to skip. Spelled out
+    /// rather than defaulted because the trait makes every backend answer the
+    /// question — the `input` backend's answer is not this one.
+    fn measure(&mut self) -> Result<(Target, ClientRect), SurfaceError> {
+        self.acquire()
+    }
+
     fn click(
         &mut self,
         target: &Target,

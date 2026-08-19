@@ -229,6 +229,34 @@ pub trait Surface {
     /// [`release`](Surface::release) owing — which is why the executor only
     /// builds its cleanup guard on the `Ok` path.
     fn acquire(&mut self) -> Result<(Self::Window, plan::ClientRect), SurfaceError>;
+
+    /// The same window and the same client area, for a job that will not send
+    /// anything: [`Mode::DryRun`].
+    ///
+    /// Required rather than defaulted to `acquire`, because a default is exactly
+    /// how this went wrong. The simulation path called `acquire`, and for the
+    /// `input` backend that means a real `SetForegroundWindow` — so turning on
+    /// the mode a cautious player turns on *first* yanked Epic Seven in front of
+    /// whatever they were doing, on every tick, while sending no input. A dry
+    /// run that reorders the desktop is not a dry run. Making this a decision
+    /// each backend has to write down is what stops the next one inheriting the
+    /// same surprise.
+    ///
+    /// Measuring is still allowed, and wanted. The rect is what resolves the
+    /// journal's screen coordinates, so without it the dry run stops answering
+    /// the question it exists for; a reachability preflight that provably
+    /// changes nothing (see `win::probe_window_reachable`) is likewise worth
+    /// keeping, since "the real run would be refused by UIPI" is the single most
+    /// useful thing a rehearsal can report. The line is *engaging*, not
+    /// *looking*.
+    ///
+    /// # Errors
+    ///
+    /// The same classification as [`acquire`](Surface::acquire), and the same
+    /// consequences: a dry run reports the faults a live run would hit, which is
+    /// the point of rehearsing.
+    fn measure(&mut self) -> Result<(Self::Window, plan::ClientRect), SurfaceError>;
+
     /// One left click at a screen point, held `press_ms`.
     ///
     /// `window` is what [`acquire`](Surface::acquire) handed back, so the
@@ -389,8 +417,17 @@ pub async fn run_executor(
             continue;
         }
         // `acquire` finds the window, may steal the foreground and sleeps out
-        // the focus settle: blocking like every other surface call.
-        let (window, rect) = match blocking(|| surface.acquire()) {
+        // the focus settle: blocking like every other surface call. A dry run
+        // takes the door that only looks — the whole mode is a promise not to
+        // touch the game, and `acquire` was breaking it before any click was
+        // even planned.
+        let (window, rect) = match blocking(|| {
+            if dry_run {
+                surface.measure()
+            } else {
+                surface.acquire()
+            }
+        }) {
             Ok(acquired) => acquired,
             Err(SurfaceError::Recoverable(reason)) => {
                 // Nothing engaged, nothing landed: drop the job and let the
@@ -620,8 +657,12 @@ mod tests {
         on_input: Box<dyn FnMut() + Send>,
         deny_after: Option<(usize, SurfaceError)>,
         releases: Arc<Mutex<usize>>,
-        /// Handed out by `acquire`, incrementing, so two jobs never share one.
+        /// Handed out by either door, incrementing, so two jobs never share one.
         acquires: u32,
+        /// Set by `acquire` and never by `measure`: the real `input` backend's
+        /// `acquire` steals the foreground, so a test can ask whether a job took
+        /// the door that acts on the desktop.
+        engaged: Arc<Mutex<bool>>,
         /// Every window this surface was *given* back, in call order: one entry
         /// per `click`/`scroll`/`release`.
         windows: Arc<Mutex<Vec<FakeWindow>>>,
@@ -637,6 +678,7 @@ mod tests {
                 deny_after: None,
                 releases: Arc::new(Mutex::new(0)),
                 acquires: 0,
+                engaged: Arc::new(Mutex::new(false)),
                 windows: Arc::new(Mutex::new(Vec::new())),
             };
             (surface, events)
@@ -664,6 +706,11 @@ mod tests {
         type Window = FakeWindow;
 
         fn acquire(&mut self) -> Result<(FakeWindow, ClientRect), SurfaceError> {
+            *self.engaged.lock().unwrap() = true;
+            self.measure()
+        }
+
+        fn measure(&mut self) -> Result<(FakeWindow, ClientRect), SurfaceError> {
             let rect = self.rect.clone()?;
             self.acquires += 1;
             Ok((FakeWindow(self.acquires), rect))
@@ -1536,6 +1583,46 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// The half of "dry run must not touch the game" the two tests around this
+    /// one cannot see: they prove no *input* is sent, and `acquire` is not an
+    /// input. On the `input` backend it is a real `SetForegroundWindow`, so the
+    /// mode a cautious player enables first was reordering their desktop on every
+    /// tick while sending nothing — and a `SetWindowPos` preflight had since been
+    /// added to that same path. `Surface` now has two doors and the live job is
+    /// what proves the engaging one still exists.
+    #[tokio::test(start_paused = true)]
+    async fn a_dry_run_takes_the_door_that_does_not_engage_the_window() {
+        for dry_run in [true, false] {
+            let rig = rig();
+            let (surface, _events) = FakeSurface::new(design_rect());
+            let engaged = surface.engaged.clone();
+            rig.job_tx
+                .send(plan::refresh_job(
+                    Trigger::Refreshed,
+                    Timings::default(),
+                    Epoch(0),
+                    1,
+                ))
+                .await
+                .unwrap();
+            drop(rig.job_tx);
+            run_executor(
+                surface,
+                rig.job_rx,
+                rig.gate,
+                rig.epoch,
+                rig.journal,
+                dry_run,
+            )
+            .await;
+            assert_eq!(
+                *engaged.lock().unwrap(),
+                !dry_run,
+                "dry_run={dry_run}: only a job that will really click may engage the window"
+            );
+        }
     }
 
     /// The other half of "dry run must not touch the game": the test above

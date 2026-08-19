@@ -145,6 +145,23 @@ impl WinSurface {
         }
     }
 
+    /// The part of acquiring that both doors owe: find the window by title, then
+    /// refuse one this process may not drive.
+    ///
+    /// The probe comes before the foreground is stolen and before any coordinate
+    /// is planned — a window this process may not drive is not worth pulling
+    /// forward, and `SendInput` will not report the refusal later, see
+    /// [`probe_window_reachable`]. A dry run keeps
+    /// it: it provably changes nothing, and "the real run would be refused" is
+    /// the most useful sentence a rehearsal can print.
+    fn locate(&mut self) -> Result<Hwnd, SurfaceError> {
+        let hwnd = self.driver.find_game_window()?;
+        self.driver
+            .probe_reachable(hwnd)
+            .map_err(|error| preflight_refusal(&error))?;
+        Ok(hwnd)
+    }
+
     fn ensure_foreground(&mut self, hwnd: Hwnd) -> Result<(), SurfaceError> {
         if self.driver.foreground_window() == hwnd {
             return Ok(());
@@ -204,15 +221,24 @@ impl Surface for WinSurface {
     type Window = Target;
 
     fn acquire(&mut self) -> Result<(Target, ClientRect), SurfaceError> {
-        let hwnd = self.driver.find_game_window()?;
-        // Before the foreground is stolen and before any coordinate is planned:
-        // a window this process may not drive is not worth pulling forward, and
-        // `SendInput` will not report the refusal later — see
-        // [`probe_window_reachable`].
-        self.driver
-            .probe_reachable(hwnd)
-            .map_err(|error| preflight_refusal(&error))?;
+        let hwnd = self.locate()?;
         self.ensure_foreground(hwnd)?;
+        let rect = self.driver.client_rect(hwnd)?;
+        Ok((Target { hwnd, rect }, rect))
+    }
+
+    /// `acquire` minus the one step that acts on the desktop, and *only* that
+    /// step: `SendInput` aims at whatever owns the foreground, so a live job
+    /// cannot skip the steal and a dry run must not perform it.
+    ///
+    /// The order in `acquire` is left alone rather than reused here, which is why
+    /// the rect read is spelled twice. `ensure_foreground` restores a minimized
+    /// window, so measuring after it is what makes a live job's rect the
+    /// restored one; a dry run reads whatever is there and reports a minimized
+    /// window as the recoverable abort it would be. Swapping the two lines to
+    /// share them would quietly move a live job onto the second behaviour.
+    fn measure(&mut self) -> Result<(Target, ClientRect), SurfaceError> {
+        let hwnd = self.locate()?;
         let rect = self.driver.client_rect(hwnd)?;
         Ok((Target { hwnd, rect }, rect))
     }
@@ -531,6 +557,41 @@ mod tests {
                 DriverCall::RequestForeground(GAME_HWND),
                 DriverCall::Sleep(FOCUS_SETTLE_MS),
                 DriverCall::Foreground,
+                DriverCall::ClientRect(GAME_HWND),
+            ]
+        );
+    }
+
+    /// The dry-run door, against the same fake as its live twin above. `Mode`
+    /// promises to send nothing, and on this backend `acquire` broke that promise
+    /// before a coordinate was even planned: `RequestForeground` is a real
+    /// `SetForegroundWindow`, so rehearsing the plan yanked Epic Seven in front
+    /// of whatever the player was doing, every tick, for no input at all.
+    ///
+    /// The call list is the assertion, not a count: `FindWindow` and `Probe` must
+    /// stay (a dry run that cannot name a UIPI refusal has stopped rehearsing)
+    /// and `ClientRect` must stay (it is what resolves the screen coordinates the
+    /// journal prints). Only the three foreground calls and the focus settle go.
+    #[test]
+    fn measure_reads_the_window_without_pulling_it_forward() {
+        let (mut surface, state) = fake_surface();
+        // The foreground belongs to someone else — the case where `acquire` would
+        // take it away.
+        state
+            .lock()
+            .unwrap()
+            .foreground_results
+            .extend([OTHER_HWND, GAME_HWND]);
+
+        let (target, rect) = surface.measure().expect("the fake measures");
+        assert_eq!(rect, game_rect());
+        assert_eq!(target.hwnd, GAME_HWND);
+        assert_eq!(target.rect, game_rect());
+        assert_eq!(
+            calls(&state),
+            vec![
+                DriverCall::FindWindow,
+                DriverCall::Probe(GAME_HWND),
                 DriverCall::ClientRect(GAME_HWND),
             ]
         );
