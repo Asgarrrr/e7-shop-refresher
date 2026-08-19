@@ -129,8 +129,18 @@ impl Fetcher {
     /// second copy of it is not a remedy for anything. The banner offers no such
     /// control, and the refusal here is what keeps that from being the only
     /// thing standing between a click and a second elevated installer.
+    ///
+    /// The test and the claim share one lock acquisition, which is the whole
+    /// reason this is not `if !accepts_a_start(&self.progress())`. That spelling
+    /// read the cell, dropped the lock, and left `Idle` in it until the worker
+    /// thread got as far as its own first write — inside `fetch_and_check`, one
+    /// thread spawn and a `remove_file` later. The window repaints at 4 Hz, so a
+    /// second click one frame after the first found `Idle` and spawned a second
+    /// worker, and on the reuse fast path that worker verifies and launches: two
+    /// elevated Npcap installers, from the guard written to prevent exactly one
+    /// of them.
     pub fn start(&self) {
-        if !accepts_a_start(&self.progress()) {
+        if !self.claim() {
             return;
         }
         let handle = self.clone();
@@ -144,6 +154,28 @@ impl Fetcher {
                 "could not start the download: {err}"
             )));
         }
+    }
+
+    /// Takes the fetch if it is there to take, under one lock acquisition.
+    ///
+    /// A separate `fn` for the same reason [`accepts_a_start`] is one: `start`
+    /// ends in a `spawn`, so a test that exercised it would perform a real
+    /// download and a real elevated `CreateProcess`. This is the part with a
+    /// rule in it, and it can be called as often as a test likes.
+    ///
+    /// `true` means the caller now owns the fetch and nobody else can take it.
+    fn claim(&self) -> bool {
+        let mut progress = crate::sync::lock_ignoring_poison(&self.progress);
+        if !accepts_a_start(&progress) {
+            return false;
+        }
+        // The claim, written before the lock is dropped. This is the whole
+        // change: reading the cell and then writing it in two acquisitions left
+        // `Idle` visible in between, and `fetch_and_check`'s own
+        // `set(Progress::Fetching)` — the first write there used to be — was a
+        // thread spawn and a `remove_file` away.
+        *progress = Progress::Fetching;
+        true
     }
 
     fn run(self) {
@@ -201,7 +233,8 @@ impl Fetcher {
         // below use `create_new`.
         let _ = std::fs::remove_file(target);
 
-        self.set(Progress::Fetching);
+        // No `set(Fetching)` here: `start` claimed the state before this thread
+        // existed, which is what makes the claim a claim.
         let bytes = download()?;
 
         self.set(Progress::Checking);
@@ -494,6 +527,51 @@ mod tests {
     // The pin's own shape is asserted where the pin now lives, in `crate::npcap`
     // — it guards `sha256`'s zeroed failure return, which is this module's, but
     // the constant it guards is not.
+
+    /// The two-clicks case, which is what the banner actually produces: the
+    /// window repaints at 4 Hz, and the second frame's click used to find `Idle`
+    /// because the only writer of `Fetching` was the worker thread, inside
+    /// `fetch_and_check`. Both workers then race one path, and on the reuse fast
+    /// path the second one verifies and launches — a second elevated Npcap
+    /// installer, out of the guard written to prevent it.
+    #[test]
+    fn a_second_click_cannot_take_a_fetch_that_is_already_claimed() {
+        let fetcher = Fetcher::new();
+        assert!(fetcher.claim(), "the first click owns the fetch");
+        assert_eq!(
+            fetcher.progress(),
+            Progress::Fetching,
+            "the claim has to be visible before `start` returns, not once the worker runs"
+        );
+        assert!(!fetcher.claim(), "the second click must find it taken");
+    }
+
+    /// The same rule under real contention rather than in sequence. Not because
+    /// the UI can produce it — `start` is only ever called from the one egui
+    /// thread — but because `Fetcher` is `Clone` and its whole purpose is to be
+    /// held by two threads at once, so "exactly one winner" is a property of the
+    /// type and not of its current caller.
+    #[test]
+    fn exactly_one_of_many_racing_claims_wins() {
+        let fetcher = Fetcher::new();
+        let start = std::sync::Barrier::new(8);
+        let won: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let (fetcher, start) = (fetcher.clone(), &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        usize::from(fetcher.claim())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a claim must not panic"))
+                .sum()
+        });
+        assert_eq!(won, 1, "one download, not eight");
+    }
 
     /// The one thing about this path that matters: it is absolute, it is under
     /// the directory Win32 named, and it is the real `curl.exe`. The property
