@@ -42,6 +42,43 @@ invariant whose failure clicks the wrong Buy button was unguarded. It now pins t
 literals *and* couples row count to geometry, mutation-proved red in three directions and
 re-proved after the split.
 
+### Validated on real hardware
+
+Three live runs against a running Epic Seven client, elevated, `backend = "message"`,
+console lane, on the manifested build. This matters because every gate in this repo is a
+static one: the audit's own themes were about invariants no tool can check.
+
+Exercised and correct:
+
+- **`obs-001` (the P0).** Both log lines read `server="wss://ingest.arkyve.dev"` — scheme
+  and host only, no path. The redaction is the type's `Display`, and `attempt=1` is the
+  field that replaced the URL.
+- **`doc-001`.** The live filter is `tcp and src port 3333`, matching what the README and
+  the capture ADR now say, `src` included.
+- **`type-003` — the finding with money attached.** A match landed in **slot 6**, which is
+  row 5 in 0-based terms: the bottom group, requiring a scroll before the click. The app
+  reported `>> → buying slot 6` and then `>> bought: ticketrare_name`. The right item, on
+  the row where a 1-based/0-based confusion would have clicked its neighbour.
+- The purchase-confirmation decode, the checklist tick and the gold echo.
+- `max_matches` semantics: the limit landed **after** the purchase resolved, not at the
+  match — which is what `Controller::stop_reason` not being consulted while `Paused` is for.
+- **`conc-001`'s halt, and `obs-003`.** `stop` typed while a refresh job was in flight:
+  the gate closed in 517 ms and the actuator abandoned the remaining clicks, logged at
+  **`warn`** so a narrowed `RUST_LOG` keeps it. Nothing clicked after the halt.
+  *This is confirmation, not proof* — the old two-variable code might well have passed one
+  observation too. What proves the fix is that the bad state is unrepresentable in a single
+  `AtomicU8`, plus the multi-threaded test that fails 5/5 against the old ordering.
+- The DPI hand-off: `awareness="per-monitor-aware" accepted=true` with
+  `ERROR_ACCESS_DENIED` from our own setter — the manifest won, which is the design.
+- `unparsed=0` in the capture funnel and `unknown_messages=0`: no packet lost, no wire
+  dialect skew.
+
+**Not exercised, and worth knowing before trusting the whole:** the **GUI lane** (winit +
+egui — all three runs were the console build, so the manifest covers the winit question but
+the window itself has not run); `backend = "input"` (real cursor, stolen foreground);
+the watchdog's recovery ladder and `pat-001`'s fix, since nothing failed; and
+`async-001`'s connect timeout, since the server answered first try every time.
+
 ### The splits
 
 Held back deliberately until every behavioural fix had landed, so each diff reads as a
