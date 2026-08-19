@@ -45,6 +45,36 @@ const DEFAULT_SERVER_URL: &str = "wss://ingest.arkyve.dev/refresh-shop";
 /// Smallest effective delay between server connection attempts.
 pub(crate) const RECONNECT_FLOOR: Duration = Duration::from_millis(100);
 
+/// Everything `config.toml` can say, in one value: a section per subsystem,
+/// each of them `default` + `deny_unknown_fields`, so an absent file is a valid
+/// configuration and a misspelled key is a parse error quoting the offending
+/// line rather than a setting that silently does nothing.
+///
+/// It is produced in exactly two places outside the test modules:
+/// [`Config::load`], which returns [`Config::default`] verbatim when the file is
+/// missing, and [`persist`], which rewrites named sections through `toml_edit`
+/// so the player's own comments and key order survive a save from the Setup tab.
+///
+/// **Most of its invariants are no longer enforced here, and that is the
+/// point.** [`Config::validate`] used to be the single gate; today it checks one
+/// thing — that a `required_substats[].min` is finite, because TOML 1.0 spells
+/// `nan` and `Option<f64>` is the one field type left that can hold a value no
+/// comparison will ever satisfy. Every other rule moved *into* a type, where it
+/// holds for a struct literal and a mutated [`Config::default`] just as much as
+/// for the load path: [`ServerUrl`] carries the cleartext rule, [`NonZeroU16`]
+/// carries `game_port != 0`, [`DelayRange`](crate::actuator::plan::DelayRange)
+/// carries `min_ms <= max_ms <= MAX_TIMING_MS`, and `filter::hunt_kinds` — the
+/// `deserialize_with` behind [`Filter`]'s `kinds`, and unlinkable here because
+/// it is private to its own module — refuses the wire's catch-all `ItemKind` at
+/// the boundary where that ambiguity actually exists.
+///
+/// The move is not tidiness. A clause in `validate` can only ever cover the
+/// loader, and the loader is not the only writer: the Setup tab reaches the file
+/// through [`persist::save`] with no `Config` anywhere in the path, which is how
+/// a checkbox once wrote a `kinds = ["unknown"]` that the next launch refused
+/// fatally. So `validate`'s body is now largely a record of which rule left and
+/// where it went — kept, so that none of them comes back as a second
+/// implementation of a proof the type already holds.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -384,11 +414,16 @@ impl Config {
         // it here would be a second implementation of a proof we already hold.
         // No `[filter] kinds` clause either. `ItemKind` is wire-tolerant
         // (`serde(other)` -> `Unknown`), which in a config file would let a typo
-        // silently match nothing — so the field does not hold an `ItemKind` any
-        // more. `filter::HuntKind` has the game's three kinds and no catch-all, so
-        // `kinds = ["equipement"]` is an `unknown variant` parse error naming the
-        // three that are legal, and the typo cannot survive as far as this
-        // function. That also closes the boundary this clause never covered: the
+        // silently match nothing — so the ambiguity is resolved where it exists,
+        // in the text. `filter::hunt_kinds`, the field's `deserialize_with`,
+        // reads each entry through `ItemKind`'s own `Deserialize` and then
+        // refuses the catch-all, so `kinds = ["equipement"]` is a parse error
+        // quoting what the player typed and naming the three that are legal, and
+        // the typo cannot survive as far as this function. A narrowed
+        // hunt-only enum was written and reverted instead — `ItemKind::Unknown`
+        // is a meaningful criterion *in the domain*, and the reasoning for that
+        // sits at `hunt_kinds` itself rather than being restated here. That also
+        // closes the boundary this clause never covered: the
         // Setup tab writes `[filter]` through `persist::save` with no `Config` in
         // the path, which is how a checkbox once wrote a `kinds = ["unknown"]`
         // that the next launch refused fatally.

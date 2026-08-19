@@ -27,11 +27,13 @@ gui = ["dep:eframe"]
 actuator = []
 
 # The lint policy, in the one place `rust-analyzer`, a plain `cargo build` and a
-# reader of this manifest all see it. Until now it existed only as the four
+# reader of this manifest all see it. Until now it existed only as the six
 # `cargo clippy … -- -D warnings` invocations in `.github/workflows/ci.yml` and
 # the `justfile`, which no editor can read. Every entry below measures **zero
-# sites** on all four feature lanes and on both matrix toolchains, so nothing
-# here is a migration.
+# sites** on all six feature lanes and on both matrix toolchains, so nothing
+# here is a migration. (Four when this was written; the `gui`-alone and
+# `actuator`-alone lanes came later, and the claim is re-measured against all
+# six each time an entry is added.)
 #
 # A `[lints]` table applies to *every* target, the test harness included. That is
 # why `clippy::unwrap_used` (257 sites, all of them in tests, where `unwrap` in a
@@ -113,6 +115,25 @@ exit = "warn"           # 0
 # `--all-targets` — not one token of it is left under `src/`, `examples/`,
 # `tests/` or `build.rs` — so it belongs here, ungated.
 unreachable = "warn"    # 0
+# The module-layout convention, pinned instead of merely observed: eleven
+# directory modules, every one of them a `mod.rs`, and since `src/config.rs`
+# became `src/config/mod.rs` there is no exception left. The entry could not
+# have been added before that move — one exception is one diagnostic, and
+# `-D warnings` turns one diagnostic into six red lanes.
+#
+# **The lint is `self_named_module_files`, and the two names are the opposite way
+# round from how they read.** `clippy::mod_module_files` *bans* `mod.rs` and asks
+# for the self-named layout; it is the entry `docs/tech-debt/_HANDOFF.md`'s
+# `proj-009` asks for by name, on a measurement of "9 sites" that were in fact
+# the nine `mod.rs` files the convention exists to keep. Re-measured before
+# enabling anything, `-W clippy::mod_module_files --all-targets` scores
+# **10 / 13 / 12 / 11 / 11 / 14** on the six CI feature lanes (the spread is the
+# cfg-gated `pcap`, `win` and `ui` trees), so that entry would redden every one
+# of them and reverse the convention it was meant to protect. This one scores
+# **0** on all six, and the zero is probe-validated rather than trusted: a
+# scratch `src/probe.rs` beside a `src/probe/` scores 1, so the count is a real
+# measurement and not a cached silence.
+self_named_module_files = "warn" # 0
 
 # rustdoc was the one lane nothing gated, and it was not clean. `just doc` and
 # the CI step both run `--document-private-items`, which is the right mode for a
