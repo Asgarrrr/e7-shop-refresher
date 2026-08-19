@@ -42,6 +42,42 @@ invariant whose failure clicks the wrong Buy button was unguarded. It now pins t
 literals *and* couples row count to geometry, mutation-proved red in three directions and
 re-proved after the split.
 
+### The 2026-08-19 wave — measurement, currency, CI
+
+Four parallel passes with disjoint file ownership. Tests **593 → 599**, nothing weakened
+or removed; clippy 0 on all six lanes, `cargo doc` 0, `cargo fmt --check` clean.
+
+- **Measurement.** [`30-measurement.md`](30-measurement.md) answers the sentence this
+  file used to end on ("No reviewer measured test coverage, because no CI lane does").
+  **72.80% of production lines** (84.88% raw — llvm counts the inline `#[cfg(test)]`
+  blocks, which cover themselves). The money path turned out to be the *best*-covered
+  code in the crate, so coverage found nothing there and every finding came from
+  mutation: 216 mutants over the five files where a survivor costs a player money, 14
+  survivors, of which **8 are real holes and 5 were reduced-lane artefacts that die on
+  the lane that ships**. `just coverage` / `just mutants` and a weekly, deliberately
+  non-blocking `quality.yml`.
+- **The first hole is fixed.** `to_screen`'s `Anchor::Center` arm was `const-003` again:
+  every test point was `x = 640.0`, exactly `DESIGN_W / 2.0`, so the offset term was
+  `0.0` at all of them and flipping its sign left the suite green. Both real Center
+  zones are off-centre (747.5, 750.0), so the flip aims the buy confirmation 220 design
+  px left of its button. Now mutation-proved red in three directions. **Seven holes
+  remain open** and are listed in `30-measurement.md`.
+- **`type-004` is closed.** `Gold` and `Crystals`, the last open finding with money on
+  it. See the ledger line for the design decisions (no `Add`/`Sub`, no `0`-fold,
+  `Display` through `render::grouped`) and for what was declined.
+- **CI supply chain**, which no reviewer in this audit looked at — 26 categories of Rust,
+  zero of workflow. Every action pinned by SHA; `permissions:` declared; a release
+  workflow with build provenance; code signing declined in writing. **The pin that was
+  meant to be the good example was broken**: `actions/cache@11d5960a…` is
+  *`actions/checkout`'s* commit and does not exist in that repository, so
+  `dependency-policy` would have failed at step setup. Found independently by two agents.
+- **`proj-009` named the wrong lint.** `clippy::mod_module_files` **bans** `mod.rs`; its
+  "9 measured sites" were the nine files the convention exists to keep. Enabling it as
+  written would have reddened all six lanes. `self_named_module_files` landed instead.
+  `24-proj.md` and `_SPLIT_BRIEF.md` carried the same inversion and are corrected.
+- **Two ledger items were already done** (`proj-005`'s stale paths, `error.rs:106`),
+  closed by `7906768` and filed open by mistake. Recorded rather than re-claimed.
+
 ### Validated on real hardware
 
 Three live runs against a running Epic Seven client, elevated, `backend = "message"`,

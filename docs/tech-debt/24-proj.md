@@ -228,7 +228,7 @@ Two findings are not about file size at all and matter more than any of them. **
 - **Severity:** P2
 - **Rule:** [`proj-mod-rs-dir`](../../.claude/skills/rust-skills/rules/proj-mod-rs-dir.md)
 - **Site:** `src/config.rs` + `src/config/persist.rs` (adjacent-file style) against nine `mod.rs` directories: `src/app/`, `src/app/session/`, `src/actuator/`, `src/capture/`, `src/domain/`, `src/domain/control/`, `src/ui/`, `src/ui/editor/`, `src/uplink/`. `Cargo.toml` has no `[lints]` section; there is no `clippy.toml`.
-- **What:** Nine to one. The rule's own "Consistency Rule" section says to pick one and pin it with a lint (`clippy::mod_module_files` or `clippy::self_named_module_files`); neither is set, so nothing stops the next module from picking whichever.
+- **What:** Nine to one. The rule's own "Consistency Rule" section says to pick one and pin it with a lint (`clippy::self_named_module_files` for a `mod.rs` crate like this one, `clippy::mod_module_files` for the opposite convention — the names read backwards, and reaching for the wrong one reverses what it pins); neither is set, so nothing stops the next module from picking whichever.
 - **Why it matters here, and the fair reading:** The 2024 edition and clippy's default lean the *other* way — `foo.rs` + `foo/` is the shape `self_named_module_files` endorses, and `src/config.rs` is arguably the one file already doing it right. But "which convention is better in the abstract" is not the question the rule asks; consistency is, and the cost of the two directions is nine files versus one. **Pick `mod.rs`.** Both lints are allow-by-default, so neither is "the default" in any enforced sense, and moving nine files (each of which changes every `use super::` path inside it) to satisfy a stylistic preference is not a good trade against moving one.
 - **Fix:** Two edits.
   1. `git mv src/config.rs src/config/mod.rs`. Nothing else changes: `src/lib.rs:18` already says `pub mod config;`, `persist.rs`'s `super::CaptureConfig` / `super::ForwardConfig` doc links still resolve, and `include_str!("../config.example.toml")` at `src/config.rs:966` becomes `include_str!("../../config.example.toml")` — that is the only path in the file that moves. Do this together with `proj-004`'s `src/config/tests.rs` extraction; the two touch the same file.
@@ -239,7 +239,7 @@ Two findings are not about file size at all and matter more than any of them. **
      unreachable_pub = "warn"
 
      [lints.clippy]
-     mod_module_files = "warn"
+     self_named_module_files = "warn"
      ```
 
   A `[lints]` table is worth adding on its own account: `cargo clippy --all-targets -- -D warnings` in CI covers the default lint set, but nothing in the repo records which *non-default* lints this crate has decided to honour, so a decision like "we chose `mod.rs`" has nowhere to live except a code review.

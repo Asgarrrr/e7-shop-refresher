@@ -51,7 +51,7 @@ file set's delta.
    assertion. If a test reaches a now-private item, prefer moving the test next to the
    item over widening the item's visibility.
 6. **Convention: `foo/mod.rs`.** The crate has nine `mod.rs` files and one exception
-   (`config.rs`); `clippy::mod_module_files` measures that. Follow the majority — new
+   (`config.rs`); `clippy::self_named_module_files` measures that (not `mod_module_files`, which bans `mod.rs` and would invert the convention). Follow the majority — new
    directories get a `mod.rs`. Do not switch the crate to the adjacent style in this pass.
 
 ## What to do when the split does not want to happen
