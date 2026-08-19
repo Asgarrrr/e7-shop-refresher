@@ -217,41 +217,11 @@ const SEARCH_FLAGS: u32 = libloading::os::windows::LOAD_LIBRARY_SEARCH_SYSTEM32
 /// process that requested the elevation, so that variable is exactly as
 /// trustworthy as the attacker in [`SEARCH_FLAGS`].
 fn dll_candidates() -> [PathBuf; 2] {
-    let system = system_directory();
+    let system = crate::system32::directory();
     [
         system.join("Npcap").join("wpcap.dll"),
         system.join("wpcap.dll"),
     ]
-}
-
-/// `GetSystemDirectoryW`, or the conventional path if it will not answer.
-///
-/// `MAX_PATH` is documented as always sufficient for this one directory, so the
-/// truncation branch is unreachable in practice; it falls back rather than
-/// truncating, because half a path is a path that could resolve somewhere else.
-fn system_directory() -> PathBuf {
-    use std::os::windows::ffi::OsStringExt;
-
-    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-
-    const MAX_PATH_WIDE: u32 = 260;
-    let mut buffer = [0_u16; MAX_PATH_WIDE as usize];
-    // SAFETY: the pointer and the count describe the same stack array, and the
-    // count is in `u16`s, which is what this call wants. It writes at most that
-    // many and returns how many it wrote, excluding the terminator; `0` is its
-    // failure return and a value above the count means it wrote nothing and is
-    // asking for a bigger buffer. Both are handled below.
-    let written = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), MAX_PATH_WIDE) };
-    match buffer.get(..written as usize) {
-        Some(path) if written > 0 => PathBuf::from(std::ffi::OsString::from_wide(path)),
-        _ => {
-            warn!(
-                written,
-                "GetSystemDirectoryW did not answer; assuming the conventional path"
-            );
-            PathBuf::from(r"C:\Windows\System32")
-        }
-    }
 }
 
 /// What to tell a player who has no Npcap at all.
@@ -978,7 +948,7 @@ mod tests {
                 path.display()
             );
             assert!(
-                path.starts_with(system_directory()),
+                path.starts_with(crate::system32::directory()),
                 "{} must be under the system directory",
                 path.display()
             );
@@ -1000,7 +970,7 @@ mod tests {
         // `LOAD_LIBRARY_SEARCH_SYSTEM32`; it cannot prove the
         // `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` half, which only matters for
         // `Packet.dll` beside a real `wpcap.dll`.
-        let path = system_directory().join("version.dll");
+        let path = crate::system32::directory().join("version.dll");
         // SAFETY: `version.dll` is a Windows system library already loaded into
         // most processes; its entry point initializes its own state only. The
         // handle is dropped immediately and no symbol is resolved from it.
@@ -1011,19 +981,6 @@ mod tests {
             "{} did not load under SEARCH_FLAGS: {:?}",
             path.display(),
             loaded.err()
-        );
-    }
-
-    #[test]
-    fn the_system_directory_is_read_from_the_os() {
-        // Not from `%SystemRoot%`, which an elevating parent chooses. The
-        // fallback is a real path too, so this holds either way.
-        let system = system_directory();
-        assert!(system.is_absolute(), "got {}", system.display());
-        assert!(
-            system.is_dir(),
-            "{} should exist on any Windows",
-            system.display()
         );
     }
 }

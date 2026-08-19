@@ -252,11 +252,18 @@ fn accepts_a_start(progress: &Progress) -> bool {
 /// To stdout rather than `--output`, so that the one process that creates the
 /// file is this one; `--max-filesize` keeps that from meaning an unbounded
 /// response body in a `Vec`.
+///
+/// The directory comes from [`crate::system32::directory`] and not from
+/// `%SystemRoot%`, which is the same correction the `wpcap.dll` candidates
+/// already carry and it belongs here more than there: this process holds an
+/// administrator token, and the value picks *the executable it runs*. An
+/// attacker who can set that variable for a launcher and plant a
+/// `System32\curl.exe` under the path it names gets arbitrary code run elevated
+/// — by exactly the medium-integrity same-user process the module header's
+/// swap-the-file attack assumes, and one step earlier than the hash pin looks.
+/// The pin cannot help: it hashes what curl *printed*, long after curl ran.
 fn download() -> Result<Vec<u8>, String> {
-    let curl =
-        PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
-            .join("System32")
-            .join("curl.exe");
+    let curl = curl_path();
     if !curl.is_file() {
         return Err("this Windows has no curl.exe to download with".to_owned());
     }
@@ -345,6 +352,22 @@ fn open_locked(path: &Path) -> std::io::Result<File> {
 #[cfg(not(windows))]
 fn create_new_locked(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+/// The `curl.exe` [`download`] will run, by absolute path.
+///
+/// Two arms for the same reason [`open_locked`] has two: the fetcher is only
+/// reachable from the Windows capture path, and this file has to compile on a
+/// dev machine. The non-Windows arm names a path that will not exist, which is
+/// the branch `download` already handles.
+#[cfg(windows)]
+fn curl_path() -> PathBuf {
+    crate::system32::directory().join("curl.exe")
+}
+
+#[cfg(not(windows))]
+fn curl_path() -> PathBuf {
+    PathBuf::from("curl.exe")
 }
 
 /// Where the download lands. The name is version-stamped and lives with the
@@ -471,6 +494,26 @@ mod tests {
     // The pin's own shape is asserted where the pin now lives, in `crate::npcap`
     // — it guards `sha256`'s zeroed failure return, which is this module's, but
     // the constant it guards is not.
+
+    /// The one thing about this path that matters: it is absolute, it is under
+    /// the directory Win32 named, and it is the real `curl.exe`. The property
+    /// this replaced — that no `%SystemRoot%` read chooses it — cannot be
+    /// asserted from inside the process without setting that variable, which
+    /// this crate never does; see [`crate::system32`]'s test for the same note.
+    /// What holds it is that the environment read is gone.
+    #[cfg(windows)]
+    #[test]
+    fn the_downloader_runs_the_system_curl_by_absolute_path() {
+        let curl = curl_path();
+        assert!(curl.is_absolute(), "{curl:?}");
+        assert!(
+            curl.starts_with(crate::system32::directory()),
+            "{curl:?} — an elevated process must not run a curl.exe chosen by its launcher"
+        );
+        // Not `is_file`: a Windows old enough to lack it is a supported machine
+        // and `download` reports it. What must hold is where we looked.
+        assert_eq!(curl.file_name(), Some(std::ffi::OsStr::new("curl.exe")));
+    }
 
     #[cfg(windows)]
     #[test]

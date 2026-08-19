@@ -45,6 +45,12 @@ mod render;
 pub mod stream;
 // The poison policy five modules used to each restate. See its header.
 pub mod sync;
+// Windows-only and ungated for the same reason `wide` is: `install` (gui) and
+// `capture::pcap` (windows + pcap-backend) both have to resolve a path under
+// System32 and neither can reach the other. See its header for why the copy had
+// to go.
+#[cfg(windows)]
+pub mod system32;
 #[cfg(feature = "gui")]
 pub mod ui;
 pub mod uplink;

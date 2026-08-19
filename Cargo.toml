@@ -215,10 +215,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography",
     # `GetModuleHandleW`, for the window class the actuator drives.
     "Win32_System_LibraryLoader",
-    # `GetSystemDirectoryW`, for the two absolute `wpcap.dll` candidates. Read
-    # from the OS rather than from `%SystemRoot%` because an elevated process
-    # inherits its environment from the one that asked for the elevation
-    # (`capture::pcap::sys::system_directory`).
+    # `GetSystemDirectoryW`, for the two absolute `wpcap.dll` candidates and for
+    # the `curl.exe` the Npcap download runs. Read from the OS rather than from
+    # `%SystemRoot%` because an elevated process inherits its environment from
+    # the one that asked for the elevation, and both callers use the answer to
+    # pick something to execute or load (`system32::directory`).
     "Win32_System_SystemInformation",
     # `HKLM\...\npcap\Parameters\AdminOnly`: the one read that tells "Npcap is
     # restricted to administrators" apart from "this machine has no adapters".
