@@ -98,13 +98,16 @@ names = ["ticketrare_name", "ticketspecial_name"]
 # the floor: a range only ever slows the loop down, never clicks earlier.
 # Every range defaults to { min_ms = 0, max_ms = 0 } (the fixed calibrated
 # timing, no randomness). min == max is a fixed extra. min_ms above max_ms is
-# refused at startup rather than quietly read as a fixed min_ms delay, and
-# max_ms is capped at 60000 (one minute) — well past any human-looking pause,
-# and short of the values that stall the loop between two clicks. The same
-# knobs live in the window's Setup tab (Click timings), applied live without
-# editing this file. Baselines, in ms: shop_opened 1180, refreshed 780,
-# purchase_resumed 400, recovery 400, confirm_refresh_modal 270, buy_modal 150,
-# between_buys 600, scroll_settle 100.
+# not read as a fixed min_ms delay — that would hand you a metronome after you
+# asked for variability — and max_ms is capped at 60000 (one minute), well past
+# any human-looking pause and short of the values that stall the loop between
+# two clicks. A line breaking either rule is ignored, not fatal: the app starts,
+# that one action runs at its bare baseline, and the startup log says which key
+# it dropped and why. Nothing rewrites the line for you, so fix it here or set
+# the range from the Setup tab. The same knobs live in that tab (Click
+# timings), applied live without editing this file. Baselines, in ms:
+# shop_opened 1180, refreshed 780, purchase_resumed 400, recovery 400,
+# confirm_refresh_modal 270, buy_modal 150, between_buys 600, scroll_settle 100.
 # refreshed = { min_ms = 200, max_ms = 800 }         # after a paid refresh
 # between_buys = { min_ms = 150, max_ms = 500 }       # between two buys
 # shop_opened = { min_ms = 0, max_ms = 0 }

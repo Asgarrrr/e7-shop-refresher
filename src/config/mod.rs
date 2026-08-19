@@ -21,8 +21,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
+use toml_edit::{DocumentMut, Item};
 
-use crate::actuator::plan::Timings;
+use crate::actuator::plan::{DelayRange, Timings};
 use crate::domain::control::Limits;
 use crate::domain::filter::Filter;
 use std::num::NonZeroU16;
@@ -61,7 +62,7 @@ pub(crate) const RECONNECT_FLOOR: Duration = Duration::from_millis(100);
 /// comparison satisfies). Every other rule moved *into* a type, holding for a
 /// struct literal or a mutated [`Config::default`] just as much as for the
 /// load path: [`ServerUrl`] carries the cleartext rule, [`NonZeroU16`]
-/// carries `game_port != 0`, [`DelayRange`](crate::actuator::plan::DelayRange)
+/// carries `game_port != 0`, [`DelayRange`]
 /// carries `min_ms <= max_ms <= MAX_TIMING_MS`, and `filter::hunt_kinds` (the
 /// `deserialize_with` behind [`Filter`]'s `kinds`) refuses the wire's
 /// catch-all `ItemKind`.
@@ -313,6 +314,12 @@ impl ForwardConfig {
 // a `#[serde(try_from)]` hook, so an invalid range cannot be built at all.
 // See `plan::MAX_TIMING_MS` for why the ceiling is one minute, and
 // `plan::DelayRangeError` for its two messages.
+//
+// Refusing the *value* is not refusing the *file*, and closing the second
+// boundary made that distinction load-bearing: a `config.toml` written while
+// the pair was still representable now meets a deserializer that rejects it,
+// and a rejected deserialize is a fatal startup. `drop_unreadable_timing_ranges`
+// below is the seam that keeps the two apart.
 
 impl Config {
     /// Loads the configuration from `path`. A missing file yields the defaults.
@@ -334,13 +341,16 @@ impl Config {
     ///   - a non-finite `[[filter.required_substats]] min` (`nan`/`inf` are
     ///     legal TOML floats), which no substat value can ever satisfy.
     ///
-    /// Four rules are absent from that list because they are enforced where
+    /// Three rules are absent from that list because they are enforced where
     /// the value is *built*, so they surface as [`Error::ConfigParse`] (line
     /// quoted) rather than [`Error::Config`]: `server_url`'s cleartext rule
-    /// ([`ServerUrl`]), `game_port = 0` ([`NonZeroU16`]), the reversed /
-    /// over-ceiling `[actuator.timings]` ranges
-    /// ([`plan::DelayRange`](crate::actuator::plan::DelayRange)), and an
-    /// unrecognized `[filter] kinds` entry (`filter::hunt_kinds`).
+    /// ([`ServerUrl`]), `game_port = 0` ([`NonZeroU16`]), and an unrecognized
+    /// `[filter] kinds` entry (`filter::hunt_kinds`).
+    ///
+    /// A reversed or over-ceiling `[actuator.timings]` range is the fourth
+    /// such rule and the one exception to that shape: it is not an error here
+    /// at all. See [`drop_unreadable_timing_ranges`] for why a value the type
+    /// refuses must not be a value the loader dies on.
     ///
     /// [`Error::Config`]: crate::Error::Config
     /// [`Error::ConfigParse`]: crate::Error::ConfigParse
@@ -349,7 +359,7 @@ impl Config {
         let path = path.as_ref();
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let config: Config = toml::from_str(&text)?;
+                let config = parse(&text)?;
                 config.validate()?;
                 Ok(config)
             }
@@ -414,4 +424,133 @@ impl Config {
     pub fn reconnect_max(&self) -> Duration {
         Duration::from_millis(self.reconnect.max_ms).max(self.reconnect_initial())
     }
+}
+
+/// Deserialize `text`, dropping any `[actuator.timings]` range this build
+/// cannot read rather than refusing the whole file over it.
+///
+/// The strict parse is tried first and is the normal path — no `toml_edit`
+/// re-parse, no allocation, nothing for a well-formed file to pay. Only when
+/// it fails does [`drop_unreadable_timing_ranges`] get a look, and only a
+/// second strict parse decides whether the result is loadable: the salvage
+/// pass *removes candidates*, it never rules on them, so there is exactly one
+/// definition of a valid config file in the crate and it is `serde`'s.
+///
+/// When the salvage finds nothing, the original refusal is returned unchanged.
+/// When it finds something and the file still will not parse, the *second*
+/// error is returned: the first named a key this pass has since dropped, so
+/// repeating it would send the player to a line that is no longer the problem.
+fn parse(text: &str) -> Result<Config> {
+    let refused = match toml::from_str::<Config>(text) {
+        Ok(config) => return Ok(config),
+        Err(refused) => refused,
+    };
+    let Some((salvaged, dropped)) = drop_unreadable_timing_ranges(text) else {
+        return Err(refused.into());
+    };
+    let config: Config = toml::from_str(&salvaged)?;
+    for (key, reason) in dropped {
+        // Not a `fatal` and not silence: the range is *not in force* (the
+        // action runs at its calibrated baseline, the setting's own default),
+        // and this is the only place that says so. It repeats every launch,
+        // because nothing has rewritten the file — which is the pressure on
+        // whoever typed it to fix it, and the reason this is a warning rather
+        // than a shrug.
+        tracing::warn!(
+            key = %format_args!("actuator.timings.{key}"),
+            reason = %reason,
+            "this timing range could not be read, so it is not in force: the action keeps its tuned baseline with no extra wait. Fix the line in config.toml, or set the range from the Setup tab's Click timing section, which writes a valid one"
+        );
+    }
+    Ok(config)
+}
+
+/// `text` with every unreadable `[actuator.timings]` range removed, and the
+/// key and reason for each, or `None` when there is nothing of the sort to
+/// remove.
+///
+/// **Why the loader forgives what the type refuses.**
+/// [`DelayRange`] is right to refuse
+/// `{ min_ms = 800, max_ms = 200 }`: read leniently it silently becomes a
+/// fixed 800 ms delay, which is the opposite of the variability the player
+/// asked for. But a *file already on disk* carrying that pair predates the
+/// refusal — `DelayRange::draw` used to read it exactly that leniently, so it
+/// was an accepted config for the whole life of the setting — and a
+/// `toml::from_str` failure in `Config::load` is fatal in `main`: no main
+/// window, only an error window, and the only cure is hand-editing a file
+/// under `%APPDATA%` that the app otherwise owns and rewrites for them.
+/// Nothing in the upgrade path reaches it first: `strip_retired_keys` runs
+/// *after* the load that failed, `persist::save` only ever rewrites an
+/// already-valid `Timings`, and `migrate` deals in ACLs.
+///
+/// That is the `kinds = ["unknown"]` incident again, exactly — and `type-010`
+/// in `docs/tech-debt/10-type.md`, the entry that asked for these private
+/// fields in the first place, is the one that describes it: "the *next launch*
+/// refused, giving a fatal error window and no way out but hand-editing the
+/// file the app owns". Making the range unrepresentable was the right half of
+/// that fix; it is only half, because a file predating the type is still on
+/// disk and nobody warned it. `validate`'s closing comment says the same thing
+/// about the retired `[capture]` / `[forward]` keys in as many words: do not
+/// lock a player out over a setting they cannot reach.
+///
+/// So the value is refused and the file is not. The refused range is dropped
+/// to its default (`0..=0`, the calibrated baseline and the setting's own
+/// absent-key behaviour) and named in a startup warning — deliberately *not*
+/// repaired into `{ min_ms = 200, max_ms = 800 }`, which would be a guess at
+/// which of the two numbers the player meant, written into their file, in a
+/// module whose neighbouring pass promises "no setting of yours is changed".
+/// Someone hand-writing this key fresh still learns their pair is wrong, at
+/// the same launch, by name and with the reason — they simply also get an app.
+///
+/// The pass walks only the eight keys `Timings::named_ranges` knows and asks
+/// `DelayRange::try_new` itself, so it can neither re-derive the rule nor
+/// reach a key it does not own. Anything else about the table — a misspelled
+/// key under `deny_unknown_fields`, `min_ms = "800"`, a negative integer — is
+/// left exactly where it is for the second strict parse to refuse.
+fn drop_unreadable_timing_ranges(text: &str) -> Option<(String, Vec<(&'static str, String)>)> {
+    let mut doc: DocumentMut = text.parse().ok()?;
+    // `as_table_like_mut` rather than `as_table_mut`, at both hops: a player
+    // may have written `[actuator.timings]`, `actuator = { timings = { .. } }`
+    // or `actuator.timings.refreshed = { .. }`, and all three are the same
+    // document to `toml` — so a pass that only understood the header form
+    // would leave the other two bricking the app it was written to unbrick.
+    let timings = doc
+        .as_table_mut()
+        .get_mut("actuator")?
+        .as_table_like_mut()?
+        .get_mut("timings")?
+        .as_table_like_mut()?;
+    let mut dropped = Vec::new();
+    for (key, _) in Timings::default().named_ranges() {
+        let Some(written) = timings.get(key).and_then(written_range) else {
+            continue;
+        };
+        if let Err(reason) = DelayRange::try_new(written.0, written.1) {
+            timings.remove(key);
+            // `DelayRangeError`'s own sentence, resolved here rather than
+            // reworded: it is what the player would have read in the error
+            // window this pass exists to prevent, and it names both of their
+            // numbers and what the pair would have been read as.
+            dropped.push((key, reason.to_string()));
+        }
+    }
+    (!dropped.is_empty()).then(|| (doc.to_string(), dropped))
+}
+
+/// The `(min_ms, max_ms)` pair an authored range spells out, with an omitted
+/// key reading 0 exactly as `RawDelayRange`'s `serde(default)` does — so the
+/// `{ max_ms = 120000 }` shorthand is judged on the same numbers `serde` would
+/// have judged it on.
+///
+/// `None` for anything that is not two non-negative integers, which is the
+/// pass declining to have an opinion: a string, a float or a negative is a
+/// different complaint, and the strict parse makes it far better than this
+/// could.
+fn written_range(item: &Item) -> Option<(u64, u64)> {
+    let table = item.as_table_like()?;
+    let field = |name: &str| match table.get(name) {
+        None => Some(0),
+        Some(written) => written.as_integer().and_then(|ms| u64::try_from(ms).ok()),
+    };
+    Some((field("min_ms")?, field("max_ms")?))
 }

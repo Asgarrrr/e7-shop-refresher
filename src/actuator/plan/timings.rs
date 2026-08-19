@@ -353,11 +353,22 @@ impl Timings {
     }
 }
 
-/// One-touch humanization level: a named `Timings` the Setup UI offers before
-/// the per-action fine-tuning. Each preset only dials the *random extra* every
-/// action can add on top of its tuned baseline (the `max_ms`); `min_ms` stays a
-/// config-only floor, so a preset never rewrites the calibrated minimum. Higher
-/// levels add more random slack so the loop clicks less like a metronome.
+/// One-touch humanization level: a named set of per-action random ceilings the
+/// Setup UI offers before the per-action fine-tuning. A preset only dials the
+/// *random extra* every action can add on top of its tuned baseline (the
+/// `max_ms`); `min_ms` stays a config-only floor, so a preset never rewrites
+/// the calibrated minimum. Higher levels add more random slack so the loop
+/// clicks less like a metronome.
+///
+/// That sentence is a promise about what a *click* does, and until
+/// [`applied_to`](Self::applied_to) existed it was only true of the value
+/// [`timings`](Self::timings) returns, not of what the Setup tab wrote with it:
+/// the tab assigned that value wholesale, so a `refreshed = { min_ms = 200,
+/// .. }` seeded from `config.toml` was replaced by a range starting at 0 and
+/// `persist::save` then wrote the loss to disk — no warning, no undo, and no
+/// way back except retyping the floor into a file the app owns. Every producer
+/// of a `Timings` *from* a preset now goes through `applied_to`, which is the
+/// merge that keeps the promise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimingPreset {
     /// Tuned minimums only, no random extra — `Timings::default()`.
@@ -385,8 +396,15 @@ impl TimingPreset {
         }
     }
 
-    /// The `Timings` this level resolves to. Only `max_ms` is set (the random
-    /// ceiling); `min_ms` stays 0 so the floor remains a config-only concern.
+    /// The `Timings` this level resolves to *on its own*: only `max_ms` is set
+    /// (the random ceiling); `min_ms` stays 0 so the floor remains a
+    /// config-only concern.
+    ///
+    /// This is the level's canonical value — the one `Instant.timings() ==
+    /// Timings::default()` pins, and the one the ceilings in
+    /// [`applied_to`](Self::applied_to) are read out of. It is *not* what a
+    /// player's click should produce: assigning it discards whatever floors
+    /// their `config.toml` set, which is what `applied_to` exists to stop.
     pub fn timings(self) -> Timings {
         // Per-action random ceilings (ms) for Human; Cautious doubles them. The
         // watchdog stays tight at every level — recovery is not humanization.
@@ -408,12 +426,77 @@ impl TimingPreset {
         }
     }
 
-    /// The preset `timings` exactly matches, or `None` when the player has
+    /// This level's ceilings over `current`'s floors — what choosing the level
+    /// in the Setup tab produces.
+    ///
+    /// Every field's `max_ms` becomes the level's; every `min_ms` is the
+    /// player's, kept. The one floor that does move is one the new ceiling has
+    /// dropped below, and it moves because [`DelayRange::set_max_ms`] brings it
+    /// down rather than leave a reversed range — the same rule the Setup tab's
+    /// drag already obeys, and the only way this can lower a floor: a
+    /// `recovery = { min_ms = 100, max_ms = 200 }` meets a level whose recovery
+    /// ceiling is 0 at every level (the watchdog is not humanization), so both
+    /// ends collapse to 0. Choosing "no random extra here" and keeping a 100 ms
+    /// forced extra is not a state this type can hold, and the ceiling is what
+    /// the player just clicked.
+    ///
+    /// Written as a merge here rather than at the one UI call site because the
+    /// invariant belongs to the preset, not to the widget: a second caller
+    /// (a "reset timings" menu item, a future CLI flag) would otherwise have
+    /// to remember to merge, and forgetting is silent — it costs a setting on
+    /// disk, not a compile error.
+    #[must_use]
+    pub fn applied_to(self, current: &Timings) -> Timings {
+        let ceilings = self.timings();
+        let mut merged = *current;
+        // Exhaustive destructuring, for the reason `Timings::named_ranges`
+        // gives: a ninth action stops compiling here until it is named, so a
+        // new knob cannot quietly sit outside the preset control.
+        let Timings {
+            shop_opened,
+            refreshed,
+            purchase_resumed,
+            recovery,
+            confirm_refresh_modal,
+            buy_modal,
+            between_buys,
+            scroll_settle,
+        } = &mut merged;
+        for (target, ceiling) in [
+            (shop_opened, ceilings.shop_opened),
+            (refreshed, ceilings.refreshed),
+            (purchase_resumed, ceilings.purchase_resumed),
+            (recovery, ceilings.recovery),
+            (confirm_refresh_modal, ceilings.confirm_refresh_modal),
+            (buy_modal, ceilings.buy_modal),
+            (between_buys, ceilings.between_buys),
+            (scroll_settle, ceilings.scroll_settle),
+        ] {
+            target.set_max_ms(ceiling.max_ms());
+        }
+        merged
+    }
+
+    /// The preset already in force in `timings`, or `None` when the player has
     /// fine-tuned away from every level ("Custom").
+    ///
+    /// Spelled as "the level a click would not change" rather than
+    /// `preset.timings() == *timings`, and it has to be: with the merge above,
+    /// clicking a level on timings carrying a floor produces something the
+    /// old equality could never match, so the segment the player just pressed
+    /// would stay dark and the bars would spring open — the control would
+    /// report that it had failed while it had in fact done exactly what it
+    /// says. Comparing against the merge instead asks the question the label
+    /// answers: are these ceilings this level's? A floor is orthogonal, it is
+    /// not editable from this control, and the per-action bars are where it is
+    /// visible.
+    ///
+    /// [`applied_to`](Self::applied_to) is idempotent, so at most one level
+    /// can match: `Instant` zeroes every ceiling and the other two do not.
     pub fn from_timings(timings: &Timings) -> Option<TimingPreset> {
         TimingPreset::ALL
             .into_iter()
-            .find(|preset| preset.timings() == *timings)
+            .find(|preset| preset.applied_to(timings) == *timings)
     }
 }
 
@@ -459,6 +542,75 @@ mod tests {
             ] {
                 assert_eq!(range.min_ms(), 0);
             }
+        }
+    }
+
+    #[test]
+    fn choosing_a_level_keeps_a_config_set_floor_and_takes_its_ceiling() {
+        // The defect this merge exists for: a floor typed into config.toml
+        // (`refreshed = { min_ms = 200, max_ms = 800 }`, the shape
+        // config.example.toml documents) used to be wiped by one click on a
+        // preset, and `persist::save` then wrote the zero to disk.
+        let seeded = Timings {
+            refreshed: range(200, 800),
+            ..Timings::default()
+        };
+        let human = TimingPreset::Human.applied_to(&seeded);
+        assert_eq!(human.refreshed.min_ms(), 200, "the player's floor stands");
+        assert_eq!(
+            human.refreshed.max_ms(),
+            TimingPreset::Human.timings().refreshed.max_ms(),
+            "and the level's ceiling replaced theirs"
+        );
+        // Every other action was inert, so it is the level's range verbatim.
+        assert_eq!(
+            human.between_buys,
+            TimingPreset::Human.timings().between_buys
+        );
+        // And the control lights the level the player just chose, floor or not
+        // — the whole reason `from_timings` compares against the merge.
+        assert_eq!(
+            TimingPreset::from_timings(&human),
+            Some(TimingPreset::Human)
+        );
+    }
+
+    #[test]
+    fn a_floor_above_the_chosen_ceiling_comes_down_with_it() {
+        // The one case where a level *does* move a floor, and the reason is
+        // `set_max_ms`'s, not the preset's: `recovery` has no random extra at
+        // any level, and `min_ms = 100, max_ms = 0` is not a range this type
+        // can hold. Everything below that ceiling is still untouched.
+        let seeded = Timings {
+            recovery: range(100, 200),
+            buy_modal: range(40, 60),
+            ..Timings::default()
+        };
+        let cautious = TimingPreset::Cautious.applied_to(&seeded);
+        assert_eq!(
+            (cautious.recovery.min_ms(), cautious.recovery.max_ms()),
+            (0, 0)
+        );
+        assert_eq!(cautious.buy_modal.min_ms(), 40, "under the ceiling, kept");
+        assert_eq!(
+            TimingPreset::from_timings(&cautious),
+            Some(TimingPreset::Cautious)
+        );
+    }
+
+    #[test]
+    fn applying_a_level_twice_changes_nothing_the_second_time() {
+        // What lets `from_timings` be "the level a click would not change":
+        // if the merge were not idempotent, the detected level would flicker
+        // between frames of a tab that renders it every one of them.
+        let seeded = Timings {
+            refreshed: range(200, 800),
+            scroll_settle: range(10, 10),
+            ..Timings::default()
+        };
+        for preset in TimingPreset::ALL {
+            let once = preset.applied_to(&seeded);
+            assert_eq!(preset.applied_to(&once), once, "{}", preset.label());
         }
     }
 

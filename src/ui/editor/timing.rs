@@ -51,12 +51,23 @@ pub(super) fn pass_estimate(t: &Timings) -> String {
         t.buy_modal,
         t.purchase_resumed,
     ];
-    // A plain sum, not a `saturating_add`: `DelayRange` carries
-    // `min_ms <= max_ms <= MAX_TIMING_MS` by construction, so `max_ms` is the
-    // band's top without checking `min_ms`, and four of them plus the routine
-    // total cannot approach `u64::MAX`.
+    // Both ends carry the slack, and the low one has to: `min_ms` is *forced*
+    // extra, added to every single draw, so a pass with four floors set is
+    // never as quick as the bare baselines. Reading the low end as
+    // `ROUTINE_TOTAL_MS` alone put two contradicting numbers on one screen —
+    // `timing_meter::resolved_band`, in the value column of each of these four
+    // bars, has always shown `baseline + min_ms` — and the contradiction grew
+    // with the setting, so the player who had most reason to trust the
+    // estimate got the worst one.
+    //
+    // Plain sums, not `saturating_add`s: `DelayRange` carries
+    // `min_ms <= max_ms <= MAX_TIMING_MS` by construction, so four of either
+    // end plus the routine total cannot approach `u64::MAX`, and `lo <= hi`
+    // holds term by term — `secs_range` would print a backwards band if it
+    // did not.
+    let lo_total: u64 = ROUTINE_TOTAL_MS + slack.iter().map(|r| r.min_ms()).sum::<u64>();
     let hi_total: u64 = ROUTINE_TOTAL_MS + slack.iter().map(|r| r.max_ms()).sum::<u64>();
-    secs_range(ROUTINE_TOTAL_MS, hi_total)
+    secs_range(lo_total, hi_total)
 }
 
 /// The per-action bars, revealed inline when the Custom mode segment is
@@ -152,6 +163,24 @@ mod tests {
         assert_eq!(
             pass_estimate(&timings),
             secs_range(ROUTINE_TOTAL_MS, ROUTINE_TOTAL_MS + 2 * plan::MAX_TIMING_MS)
+        );
+    }
+
+    #[test]
+    fn the_per_pass_low_end_agrees_with_the_bars_above_it() {
+        // One screen, two readings of the same four waits: this sentence and
+        // the value column of each bar. A floor of 200 ms on the paid refresh
+        // means every pass really does take 200 ms longer, and
+        // `timing_meter::resolved_band` says so on that row — so the estimate
+        // must not keep quoting the bare baseline as its floor.
+        let timings = Timings {
+            refreshed: DelayRange::try_new(200, 800).expect("a valid fixture range"),
+            buy_modal: DelayRange::try_new(50, 50).expect("a valid fixture range"),
+            ..Timings::default()
+        };
+        assert_eq!(
+            pass_estimate(&timings),
+            secs_range(ROUTINE_TOTAL_MS + 250, ROUTINE_TOTAL_MS + 850)
         );
     }
 

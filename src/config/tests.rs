@@ -354,8 +354,16 @@ fn actuator_timings_parse_and_default_to_zero() {
 fn reversed_timing_range_is_rejected_and_names_both_values() {
     // `{ min_ms = 800, max_ms = 200 }` is a plausible typo in this inline
     // form; accepted, it would silently reread as a fixed 800 ms delay.
-    // Refused by `DelayRange`'s `try_from` now, so it is a *parse* error —
-    // `toml` quotes the offending line and points a caret at the value.
+    // Refused by `DelayRange`'s `try_from`, so it is a *parse* error — `toml`
+    // quotes the offending line and points a caret at the value.
+    //
+    // `toml::from_str` directly, not `Config::load`: the refusal is the
+    // deserializer's and this is what pins it. The loader deliberately does
+    // *not* die on this any more (see `a_players_reversed_timing_range_no…`
+    // below, and `drop_unreadable_timing_ranges` for the argument) — the
+    // refused value still never reaches the loop, which is what this test is
+    // about; what changed is that it costs the player a warning instead of a
+    // startup.
     let error =
         parse_and_validate("[actuator.timings]\nrefreshed = { min_ms = 800, max_ms = 200 }")
             .expect_err("a reversed range must not be silently reinterpreted");
@@ -445,6 +453,139 @@ fn every_timing_preset_survives_validation() {
             preset.label()
         );
     }
+}
+
+/// **The regression this salvage pass exists to prevent**, and the twin of
+/// `a_config_written_before_the_capture_keys_were_retired_still_loads` one
+/// release later.
+///
+/// `DelayRange::draw` read a reversed pair as a point at `min_ms` for the
+/// whole life of the setting, so this file was a *working* config; the day the
+/// type started refusing it, `Config::load` started failing and `main` turned
+/// that into `fatal()` — an error window instead of the app, curable only by
+/// hand-editing a file under `%APPDATA%` that the Setup tab otherwise owns.
+#[test]
+fn a_players_reversed_timing_range_no_longer_bricks_the_app() {
+    let dir = TempDir::new("unreadable-timings");
+    std::fs::create_dir_all(dir.path()).expect("fixture dir");
+    let path = dir.join("config.toml");
+    // Both shapes the finding names: the transposed inline pair (an ordinary
+    // typo in this form) and the over-ceiling `{ max_ms = 120000 }` shorthand,
+    // whose omitted `min_ms` must be read as the 0 `serde` would have used.
+    let text = "\
+# hand-written
+game_port = 3333
+
+[filter]
+names = [\"ticketrare_name\"]
+
+[actuator.timings]
+shop_opened = { min_ms = 100, max_ms = 900 }
+refreshed = { min_ms = 800, max_ms = 200 }
+between_buys = { max_ms = 120000 }
+";
+    std::fs::write(&path, text).expect("seed a pre-refusal config");
+
+    let config = Config::load(&path).expect("an existing config must still open the app");
+    // The unreadable ranges are *not in force*: each action falls back to its
+    // calibrated baseline, which is exactly what an absent key means.
+    assert_eq!(config.actuator.timings.refreshed, DelayRange::default());
+    assert_eq!(config.actuator.timings.between_buys, DelayRange::default());
+    // Its readable neighbour in the same table is untouched — the pass drops
+    // the key it cannot read, never the section.
+    assert_eq!(config.actuator.timings.shop_opened.min_ms(), 100);
+    assert_eq!(config.actuator.timings.shop_opened.max_ms(), 900);
+    // And nothing outside `[actuator.timings]` was affected.
+    assert_eq!(config.game_port.get(), 3333);
+    assert_eq!(config.filter.names, vec!["ticketrare_name".to_owned()]);
+    config.validate().expect("and the result must validate");
+
+    // The file is left alone, comment and typo included. Swapping the pair for
+    // the player would be guessing which of their two numbers was the wrong
+    // one and writing the guess into their file; the warning names the key so
+    // they can decide.
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("still readable"),
+        text,
+        "the loader must not rewrite the player's config"
+    );
+}
+
+#[test]
+fn an_unreadable_range_is_dropped_whichever_way_the_table_is_spelled() {
+    // `[actuator.timings]`, the dotted key and the inline table are the same
+    // document to `toml`, so a player bricked by any of the four must be
+    // unbricked by all of them.
+    for text in [
+        "[actuator.timings]\nrefreshed = { min_ms = 800, max_ms = 200 }\n",
+        "actuator.timings.refreshed = { min_ms = 800, max_ms = 200 }\n",
+        "actuator = { timings = { refreshed = { min_ms = 800, max_ms = 200 } } }\n",
+        "[actuator.timings.refreshed]\nmin_ms = 800\nmax_ms = 200\n",
+    ] {
+        let config = parse(text).unwrap_or_else(|err| panic!("{text:?}: {}", err.report()));
+        assert_eq!(
+            config.actuator.timings.refreshed,
+            DelayRange::default(),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn the_salvage_pass_rules_on_nothing_but_the_ranges_it_can_read() {
+    // It removes candidates and lets the strict parse decide; anything it
+    // does not understand must survive to be refused properly, or a real
+    // mistake would load as "range dropped, carry on".
+    for text in [
+        // A misspelled key beside the reversed one: still `deny_unknown_fields`.
+        "[actuator.timings]\nrefreshed = { min_ms = 800, max_ms = 200 }\nrefesh = { max_ms = 5 }\n",
+        // Not two integers: a different complaint, reported far better by serde.
+        "[actuator.timings]\nrefreshed = { min_ms = \"800\", max_ms = 200 }\n",
+        "[actuator.timings]\nrefreshed = { min_ms = -800, max_ms = 200 }\n",
+        // Nothing to do with timings at all: the original refusal, unchanged.
+        "game_port = 0\n",
+        "[filter]\nkinds = [\"equipement\"]\n",
+    ] {
+        assert!(
+            parse(text).is_err(),
+            "{text:?} must still be refused outright"
+        );
+    }
+    // The misspelling is what the player is told about, not the range this
+    // pass already dropped — repeating the stale one would point at a line
+    // that is no longer the problem.
+    let error = parse(
+        "[actuator.timings]\nrefreshed = { min_ms = 800, max_ms = 200 }\nrefesh = { max_ms = 5 }\n",
+    )
+    .expect_err("an unknown key is still an unknown key");
+    assert!(error.report().contains("refesh"), "{}", error.report());
+}
+
+#[test]
+fn a_valid_file_never_reaches_the_salvage_pass() {
+    // The normal path stays a single strict parse: the pass finds nothing to
+    // drop in a file whose ranges are all readable, so a well-formed config
+    // pays no second parse and no rewrite.
+    assert!(
+        drop_unreadable_timing_ranges(
+            "[actuator.timings]\nrefreshed = { min_ms = 200, max_ms = 800 }\n\
+             buy_modal = { min_ms = 500, max_ms = 500 }\n"
+        )
+        .is_none()
+    );
+    // Including the two boundary values, which are legal and must not be
+    // mistaken for the thing this pass removes.
+    let ceiling = crate::actuator::plan::MAX_TIMING_MS;
+    assert!(
+        drop_unreadable_timing_ranges(&format!(
+            "[actuator.timings]\nrefreshed = {{ min_ms = {ceiling}, max_ms = {ceiling} }}\n"
+        ))
+        .is_none()
+    );
+    // And a file with no `[actuator]` section at all — the common case — is
+    // declined at the first hop rather than walked.
+    assert!(drop_unreadable_timing_ranges("game_port = 3333\n").is_none());
+    assert!(drop_unreadable_timing_ranges("[actuator]\ndry_run = true\n").is_none());
 }
 
 #[test]

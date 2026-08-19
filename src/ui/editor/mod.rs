@@ -333,9 +333,9 @@ fn timing_body(ui: &mut egui::Ui, editor: &mut EditorState) {
 /// Custom segment that reveals the per-action bars. The active segment is the
 /// preset the timings match, or Custom when fine-tuning is open or the
 /// timings match no preset. Clicking a preset overwrites every action's
-/// random extra and hides the bars; clicking Custom reveals them without
-/// touching the timings. Returns `Some(preset)` for a preset, `None` for
-/// Custom.
+/// random extra — and only that, see [`TimingPreset::applied_to`] — then hides
+/// the bars; clicking Custom reveals them without touching the timings.
+/// Returns `Some(preset)` for a preset, `None` for Custom.
 fn preset_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Option<TimingPreset> {
     let detected = TimingPreset::from_timings(&editor.timings);
     // Custom wins whenever the bars are open or the mix matches no preset, so
@@ -357,7 +357,12 @@ fn preset_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Option<TimingPrese
                 for preset in TimingPreset::ALL {
                     let selected = !custom && detected == Some(preset);
                     if ui.selectable_label(selected, preset.label()).clicked() {
-                        editor.timings = preset.timings();
+                        // `applied_to`, not `timings()`: the segment sets the
+                        // random ceilings, which is all it claims to set. The
+                        // bare value carries `min_ms = 0` on all eight
+                        // actions, so assigning it silently dropped every
+                        // config-set floor into the file on the next Apply.
+                        editor.timings = preset.applied_to(&editor.timings);
                         editor.fine_tune_open = false;
                     }
                 }
@@ -678,6 +683,43 @@ mod tests {
         harness.run();
         drop(harness);
         assert_eq!(editor.timings, TimingPreset::Cautious.timings());
+    }
+
+    #[test]
+    fn clicking_a_preset_keeps_a_config_set_delay_floor() {
+        // The click that used to cost a setting. `refreshed = { min_ms = 200,
+        // max_ms = 800 }` is the shape config.example.toml documents; seeded
+        // from it, the tab reads "Custom", and one click on Human replaced the
+        // whole draft with ranges starting at 0 — which Apply then wrote to
+        // disk through `persist::save`, wholesale, with no undo.
+        let floored = Timings {
+            refreshed: DelayRange::try_new(200, 800).expect("a valid fixture range"),
+            ..Timings::default()
+        };
+        let mut editor = EditorState::new(named_filter(), Limits::default(), floored);
+        editor.timing_open = true;
+        let mut harness = Harness::new_ui(|ui| {
+            edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Human").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(
+            editor.timings.refreshed.min_ms(),
+            200,
+            "the floor is config-only and the preset must not touch it"
+        );
+        assert_eq!(
+            editor.timings.refreshed.max_ms(),
+            TimingPreset::Human.timings().refreshed.max_ms(),
+            "while the ceiling is the one just chosen"
+        );
+        // And the click is legible: the Human segment lights rather than the
+        // control falling back to Custom over a floor it does not edit.
+        assert_eq!(
+            TimingPreset::from_timings(&editor.timings),
+            Some(TimingPreset::Human)
+        );
     }
 
     #[test]
