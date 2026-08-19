@@ -186,11 +186,20 @@ one. That is not a foundation for a pipeline that spends a player's gold, and it
 would also mean spawning and supervising a CLI for the life of every session.
 `LogBuffersLost` was 133 rather than 0 in that run.
 
+**Npcap, in the same conditions, captures fine.** Checked rather than assumed,
+since the whole point of the paragraph above is that an untested "it should
+work" had just been wrong twice: `dumpcap -D` lists ProtonVPN's WinTUN adapter
+(`ProTUN`) alongside the physical ones, and capturing on it while 5 MB moved
+through the tunnel gave **7 188 packets, 0 dropped, 6.1 MB** — the tunnel's
+plaintext, on the virtual adapter. That is what "open every adapter" buys, and
+it is the first time this backend was exercised behind a VPN at all.
+
 **Conclusion: Npcap stays**, and the reason is now specific rather than general.
 It is not that driverless capture is impossible — it demonstrably is possible,
-at full fidelity, with no install. It is that the driverless path is blind
-exactly where this product's users are most likely to be: behind a region VPN,
-which is routine for gacha players.
+at full fidelity, with no install, and on one adapter it beats Npcap's own
+numbers. It is that the driverless path is blind exactly where this product's
+users are most likely to be: behind a region VPN, which is routine for gacha
+players, and where Npcap is measured to work.
 
 ## The transferable rule
 
