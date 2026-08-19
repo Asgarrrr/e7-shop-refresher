@@ -73,7 +73,8 @@ installs), which you install yourself:
 3. That is all. No reboot, and nothing to configure in this app.
 
 If Npcap is missing, the app still starts and tells you so with a message naming
-the download page — it does not crash and it does not fail silently.
+the download page — it does not crash and it does not fail silently. In the
+window the address is a link; installing Npcap then needs the app restarted.
 
 **What leaves your machine**: only the reassembled game-port byte stream, sent
 over TLS to the configured `server_url`. Nothing else on the network is read,
@@ -250,10 +251,12 @@ Reading it yourself:
   temp directory, so one of those with no session log beside it means the app
   definitely ran.
 - `wpcap.dll loaded` missing → Npcap is not installed, or its driver is not
-  running. The error that follows says which, and names https://npcap.com. If it
-  says Npcap enumerated no capture device at all on a machine that clearly has
-  one, the driver is not running; reinstalling Npcap with default options is the
-  fix.
+  running. The error that follows says which, and names https://npcap.com — in
+  the window it is a link you can click. **Installing Npcap then needs the app
+  restarted**: the capture tap is opened once, at startup, so a window left open
+  through the install stays dead. If the error says Npcap enumerated no capture
+  device at all on a machine that clearly has one, the driver is not running;
+  reinstalling Npcap with default options is the fix.
 - `adapter opened and filtered` on no adapter at all → every adapter was
   refused, and the error lists each one with its reason. An install that ticked
   *"Restrict Npcap driver's access to Administrators"* is the usual cause, and

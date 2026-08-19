@@ -184,8 +184,14 @@ pub(super) struct Wpcap {
 pub(super) const DLL_CANDIDATES: [&str; 2] = ["wpcap.dll", r"C:\Windows\System32\Npcap\wpcap.dll"];
 
 /// What to tell a player who has no Npcap at all.
+///
+/// It ends on "then restart this app" because the capture source is opened once,
+/// from `Session::run`, at startup: a player who installs Npcap and comes back to
+/// the still-open window is looking at a dead session with nothing to click. The
+/// sentence is the cheap half of that fix; the expensive half is a re-probe that
+/// rebuilds the session in place, which `docs/npcap-provisioning.md` leaves open.
 pub(super) const INSTALL_HINT: &str = "install Npcap from https://npcap.com/#download and leave \
-     \"Restrict Npcap driver's access to Administrators\" UNCHECKED";
+     \"Restrict Npcap driver's access to Administrators\" UNCHECKED, then restart this app";
 
 impl Wpcap {
     pub(super) fn load() -> Result<(Self, &'static str)> {
