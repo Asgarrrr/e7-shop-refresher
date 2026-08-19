@@ -92,6 +92,13 @@ impl Fetcher {
             .clone()
     }
 
+    /// Records a failure raised by the window rather than by the worker — the
+    /// relaunch is the only one, and it has nowhere else to be seen.
+    pub fn fail(&self, reason: String) {
+        warn!(reason = %reason, "the install flow failed at the window");
+        self.set(Progress::Failed(reason));
+    }
+
     fn set(&self, next: Progress) {
         *self
             .progress
@@ -195,6 +202,43 @@ impl Fetcher {
 /// or replaces it instead of littering.
 fn installer_path() -> PathBuf {
     std::env::temp_dir().join("arkyve-npcap-1.88.exe")
+}
+
+/// Starts a second copy of this executable, for the caller to follow with a
+/// window close.
+///
+/// # Why a relaunch and not a re-probe
+///
+/// Nothing technical forces it. Measured: Windows does **not** cache a failed
+/// `LoadLibrary` — a path that answered `ERROR_MOD_NOT_FOUND` (126) loads
+/// successfully in the same process once the file appears — so re-opening the
+/// tap in place would work.
+///
+/// What forces it is where the failure lands. `build_source` runs inside
+/// `Session::run`, and its `?` ends the session; the window survives holding
+/// [`SessionHandles`](crate::app::SessionHandles) whose command receiver went
+/// with it. Reviving that means `Option<CaptureWorker>` inside `SessionWorkers`,
+/// six values kept alive for a second attempt, and a changed teardown path —
+/// the one whose comments record that an error there leaves an orphaned live
+/// capture session on every launch/close cycle. Against that, a relaunch costs
+/// the player one click and loses nothing: at this point the session is dead,
+/// the journal holds two lines, and nothing has been typed.
+///
+/// No second UAC prompt: the exe is manifested `requireAdministrator` and this
+/// process already holds the token, so the child inherits it.
+///
+/// # Errors
+///
+/// If the running executable's path cannot be read, or the child cannot be
+/// spawned. The window keeps its banner in either case — a failed relaunch must
+/// not look like a successful one.
+pub fn relaunch() -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    // The child is deliberately not held: it outlives this process by design,
+    // and waiting on it here would deadlock the window that is about to close.
+    Command::new(&exe).spawn()?;
+    info!(path = %exe.display(), "relaunching after the Npcap install");
+    Ok(())
 }
 
 /// `Ok(())` only for the exact pinned build.
@@ -302,6 +346,17 @@ mod tests {
         let err = verify(&path).expect_err("a 16-byte file is not the installer");
         assert!(err.contains("not the expected"), "got: {err}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_window_side_failure_lands_in_the_same_cell() {
+        // The relaunch is the one failure the worker cannot report; it must not
+        // be able to leave the banner claiming success.
+        let fetcher = Fetcher::new();
+        fetcher.set(Progress::Launched);
+        fetcher.fail("could not restart: access denied".to_owned());
+        assert!(matches!(fetcher.progress(), Progress::Failed(reason)
+            if reason.contains("could not restart")));
     }
 
     #[test]

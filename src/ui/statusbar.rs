@@ -97,10 +97,24 @@ fn install_button(ui: &mut egui::Ui, url: &str, fetcher: &Fetcher) {
             ui.ctx().request_repaint_after(REPAINT_WHILE_FETCHING);
         }
         Progress::Launched => {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                "installer opened — finish it, then restart this app",
-            );
+            ui.colored_label(ui.visuals().warn_fg_color, "installer opened — finish it,");
+            ui.add_space(theme::SP_XS);
+            // The relaunch is one click rather than "close this and open it
+            // again": the tap is opened once, inside the session that already
+            // died, so a fresh process is what picks Npcap up. See
+            // `install::relaunch` for why that is not a re-probe.
+            if ui
+                .button("Restart now")
+                .on_hover_text("starts a fresh copy and closes this window")
+                .clicked()
+            {
+                match crate::install::relaunch() {
+                    Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                    // Reported through the same cell as every other failure, so
+                    // a relaunch that did not happen cannot read as one that did.
+                    Err(err) => fetcher.fail(format!("could not restart: {err}")),
+                }
+            }
         }
         Progress::Failed(reason) => {
             // The retry stays available: the common failures here are transient
