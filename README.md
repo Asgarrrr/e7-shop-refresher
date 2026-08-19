@@ -60,21 +60,18 @@ is extracted, no service is registered by this tool. Instead the app uses
 **Npcap** (the standard Windows packet-capture library, the one Wireshark
 installs), which you install yourself:
 
-1. Download it from **https://npcap.com** and run the installer.
+1. Download and run
+   **https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe**
 
-   **If that page is slow or the download fails**, install Wireshark instead —
-   it bundles Npcap, and its download servers are fast:
-
-   ```
-   winget install WiresharkFoundation.Wireshark
-   ```
-
-   Wireshark's own download page states that *"each Windows package comes with
-   the latest stable release of Npcap"*, so this gets you the same driver by a
-   faster route. It costs about 80 MB against Npcap's ~1 MB, which is still the
-   better trade when npcap.com will not answer — measured from here at a 6–9 s
-   time-to-first-byte, with the direct installer URL failing outright at 19 s.
-   You never have to open Wireshark; the driver is what this app needs.
+   That is Wireshark's build mirror, not npcap.com, and the swap is measured
+   rather than preferred: npcap.com answers in 6–9 seconds from here and its own
+   installer URL failed outright at 19 seconds with the TLS handshake never
+   completing, while the mirror answers in 0.27 s and delivers the 1.3 MB in
+   0.81 s. The file is the genuine installer, not a repackage —
+   Authenticode-signed `CN=Nmap Software LLC`, issued by DigiCert, valid to 2027
+   and timestamped, which you can check yourself with
+   `Get-AuthenticodeSignature npcap-1.88.exe`. **https://npcap.com** remains the
+   canonical home if you would rather go through it.
 2. **Keep the default options.** In particular:
    - Leave *"Restrict Npcap driver's access to Administrators"* **unchecked**
      (that is the default). The app works either way, but unchecking it is what

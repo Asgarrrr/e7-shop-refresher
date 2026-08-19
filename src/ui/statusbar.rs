@@ -40,17 +40,25 @@ fn split_help_url(text: &str) -> Option<(&str, &str, &str)> {
 /// wraps as it did before.
 fn error_banner(ui: &mut egui::Ui, text: &str) {
     let color = ui.visuals().error_fg_color;
-    let Some((before, url, after)) = split_help_url(text) else {
+    if split_help_url(text).is_none() {
         ui.colored_label(color, text);
         return;
-    };
+    }
     ui.horizontal_wrapped(|ui| {
         // The item spacing would otherwise open a gap inside a sentence that
         // was one string a moment ago.
         ui.spacing_mut().item_spacing.x = 0.0;
-        ui.colored_label(color, before);
-        ui.hyperlink_to(url, url);
-        ui.colored_label(color, after);
+        // Every URL, not just the first. The shipped Npcap message carries one,
+        // but a banner that linkifies only the first address and leaves the rest
+        // flat is worse than one that linkifies none: the flat ones read as the
+        // unimportant ones.
+        let mut rest = text;
+        while let Some((before, url, after)) = split_help_url(rest) {
+            ui.colored_label(color, before);
+            ui.hyperlink_to(url, url);
+            rest = after;
+        }
+        ui.colored_label(color, rest);
     });
 }
 
@@ -265,6 +273,19 @@ mod tests {
         // Only https. A cleartext http link in an error banner is one the app
         // should not be teaching anyone to click.
         assert!(split_help_url("see http://example.invalid/x").is_none());
+    }
+
+    #[test]
+    fn the_banner_links_every_url_not_just_the_first() {
+        let view = idle_view();
+        let two = "install Npcap from https://npcap.com/#download (if that page is slow, \
+                   the same signed installer is at \
+                   https://dev-libs.wireshark.org/windows/packages/Npcap/ ), then restart";
+        let harness = Harness::new_ui(|ui| {
+            let _ = render_status_bar(ui, &view, Some(two), true);
+        });
+        harness.get_by_label("https://npcap.com/#download");
+        harness.get_by_label("https://dev-libs.wireshark.org/windows/packages/Npcap/");
     }
 
     #[test]
