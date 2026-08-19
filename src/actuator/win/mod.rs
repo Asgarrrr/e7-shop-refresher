@@ -163,24 +163,9 @@ fn release_twice(
 
 /// Null-terminated UTF-16, the shape W-suffixed Win32 calls want.
 ///
-/// The buffer *is* the value: dropping it leaves the caller passing a
-/// dangling `as_ptr()` to Win32.
-///
-/// Sized up front rather than `collect()`ed: `EncodeUtf16::size_hint` reports a
-/// *lower* bound of `ceil(len / 3)`, which is what `Vec::from_iter` reserves, so
-/// ASCII titles would allocate small and then grow. `text.len() + 1` is exact for
-/// ASCII and never short: one UTF-16 unit per byte at most, plus the terminator.
-///
-/// Callers that run once per process (the shield's class name) use this
-/// directly; the hot path (`find_game_window`) reads the compile-time
-/// `GAME_WINDOW_TITLE_W` instead rather than re-encoding on every call.
-#[must_use]
-pub(super) fn wide(text: &str) -> Vec<u16> {
-    let mut buffer = Vec::with_capacity(text.len() + 1);
-    buffer.extend(text.encode_utf16());
-    buffer.push(0);
-    buffer
-}
+/// `capture::pcap` had a byte-identical copy of this, down to the sizing
+/// argument; both now read [`crate::wide`], which carries that argument once.
+pub(super) use crate::wide::wide;
 
 /// [`GAME_WINDOW_TITLE`] as the NUL-terminated UTF-16 `FindWindowW` wants,
 /// encoded once at compile time.

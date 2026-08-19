@@ -672,16 +672,9 @@ fn npcap_admin_only() -> Option<u32> {
 
 /// NUL-terminated UTF-16, as every `...W` entry point wants it.
 ///
-/// Sized up front rather than collected: `EncodeUtf16::size_hint`'s lower
-/// bound is `ceil(len / 3)`, what `collect` would reserve, so that spelling
-/// allocates small and grows. `len + 1` is exact for ASCII and a safe
-/// over-estimate otherwise.
-fn wide(text: &str) -> Vec<u16> {
-    let mut wide = Vec::with_capacity(text.len() + 1);
-    wide.extend(text.encode_utf16());
-    wide.push(0);
-    wide
-}
+/// `actuator::win` had a byte-identical copy of this, down to the sizing
+/// argument; both now read [`crate::wide`], which carries that argument once.
+use crate::wide::wide;
 
 /// `\Device\NPF_{GUID}` is unreadable in a log line; the GUID alone is enough to
 /// tell two adapters apart.
