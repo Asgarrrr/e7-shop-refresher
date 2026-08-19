@@ -262,10 +262,14 @@ Reading it yourself:
   temp directory, so one of those with no session log beside it means the app
   definitely ran.
 - `wpcap.dll loaded` missing → Npcap is not installed, or its driver is not
-  running. The error that follows says which, and names https://npcap.com — in
-  the window it is a link you can click. **Installing Npcap then needs the app
-  restarted**: the capture tap is opened once, at startup, so a window left open
-  through the install stays dead. If the error says Npcap enumerated no capture
+  running. The error that follows says which. When it is the installer that is
+  missing, the window turns the address into a **Download Npcap** button that
+  fetches the one pinned build, checks it against a pinned SHA-256, and runs it —
+  the address itself is the button's hover text, not 90 characters of link to
+  select out of a sentence. **Installing Npcap then needs the app restarted**:
+  the capture tap is opened once, at startup, so a window left open through the
+  install stays dead — the banner offers a **Restart now** button for that too.
+  If the error says Npcap enumerated no capture
   device at all on a machine that clearly has one, the driver is not running;
   reinstalling Npcap with default options is the fix.
 - `adapter opened and filtered` on no adapter at all → every adapter was

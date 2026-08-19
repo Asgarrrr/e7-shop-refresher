@@ -1,5 +1,8 @@
-# Copy to `config.toml` and adjust. Every key has a default, but the relay
-# refuses to start without at least one [filter] criterion.
+# Copy to `config.toml` and adjust. Every key has a default, and what happens
+# without a [filter] criterion depends on which build you run: the console build
+# refuses to start (it has no editor, so an unrestricted filter could only be
+# fixed here), while the shipped windowed build opens and refuses to *arm* the
+# hunt until you set one, in this file or in the Setup tab.
 
 # Epic Seven game server TCP port. Capture is passive throughout: the tap hands
 # the tool a copy of each matching packet and the original travels on untouched.
