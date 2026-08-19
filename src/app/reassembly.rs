@@ -183,8 +183,14 @@ async fn flush_anchor(
         };
         match status {
             ForwardStatus::Open => {}
-            // Both forms of pressure abandon the rest of the burst: its bytes
-            // belong to an origin that no longer exists.
+            // Either form of pressure abandons the rest of the burst. For the
+            // flow that actually failed, its bytes belong to an origin that no
+            // longer exists; for the others under a shared-quota failure, they
+            // are dropped as conservatism rather than necessity — one anchor
+            // window is re-armed here and the surviving flows carry on through
+            // it. `ReassemblyOutcome` deliberately does not distinguish the two
+            // (`stream::reassembly` does, and sizes the eviction to the cause);
+            // the caller's response is the same either way.
             ForwardStatus::Pressure => {
                 *anchor = AnchorState::AwaitingFirst;
                 return true;

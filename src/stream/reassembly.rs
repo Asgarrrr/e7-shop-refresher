@@ -158,15 +158,42 @@ impl Reassembler {
         // compile error here, not a runtime panic that kills the session.
         match outcome {
             HalfOutcome::Chunks(chunks) => ReassemblyOutcome::Chunks(chunks),
-            HalfOutcome::Pressure => {
-                // All anchors are invalid after a shared pending-quota
-                // failure; clearing lets the next segment start cleanly.
-                self.clear();
+            HalfOutcome::Pressure(cause) => {
+                // The two refusals inside `buffer_future` have very different
+                // blast radii, and this arm used to apply the wider one to
+                // both. `MAX_PENDING_BYTES` is a *per-stream* cap (8 MiB) and
+                // half `REASSEMBLY_STAGE_BYTES`, so a single stream reaches it
+                // without the shared pool being anywhere near full — the
+                // compile-time assert in the parent module exists to keep it
+                // that way. Capture is port-wide (`tcp and src port …`, no host
+                // filter), so a connection lingering from before a reconnect,
+                // or anything else sending from that port, mints a second
+                // `FlowKey`, loses one segment, and piles 8 MiB behind the gap.
+                // Clearing the whole map then took the game's own flow with it:
+                // it lost `baseline` and `next_off` mid-message and had to
+                // re-anchor, costing that refresh's shop snapshot, over a quota
+                // it never touched. Only the stream that overflowed is dropped
+                // now. It has to re-anchor regardless — FIN is not modelled, so
+                // the gap it is waiting behind will never be filled — but that
+                // is one flow's continuity, not everyone's.
+                //
+                // Shared-stage exhaustion is the opposite case and keeps the
+                // wide reset: the bytes that have to be handed back before
+                // *anyone* can buffer again are precisely the other streams'
+                // pending buffers, so dropping all of them is the recovery
+                // rather than collateral damage.
+                match cause {
+                    PressureCause::Stream => {
+                        self.streams.remove(&key);
+                    }
+                    PressureCause::Shared => self.clear(),
+                }
                 // Drop metrics identify only the packet that caused recovery;
-                // chunks discarded by the clear are collateral, not extra captures.
+                // chunks discarded by the reset above — one stream's or every
+                // stream's — are collateral, not extra captures.
                 budget.record_drop(dropped_capacity);
                 budget.record_resync();
-                warn_reassembly_pressure(&budget);
+                warn_reassembly_pressure(&budget, cause);
                 ReassemblyOutcome::Pressure
             }
         }
@@ -266,11 +293,11 @@ impl HalfStream {
         // returned by value twice per packet — an unmeasured malloc-for-memcpy
         // trade. Nothing here is profiled, and `mem-smallvec` asks for one first.
         let mut out = Vec::with_capacity(1);
-        if !self.absorb(offset, payload, &mut out) {
-            return HalfOutcome::Pressure;
+        if let Err(cause) = self.absorb(offset, payload, &mut out) {
+            return HalfOutcome::Pressure(cause);
         }
-        if !self.drain(&mut out) {
-            return HalfOutcome::Pressure;
+        if let Err(cause) = self.drain(&mut out) {
+            return HalfOutcome::Pressure(cause);
         }
         HalfOutcome::Chunks(out)
     }
@@ -281,9 +308,9 @@ impl HalfStream {
         offset: i64,
         mut payload: BudgetedChunk,
         out: &mut Vec<BudgetedChunk>,
-    ) -> bool {
+    ) -> Result<(), PressureCause> {
         if payload.as_slice().is_empty() {
-            return true;
+            return Ok(());
         }
         if offset > self.next_off {
             return self.buffer_future(offset, payload);
@@ -295,8 +322,10 @@ impl HalfStream {
         // segment — freezing this half-stream forever, silently.
         let Ok(already) = usize::try_from(self.next_off - offset) else {
             report_absorb_invariant(self.next_off, offset);
-            // Deliver nothing, but don't report pressure — a spurious `false` here would clear every anchor of every flow.
-            return true;
+            // Deliver nothing, but don't report pressure: no quota refused
+            // anything here, and inventing one would throw away an anchor —
+            // this stream's at least — over an arithmetic bug in this function.
+            return Ok(());
         };
         if already < payload.as_slice().len() {
             if already != 0 {
@@ -305,10 +334,24 @@ impl HalfStream {
             self.next_off += payload.as_slice().len() as i64;
             out.push(payload);
         }
-        true
+        Ok(())
     }
 
-    fn buffer_future(&mut self, offset: i64, mut payload: BudgetedChunk) -> bool {
+    /// Buffers a segment that sits past the gap, or reports which quota
+    /// refused it.
+    ///
+    /// The two refusals are checked in that order for a reason beyond
+    /// cheapness (`fits_pending` is arithmetic on a field; `try_retag_pending`
+    /// takes the shared budget mutex): the per-stream cap is the tighter of
+    /// the two by construction, so asking it first attributes an overflow to
+    /// the stream that caused it even when the shared pool happens to be
+    /// nearly full as well. Reversing them would blame the pool for a stream
+    /// that had already exhausted its own allowance.
+    fn buffer_future(
+        &mut self,
+        offset: i64,
+        mut payload: BudgetedChunk,
+    ) -> Result<(), PressureCause> {
         let capacity = payload.capacity();
         // One `entry` probe, not `get`+`remove`+`insert`, saves two `O(log n)`
         // walks and displaces a chunk only once the new one clears the quota.
@@ -316,14 +359,14 @@ impl HalfStream {
             Entry::Occupied(mut slot) => {
                 // Keep only the largest segment seen at a given offset.
                 if slot.get().as_slice().len() >= payload.as_slice().len() {
-                    return true;
+                    return Ok(());
                 }
                 let held = pending_after_release(self.pending_bytes, slot.get().capacity());
                 let Some(total) = fits_pending(held, capacity) else {
-                    return false;
+                    return Err(PressureCause::Stream);
                 };
                 if !payload.try_retag_pending() {
-                    return false;
+                    return Err(PressureCause::Shared);
                 }
                 self.pending_bytes = total;
                 // Returns the displaced chunk, whose lease releases as it drops.
@@ -331,31 +374,29 @@ impl HalfStream {
             }
             Entry::Vacant(slot) => {
                 let Some(total) = fits_pending(self.pending_bytes, capacity) else {
-                    return false;
+                    return Err(PressureCause::Stream);
                 };
                 if !payload.try_retag_pending() {
-                    return false;
+                    return Err(PressureCause::Shared);
                 }
                 self.pending_bytes = total;
                 slot.insert(payload);
             }
         }
-        true
+        Ok(())
     }
 
     /// Flushes buffered segments that became contiguous once `next_off` advanced.
-    fn drain(&mut self, out: &mut Vec<BudgetedChunk>) -> bool {
+    fn drain(&mut self, out: &mut Vec<BudgetedChunk>) -> Result<(), PressureCause> {
         while let Some((&offset, _)) = self.pending.first_key_value() {
             if offset > self.next_off {
                 break; // gap still present.
             }
             let (offset, payload) = self.pending.pop_first().expect("peeked above");
             self.pending_bytes = pending_after_release(self.pending_bytes, payload.capacity());
-            if !self.absorb(offset, payload, out) {
-                return false;
-            }
+            self.absorb(offset, payload, out)?;
         }
-        true
+        Ok(())
     }
 
     /// Sequence number of the next expected byte: `baseline + next_off`, back
@@ -380,9 +421,17 @@ fn report_absorb_invariant(next_off: i64, offset: i64) {
 /// The rare branch of [`Reassembler::push_budgeted`]'s pressure arm: the budget mutex and seven fields belong off the per-packet path.
 #[cold]
 #[inline(never)]
-fn warn_reassembly_pressure(budget: &PipelineBudget) {
+fn warn_reassembly_pressure(budget: &PipelineBudget, cause: PressureCause) {
     let stats = budget.snapshot();
+    // The scope is the first thing worth knowing from a log line like this:
+    // the same counters accompany a flood on some unrelated port and a genuine
+    // pool exhaustion, and only the second is a reason to revisit the quotas.
+    let scope = match cause {
+        PressureCause::Stream => "one stream's own pending cap; that flow re-anchors",
+        PressureCause::Shared => "the shared reassembly quota; every flow re-anchors",
+    };
     warn!(
+        scope,
         current_total = stats.current_total,
         capture_bytes = stats.current_capture,
         pending_bytes = stats.current_reassembly,
@@ -394,9 +443,26 @@ fn warn_reassembly_pressure(budget: &PipelineBudget) {
     );
 }
 
+/// Which of the two independent quotas refused to buffer a segment.
+///
+/// They are separate limits, not two readings of one: [`MAX_PENDING_BYTES`]
+/// bounds a single stream's gap buffer and is half the reassembly stage's
+/// share of the pool, so either can be reached with the other still slack.
+/// The distinction only exists so [`Reassembler::push_budgeted`] can size the
+/// recovery to the failure; nothing above this module sees it.
+///
+/// [`MAX_PENDING_BYTES`]: super::MAX_PENDING_BYTES
+#[derive(Clone, Copy)]
+enum PressureCause {
+    /// This one stream filled its own pending-byte cap.
+    Stream,
+    /// The reassembly stage's shared quota is full, whoever holds it.
+    Shared,
+}
+
 enum HalfOutcome {
     Chunks(Vec<BudgetedChunk>),
-    Pressure,
+    Pressure(PressureCause),
 }
 
 /// What [`Reassembler::push_budgeted`] did with a segment.
@@ -404,8 +470,12 @@ pub(crate) enum ReassemblyOutcome {
     /// The bytes that became contiguous, in order. Empty is normal: a
     /// duplicate, a partial gap fill, or a segment still waiting on a predecessor.
     Chunks(Vec<BudgetedChunk>),
-    /// The pending-byte quota was exhausted: every flow's state has been
-    /// cleared and the caller must re-anchor. Not a "nothing yet".
+    /// A pending-byte quota was exhausted and the segment's flow has lost its
+    /// place in the stream: its state is gone and the caller must re-anchor.
+    /// Not a "nothing yet". Whether the other tracked flows were cleared too
+    /// depends on which quota failed and is deliberately not reported here —
+    /// the caller re-arms one anchor window either way, and any flow that kept
+    /// its baseline simply carries on through it.
     Pressure,
 }
 
@@ -436,7 +506,7 @@ const fn seq_diff(a: u32, b: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::{flow, flow_from, sized_seg, test_budget};
+    use crate::stream::{MAX_PENDING_BYTES, flow, flow_from, sized_seg, test_budget};
 
     fn seg_in(flow: FlowKey, seq: u32, syn: bool, payload: &[u8]) -> Segment {
         Segment {
@@ -461,10 +531,16 @@ mod tests {
                 .into_iter()
                 .flat_map(|chunk| chunk.into_parts().0)
                 .collect(),
-            HalfOutcome::Pressure => Vec::new(),
+            HalfOutcome::Pressure(_) => Vec::new(),
         }
     }
 
+    /// The shared arm: 64 streams holding 16 pending bytes each, none of them
+    /// anywhere near its own 8 MiB cap, exhaust the reassembly stage between
+    /// them. That is the one case where every anchor deserves to go — the
+    /// bytes that have to come back are spread across all 64 buffers — so the
+    /// wide `clear()` is asserted here, by the reassembly total returning to
+    /// zero rather than to the 63 buffers a per-stream eviction would leave.
     #[test]
     fn pending_bytes_are_global_across_sixty_four_streams() {
         let budget = test_budget(4096, 4096, 1024, 4096);
@@ -480,6 +556,13 @@ mod tests {
             assert!(budget.snapshot().current_total <= 4096);
         }
         assert_eq!(budget.snapshot().current_reassembly, 1024);
+        // Exactly the check the failing stream is about to run: its own cap
+        // still has room, so what refuses below is the shared quota and this
+        // stays a test of the shared arm even if the constants move.
+        assert!(
+            fits_pending(16, 16).is_some(),
+            "the per-stream cap must not be the limit under test here"
+        );
         assert!(matches!(
             reassembler.push_budgeted(
                 budget
@@ -488,6 +571,89 @@ mod tests {
             ),
             ReassemblyOutcome::Pressure
         ));
+        assert_eq!(budget.snapshot().current_reassembly, 0);
+        drop(reassembler);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// The per-stream arm, and the reason the two are told apart at all.
+    ///
+    /// Capture is port-wide, so a second flow on the game port is ordinary:
+    /// a connection left over from before a reconnect, or anyone else sending
+    /// from it. Give that flow a gap and it buffers up to its own 8 MiB cap —
+    /// reachable on its own, since the cap is half the reassembly stage's
+    /// share — while the flow that matters is mid-message. Losing the game
+    /// flow's baseline there costs a whole shop refresh, so the recovery must
+    /// stop at the stream that overflowed.
+    ///
+    /// Every shared quota is set to four times the per-stream cap, which is
+    /// what keeps this a test of `fits_pending` and not a second spelling of
+    /// the shared-arm test above: `try_retag_pending` cannot fail with that
+    /// much slack, and the snapshot below pins the slack that was actually
+    /// there at the moment of refusal.
+    #[test]
+    fn a_stream_that_fills_its_own_pending_cap_leaves_every_other_anchor_alone() {
+        const CHUNK: usize = 64 * 1024;
+        const SHARED: usize = MAX_PENDING_BYTES * 4;
+        let budget = test_budget(SHARED, SHARED, SHARED, SHARED);
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let game = flow_from(51000);
+        let stranger = flow_from(51001);
+
+        assert_eq!(push(&mut reassembler, seg_on(game, 1000, b"AB")), b"AB");
+        // The stranger anchors, then loses the byte at 1001 forever.
+        assert_eq!(push(&mut reassembler, seg_on(stranger, 1000, b"A")), b"A");
+
+        let capacity_chunks = MAX_PENDING_BYTES / CHUNK;
+        for index in 0..capacity_chunks {
+            let seq = 2000 + (index * CHUNK) as u32;
+            assert!(
+                push(&mut reassembler, sized_seg(stranger, seq, CHUNK, CHUNK)).is_empty(),
+                "chunk {index} sits behind the gap and delivers nothing"
+            );
+        }
+        let before = budget.snapshot();
+        assert_eq!(before.current_reassembly, MAX_PENDING_BYTES);
+        assert!(
+            before.current_reassembly + CHUNK <= SHARED,
+            "the shared quota must still have room, or this proves nothing"
+        );
+
+        let overflow = 2000 + (capacity_chunks * CHUNK) as u32;
+        assert!(matches!(
+            reassembler.push_budgeted(
+                budget
+                    .admit_capture(sized_seg(stranger, overflow, CHUNK, CHUNK))
+                    .unwrap()
+            ),
+            ReassemblyOutcome::Pressure
+        ));
+
+        assert!(
+            !reassembler.streams.contains_key(&stranger),
+            "the stream that overflowed must lose its state and re-anchor"
+        );
+        assert!(
+            reassembler.streams.contains_key(&game),
+            "another flow's private cap is not this flow's problem: its anchor must survive"
+        );
+        let survivor = &reassembler.streams[&game];
+        assert_eq!(survivor.baseline, Some(1000));
+        assert_eq!(survivor.next_off, 2);
+        // The behavioural half of the same claim, and the assertion that goes
+        // red on the old `self.clear()`: a retransmission is recognisable as
+        // history only while the anchor holds. A cleared flow re-anchors on it
+        // and delivers "AB" a second time — two bytes of duplicate injected
+        // mid-message into a decoder that can resync but cannot un-see them.
+        assert!(
+            push(&mut reassembler, seg_on(game, 1000, b"AB")).is_empty(),
+            "the surviving flow must still know 1000 is behind it"
+        );
+        assert_eq!(push(&mut reassembler, seg_on(game, 1002, b"CD")), b"CD");
+
         assert_eq!(budget.snapshot().current_reassembly, 0);
         drop(reassembler);
         assert_eq!(budget.snapshot().current_total, 0);
