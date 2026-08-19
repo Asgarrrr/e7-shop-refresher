@@ -212,6 +212,41 @@ mod tests {
         }
     }
 
+    /// Slot tolerance at the envelope, which is where the outage happened.
+    ///
+    /// `domain::shop`'s own tests pin `lenient_slots` at the `ShopSnapshot`
+    /// level, and that is where the decision lives — but the failure was a whole
+    /// `ServerMessage` refused, taking the merchant, the refresh meta and the
+    /// five good slots with it, and this module is the only place the crate
+    /// decodes one off JSON. The inner test cannot pass while the outer one
+    /// fails, so this is not a second opinion; it is the assertion that the
+    /// tolerance is reachable from the wire at all.
+    ///
+    /// `slot: 300` overflows the `u8`, which is a per-element failure. A `slots`
+    /// that is not an array at all is the other half: the whole list degrades to
+    /// empty, and the message still arrives.
+    #[test]
+    fn one_undecodable_slot_costs_its_slot_and_not_the_message() {
+        let snapshot = shop(
+            r#"{"type":"shop","merchant":"Secret Shop",
+                 "slots":[{"id":101,"slot":1},{"id":102,"slot":300}],
+                 "refresh":{"crystal_balance":95,"cost":3}}"#,
+        );
+        assert_eq!(snapshot.slots.len(), 1, "the readable slot must survive");
+        assert_eq!(snapshot.slots[0].id, CatalogId::new(101));
+        // The fields that used to die with the message: everything outside
+        // `slots` is what makes a refused envelope expensive.
+        assert_eq!(snapshot.merchant.as_deref(), Some("Secret Shop"));
+        assert_eq!(
+            snapshot.refresh.map(|meta| meta.cost),
+            Some(Crystals::new(3))
+        );
+
+        let scalar = shop(r#"{"type":"shop","merchant":"Secret Shop","slots":7}"#);
+        assert!(scalar.slots.is_empty());
+        assert_eq!(scalar.merchant.as_deref(), Some("Secret Shop"));
+    }
+
     #[test]
     fn unknown_type_still_falls_back() {
         let message = parse(r#"{"type":"telemetry","whatever":1}"#);

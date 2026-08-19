@@ -146,5 +146,12 @@ coverage:
 # a failure: read `mutants.out/missed.txt` and decide per mutant whether the
 # expression was unobservable (then it is noise) or whether the test that should
 # have noticed cannot fail (then it is the thing this lane was built to find).
+#
+# No `--shard` here, deliberately: a local run should be complete. The cost is
+# that this recipe says nothing about how CI splits the same set — four shards,
+# `0/4` through `3/4`, whose matrix lives in `.github/workflows/quality.yml`,
+# where an off-by-one once left shard 0 unevaluated while the lane reported
+# green. The file list and `--timeout` below are the two halves that *must* stay
+# in step with that job; the sharding is the one that must not.
 mutants:
     cargo mutants --file src/actuator/plan/geometry.rs --file src/actuator/plan/jobs.rs --file src/domain/control/mod.rs --file src/domain/control/watchdog.rs --file src/domain/control/dedup.rs --timeout 120
