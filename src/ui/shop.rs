@@ -24,7 +24,18 @@ pub(super) fn render_shop_tab(
     }
     if rows.is_empty() {
         super::content_inset(ui, |ui| {
-            ui.weak("the last shop message carried no slots — re-open the shop in game");
+            // Names no cause, because this line no longer has one. It used to be
+            // reachable only from a genuinely slotless shop, so "re-open it in
+            // game" was sound advice; since `domain::shop::lenient_slots` began
+            // degrading an unusable `slots` to empty rather than failing the
+            // whole message, the same line is also what a *server* fault looks
+            // like — and sending the player to act on the game for a payload
+            // problem is the same misattribution the tolerance was filed
+            // against. The log has the `warn!` that tells the two apart, which
+            // is why the advice is to send it.
+            ui.weak(
+                "the last shop message carried no usable slots — if this repeats, send the log",
+            );
         });
         return;
     }
@@ -234,12 +245,25 @@ mod tests {
         harness.get_by_label("SLOT");
     }
 
+    /// Two claims, and the second is the one that moved: the placeholder must
+    /// not resurrect onboarding, and it must not blame the player for a payload
+    /// only the server could have sent. An empty `rows` reaches here from a
+    /// slotless shop *and* from a `slots` the decoder degraded, and the text
+    /// cannot tell which — so it must not pretend to.
     #[test]
-    fn slotless_snapshot_shows_the_reopen_hint_not_quick_start() {
+    fn slotless_snapshot_shows_a_hint_that_blames_nobody_not_quick_start() {
         let (ctrl, view, rows) = captured(vec![]);
         let detail = details(&ctrl);
         let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view, rows.rows(), &detail));
         assert!(harness.query_by_label("QUICK START").is_none());
-        harness.get_by_label("the last shop message carried no slots — re-open the shop in game");
+        harness.get_by_label(
+            "the last shop message carried no usable slots — if this repeats, send the log",
+        );
+        assert!(
+            harness
+                .query_by_label("the last shop message carried no slots — re-open the shop in game")
+                .is_none(),
+            "the old wording sent the player to act on the game for a server fault"
+        );
     }
 }
