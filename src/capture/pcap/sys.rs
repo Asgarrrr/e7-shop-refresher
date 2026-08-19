@@ -207,9 +207,9 @@ pub(super) const DLL_CANDIDATES: [&str; 2] = ["wpcap.dll", r"C:\Windows\System32
 /// the still-open window is looking at a dead session with nothing to click. The
 /// sentence is the cheap half of that fix; the expensive half is a re-probe that
 /// rebuilds the session in place, which `docs/npcap-provisioning.md` leaves open.
-pub(super) const INSTALL_HINT: &str = "install Npcap from https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe \
-     — leave \"Restrict Npcap driver's access to Administrators\" UNCHECKED, \
-     then restart this app";
+pub(super) const INSTALL_HINT: &str = "Npcap is missing, and the capture needs it. \
+     https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe \
+     Keep the installer's defaults, then restart this app.";
 
 impl Wpcap {
     pub(super) fn load() -> Result<(Self, &'static str)> {
@@ -275,17 +275,16 @@ impl Wpcap {
             };
             return Ok((resolved, path));
         }
-        // Action first, diagnostics last. This string is the whole of what a
-        // player without Npcap ever sees, and it reaches them through
-        // `SessionErrorSlot` into a non-selectable label in a 500 px window:
-        // with the two candidate paths and their OS error text in front, the
-        // download URL sat past 300 characters, off the end of what anyone
-        // reads. The paths still matter when Npcap *is* installed and the load
-        // failed anyway, so they stay — behind the sentence that fixes it.
-        Err(Error::Capture(format!(
-            "{INSTALL_HINT}. (wpcap.dll could not be loaded: {})",
-            failures.join("; ")
-        )))
+        // The candidate paths and their OS errors go to the log, not to the
+        // player. They only ever matter when Npcap *is* installed and the load
+        // failed anyway — a case for whoever reads `logs\*.log`, not for the
+        // banner, where they turned one actionable sentence into six lines of
+        // red that nobody finishes.
+        warn!(
+            candidates = %failures.join("; "),
+            "no wpcap.dll could be loaded"
+        );
+        Err(Error::Capture(INSTALL_HINT.to_owned()))
     }
 
     pub(super) fn version(&self) -> String {

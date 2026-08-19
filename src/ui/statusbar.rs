@@ -33,11 +33,17 @@ fn split_help_url(text: &str) -> Option<(&str, &str, &str)> {
     Some((&text[..start], &rest[..len], &rest[len..]))
 }
 
-/// The error line, with any URL in it clickable.
+/// The error line, with any URL in it turned into something clickable.
 ///
-/// `horizontal_wrapped` rather than one label: the parts have to sit on one
-/// flowing line, and the banner is the full panel width, so a long message
-/// wraps as it did before.
+/// A URL that ends in `.exe` becomes a **button** rather than a link. The
+/// difference is not decoration: a 90-character address rendered inline is what
+/// made this banner six lines of red that nobody finishes, and "Download" is
+/// what the player is actually being asked to do. Anything else stays a plain
+/// hyperlink showing its address, because for a documentation page the address
+/// *is* the information.
+///
+/// `horizontal_wrapped` so the parts still flow as one sentence at the panel's
+/// width.
 fn error_banner(ui: &mut egui::Ui, text: &str) {
     let color = ui.visuals().error_fg_color;
     if split_help_url(text).is_none() {
@@ -45,20 +51,28 @@ fn error_banner(ui: &mut egui::Ui, text: &str) {
         return;
     }
     ui.horizontal_wrapped(|ui| {
-        // The item spacing would otherwise open a gap inside a sentence that
-        // was one string a moment ago.
+        // Item spacing would otherwise open a gap inside a sentence that was one
+        // string a moment ago; the button gets its own padding back.
         ui.spacing_mut().item_spacing.x = 0.0;
         // Every URL, not just the first. The shipped Npcap message carries one,
-        // but a banner that linkifies only the first address and leaves the rest
-        // flat is worse than one that linkifies none: the flat ones read as the
+        // but a banner that handles only the first address and leaves the rest
+        // flat is worse than one that handles none: the flat ones read as the
         // unimportant ones.
         let mut rest = text;
         while let Some((before, url, after)) = split_help_url(rest) {
-            ui.colored_label(color, before);
-            ui.hyperlink_to(url, url);
+            ui.colored_label(color, before.trim_end());
+            if url.to_ascii_lowercase().ends_with(".exe") {
+                ui.add_space(theme::SP_XS);
+                if ui.button("Download").on_hover_text(url).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+                ui.add_space(theme::SP_XS);
+            } else {
+                ui.hyperlink_to(url, url);
+            }
             rest = after;
         }
-        ui.colored_label(color, rest);
+        ui.colored_label(color, rest.trim_start());
     });
 }
 
@@ -305,6 +319,30 @@ mod tests {
         // The address is its own widget, so it is clickable rather than a run of
         // characters to be selected out of a 270-character line.
         harness.get_by_label("https://npcap.com/#download");
+    }
+
+    /// The shipped message points at an `.exe`, and that one becomes a button
+    /// labelled `Download` — not a 90-character address rendered inline, which
+    /// is what turned this banner into six lines of red.
+    #[test]
+    fn an_installer_url_becomes_a_button_not_an_address() {
+        let view = idle_view();
+        let msg = "Npcap is missing, and the capture needs it. \
+                   https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe \
+                   Keep the installer's defaults, then restart this app.";
+        let harness = Harness::new_ui(|ui| {
+            let _ = render_status_bar(ui, &view, Some(msg), true);
+        });
+        harness.get_by_label("Download");
+        // The address itself is not on screen; it is the button's hover text.
+        assert!(
+            harness
+                .query_by_label(
+                    "https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe"
+                )
+                .is_none(),
+            "the raw address should not be rendered beside the button"
+        );
     }
 
     #[test]
