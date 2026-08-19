@@ -152,6 +152,31 @@ rule, which erodes the "installs nothing" argument that motivated the idea.
 Rejected as unproven. It remains the only candidate that would beat Npcap on
 install footprint.
 
+**Re-measured 2026-08-19** on Windows 11 26200, Wi-Fi, all three firewall
+profiles enabled, after the question was reopened. Same answer, and this time
+with a ground truth rather than a packet count: `curl` wrote exactly 30 000 000
+bytes to disk while the socket reported **zero inbound TCP packets and zero
+inbound TCP bytes** — and 3 173 *outbound* TCP packets averaging **52 bytes**,
+which is pure ACK size. The machine therefore received 30 MB and acknowledged
+it, packet by packet, while the socket showed none of it. Two possible artefacts
+were ruled out rather than argued away: a 64 MB receive buffer changed nothing,
+and 2 962 inbound *UDP* packets arrived in the same window, so inbound delivery
+works in general and it is TCP specifically that is withheld. `RCVALL_ON` and
+`RCVALL_IPLEVEL` behave identically.
+
+One fact that is new and belongs here for whoever picks this up if the firewall
+question is ever settled: **`connect()` on the raw socket still filters by source
+address under `SIO_RCVALL`.** Measured in both orderings (connect before the
+ioctl and after): an unconnected socket saw 10 971 packets from 3 sources while a
+connected one saw 10, from the connected peer only, with zero leakage. That
+matters because the strongest objection to a raw-socket backend is not the
+install footprint but the loss of the kernel-side BPF filter — this crate's
+README promises that no other traffic is even copied, and a userspace filter
+makes that false. `connect()` gives a kernel-side filter back, narrowed to one
+peer, and `GetExtendedTcpTable` can supply that peer's address from the game's
+PID without capturing anything. None of it rescues the design today, because the
+packets it would filter never arrive.
+
 **A local relay (proxy) the game connects through.** Never evaluated in the
 earlier note, and it should have been, because it is the obvious answer for
 anyone who has done this on a platform with a proxy setting. Rejected on what it
@@ -210,7 +235,13 @@ Two secondary points, both measured rather than assumed:
   antivirus the way WinDivert is.
 - **A confirmed Windows Firewall rule making inbound TCP reach `SIO_RCVALL`.**
   That would be strictly better on install footprint than any driver, and the
-  probe used to measure it is easy to rebuild.
+  probe used to measure it is easy to rebuild. Note this is now the *only* thing
+  standing in the way: the second objection — no kernel-side filter, and so no
+  honest way to keep the README's "no other traffic is even copied" — was
+  answered by the `connect()` measurement above. Whoever tests the firewall
+  hypothesis should establish a ground truth first (download a known byte count
+  and compare), because packet counts alone made this look like a quiet network
+  twice.
 - **A PktMon revision exposing a documented single-tap capture mode at the IP
   layer.** As of Windows 11 26200, no such mode exists.
 - **Evidence that the per-adapter fan-out does not scale** on a machine with many
