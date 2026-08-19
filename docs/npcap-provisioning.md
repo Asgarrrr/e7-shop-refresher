@@ -195,48 +195,71 @@ taste. They are listed in the next section because they are the work.
 
 ## What happens today, exactly
 
-`Wpcap::load` (`src/capture/pcap/sys.rs`) tries `wpcap.dll` and then
-`C:\Windows\System32\Npcap\wpcap.dll`; both failing yields
+**Exercised on real hardware, 2026-08-19.** Both x64 `wpcap.dll` copies were
+renamed aside on a machine with Npcap 1.10.4 installed, reproducing exactly what
+`Wpcap::load` sees where Npcap is absent — its two candidates are `wpcap.dll`
+(by name, so System32) and `C:\Windows\System32\Npcap\wpcap.dll`. The console
+build was run against that state. This is the first time this path has been
+observed rather than reasoned about.
 
 ```text
-could not load wpcap.dll (<per-candidate reasons>) — install Npcap from
-https://npcap.com/#download and leave "Restrict Npcap driver's access to
-Administrators" UNCHECKED
+Fatal error: network capture: install Npcap from https://npcap.com/#download and
+leave "Restrict Npcap driver's access to Administrators" UNCHECKED. (wpcap.dll
+could not be loaded: wpcap.dll: LoadLibraryExW failed;
+C:\Windows\System32\Npcap\wpcap.dll: LoadLibraryExW failed)
 ```
 
-That `Error::Capture` travels `PcapSource::open` → `build_source`
-(`src/app/mod.rs`) → the `?` in `Session::run` → `app::supervise`, which
-prefixes it `session error: ` → `SessionErrorSlot` → `render_status_bar`
-(`src/ui/statusbar.rs`), which draws it with `ui.colored_label`.
+The `Error::Capture` travels `PcapSource::open` → `build_source`
+(`src/app/mod.rs`) → the `?` in `Session::run`. The two lanes diverge there, and
+only one of them goes through `supervise`: the console arm calls `app::run`
+directly and prints `Fatal error: `, while the GUI arm (`main.rs:225`) goes
+through `app::supervise`, which prefixes `session error: `, into
+`SessionErrorSlot` → `render_status_bar` (`src/ui/statusbar.rs`). They never
+stack; a player sees one prefix or the other.
 
-Three things are wrong with that, and they are what this decision funds:
+Of the three defects this decision funded, two are fixed (`e16ab73`) and one is
+open.
 
-1. **The link cannot be used.** The message arrives as one unbroken string,
-   prefixed with `session error:`, in a plain `ui.colored_label` at the top of a
-   500-px window. `INSTALL_HINT` alone is 135 characters, and `Wpcap::load`
-   joins *both* failed candidate paths with their OS error text in front of it,
-   so the real line is upwards of 300 — the two `wpcap.dll` paths and their
-   `libloading` errors are read first, and the actionable half last. egui labels
-   are not
-   selectable by default and a bare URL in one is not clickable. The single most
-   actionable token this product ever emits is the one token its only surface
-   cannot hand over. Note that `src/ui/theme.rs:78` already sets
-   `visuals.hyperlink_color = ACCENT` — for a hyperlink nothing in the crate
-   renders.
-2. **One branch gives advice the player has already taken.**
-   `no_usable_device_error`'s `AdminOnly` arm ends "…reinstall it with … or **run
-   this app elevated**". The shipped exe is manifested `requireAdministrator`
-   (`build.rs`); the player approved a UAC prompt to reach that message. In the
-   shipped build that branch should be unreachable *because* the process is
-   elevated — which is precisely what `docs/capture-backend-choice.md` says
-   ("a machine that did tick it still works"). The sentence is a leftover from
-   the unelevated-capture probe and now points at a non-fix.
-3. **There is no way back without a relaunch.** `PcapSource::open` runs once,
-   from `Session::run`, at startup. A player who reads the message, installs
-   Npcap, and returns to the window is looking at a dead session, and nothing
-   tells them to restart the app. The README's troubleshooting section has the
-   same gap: it explains what `wpcap.dll loaded` missing means, and never says
-   that fixing it needs the app relaunched.
+1. **The link is reachable now.** ~~The message arrives as one unbroken
+   string…~~ **Fixed, and the original claim here was overstated.** This section
+   asserted the line was "upwards of 300" characters. Measured against the live
+   output: the whole string is **269** characters and the URL began at character
+   **171**. Bad, but not what was written — an estimate repeated as a
+   measurement, which is the habit the rest of these documents exist to avoid.
+   With the hint moved in front of the diagnostics the URL now begins at
+   character **49** (console) or **51** (GUI, whose prefix is two characters
+   longer). The candidate paths are still there, behind the sentence that fixes
+   the problem, because they are what distinguishes "no Npcap" from "Npcap
+   present and the load failed anyway".
+
+   Still true and still unfunded: egui labels are not selectable by default and a
+   bare URL in one is not clickable, so the player must retype it.
+   `src/ui/theme.rs:78` already sets `visuals.hyperlink_color = ACCENT` — for a
+   hyperlink nothing in the crate renders.
+2. **The advice the player had already taken is gone.** ~~`no_usable_device_error`'s
+   `AdminOnly` arm ends "…or run this app elevated".~~ **Fixed.** The shipped exe
+   is manifested `requireAdministrator` (`build.rs`), so anyone reading that
+   message approved a UAC prompt to get there and has nothing left to raise;
+   reinstalling with the box unchecked is now the only lever offered.
+
+   Worth recording because it bounds what can ever be tested: that branch is
+   close to unreachable in the shipped build *by construction*. `AdminOnly=1`
+   restricts non-administrator processes, and this process is always elevated, so
+   reaching it needs an elevated process that still enumerates no adapter. A
+   `wpcap.dll` rename cannot produce that state, and neither can uninstalling
+   Npcap. The fix is a reading of the code, not an observation.
+3. **There is still no way back without a relaunch.** `PcapSource::open` runs
+   once, from `Session::run`, at startup. A player who reads the message,
+   installs Npcap, and returns to the window is looking at a dead session, and
+   nothing tells them to restart the app. The README's troubleshooting section
+   has the same gap.
+
+   Deliberately not fixed: a Retry button rests on whether a fresh Npcap install
+   is visible to an already-running process, and that has not been measured. The
+   live run above could not settle it either — it restores a DLL that was present
+   when the process started, which is not the same question. Building the button
+   on an untested assumption is how `capture-backend-choice.md` got rewritten
+   twice.
 
 ## What the decision costs
 

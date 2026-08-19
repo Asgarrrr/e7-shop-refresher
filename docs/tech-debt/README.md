@@ -93,9 +93,13 @@ clean, and the 63 `// SAFETY:` blocks still 63.
   redistribution is forbidden, the silent installer is an OEM feature starting at
   $39,980, and winget has no Npcap package (measured). The licensor recommends exactly
   what the README already does. See [`../npcap-provisioning.md`](../npcap-provisioning.md).
-  The research's real yield was two defects in what a player without Npcap sees: the
-  download URL sat past 300 characters of DLL paths in a non-selectable label, and the
-  `AdminOnly` branch advised running the app elevated — which it already is, by manifest.
+  The research's real yield was two defects in what a player without Npcap sees, both
+  fixed in `e16ab73` and since **exercised on real hardware** by hiding the two x64
+  `wpcap.dll` copies: the download URL sat behind the DLL paths in a non-selectable
+  label, and the `AdminOnly` branch advised running the app elevated — which it already
+  is, by manifest. The URL moved from character 171 to 49. Both the ADR and the commit
+  message had said "past 300", an estimate repeated as a measurement; the whole string
+  is 269 characters. Corrected at both sites.
 
 ### Validated on real hardware
 
