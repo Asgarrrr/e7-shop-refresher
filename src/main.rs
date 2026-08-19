@@ -84,8 +84,12 @@ fn main() -> ExitCode {
         "arkyve-refresh-shop starting"
     );
     seed_config_if_missing(&config_path);
-    let config = match Config::load(&config_path) {
-        Ok(config) => config,
+    // `load_reporting`, not `load`: the salvage warning is already in the log by
+    // the time this returns, and in the windowed build that is a file nobody has
+    // opened. Carried to `run_mode` so the journal can say it too, once there is
+    // a journal — the same trip `log_setup` makes just above.
+    let (config, dropped_ranges) = match Config::load_reporting(&config_path) {
+        Ok(loaded) => loaded,
         Err(err) => {
             // Structured for the file, prose for the player: the two audiences
             // want different things, and the prose carries embedded newlines
@@ -138,21 +142,29 @@ fn main() -> ExitCode {
             return fatal(format!("Failed to start the async runtime: {err}"));
         }
     };
-    run_mode(runtime, config, config_path, log_setup.destination())
+    run_mode(
+        runtime,
+        config,
+        config_path,
+        log_setup.destination(),
+        dropped_ranges,
+    )
 }
 
 /// Console-only build: the session blocks the main thread, as before.
 ///
-/// `_log_file` is unused here on purpose: when every log directory refuses,
-/// `install_logging` falls back to a stdout subscriber, and this is the lane with
-/// a real terminal — so "there is no log file" is already on screen. The windowed
-/// arm below has no such surface and has to say it in the journal.
+/// `_log_file` and `_dropped_ranges` are unused here on purpose: when every log
+/// directory refuses, `install_logging` falls back to a stdout subscriber, and
+/// this is the lane with a real terminal — so "there is no log file" and the
+/// config salvage warning are both already on screen. The windowed arm below has
+/// no such surface and has to say them in the journal.
 #[cfg(not(feature = "gui"))]
 fn run_mode(
     runtime: tokio::runtime::Runtime,
     config: Config,
     _config_path: PathBuf,
     _log_file: Option<&std::path::Path>,
+    _dropped_ranges: arkyve_refresh_shop::config::DroppedRanges,
 ) -> ExitCode {
     let outcome = runtime.block_on(app::run(config));
     // Not a plain drop: tokio::io::stdin parks an uncancelable blocking read,
@@ -180,6 +192,7 @@ fn run_mode(
     config: Config,
     config_path: PathBuf,
     log_file: Option<&std::path::Path>,
+    dropped_ranges: arkyve_refresh_shop::config::DroppedRanges,
 ) -> ExitCode {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -210,6 +223,15 @@ fn run_mode(
                     .to_owned(),
             ],
         );
+    }
+    // Second startup fact with the same shape and the same reason: `Config::load`
+    // salvaged a timing range and said so in a `warn!` that, in this build, went
+    // only to the log file. A setting silently not in force is exactly what a
+    // player would otherwise spend an evening not understanding. Empty on every
+    // launch from a file the app wrote itself, so this costs a `Vec::is_empty`.
+    let salvage = dropped_ranges.journal_lines();
+    if !salvage.is_empty() {
+        handles.journal.emit_at(tracing::Level::WARN, &salvage);
     }
     let error = ui::SessionErrorSlot::default();
     let failed = Arc::new(AtomicBool::new(false));

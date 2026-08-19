@@ -356,14 +356,34 @@ impl Config {
     /// [`Error::ConfigParse`]: crate::Error::ConfigParse
     /// [`Error::ConfigRead`]: crate::Error::ConfigRead
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_reporting(path).map(|(config, _)| config)
+    }
+
+    /// [`load`](Config::load), plus the timing ranges it had to drop.
+    ///
+    /// The salvage is already in the log by the time this returns — that half
+    /// belongs to whoever parsed the file, and every caller gets it. What this
+    /// hands back is the same fact as a *value*, for the one caller that has a
+    /// second audience to reach and cannot reach it yet: in the windowed build
+    /// the journal panel is the only surface the player sees, and it does not
+    /// exist until `app::setup` has run. Same deferral, and the same reason, as
+    /// [`crate::LogSetup`] and [`crate::migrate::Leftovers`].
+    ///
+    /// # Errors
+    ///
+    /// Exactly [`load`](Config::load)'s, which is the whole point of the pair:
+    /// the report rides along, it does not change what is refused.
+    pub fn load_reporting(path: impl AsRef<Path>) -> Result<(Self, DroppedRanges)> {
         let path = path.as_ref();
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let config = parse(&text)?;
+                let (config, dropped) = parse(&text)?;
                 config.validate()?;
-                Ok(config)
+                Ok((config, dropped))
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok((Self::default(), DroppedRanges::default()))
+            }
             // Name the file: it lives out of the way under %APPDATA%, so a bare
             // "Access is denied. (os error 5)" leaves nothing to act on.
             Err(source) => Err(crate::Error::ConfigRead {
@@ -440,29 +460,71 @@ impl Config {
 /// When it finds something and the file still will not parse, the *second*
 /// error is returned: the first named a key this pass has since dropped, so
 /// repeating it would send the player to a line that is no longer the problem.
-fn parse(text: &str) -> Result<Config> {
+fn parse(text: &str) -> Result<(Config, DroppedRanges)> {
     let refused = match toml::from_str::<Config>(text) {
-        Ok(config) => return Ok(config),
+        Ok(config) => return Ok((config, DroppedRanges::default())),
         Err(refused) => refused,
     };
     let Some((salvaged, dropped)) = drop_unreadable_timing_ranges(text) else {
         return Err(refused.into());
     };
     let config: Config = toml::from_str(&salvaged)?;
+    let mut names = Vec::with_capacity(dropped.len());
     for (key, reason) in dropped {
+        let key = format!("actuator.timings.{key}");
         // Not a `fatal` and not silence: the range is *not in force* (the
         // action runs at its calibrated baseline, the setting's own default),
         // and this is the only place that says so. It repeats every launch,
         // because nothing has rewritten the file — which is the pressure on
         // whoever typed it to fix it, and the reason this is a warning rather
         // than a shrug.
+        //
+        // Structured, and staying that way: it carries `reason`, which is
+        // `DelayRangeError`'s sentence naming both of the player's numbers. The
+        // journal half below says less on purpose — see [`DroppedRanges`].
         tracing::warn!(
-            key = %format_args!("actuator.timings.{key}"),
+            key = %key,
             reason = %reason,
             "this timing range could not be read, so it is not in force: the action keeps its tuned baseline with no extra wait. Fix the line in config.toml, or set the range from the Setup tab's Click timing section, which writes a valid one"
         );
+        names.push(key);
     }
-    Ok(config)
+    Ok((config, DroppedRanges(names)))
+}
+
+/// Which `[actuator.timings]` ranges [`parse`] dropped, so a caller can say so
+/// again somewhere the log is not.
+///
+/// Only the key names, not the reasons. The `warn!` in `parse` already holds the
+/// full diagnosis for whoever reads the file, and the surface this feeds is the
+/// journal panel — a scrolling list beside a running hunt, where the useful
+/// sentence is "this setting is not in force, and here is where to fix it", not
+/// a per-key restatement of which two numbers were reversed. Same split as
+/// `main`'s config-error arm: structured for the file, prose for the player.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DroppedRanges(Vec<String>);
+
+impl DroppedRanges {
+    /// The journal lines, empty when nothing was dropped — which is every
+    /// launch on a file the app itself wrote.
+    ///
+    /// One line for all of them rather than one line each: the advice does not
+    /// vary by key, and the journal is a shared, bounded ring.
+    #[must_use]
+    pub fn journal_lines(&self) -> Vec<String> {
+        if self.0.is_empty() {
+            return Vec::new();
+        }
+        vec![format!(
+            ">> config: {} could not be read, so {} not in force — the action keeps its tuned baseline. Fix the line in config.toml, or set the range in Setup ▸ Click timing, which writes a valid one",
+            self.0.join(", "),
+            if self.0.len() == 1 {
+                "it is"
+            } else {
+                "they are"
+            }
+        )]
+    }
 }
 
 /// `text` with every unreadable `[actuator.timings]` range removed, and the

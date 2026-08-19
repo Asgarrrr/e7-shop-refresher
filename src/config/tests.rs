@@ -486,7 +486,18 @@ between_buys = { max_ms = 120000 }
 ";
     std::fs::write(&path, text).expect("seed a pre-refusal config");
 
-    let config = Config::load(&path).expect("an existing config must still open the app");
+    let (config, dropped) =
+        Config::load_reporting(&path).expect("an existing config must still open the app");
+    // The half the log file cannot deliver in a windowed build. Both keys in one
+    // line, naming both, because the advice is the same for either.
+    let lines = dropped.journal_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("actuator.timings.refreshed"), "{lines:?}");
+    assert!(
+        lines[0].contains("actuator.timings.between_buys"),
+        "{lines:?}"
+    );
+    assert!(lines[0].contains("they are not in force"), "{lines:?}");
     // The unreadable ranges are *not in force*: each action falls back to its
     // calibrated baseline, which is exactly what an absent key means.
     assert_eq!(config.actuator.timings.refreshed, DelayRange::default());
@@ -509,6 +520,20 @@ between_buys = { max_ms = 120000 }
         text,
         "the loader must not rewrite the player's config"
     );
+
+    // The other side of the pair, on the same fixture minus the two bad ranges:
+    // a file the app wrote itself is every launch after the first, and it must
+    // put nothing in the journal at all.
+    std::fs::write(
+        &path,
+        "game_port = 3333\n\n[filter]\nnames = [\"ticketrare_name\"]\n\n[actuator.timings]\nshop_opened = { min_ms = 100, max_ms = 900 }\n",
+    )
+    .expect("seed a clean config");
+    let (_, none) = Config::load_reporting(&path).expect("a clean config loads");
+    assert!(
+        none.journal_lines().is_empty(),
+        "a clean load must not put a line in the journal"
+    );
 }
 
 #[test]
@@ -522,11 +547,24 @@ fn an_unreadable_range_is_dropped_whichever_way_the_table_is_spelled() {
         "actuator = { timings = { refreshed = { min_ms = 800, max_ms = 200 } } }\n",
         "[actuator.timings.refreshed]\nmin_ms = 800\nmax_ms = 200\n",
     ] {
-        let config = parse(text).unwrap_or_else(|err| panic!("{text:?}: {}", err.report()));
+        let (config, dropped) =
+            parse(text).unwrap_or_else(|err| panic!("{text:?}: {}", err.report()));
         assert_eq!(
             config.actuator.timings.refreshed,
             DelayRange::default(),
             "{text:?}"
+        );
+        // The value the window needs, on all four spellings: a salvage the GUI
+        // cannot name is a setting silently not in force.
+        assert_eq!(
+            dropped.journal_lines().len(),
+            1,
+            "{text:?}: the drop must be reportable, not only logged"
+        );
+        assert!(
+            dropped.journal_lines()[0].contains("actuator.timings.refreshed"),
+            "{text:?}: {:?}",
+            dropped.journal_lines()
         );
     }
 }
