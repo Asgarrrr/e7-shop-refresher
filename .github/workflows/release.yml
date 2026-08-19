@@ -1,0 +1,403 @@
+name: Release
+# What this workflow is defending, stated first because every choice below
+# follows from it.
+#
+# The product is *one* file: `arkyve-refresh-shop.exe`, manifested
+# `requireAdministrator`, which a player downloads from a GitHub release page,
+# double-clicks, approves a UAC prompt for, and which then drives another
+# process's window and dispatches synthetic input. There is no installer to
+# inspect, no package manager to mediate, no console in the shipped build, and
+# the only post-mortem channels are a rotated log and `crash.log` under
+# `%LOCALAPPDATA%`. The download link is therefore a trust boundary in the
+# literal sense: whatever bytes are behind it get the administrator token.
+#
+# So the question this workflow has to answer is not "did it build" — `ci.yml`
+# answers that on every push — but "is the exe on the release page the one this
+# repository's source produced". Everything here is either that answer or a
+# guard on the artifact's own product declarations.
+on:
+  # Tag-triggered, matching `vMAJOR.MINOR.PATCH`. Deliberately narrow: a glob as
+  # loose as `v*` also fires on `v0.1.0-notes`, `verify-thing` and every other
+  # tag that happens to start with a v, and a release workflow that publishes on
+  # a tag nobody meant as a release is a bad surprise with a public URL on it.
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  # The dry run, and it is here for a specific reason rather than for symmetry.
+  # A tag-only workflow can be tested exactly once — by cutting a real tag — so
+  # its first execution is also its first publication, and a typo in it is a
+  # broken release rather than a red run. `workflow_dispatch` executes the whole
+  # path (build, manifest assertion, checksum) and stops before the two steps
+  # that have side effects outside this run, which are gated on the ref actually
+  # being a tag. Nothing is uploaded on a dispatch: the point is to prove the
+  # path runs, and the exe it produces is one `ci.yml` already builds on every
+  # push, so keeping it would mean pinning another action to hand back a
+  # duplicate.
+  workflow_dispatch:
+
+# Nothing by default, then per job, because unlike `ci.yml` the two jobs here
+# genuinely differ: one reads, one publishes. Granting the union at the top would
+# hand `contents: write` and a Sigstore signing identity to a job whose entire
+# purpose is to run a linter over `Cargo.lock`.
+permissions: {}
+
+jobs:
+  # Why the advisory check is on the release path at all, and why *only* the
+  # advisory check.
+  #
+  # `ci.yml` already runs the full `cargo deny` set on every push, so bans,
+  # licences and sources were checked on the exact commit being tagged and are
+  # pure functions of `Cargo.lock` — re-running them here would re-derive a
+  # known answer. Advisories are the one verdict that changes while the tree does
+  # not: a RustSec entry can be published against a version this lockfile already
+  # pins, on any day, and the weekly cron in `ci.yml` catches that on Mondays.
+  # Tags are not cut on Mondays. Shipping a binary with a known-vulnerable
+  # dependency to players who run it elevated is precisely the outcome that gate
+  # exists for, so it is re-asked at the moment the artifact becomes something
+  # people run.
+  #
+  # The cost is one Ubuntu job of a couple of minutes on a path that runs at most
+  # a few times a year, and it reuses `ci.yml`'s cache keys verbatim so the
+  # `cargo install` is normally a cache hit. The escape hatch when an advisory
+  # has no fixed version available is `deny.toml`'s `ignore` list — a reviewed
+  # edit with the reason beside it, which is a commit, not a `continue-on-error`.
+  advisories:
+    name: Advisories at release time
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # `actions/checkout` only.
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+      RUSTUP_TOOLCHAIN: "1.92.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+
+      - name: Cache cargo-deny binary
+        id: cargo-deny-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_DENY_VERSION }}
+
+      - name: Install pinned cargo-deny
+        if: steps.cargo-deny-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+
+      - name: Verify cargo-deny version
+        run: test "$(cargo deny --version)" = "cargo-deny $CARGO_DENY_VERSION"
+
+      # No `~/.cargo/advisory-dbs` cache here, unlike `ci.yml`. That cache is a
+      # warm start for a job that runs on every push; this one runs a handful of
+      # times a year, so restoring a months-old clone to save a few seconds on
+      # the fetch buys nothing and makes `deny.toml`'s `maximum-db-staleness`
+      # the difference between a full clone and a stale one for no reason. A
+      # cold, complete fetch is the honest input for the run that decides what
+      # ships.
+      - name: Check RustSec advisories and yanked crates
+        run: cargo deny --all-features --locked check advisories
+
+  release:
+    name: Build, attest and publish
+    needs: advisories
+    # Pinned, unlike `ci.yml`'s `windows-latest`, and the asymmetry is the point:
+    # `verify` wants to be told when the runner image moves, this job wants the
+    # image not to move under a release. `link.exe` — which embeds the manifest
+    # asserted below — comes from whatever Visual Studio build tools the image
+    # ships, so a floating label makes the shipped binary a function of the week
+    # it was tagged in addition to the source it was built from.
+    #
+    # The cost is real and worth naming: `windows-2025` is only exercised by CI
+    # for as long as `windows-latest` resolves to it, so the day GitHub flips
+    # that label this pin becomes a lane nothing else builds. That day is the
+    # signal to bump it — deliberately, after `verify` has been green on the new
+    # image — not a reason to leave it floating now.
+    runs-on: windows-2025
+    permissions:
+      # Create the release and upload the two assets. This is the one write
+      # scope in either workflow, and it is why this job is separate from the
+      # one above rather than a step inside it.
+      contents: write
+      # Sigstore. `actions/attest-build-provenance` exchanges the job's OIDC
+      # token for a short-lived signing certificate that encodes *this*
+      # repository, workflow, commit and run; there is no long-lived key
+      # anywhere, which is the entire reason the attestation is affordable here
+      # and a code-signing certificate is not (see below).
+      id-token: write
+      # Write the resulting attestation to the repository's attestation store,
+      # which is what `gh attestation verify` later reads.
+      attestations: write
+    env:
+      # Same reasoning as both jobs in `ci.yml`: `rust-toolchain.toml` outranks
+      # the `rustup default` that the toolchain action performs, so without this
+      # the toolchain would come from the file regardless of what is requested
+      # here. It happens to agree — say it out loud rather than rely on it.
+      #
+      # The MSRV, not `stable`, and this is a choice rather than a copy of the
+      # `dependency-policy` job. A release built on `stable` is a binary whose
+      # compiler is whatever rustc shipped that week: two builds of the same tag
+      # a month apart are two different binaries, which makes "the exe the
+      # repository's source produced" a claim with no fixed referent. `1.92.0`
+      # is the one toolchain this repository names a version for, in
+      # `rust-toolchain.toml` and in `Cargo.toml`'s `rust-version`.
+      #
+      # What that costs, stated plainly: `ci.yml` gates its release build and
+      # manifest assertion on `matrix.toolchain == 'stable'`, so the exact
+      # combination shipped here — MSRV plus `--release` plus default features —
+      # is not built on a push. It is not unbuilt either: `rust-toolchain.toml`
+      # pins *local* builds to the same MSRV, so it is what the maintainer
+      # compiles every day, and CI's `1.92.0` arm clippy-checks and tests the
+      # same feature set. If it did break, this job fails at the build step,
+      # which is before anything is published — a tag that does not release,
+      # not a bad exe that does.
+      RUSTUP_TOOLCHAIN: "1.92.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+
+      # No `Swatinem/rust-cache` here, on purpose. A cache is a build input, and
+      # this is the one build whose inputs are the point: a restored `target/`
+      # means some of the shipped object code was produced by an earlier run,
+      # under an earlier tree, and the provenance attestation below would be
+      # signing a claim about a build this run only partly performed. `ci.yml`
+      # caches because it optimises for turnaround on every push; this optimises
+      # for the artifact being a function of the commit and nothing else. The
+      # price is one cold release build, a few minutes, a few times a year.
+      #
+      # Default features, which is the shipped combination (`pcap-backend`,
+      # `gui`, `actuator`) — the same set `ci.yml`'s "Check shipped default
+      # features" lane gates. `--locked` so the dependency versions are the ones
+      # `Cargo.lock` records and the ones `advisories` above just cleared; a
+      # resolver free to pick something newer would make that check advisory in
+      # the other sense of the word.
+      - name: Build the shipped release
+        run: cargo build --locked --release
+
+      # The same assertion as `ci.yml`'s, duplicated rather than shared, and the
+      # duplication is deliberate. Factoring eight lines of PowerShell into a
+      # composite action adds a third file that has to be kept in step with two
+      # callers, to avoid repeating a list of three string literals. More to the
+      # point, the two copies are not the same check doing the same job: CI's
+      # catches the regression at pull-request time on a throwaway binary, this
+      # one is the last thing standing between a manifest-less exe and a
+      # download link. A shared step that someone edits for CI's convenience is
+      # exactly how the second one would stop meaning what it says.
+      #
+      # See `build.rs` for why each of the three is a product requirement and
+      # why none of them is visible to the compiler. Short version: without
+      # `requireAdministrator`, UIPI silently refuses every click at the game's
+      # higher integrity level; without `dpiAwareness`/`permonitorv2` the
+      # process's DPI awareness is whatever `winit` set, and the actuator halts
+      # the watch rather than click at coordinates it cannot trust.
+      - name: Assert the release exe's embedded manifest
+        shell: pwsh
+        run: |
+          $exe = "target\release\arkyve-refresh-shop.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+          foreach ($claim in "requireAdministrator", "dpiAwareness", "permonitorv2") {
+            if (-not $text.Contains($claim)) {
+              throw "no $claim in the manifest embedded in $exe"
+            }
+            "$claim is embedded"
+          }
+
+      # A checksum, and an honest account of what it is for, because a
+      # `.sha256` beside a download is routinely mistaken for a security
+      # control. It is not one: anyone able to replace the exe on the release
+      # page can replace the checksum file next to it, and both are served from
+      # the same origin by the same credential. What it genuinely does is catch
+      # a truncated or corrupted download and give a player reporting "it will
+      # not start" a one-command way to establish that the bytes they have are
+      # the bytes that were published. The provenance attestation in the next
+      # step is what carries trust.
+      #
+      # Written in `sha256sum(1)`'s two-space format with an LF ending and no
+      # BOM so `sha256sum -c` accepts it as-is — PowerShell's own
+      # `Set-Content` would emit CRLF, and GNU coreutils then reads the `\r`
+      # as part of the filename and reports the file missing.
+      - name: Write the SHA-256 checksum
+        shell: pwsh
+        run: |
+          $exe = "target\release\arkyve-refresh-shop.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLower()
+          $line = "$hash  arkyve-refresh-shop.exe`n"
+          [System.IO.File]::WriteAllText(
+            "$PWD\target\release\arkyve-refresh-shop.exe.sha256",
+            $line,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          $line
+
+      # This is the step that answers the question at the top of the file, and
+      # the only one that does. It records, in a transparency log, that this
+      # exact digest was produced by this workflow, from this commit, in this
+      # repository — signed by a certificate minted from the job's OIDC identity
+      # and valid for minutes, so there is no key for anyone to steal or for the
+      # maintainer to store. A player, or anyone triaging a suspicious copy,
+      # verifies it with one command and no prior setup:
+      #
+      #     gh attestation verify arkyve-refresh-shop.exe --repo Asgarrrr/e7-shop-refresher
+      #
+      # which fails on a modified binary, on one built from a fork, and on one
+      # that was never built here at all. Free and available because this
+      # repository is public; on a private repository the attestations API needs
+      # a paid plan, and this step would have to be dropped rather than faked.
+      #
+      # **Code signing is not done here, and is not an oversight.** Authenticode
+      # is what would actually remove the SmartScreen warning a player sees on
+      # an elevated download, and it needs a publicly-trusted code-signing
+      # certificate: an OV or EV certificate from a CA, a few hundred euro a
+      # year, identity documents for the holder, and since mid-2023 mandatory
+      # hardware or HSM key storage for the private key — which also means the
+      # signing cannot happen in a hosted runner without a cloud HSM. That is a
+      # standing cost and a standing secret, for a hobby tool, and this
+      # repository does not have either. Generating a self-signed certificate
+      # instead would be worse than nothing: it removes no warning, and the only
+      # way to make it appear to work is to talk a player through installing a
+      # root CA, which is a genuinely dangerous habit to teach. The honest
+      # position is that this binary is unsigned, that SmartScreen will say so,
+      # and that the attestation is the verifiable claim on offer in its place.
+      # If a certificate is ever acquired, note that `build.rs`'s argument for
+      # elevation changes with it — `uiAccess='true'` requires an
+      # Authenticode-signed image in a secure location, and it is currently
+      # ruled out on exactly that ground.
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: target/release/arkyve-refresh-shop.exe
+
+      # `gh` rather than a release action, because the runner already has it
+      # authenticated by the job token and it is one fewer third-party action
+      # holding `contents: write`.
+      #
+      # `--generate-notes` for the commit-and-PR changelog and `--notes` for the
+      # fixed preamble; `gh` prepends the latter to the former. The preamble is
+      # not marketing — it is the three things a player cannot learn from the
+      # release page itself: that the exe will demand administrator and why,
+      # that it is unsigned so the SmartScreen warning is expected rather than a
+      # sign of tampering, and how to check the bytes anyway. Attaching it to
+      # every release is the only way those instructions cannot drift away from
+      # the artifact they describe.
+      #
+      # The body is a **single-quoted** here-string. In PowerShell's `@"…"@` form
+      # a backtick is the escape character, so every Markdown code span in here
+      # would have to be written doubled, and a reader could not tell an intended
+      # backtick from an escaping accident. `@'…'@` is literal, and the one thing
+      # that does need substituting is done explicitly by `.Replace` below.
+      #
+      # `--verify-tag` so a run somehow reaching this step without the tag
+      # existing on the remote fails rather than quietly creating one.
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # ASCII only from here down, deliberately, and this comment is inside
+          # the script rather than above it so it travels with the rule it
+          # states. GitHub writes this block to a `.ps1` on the runner and
+          # PowerShell decodes that file using the host encoding, not UTF-8;
+          # reproduced locally, a script containing an em dash in a string
+          # prints a plain hyphen instead. The prose comments elsewhere in this
+          # file use the full character set freely because YAML comments are
+          # never executed, but this string is published verbatim on a release
+          # page, so it stays inside the set that survives the round trip.
+          $notes = @'
+          Download `arkyve-refresh-shop.exe` below. It is the whole product: no
+          installer, no side files. You also need **Npcap**, installed once with
+          default options (see the README).
+
+          Windows shows a UAC prompt at every launch, because the exe carries a
+          `requireAdministrator` manifest. That is what lets it click in the game
+          window: STOVE always launches Epic Seven elevated, and Windows refuses
+          input aimed at a window running at a higher integrity level than the
+          sender.
+
+          ### Checking what you downloaded
+
+          This exe is **not code-signed**, so SmartScreen will warn about an
+          unrecognised app. In place of a signature it carries a build provenance
+          attestation, which says more about where the file came from and costs
+          nothing to check. With the [GitHub CLI](https://cli.github.com):
+
+          ```
+          gh attestation verify arkyve-refresh-shop.exe --repo REPO_SLUG
+          ```
+
+          That succeeds only for a file built by this repository's release
+          workflow from the tagged commit, and fails for a modified copy, a copy
+          built from a fork, and a copy that was never built here at all.
+
+          `arkyve-refresh-shop.exe.sha256` is attached as well, but it is a
+          download-integrity check and not a security one: anyone who could
+          replace the exe could replace the checksum sitting beside it.
+          '@
+          # Substituted on its own line rather than inline in the argument list:
+          # PowerShell parses arguments to a native command in argument mode,
+          # where a bare `$x.Method(…)` is a shape better not relied on. A plain
+          # variable is unambiguous.
+          $notes = $notes.Replace("REPO_SLUG", $env:GITHUB_REPOSITORY)
+          gh release create "$env:GITHUB_REF_NAME" `
+            --title "$env:GITHUB_REF_NAME" `
+            --notes $notes `
+            --generate-notes `
+            --verify-tag `
+            "target/release/arkyve-refresh-shop.exe" `
+            "target/release/arkyve-refresh-shop.exe.sha256"
+
+      # Reproducibility, recorded rather than claimed, because "reproducible
+      # build" is the sort of phrase that ends up in a README without anyone
+      # having checked it.
+      #
+      # Two of the three inputs are already pinned. `--locked` fixes every
+      # dependency version and is used on every cargo invocation in both
+      # workflows and the justfile; `RUSTUP_TOOLCHAIN: "1.92.0"` fixes rustc; the
+      # `windows-2025` label fixes the image, and with it `link.exe`. That is
+      # enough for two builds of the same tag on the same day to agree, and it is
+      # why the build above refuses a `target/` cache.
+      #
+      # What is still out of reach, and would have to be closed before anything
+      # here claimed byte-for-byte reproducibility:
+      #
+      #   - The PE header carries a timestamp and the debug directory a build
+      #     GUID. `link.exe /Brepro` replaces both with a content hash, but it is
+      #     not reachable from cargo without another `rustc-link-arg-bins` line
+      #     in `build.rs`, and it interacts with `strip = "debuginfo"` in a way
+      #     nobody here has measured.
+      #   - Absolute paths of the checkout and of `~/.cargo/registry` are baked
+      #     into panic messages. `--remap-path-prefix` fixes it and changes what
+      #     `crash.log` — the product's only post-mortem channel — reports, so it
+      #     is a product decision, not a CI flag.
+      #   - The runner image is pinned by *label*, not by content. GitHub patches
+      #     `windows-2025` in place, so the MSVC toolset behind that label moves
+      #     without the label doing so.
+      #
+      # None of that is a gap in what ships, because reproducibility is not what
+      # this workflow leans on: the attestation asserts origin directly, and it
+      # does so without needing an independent rebuild to agree bit for bit.
+      # Reproducibility would let a third party *re-derive* that claim instead of
+      # trusting the log, which is a strictly better property and a much larger
+      # project than pinning three inputs.
+      - name: Record what was published
+        shell: pwsh
+        run: |
+          $exe = "target\release\arkyve-refresh-shop.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLower()
+          $size = (Get-Item $exe).Length
+          $tagged = "${{ startsWith(github.ref, 'refs/tags/') }}"
+          @(
+            "| | |",
+            "|---|---|",
+            "| ref | ``$env:GITHUB_REF_NAME`` |",
+            "| commit | ``$env:GITHUB_SHA`` |",
+            "| toolchain | ``$env:RUSTUP_TOOLCHAIN`` on ``$env:RUNNER_OS`` (windows-2025) |",
+            "| sha256 | ``$hash`` |",
+            "| size | $size bytes |",
+            "| published | $tagged |"
+          ) | Add-Content -Path $env:GITHUB_STEP_SUMMARY

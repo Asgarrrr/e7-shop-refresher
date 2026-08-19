@@ -4,9 +4,50 @@ all-features = true
 
 [advisories]
 yanked = "deny"
-unmaintained = "workspace"
+# The two scopes below are asymmetric on purpose, and the asymmetry is the whole
+# policy, so it is written down rather than left to look like a typo.
+#
+# `unsound` is `"all"`: an unsound advisory says a safe API can be driven into
+# undefined behaviour, and this crate does not get to be picky about where in the
+# tree that happens. It calls into `wpcap.dll` through hand-transcribed FFI, into
+# Win32 through `windows-sys`, and it runs elevated — a UB primitive four crates
+# deep is reachable from here exactly like one at the top.
+#
+# `unmaintained` is `"workspace"`, which is the narrow end and also cargo-deny's
+# own default since 0.16.3. "Unmaintained" is a statement about a repository, not
+# about this binary: it is actionable for a direct dependency (swap it) and
+# almost never actionable transitively, where the answer is to wait for an
+# upstream that has its own reasons. Widening it to `"all"` on a tree this size —
+# `eframe` alone pulls a few hundred crates — buys a standing red gate whose only
+# available response is an `ignore` entry per crate, which is the shape of gate
+# this repository argues against everywhere else: one that gets switched off
+# within a month and is then worse than never having existed. Vulnerabilities are
+# unaffected by either knob; those are denied across the whole graph regardless.
 unsound = "all"
+# Empty, and it is meant to stay that way: an entry here is the documented escape
+# hatch for an advisory with no fixed version available, and it is a deliberate,
+# reviewed edit with the reason beside it — not something a release path is
+# allowed to add under pressure to get a tag out.
 ignore = []
+# The backstop for the failure this gate degrades into rather than fails at.
+# `cargo deny check` fetches the RustSec database on every run (nothing in
+# `.github/workflows/` passes `--offline`), but a *failed* fetch is a warning, not
+# an error — cargo-deny falls back to whatever copy is on disk and reports
+# "advisories ok" against it. CI restores that copy from an `actions/cache` entry
+# which, on an exact key hit, is never re-saved and so keeps whatever age it had
+# when it was first written. Without a ceiling the gate can therefore go on
+# passing indefinitely while auditing nothing new, and nothing in the log says so.
+#
+# Measured, not assumed: staleness is counted from the last successful *fetch*,
+# not from the newest commit in the database, and exceeding it is an error that
+# fails the check (`--offline` with `maximum-db-staleness = "P0D"` → "repository
+# is stale (last update: …)"; the same run with fetching allowed → "advisories
+# ok"). So a working network resets the clock on every run and this can never
+# redden on noise — it fires only after the fetch has been broken for two weeks
+# straight, which is two missed Monday crons and a real "this gate is dead"
+# signal. Left far tighter than cargo-deny's 90-day default, which is three
+# months of silent nothing.
+maximum-db-staleness = "P14D"
 
 [licenses]
 include-dev = true

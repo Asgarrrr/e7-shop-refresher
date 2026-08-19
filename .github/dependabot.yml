@@ -1,0 +1,57 @@
+version: 2
+# This file exists for one reason: SHA-pinned actions rot, and a pin with no
+# update path is how a workflow ends up running a three-year-old action that
+# nobody chose to keep. `ci.yml` and `release.yml` pin every `uses:` by full
+# commit SHA with a `# <tag>` trailing comment precisely so that Dependabot can
+# read both halves and rewrite them together — that comment is the only thing
+# telling anyone, human or machine, what the 40 hex characters above it are.
+# Without this file the pins are still correct and still unauditable in
+# practice.
+#
+# It is also the mechanism that would have caught the defect this posture was
+# introduced over: `ci.yml`'s two `actions/cache` steps were pinned to a SHA
+# belonging to `actions/checkout`, which does not exist in `actions/cache` at
+# all, so the dependency-policy job failed at step setup rather than running.
+# Dependabot resolves each pin against its own repository and cannot carry a
+# mismatch like that forward silently.
+updates:
+  # GitHub Actions only. `cargo` is deliberately **not** an ecosystem here, and
+  # the reason is the one this repository applies to every gate: a gate that
+  # produces noise gets switched off, and a switched-off gate is worse than none.
+  #
+  # A Rust binary with `eframe` in the tree has a few hundred transitive crates.
+  # Turning Dependabot loose on `Cargo.lock` means a steady stream of pull
+  # requests for patch bumps of crates nothing here calls directly, each of
+  # which invalidates the release build's inputs and each of which has to be
+  # reviewed by someone. The two questions that actually matter about those
+  # dependencies are already answered by things that do not generate a pull
+  # request per crate: `cargo deny check advisories` runs on every push, every
+  # Monday via `ci.yml`'s cron, and again on the release path before anything is
+  # published, so a *security*-relevant version is caught within a week and
+  # blocks a tag; `cargo deny check bans licenses sources` covers the rest.
+  # Routine version drift is then a deliberate `cargo update` when someone wants
+  # one, which is also what keeps `--locked` meaningful everywhere.
+  #
+  # Actions are the opposite shape: five pins, changing a few times a year, each
+  # one a piece of third-party code executing inside a job that holds this
+  # repository's token — the exact thing the pinning is defending against, and
+  # small enough to review properly every time.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      # Monthly, not weekly. An action release is not urgent — the pin means the
+      # old code keeps running unchanged until someone accepts the bump — and a
+      # monthly cadence keeps this to a handful of pull requests a year that get
+      # read, rather than a weekly one that gets rubber-stamped.
+      interval: monthly
+    # One pull request for all five actions rather than one each. They are
+    # reviewed together (all five are read at once when checking the pins), they
+    # are verified together by a single CI run, and a grouped bump cannot leave
+    # the workflow half-updated between merges.
+    groups:
+      actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"

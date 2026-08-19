@@ -6,9 +6,58 @@ on:
   push:
   pull_request:
   schedule:
+    # Monday morning, for the one gate in this file whose verdict changes while
+    # the repository does not: `dependency-policy`'s advisory check. A RustSec
+    # advisory is published against a version already pinned in `Cargo.lock`, so
+    # on push-and-pull-request alone a tree that nobody touches for a month is a
+    # tree nobody re-audits for a month. Everything else here — clippy, tests,
+    # the manifest assertion — is a pure function of the commit and learns
+    # nothing from being re-run, so the cron is carried by that one job.
+    #
+    # It is effective rather than decorative, which is worth stating because the
+    # obvious failure mode is a cron that re-checks against a cached, frozen
+    # advisory database: `cargo deny check` fetches the database on every run
+    # unless `--offline` is passed, and no invocation in this file passes it. See
+    # the cache step's comment in `dependency-policy` for the rest of that
+    # argument.
     - cron: "17 4 * * 1"
+
+# Least privilege, declared rather than inherited. With no `permissions:` block a
+# workflow gets whatever the repository's default is — historically
+# read-and-write on every scope, and still write today for any repo whose
+# setting was never changed — which every third-party action in every job then
+# runs with. Nothing here writes to the repo: the two jobs check out, compile,
+# test and read the dependency graph, so `contents: read` is the whole
+# requirement and the rest (packages, issues, pull-requests, id-token,
+# attestations, …) are implicitly set to `none` the moment any scope is named.
+#
+# Declared once at workflow level rather than per job because both jobs need
+# exactly the same thing; the release workflow does the opposite — `{}` at the
+# top and a scope list per job — because there the two jobs genuinely differ.
+permissions:
+  contents: read
+
+# Third-party actions are pinned by full commit SHA, every one of them, with the
+# tag it resolved to in a trailing comment. A tag — even `v4` — is a mutable
+# pointer the action's owner can move, and `@master` is not even a pointer, it is
+# whatever was pushed last; either way the code lands in a job holding this
+# repository's token. The SHA is the only ref GitHub will not re-resolve.
+#
+# The comment is not decoration: a SHA carries no version, so without it nobody
+# can tell whether the pin is a month or three years behind, and the pin quietly
+# becomes "never updated" instead of "deliberately not updated". Dependabot reads
+# these comments and rewrites both halves together, which is why the format has
+# to stay exactly `<40 hex> # <tag>`.
 jobs:
   verify:
+    # `windows-latest` on purpose, and deliberately *not* pinned the way
+    # `dependency-policy`'s `ubuntu-24.04` and the release workflow's
+    # `windows-2025` are. The two want opposite things from the runner image.
+    # This job is where a moving image should be found out: it carries the MSVC
+    # `link.exe` that embeds the manifest, the OpenGL stack `eframe` needs, and
+    # the Win32 headers behind `windows-sys`, so an image bump that breaks any of
+    # them should redden a pull request rather than a tag. The release build
+    # wants the reverse — the fewest floating inputs possible — and pins.
     runs-on: windows-latest
     # `dtolnay/rust-toolchain` activates its toolchain with `rustup default` and
     # nothing else, and rustup ranks `rustup default` *below* a repo-root
@@ -24,12 +73,24 @@ jobs:
       matrix:
         toolchain: ["1.92.0", stable]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # `dtolnay/rust-toolchain` has exactly one tag in the whole repository —
+      # `v1`, which currently points at the head of `master` and is moved
+      # forward with it. So `# v1` below is the tag this SHA resolves to and is
+      # what keeps the pin machine-readable, but it names a major version rather
+      # than a release: there is no `v1.4.2` to be behind. Reading the pin's age
+      # means comparing the SHA to `master`, not the comment to a changelog.
+      #
+      # That is also why `@master` was the worst ref in this file rather than
+      # merely the untidiest. `@v4` on the actions above cannot change without
+      # someone deciding to move it; `@master` was whatever had been pushed most
+      # recently, chosen by nobody here, executing in a job holding this
+      # repository's token. The SHA below was read off `master` on 2026-08-05.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ${{ matrix.toolchain }}
       - if: matrix.toolchain == '1.92.0'
@@ -64,22 +125,53 @@ jobs:
       - name: Build shipped release (default features)
         if: matrix.toolchain == 'stable'
         run: cargo build --locked --release
-      # The exe drives another process's window, which UIPI refuses unless this
-      # one is at least as privileged — so the manifest is a product requirement,
-      # not a build detail. It is also invisible to every compile-time check:
-      # dropping the two link args still produces a binary that runs, and only
-      # fails once a player tries to click. Assert it on the shipped artifact.
-      - name: Assert the release exe requests administrator
+      # Everything this exe declares about itself to Windows lives in one
+      # embedded manifest, and every declaration in it is a *product*
+      # requirement that no compile-time check can see. Drop a `build.rs` link
+      # arg and the binary still builds, still links, still runs, and fails only
+      # in front of a player:
+      #
+      #   - `requireAdministrator` — UIPI refuses input aimed at a window whose
+      #     integrity level is higher than the sender's, and Epic Seven inherits
+      #     **high** from STOVE, which always elevates. Without the token every
+      #     click is refused, silently, by `SendInput`.
+      #   - `dpiAwareness` / `permonitorv2` — the actuator's coordinates are
+      #     physical-pixel arithmetic and only a per-monitor-aware process is
+      #     told the truth about a window rect. Without the declaration the
+      #     awareness is whatever `winit` happened to set (per-monitor-v2 today,
+      #     an undocumented internal one dependency bump from changing), and
+      #     `actuator::win::dpi::ensure_dpi_awareness` halts the watch rather
+      #     than click at the wrong place. `permonitorv2` is checked as well as
+      #     `dpiAwareness` because the element is worthless empty: the value is a
+      #     fallback *list* (`permonitorv2, permonitor`) and an element that
+      #     survived with the wrong content would pass a check for the tag name
+      #     alone.
+      #
+      # All three are asserted in one step rather than three because they are one
+      # artifact property with one failure mode — the manifest did not make it
+      # into the exe — and reading an 11 MB file three times to say so would be
+      # three ways to be told the same thing.
+      #
+      # `mt.exe` would parse the resource properly and is deliberately not used:
+      # it is a Windows SDK tool this build otherwise needs nothing from, and the
+      # question here is not "is the XML well formed" (the linker rejected it
+      # already if not) but "is it in there at all", which a byte grep answers.
+      # `.Contains` rather than `-notmatch` so the needles stay literal — every
+      # token below is metacharacter-free today, and this way a fourth one
+      # containing a `.` cannot silently widen into a wildcard.
+      - name: Assert the release exe's embedded manifest
         if: matrix.toolchain == 'stable'
         shell: pwsh
         run: |
           $exe = "target\release\arkyve-refresh-shop.exe"
           $bytes = [System.IO.File]::ReadAllBytes($exe)
           $text = [System.Text.Encoding]::UTF8.GetString($bytes)
-          if ($text -notmatch "requireAdministrator") {
-            throw "no requireAdministrator manifest embedded in $exe"
+          foreach ($claim in "requireAdministrator", "dpiAwareness", "permonitorv2") {
+            if (-not $text.Contains($claim)) {
+              throw "no $claim in the manifest embedded in $exe"
+            }
+            "$claim is embedded"
           }
-          "requireAdministrator is embedded"
       - run: cargo test --locked --no-default-features
       - run: cargo test --locked --no-default-features --features gui,actuator
       - name: Test passive Npcap backend (non-elevated tests)
@@ -97,18 +189,63 @@ jobs:
       # the pinned action. Say it out loud so the agreement is not accidental.
       RUSTUP_TOOLCHAIN: "1.92.0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # This step used to be `dtolnay/rust-toolchain@1.92.0` with no `with:`
+      # block, and the version came from the *ref*: that action ships a separate
+      # branch per Rust release whose `action.yml` has no `toolchain` input at
+      # all, the version being baked in. Pinning by SHA therefore cannot be a
+      # one-line substitution — master's `action.yml` declares `toolchain` as
+      # `required: true` and its first step exits 1 when it arrives empty, so
+      # the SHA without the input below is a hard failure, not a silent default.
+      #
+      # Taking the input back turned the version into a second copy of the
+      # string in `RUSTUP_TOOLCHAIN` above, which is the thing that comment
+      # exists to warn about, so it reads the env var instead. The MSRV is now
+      # named once per job and the "agreement is not accidental" claim is
+      # structural rather than a promise. (Both jobs pin the same master SHA;
+      # one action, one thing to bump.)
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
 
+      # Both `actions/cache` pins below were `11d5960a…`, which is the head of
+      # **`actions/checkout`**'s v4 branch and does not exist in `actions/cache`
+      # at all (`GET /repos/actions/cache/commits/11d5960a…` → 422, "No commit
+      # found for SHA"). GitHub resolves `uses:` against the named repository,
+      # so the runner would have stopped at "unable to find version" during step
+      # setup and this job would have failed before cargo-deny ever ran —
+      # meaning the dependency gate would have been dead rather than lenient.
+      # "Would have" and not "was": the job was added on the branch and never
+      # pushed, so the last CI run predates it and nothing ever executed this.
+      # It was on course to fail on its first run. Corrected to `actions/cache`'s
+      # own v4 head.
+      #
+      # Worth keeping as the argument for pinning by SHA *and* verifying the
+      # pin. A 40-hex string is unreadable by eye, so a copy-paste from the
+      # wrong line is invisible in review and indistinguishable from a correct
+      # pin until a resolver is asked. That is the job `.github/dependabot.yml`
+      # now does continuously.
       - name: Cache cargo-deny binary
         id: cargo-deny-cache
-        uses: actions/cache@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cargo/bin/cargo-deny
           key: cargo-deny-${{ runner.os }}-${{ runner.arch }}-${{ env.CARGO_DENY_VERSION }}
 
+      # A note on what this cache does and does not freeze, because the RustSec
+      # database is in it and a frozen advisory database would be a gate that
+      # reports last quarter's news. `actions/cache` saves only when the primary
+      # key *missed*, so on a week where neither `Cargo.lock` nor `deny.toml`
+      # moved the key hits, nothing is re-saved, and the restored
+      # `advisory-dbs` is as old as the first save. That is harmless here and
+      # only because of one fact: `cargo deny check` fetches the advisory
+      # database on every run unless `--offline` is passed, and it is not passed
+      # anywhere in this file. The cache is a warm start for the clone, never
+      # the data the check reads. `deny.toml`'s `maximum-db-staleness` is the
+      # backstop for the case where that fetch quietly starts failing — see the
+      # comment there.
       - name: Cache registry indexes and RustSec database
-        uses: actions/cache@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
