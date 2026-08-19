@@ -32,13 +32,14 @@ use view::{SlotRow, SlotRows, ViewState, slot_detail, view_state};
 /// end): written once by the spawn wrapper in `main`, shown as a banner.
 pub type SessionErrorSlot = Arc<Mutex<Option<String>>>;
 
-/// A poisoned lock means the session panicked. Keep rendering the last
-/// state (the banner reports the crash) rather than double-panic the window.
-fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+/// A poisoned lock means the session panicked. Keep rendering the last state —
+/// the banner is what reports that crash, and it cannot be drawn from a thread
+/// that just double-panicked getting at it. Nothing the window reads is written
+/// in more than one step: it clones or copies out and releases.
+///
+/// The policy itself, and the obligation that last sentence discharges, are in
+/// [`crate::sync`].
+use crate::sync::lock_ignoring_poison;
 
 /// Fallback window for errors raised before any session exists (bad
 /// config.toml): a double-clicked exe must not flash a console and vanish.

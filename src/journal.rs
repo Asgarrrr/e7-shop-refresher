@@ -100,11 +100,9 @@ impl EventLog {
         let at_ms = self.now_ms();
         // Poison-tolerant like `to_entries`: `emit` runs on the session loop,
         // the actuator executor and the watchdog, so panicking here would
-        // cascade and freeze the GUI's history.
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // cascade and freeze the GUI's history. `crate::sync`'s obligation is
+        // discharged by the deque only ever being pushed to and read whole.
+        let mut entries = crate::sync::lock_ignoring_poison(&self.entries);
         for text in lines {
             entries.push_back(LogLine {
                 at_ms,
@@ -133,9 +131,7 @@ impl EventLog {
     /// and 500 bumps are still real work 4 times a second, hence the cache.
     /// Poison-tolerant, so the GUI can still show history after a panic.
     pub fn to_entries(&self) -> Vec<LogLine> {
-        self.entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::sync::lock_ignoring_poison(&self.entries)
             .iter()
             .cloned()
             .collect()

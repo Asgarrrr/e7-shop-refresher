@@ -2,7 +2,7 @@
 //! decisions to the capture gate, and echo every outcome to the player.
 
 use std::fmt::Write as _;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
@@ -32,18 +32,15 @@ const HEARTBEAT_EVERY_TICKS: u64 = 30;
 /// without this window a crash reads as a clean "session ended".
 const FATAL_REPORT_GRACE: Duration = Duration::from_millis(150);
 
-/// The controller's poison-tolerant lock: a panic elsewhere must not turn
-/// every later dispatch into a second panic, matching the journal, view,
-/// actuator, and stream budget's policy — and the GUI's, which reads this
-/// same mutex through `ui::lock_ignoring_poison`.
+/// The controller's poison-tolerant lock: a panic elsewhere must not turn every
+/// later dispatch into a second panic. `.expect("controller mutex poisoned")`
+/// was rejected here for a measured reason — it turned a recoverable frame fault
+/// into `supervise` reporting "session crashed" and stopping the relay.
 ///
-/// `.expect("controller mutex poisoned")` was rejected: it turned a
-/// recoverable frame fault into `supervise` reporting "session crashed" and
-/// stopping the relay. `Controller::handle` is pure and saturating, so a
-/// guard released by an unwinding thread never leaves state half-written.
-fn lock(controller: &Mutex<Controller>) -> MutexGuard<'_, Controller> {
-    controller.lock().unwrap_or_else(PoisonError::into_inner)
-}
+/// [`crate::sync`]'s obligation is discharged by `Controller::handle` being pure
+/// and saturating, so a guard released by an unwinding thread never leaves state
+/// half-written. The GUI reads this same mutex through the same function.
+use crate::sync::lock_ignoring_poison as lock;
 
 /// Why the loop stopped. Exactly one holds when the loop breaks, and the
 /// teardown event and fatal-report grace window are both read off it.

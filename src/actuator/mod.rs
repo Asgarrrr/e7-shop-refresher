@@ -10,7 +10,7 @@ mod shield;
 pub mod win;
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -20,14 +20,12 @@ use crate::watch::{HaltSource, WatchGate};
 
 use plan::{Epoch, Input, Job, ScreenError, Timings};
 
-/// The actuator's poison-tolerant lock, matching the policy the journal, the
-/// view and the stream budget already state: a panic on some other thread must
-/// not turn every later click into a fatal, and none of the state guarded here
-/// can be left half-written (`Timings` is `Copy` and copied straight out; the
-/// shield's slot is a plain handle).
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
+/// The actuator's poison-tolerant lock: a panic on some other thread must not
+/// turn every later click into a fatal. The obligation [`crate::sync`] puts on
+/// its callers is discharged here by the shape of what is guarded — `Timings` is
+/// `Copy` and copied straight out, and the shield's slot is a plain handle, so
+/// neither can be caught half-written.
+use crate::sync::lock_ignoring_poison as lock;
 
 /// Generation counter of the shop state, bumped on every shop message. A job
 /// carries the epoch it was planned against and the executor refuses to act

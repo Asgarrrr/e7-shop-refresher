@@ -226,12 +226,11 @@ fn run_mode(
         if session_failed {
             flag.store(true, Ordering::Relaxed);
         }
-        // Poison-tolerant like the view's own reads (`ui::lock_ignoring_poison`):
-        // panicking here would kill this task silently — no banner, no failed
-        // flag — and report a dead session as a clean exit.
-        *slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+        // Poison-tolerant like the view's own reads, and through the same
+        // function: panicking here would kill this task silently — no banner, no
+        // failed flag — and report a dead session as a clean exit. The slot is
+        // written once, whole.
+        *arkyve_refresh_shop::sync::lock_ignoring_poison(&slot) = Some(outcome);
     });
 
     let result = eframe::run_native(
