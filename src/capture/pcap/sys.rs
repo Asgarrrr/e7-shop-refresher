@@ -185,12 +185,19 @@ pub(super) const DLL_CANDIDATES: [&str; 2] = ["wpcap.dll", r"C:\Windows\System32
 
 /// What to tell a player who has no Npcap at all.
 ///
+/// The Wireshark clause is not a preference, it is a fallback for a measured
+/// failure: npcap.com answers in 6–9 s from here and the direct installer URL
+/// failed outright at 19 s, while Wireshark ships "the latest stable release of
+/// Npcap" (its own words) from a fast CDN and is in `winget`. Nothing is
+/// redistributed either way — the player fetches from the vendor.
+///
 /// It ends on "then restart this app" because the capture source is opened once,
 /// from `Session::run`, at startup: a player who installs Npcap and comes back to
 /// the still-open window is looking at a dead session with nothing to click. The
 /// sentence is the cheap half of that fix; the expensive half is a re-probe that
 /// rebuilds the session in place, which `docs/npcap-provisioning.md` leaves open.
-pub(super) const INSTALL_HINT: &str = "install Npcap from https://npcap.com/#download and leave \
+pub(super) const INSTALL_HINT: &str = "install Npcap from https://npcap.com/#download \
+     (if that is slow, `winget install WiresharkFoundation.Wireshark` bundles it), leave \
      \"Restrict Npcap driver's access to Administrators\" UNCHECKED, then restart this app";
 
 impl Wpcap {

@@ -61,6 +61,20 @@ is extracted, no service is registered by this tool. Instead the app uses
 installs), which you install yourself:
 
 1. Download it from **https://npcap.com** and run the installer.
+
+   **If that page is slow or the download fails**, install Wireshark instead —
+   it bundles Npcap, and its download servers are fast:
+
+   ```
+   winget install WiresharkFoundation.Wireshark
+   ```
+
+   Wireshark's own download page states that *"each Windows package comes with
+   the latest stable release of Npcap"*, so this gets you the same driver by a
+   faster route. It costs about 80 MB against Npcap's ~1 MB, which is still the
+   better trade when npcap.com will not answer — measured from here at a 6–9 s
+   time-to-first-byte, with the direct installer URL failing outright at 19 s.
+   You never have to open Wireshark; the driver is what this app needs.
 2. **Keep the default options.** In particular:
    - Leave *"Restrict Npcap driver's access to Administrators"* **unchecked**
      (that is the default). The app works either way, but unchecking it is what
