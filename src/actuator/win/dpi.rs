@@ -134,13 +134,21 @@ pub(super) fn ensure_dpi_awareness() -> Result<(), SurfaceError> {
         // bare `set == 0` used to spell — with the error it names captured back
         // when it still belonged to that call.
         if let Some(error) = set_error {
-            // Whoever set it first won: winit in the GUI build, or a shim.
-            // Recorded either way.
+            // Since the manifest declares the awareness, this branch is the
+            // *expected* path, not a surprise: the loader set the value before
+            // any code ran, so our setter was always going to be refused
+            // (`ERROR_ACCESS_DENIED`, measured). The message says so, because a
+            // line that reads like an anomaly on every single launch is a line
+            // people learn to skip — and the one launch where `accepted` is
+            // `false` is the one that matters. That case means something
+            // outranked the manifest: a `__COMPAT_LAYER` shim, or the
+            // "Override high DPI scaling behavior" checkbox.
             tracing::info!(
                 awareness = awareness_name(awareness),
                 accepted = verdict.is_ok(),
                 error = %error,
-                "process DPI awareness was already set before the actuator asked"
+                "the DPI awareness was already established before the actuator asked — \
+                 expected, the manifest sets it; `accepted=false` means something outranked it"
             );
         }
         verdict
