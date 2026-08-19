@@ -105,6 +105,26 @@ pub(super) async fn session_loop(
             // The player's own stop, like Ctrl+C.
             break Exit::PlayerStopped;
         }
+        // `biased` polls in source order and takes the first ready branch, so
+        // this list is a priority order and a branch that is *always* ready
+        // starves everything below it. `messages` is the one branch that can be:
+        // it is fed by the uplink over 256 slots, and a server sending faster
+        // than `on_message` runs keeps it perpetually ready.
+        //
+        // So the four branches that end the session come first, together. Three
+        // of them used to sit below `messages` — including `fatal_errors`, whose
+        // own comment says "break immediately: the channel cascade can take tens
+        // of seconds, during which the window would keep claiming a healthy
+        // watch", which the ordering then contradicted. `ctrl_c` sat last of
+        // all, two branches below the `shutdown` signal that is the same
+        // player intent in the windowed build.
+        //
+        // The safety halt stays first of the four; that much was already argued
+        // (`docs/tech-debt/06-async.md`, `async-cancel-safety`). Nothing below
+        // the exits can starve anything: `commands` is human-paced, and `ticker`
+        // is last because a tick is the branch it is cheapest to be late for —
+        // and while `messages` is flooding, the loop is being driven by the real
+        // shop rather than by a timer.
         tokio::select! {
             biased;
             source = gate.next_halt() => {
@@ -123,6 +143,25 @@ pub(super) async fn session_loop(
             // so the branch disables instead of spinning.
             changed = shutdown.changed(), if shutdown_open => {
                 shutdown_open = changed.is_ok();
+            },
+            _ = &mut ctrl_c => {
+                journal.emit(&[">> Ctrl+C, stopping".to_owned()]);
+                break Exit::PlayerStopped;
+            }
+            error = fatal_errors.recv(), if fatal_open => match error {
+                Some(error) => {
+                    // Break immediately: the channel cascade can take tens
+                    // of seconds, during which the window would keep
+                    // claiming a healthy watch. `error`, not `info`:
+                    // README's troubleshooting tells the player to look for
+                    // this line, and a narrowed `RUST_LOG` would delete it.
+                    journal.emit_at(
+                        tracing::Level::ERROR,
+                        &[format!(">> session aborted — {error}")],
+                    );
+                    break Exit::Fatal(error);
+                }
+                None => fatal_open = false,
             },
             command = commands.recv(), if commands_open => match command {
                 Some(command) => on_command(controller, gate, journal, actuator, command, now_ms()),
@@ -160,21 +199,6 @@ pub(super) async fn session_loop(
                 }
                 None => break Exit::UplinkClosed,
             },
-            error = fatal_errors.recv(), if fatal_open => match error {
-                Some(error) => {
-                    // Break immediately: the channel cascade can take tens
-                    // of seconds, during which the window would keep
-                    // claiming a healthy watch. `error`, not `info`:
-                    // README's troubleshooting tells the player to look for
-                    // this line, and a narrowed `RUST_LOG` would delete it.
-                    journal.emit_at(
-                        tracing::Level::ERROR,
-                        &[format!(">> session aborted — {error}")],
-                    );
-                    break Exit::Fatal(error);
-                }
-                None => fatal_open = false,
-            },
             _ = ticker.tick() => {
                 let now = now_ms();
                 dispatch(controller, gate, journal, actuator, Event::Tick { now_ms: now }, now);
@@ -182,10 +206,6 @@ pub(super) async fn session_loop(
                 if ticks.is_multiple_of(HEARTBEAT_EVERY_TICKS) {
                     heartbeat(controller, gate, now, last_shop_ms, unknown_messages);
                 }
-            }
-            _ = &mut ctrl_c => {
-                journal.emit(&[">> Ctrl+C, stopping".to_owned()]);
-                break Exit::PlayerStopped;
             }
         }
     };

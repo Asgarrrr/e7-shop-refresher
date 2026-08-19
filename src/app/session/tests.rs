@@ -150,6 +150,84 @@ async fn a_worker_panic_is_reported_when_the_uplink_channel_closes() {
     assert_eq!(failure, Some("uplink task panicked".to_owned()));
 }
 
+/// A `biased` select is a priority list, and `messages` is the one branch a
+/// remote party can keep permanently ready: the uplink fills 256 slots, and a
+/// server sending faster than `on_message` runs means `recv()` is ready on every
+/// poll. While `fatal_errors` sat below it, "break immediately" — the fatal
+/// arm's own instruction — meant "after the flood drains", and a worker death
+/// went unreported while the window still claimed a healthy watch.
+///
+/// *When* is the assertion, not the exit: the old order reached `Exit::Fatal`
+/// too, just after handling every queued message first. So the test reads the
+/// journal — one shop snapshot handled before the abort line is one too many.
+#[tokio::test]
+async fn a_flood_of_messages_cannot_delay_a_fatal() {
+    const QUEUED: usize = 8;
+
+    let gate = WatchGate::new(false);
+    let journal = EventLog::default();
+    let controller = Mutex::new(Controller::new(
+        Filter::matching_default_items(),
+        Limits::default(),
+    ));
+
+    // Armed, so a snapshot the filter does not match produces a journal line:
+    // an idle controller ignores shop messages, and a test where the flood is
+    // silent cannot tell the two orders apart.
+    on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
+    let armed_lines = journal.to_entries().len();
+
+    let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
+    // Kept alive: a closed channel would end the loop through `UplinkClosed`,
+    // which is the branch this test is not about.
+    let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(QUEUED);
+    for id in 0..QUEUED {
+        message_tx
+            .try_send(UplinkEvent::Message(ServerMessage::Shop(dud_shop(
+                u32::try_from(id).expect("a fixture index fits") + 1,
+            ))))
+            .expect("fill the bounded uplink queue");
+    }
+    assert_eq!(message_tx.capacity(), 0, "the flood is queued and ready");
+
+    let (error_tx, error_rx) = mpsc::channel::<String>(1);
+    error_tx
+        .try_send("network capture: the adapter died".to_owned())
+        .expect("one fatal, waiting behind the flood");
+
+    let failure = session_loop(
+        &controller,
+        &gate,
+        &journal,
+        &off(),
+        command_rx,
+        message_rx,
+        error_rx,
+        never_shutdown(),
+    )
+    .await;
+
+    assert_eq!(
+        failure,
+        Some("network capture: the adapter died".to_owned())
+    );
+    // The journal, not `Sender::capacity`: dropping the receiver discards the
+    // buffered messages too, so the free-slot count reads full either way.
+    // What separates the orders is whether anything was *processed*.
+    let said: Vec<Arc<str>> = journal
+        .to_entries()
+        .into_iter()
+        .skip(armed_lines)
+        .map(|line| line.text)
+        .collect();
+    assert!(
+        said.first()
+            .is_some_and(|text| text.contains("session aborted")),
+        "the fatal must be the first thing the loop says, not the {QUEUED}th: {said:?}"
+    );
+    drop(message_tx);
+}
+
 #[test]
 fn stop_while_idle_reports_no_effect() {
     let gate = WatchGate::new(false);
