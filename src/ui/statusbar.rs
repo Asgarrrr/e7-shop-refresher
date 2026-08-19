@@ -12,6 +12,48 @@ use super::theme;
 use super::view::ViewState;
 use crate::render::amount_or_dash;
 
+/// Splits an error line around the first URL in it: `(before, url, after)`.
+///
+/// The one error a player is most likely to meet — Npcap missing — ends in a
+/// download address, and an address in a `colored_label` has to be selected
+/// character by character out of a 270-character line before it can be pasted
+/// into a browser. Rendering it as a link instead costs nothing: `webbrowser`
+/// is already compiled (a non-optional dependency of `egui-winit`, which eframe
+/// pulls in) and `theme` already sets `hyperlink_color`, for a hyperlink the
+/// crate never drew.
+///
+/// A URL ends at the first whitespace, so a trailing `)` or `.` stays attached.
+/// Both are legal URL characters and no general rule can separate "end of
+/// sentence" from "end of path"; `INSTALL_HINT` is written so the address is
+/// followed by a space.
+fn split_help_url(text: &str) -> Option<(&str, &str, &str)> {
+    let start = text.find("https://")?;
+    let rest = &text[start..];
+    let len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some((&text[..start], &rest[..len], &rest[len..]))
+}
+
+/// The error line, with any URL in it clickable.
+///
+/// `horizontal_wrapped` rather than one label: the parts have to sit on one
+/// flowing line, and the banner is the full panel width, so a long message
+/// wraps as it did before.
+fn error_banner(ui: &mut egui::Ui, text: &str) {
+    let color = ui.visuals().error_fg_color;
+    let Some((before, url, after)) = split_help_url(text) else {
+        ui.colored_label(color, text);
+        return;
+    };
+    ui.horizontal_wrapped(|ui| {
+        // The item spacing would otherwise open a gap inside a sentence that
+        // was one string a moment ago.
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.colored_label(color, before);
+        ui.hyperlink_to(url, url);
+        ui.colored_label(color, after);
+    });
+}
+
 /// Top chrome: the error banner, then two rows — status (dot + word + clause)
 /// with the one contextual button on the right, and under it a row of stat
 /// tiles (balances | refreshes + the per-token haul). Returns the clicked
@@ -25,7 +67,7 @@ pub(super) fn render_status_bar(
 ) -> Option<Command> {
     let mut clicked = None;
     if let Some(outcome) = outcome {
-        ui.colored_label(ui.visuals().error_fg_color, outcome);
+        error_banner(ui, outcome);
         ui.separator();
     }
 
@@ -195,6 +237,63 @@ mod tests {
     fn value_over_limit_renders_missing_limit_as_dash() {
         assert_eq!(value_over_limit(3, Some(10)), "3/10");
         assert_eq!(value_over_limit(3, None), "3/—");
+    }
+
+    /// The shape of the message a player without Npcap actually gets, kept here
+    /// as a literal rather than imported: `INSTALL_HINT` lives behind
+    /// `cfg(all(windows, feature = "pcap-backend"))` and this test runs on every
+    /// lane. Only the structure is asserted, so the wording can move.
+    const NPCAP_ERROR: &str = "session error: network capture: install Npcap from \
+         https://npcap.com/#download and leave \"Restrict Npcap driver's access to \
+         Administrators\" UNCHECKED. (wpcap.dll could not be loaded: wpcap.dll: \
+         LoadLibraryExW failed)";
+
+    #[test]
+    fn split_help_url_finds_the_address_inside_a_sentence() {
+        let (before, url, after) = split_help_url(NPCAP_ERROR).expect("the hint carries a URL");
+        assert!(before.ends_with("install Npcap from "));
+        assert_eq!(url, "https://npcap.com/#download");
+        assert!(after.starts_with(" and leave"));
+        // Reassembling must give back the original: the banner renders these
+        // three pieces and nothing else, so a lost character is a lost word.
+        assert_eq!(format!("{before}{url}{after}"), NPCAP_ERROR);
+    }
+
+    #[test]
+    fn split_help_url_declines_text_without_one() {
+        assert!(split_help_url("session error: the game window vanished").is_none());
+        // Only https. A cleartext http link in an error banner is one the app
+        // should not be teaching anyone to click.
+        assert!(split_help_url("see http://example.invalid/x").is_none());
+    }
+
+    #[test]
+    fn split_help_url_keeps_a_trailing_url_whole() {
+        let (before, url, after) = split_help_url("get it from https://npcap.com").expect("a URL");
+        assert_eq!(before, "get it from ");
+        assert_eq!(url, "https://npcap.com");
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn the_npcap_banner_offers_the_download_as_a_link() {
+        let view = idle_view();
+        let harness = Harness::new_ui(|ui| {
+            let _ = render_status_bar(ui, &view, Some(NPCAP_ERROR), true);
+        });
+        // The address is its own widget, so it is clickable rather than a run of
+        // characters to be selected out of a 270-character line.
+        harness.get_by_label("https://npcap.com/#download");
+    }
+
+    #[test]
+    fn an_error_without_a_url_still_renders() {
+        let view = idle_view();
+        let plain = "session error: the game window vanished";
+        let harness = Harness::new_ui(|ui| {
+            let _ = render_status_bar(ui, &view, Some(plain), true);
+        });
+        harness.get_by_label(plain);
     }
 
     #[test]

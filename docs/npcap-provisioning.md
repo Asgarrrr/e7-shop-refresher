@@ -9,10 +9,14 @@ answers that, and the answer is settled by a licence rather than by engineering.
 
 The app **never ships, downloads, extracts, or installs Npcap**, and never will
 without written permission from the Nmap Project. What it does instead is detect
-the absence properly and hand the player something they can act on: a message
-that names the one step, a clickable link to the download page in the window
-that is the only surface this build has, and a re-probe that does not need the
-app to be relaunched.
+the absence properly and hand the player something they can act on.
+
+Landed: a message that leads with the one step rather than with two DLL paths,
+and a clickable link to the download page in the window that is the only surface
+this build has. Both are exercised — see *What happens today*.
+
+Deferred, deliberately: the re-probe, so that installing Npcap does not need the
+app relaunched. It waits on a measurement, not on a decision.
 
 Every richer option on the list is either forbidden by the licence, or is
 worse than this one on grounds that have nothing to do with the licence.
@@ -232,10 +236,22 @@ open.
    the problem, because they are what distinguishes "no Npcap" from "Npcap
    present and the load failed anyway".
 
-   Still true and still unfunded: egui labels are not selectable by default and a
-   bare URL in one is not clickable, so the player must retype it.
-   `src/ui/theme.rs:78` already sets `visuals.hyperlink_color = ACCENT` — for a
-   hyperlink nothing in the crate renders.
+   **The address is a link now**, and the second half of this item was wrong
+   too. It claimed egui labels "are not selectable by default", so the player
+   "must retype" the URL. Measured: `selectable_labels` defaults to `true`
+   (egui 0.35 `style.rs:1482`) and the crate never overrides it, so the address
+   has always been selectable — the defect was that it had to be picked
+   character by character out of a 270-character line, which is tedious rather
+   than impossible. Overstated in the same direction as the character count, and
+   from the same habit.
+
+   `statusbar::split_help_url` splits the message around its first `https://`
+   and the banner renders that piece with `ui.hyperlink_to`. Cost: **zero
+   dependencies.** `webbrowser` is already compiled — a non-optional dependency
+   of `egui-winit`, which eframe pulls in (`cargo tree -i webbrowser`) — and
+   `src/ui/theme.rs:72` was already setting `visuals.hyperlink_color = ACCENT`
+   for a hyperlink the crate never drew. (The line is 72, not the 78 this
+   document first gave.)
 2. **The advice the player had already taken is gone.** ~~`no_usable_device_error`'s
    `AdminOnly` arm ends "…or run this app elevated".~~ **Fixed.** The shipped exe
    is manifested `requireAdministrator` (`build.rs`), so anyone reading that
