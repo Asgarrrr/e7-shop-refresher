@@ -51,7 +51,7 @@ use tracing::{debug, info, warn};
 
 use super::{CaptureStop, PacketSource, Segment, parse_segment};
 use crate::error::{Error, Result};
-use sys::{DLL_CANDIDATES, INSTALL_HINT, SNAPLEN, Wpcap, capture_loop, enumerate, open_device};
+use sys::{INSTALL_HINT, SNAPLEN, Wpcap, capture_loop, enumerate, open_device};
 
 /// Packet frames between two funnel log lines. Every captured packet passes
 /// through the funnel, plus once on the very first packet, so a capture about
@@ -169,10 +169,14 @@ impl PcapSource {
     ///   Npcap install; already-spawned threads are still joined by [`Drop`].
     pub(crate) fn open(game_port: NonZeroU16) -> Result<(Self, PcapStop)> {
         let (wpcap, loaded_from) = Wpcap::load()?;
+        // No `plain_name_resolved` field any more: there is no plain name to
+        // resolve, because resolving one is what let a `wpcap.dll` beside the
+        // exe run at high integrity. The path carries what that boolean did —
+        // ending in `System32\wpcap.dll` rather than `System32\Npcap\wpcap.dll`
+        // is the WinPcap-compatible install.
         info!(
-            path = loaded_from,
+            path = %loaded_from.display(),
             version = %wpcap.version(),
-            plain_name_resolved = loaded_from == DLL_CANDIDATES[0],
             "wpcap.dll loaded"
         );
         let wpcap = Arc::new(wpcap);

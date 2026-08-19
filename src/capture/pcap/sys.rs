@@ -17,6 +17,7 @@
 //! no pointer, and it is the one that left.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -173,15 +174,85 @@ pub(super) struct Wpcap {
     lib_version: unsafe extern "C" fn() -> *const c_char,
 }
 
+/// Search flags for every candidate below, and the reason the bare name
+/// `"wpcap.dll"` is no longer one of them.
+///
+/// `libloading::Library::new` is `LoadLibraryExW(name, NULL, 0)` — the standard
+/// search order, whose **first** entry is the directory of the running
+/// executable. This exe is manifested `requireAdministrator` (`build.rs`) and a
+/// player runs the single downloaded file straight out of
+/// `%USERPROFILE%\Downloads`, a directory any medium-integrity process of the
+/// same user can write. A `wpcap.dll` dropped there would have had its
+/// `DllMain` executed at high integrity before [`Wpcap::load`] returned: a
+/// local privilege escalation reached by writing one file and waiting.
+///
+/// Absolute paths alone would fix the hijack but break the load, because
+/// `wpcap.dll` in Npcap's private directory imports `Packet.dll` from beside
+/// it, and a `LoadLibrary` of an absolute path searches the *application*
+/// directory for dependencies, not the loaded module's own.
+/// `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` is what makes that import resolve, and
+/// naming any `LOAD_LIBRARY_SEARCH_*` flag replaces the standard order outright
+/// — the exe's directory is no longer in it. `LOAD_LIBRARY_SEARCH_SYSTEM32`
+/// covers the WinPcap-compatible copy's own dependencies.
+///
+/// These flags require a fully qualified path, which is the other half of why
+/// the bare name had to go.
+/// Spelled `u32` because `libloading`'s own `LOAD_LIBRARY_FLAGS` alias for it is
+/// private, while the constants below are not.
+const SEARCH_FLAGS: u32 = libloading::os::windows::LOAD_LIBRARY_SEARCH_SYSTEM32
+    | libloading::os::windows::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR;
+
 /// Where `wpcap.dll` is looked for, in order.
 ///
-/// The plain name resolves only when Npcap was installed in WinPcap-compatible
-/// mode (the installer default, though the player may have unchecked it); the
-/// second path is the private directory Npcap always writes to, not on any
-/// DLL search path. Which one answered is logged: "the plain name did not
-/// resolve" is the difference between a working and a broken install on a
-/// machine we cannot inspect.
-pub(super) const DLL_CANDIDATES: [&str; 2] = ["wpcap.dll", r"C:\Windows\System32\Npcap\wpcap.dll"];
+/// `Npcap\wpcap.dll` first: it is the private directory Npcap always writes to,
+/// so it is present on every install. The System32 copy exists only when the
+/// installer's WinPcap-compatible mode was kept (its default, though the player
+/// may have unchecked it), so it is the fallback rather than the first ask —
+/// the reverse of the order this list had while its first entry was a bare
+/// name. Which one answered is logged, and the path says which install mode the
+/// machine has, on a machine we cannot inspect.
+///
+/// The directory comes from `GetSystemDirectoryW` and not from `%SystemRoot%`:
+/// a UAC-elevated process inherits its environment from the medium-integrity
+/// process that requested the elevation, so that variable is exactly as
+/// trustworthy as the attacker in [`SEARCH_FLAGS`].
+fn dll_candidates() -> [PathBuf; 2] {
+    let system = system_directory();
+    [
+        system.join("Npcap").join("wpcap.dll"),
+        system.join("wpcap.dll"),
+    ]
+}
+
+/// `GetSystemDirectoryW`, or the conventional path if it will not answer.
+///
+/// `MAX_PATH` is documented as always sufficient for this one directory, so the
+/// truncation branch is unreachable in practice; it falls back rather than
+/// truncating, because half a path is a path that could resolve somewhere else.
+fn system_directory() -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    const MAX_PATH_WIDE: u32 = 260;
+    let mut buffer = [0_u16; MAX_PATH_WIDE as usize];
+    // SAFETY: the pointer and the count describe the same stack array, and the
+    // count is in `u16`s, which is what this call wants. It writes at most that
+    // many and returns how many it wrote, excluding the terminator; `0` is its
+    // failure return and a value above the count means it wrote nothing and is
+    // asking for a bigger buffer. Both are handled below.
+    let written = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), MAX_PATH_WIDE) };
+    match buffer.get(..written as usize) {
+        Some(path) if written > 0 => PathBuf::from(std::ffi::OsString::from_wide(path)),
+        _ => {
+            warn!(
+                written,
+                "GetSystemDirectoryW did not answer; assuming the conventional path"
+            );
+            PathBuf::from(r"C:\Windows\System32")
+        }
+    }
+}
 
 /// What to tell a player who has no Npcap at all.
 ///
@@ -212,21 +283,24 @@ pub(super) const INSTALL_HINT: &str = "Npcap is missing, and the capture needs i
      Keep the installer's defaults, then restart this app.";
 
 impl Wpcap {
-    pub(super) fn load() -> Result<(Self, &'static str)> {
+    pub(super) fn load() -> Result<(Self, PathBuf)> {
         let mut failures = Vec::new();
-        for path in DLL_CANDIDATES {
-            // SAFETY: `Library::new` runs the DLL's entry point, which for
+        for path in dll_candidates() {
+            // SAFETY: `load_with_flags` runs the DLL's entry point, which for
             // `wpcap.dll` only initializes the library's own state. The symbols
             // resolved just below are copied out as plain function pointers;
             // they stay valid exactly as long as `_lib` — stored in the same
             // struct, never separated from them — keeps the module loaded.
             // Failure mode: the DLL is absent or is not a valid image, which
             // surfaces as an `Err` here and is collected rather than fatal, so
-            // the second candidate still gets its turn.
-            let lib = match unsafe { libloading::Library::new(path) } {
-                Ok(lib) => lib,
+            // the second candidate still gets its turn. The flags are argued at
+            // [`SEARCH_FLAGS`]; the path is absolute, which they require.
+            let lib = match unsafe {
+                libloading::os::windows::Library::load_with_flags(&path, SEARCH_FLAGS)
+            } {
+                Ok(lib) => libloading::Library::from(lib),
                 Err(err) => {
-                    failures.push(format!("{path}: {err}"));
+                    failures.push(format!("{}: {err}", path.display()));
                     continue;
                 }
             };
@@ -249,7 +323,8 @@ impl Wpcap {
                         Ok(symbol) => *symbol,
                         Err(err) => {
                             failures.push(format!(
-                                "{path}: {} is missing ({err})",
+                                "{}: {} is missing ({err})",
+                                path.display(),
                                 String::from_utf8_lossy($name).trim_end_matches('\0')
                             ));
                             continue;
@@ -762,5 +837,70 @@ mod tests {
         let unterminated = [b'x'.cast_signed(); PCAP_ERRBUF_SIZE];
         assert_eq!(errbuf_text(&unterminated).len(), PCAP_ERRBUF_SIZE);
         assert_eq!(errbuf_text(&[0 as c_char; PCAP_ERRBUF_SIZE]), "");
+    }
+
+    #[test]
+    fn no_wpcap_candidate_is_a_relative_name() {
+        // The regression this pins is one character wide — a `"wpcap.dll"` back
+        // in the list — and its consequence is arbitrary code at high
+        // integrity, so it is asserted rather than left to the comment above
+        // `SEARCH_FLAGS`. A relative name also makes `load_with_flags` fail
+        // outright, but "the capture stopped working" is not the failure that
+        // needs catching here.
+        let candidates = dll_candidates();
+        for path in &candidates {
+            assert!(
+                path.is_absolute(),
+                "{} must be absolute: a relative name resolves against the exe's own directory",
+                path.display()
+            );
+            assert!(
+                path.starts_with(system_directory()),
+                "{} must be under the system directory",
+                path.display()
+            );
+        }
+        assert_eq!(
+            candidates[0].parent().and_then(|dir| dir.file_name()),
+            Some(std::ffi::OsStr::new("Npcap")),
+            "Npcap's private directory is present on every install, so it is asked first"
+        );
+    }
+
+    #[test]
+    fn the_search_flags_still_load_a_system_dll_by_absolute_path() {
+        // The risk in narrowing the search order is that it narrows past the
+        // real `wpcap.dll` too, and this machine cannot say — it has no Npcap,
+        // so `the_tap_opens_on_this_machine_without_elevation` is unrunnable
+        // here. `version.dll` stands in: same directory, same flags, same call.
+        // It proves the combination resolves an absolute path under
+        // `LOAD_LIBRARY_SEARCH_SYSTEM32`; it cannot prove the
+        // `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` half, which only matters for
+        // `Packet.dll` beside a real `wpcap.dll`.
+        let path = system_directory().join("version.dll");
+        // SAFETY: `version.dll` is a Windows system library already loaded into
+        // most processes; its entry point initializes its own state only. The
+        // handle is dropped immediately and no symbol is resolved from it.
+        let loaded =
+            unsafe { libloading::os::windows::Library::load_with_flags(&path, SEARCH_FLAGS) };
+        assert!(
+            loaded.is_ok(),
+            "{} did not load under SEARCH_FLAGS: {:?}",
+            path.display(),
+            loaded.err()
+        );
+    }
+
+    #[test]
+    fn the_system_directory_is_read_from_the_os() {
+        // Not from `%SystemRoot%`, which an elevating parent chooses. The
+        // fallback is a real path too, so this holds either way.
+        let system = system_directory();
+        assert!(system.is_absolute(), "got {}", system.display());
+        assert!(
+            system.is_dir(),
+            "{} should exist on any Windows",
+            system.display()
+        );
     }
 }
