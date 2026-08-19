@@ -20,10 +20,11 @@ mod send_input;
 
 use std::fmt;
 
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NOT_READY, HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetClientRect, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    FindWindowW, GetClientRect, IsHungAppWindow, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SetWindowPos,
 };
 
 use super::SurfaceError;
@@ -292,7 +293,36 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
 /// reach, unlike a synthetic mouse message which would nudge the game's own
 /// cursor tracking, and refused on one we cannot through the same gate
 /// `shield::raise` hits a moment later.
+///
+/// # Why the hang check comes first
+///
+/// `SetWindowPos` on another process's window is synchronous *in the target's
+/// message loop*: Win32 delivers `WM_WINDOWPOSCHANGING` and waits for that
+/// thread to answer, and there is no timeout parameter — `SendMessageTimeout`
+/// has one, `SetWindowPos` does not. So against a frozen Epic Seven this call
+/// does not fail, it never returns, and it is reached through
+/// [`blocking`](crate::actuator::blocking) → `block_in_place`: the actuator task
+/// parks on a runtime worker and stays parked. Every later job is queued behind
+/// a call that will not come back, nothing is journaled, and the wedge outlives
+/// window close — `JoinHandle::abort` cannot interrupt a thread inside a Win32
+/// call any more than one inside `thread::sleep`.
+///
+/// [`IsHungAppWindow`] is the OS's own answer to that question and sends
+/// nothing, so it cannot itself block. It narrows rather than closes the hole: a
+/// game that freezes between this check and the call below still parks the task.
+/// What it removes is the case that actually happens — a game already frozen
+/// when the job starts — turning a permanent silent wedge into a `Recoverable`
+/// with a sentence the player can act on, which the watchdog then retries.
 fn probe_window_reachable(hwnd: HWND) -> std::io::Result<()> {
+    // SAFETY: `hwnd` is the handle `find_game_window` just returned; the call
+    // reads window-manager state, takes no pointer, borrows nothing past the
+    // call, and answers FALSE for a window that died in between.
+    if unsafe { IsHungAppWindow(hwnd) } != 0 {
+        // Not `last_os_error`: nothing failed. The code is what `preflight_refusal`
+        // classifies on, and `ERROR_NOT_READY` is the closest documented truth —
+        // the window is there and is not answering.
+        return Err(std::io::Error::from_raw_os_error(ERROR_NOT_READY as i32));
+    }
     // SAFETY: `hwnd` is the handle `find_game_window` just returned; a window
     // that died in between is reported as FALSE rather than faulting. The null
     // insert-after handle is ignored under `SWP_NOZORDER`, the geometry is inert
@@ -337,6 +367,20 @@ fn probe_window_reachable(hwnd: HWND) -> std::io::Result<()> {
 /// change is this app, which is why the advice is to restart *it* as
 /// administrator.
 pub(super) fn preflight_refusal(error: &std::io::Error) -> SurfaceError {
+    // The one arm that is not fatal, and the only one where nothing was refused:
+    // a frozen game is the most transient fault this preflight can meet — it
+    // heals when the game answers again, or when the player kills it — so it
+    // drops the job and leaves the watch armed for the watchdog's retry.
+    // Halting here would make a two-second stall a stop the player has to undo
+    // by hand. See [`probe_window_reachable`]'s "why the hang check comes
+    // first" for why this is detected at all rather than waited out.
+    if error.raw_os_error() == Some(ERROR_NOT_READY as i32) {
+        return SurfaceError::Recoverable(
+            "the game window has stopped responding, so no click aimed at it would be read — \
+             waiting for Epic Seven to answer again"
+                .to_owned(),
+        );
+    }
     let cause = if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
         "the game window runs at a higher integrity level than this app, so Windows refuses every \
          click aimed at it — Epic Seven runs as administrator because the STOVE launcher requires \
@@ -425,6 +469,30 @@ mod tests {
         };
         assert!(reason.contains("restart it as administrator"), "{reason}");
         assert!(!reason.contains("without administrator rights"), "{reason}");
+    }
+
+    /// `IsHungAppWindow`'s answer, and the one arm of this classifier that is not
+    /// fatal.
+    ///
+    /// Both halves matter. `Recoverable`, because a frozen game heals — on its
+    /// own or when the player kills it — and halting the watch would make a
+    /// two-second stall a stop they have to undo by hand. And detected at all,
+    /// because the alternative is not an error: `SetWindowPos` on another
+    /// process's window waits in *that* process's message loop with no timeout,
+    /// so the preflight this replaces never returned, and it runs under
+    /// `block_in_place` — the actuator task parks on a runtime worker, every
+    /// later job queues behind it, and `abort` cannot reach a thread inside a
+    /// Win32 call.
+    #[test]
+    fn a_frozen_game_window_is_waited_out_rather_than_halted() {
+        let hung = std::io::Error::from_raw_os_error(ERROR_NOT_READY as i32);
+        let SurfaceError::Recoverable(reason) = preflight_refusal(&hung) else {
+            panic!("a game that stopped answering is the most transient fault here");
+        };
+        assert!(reason.contains("stopped responding"), "{reason}");
+        // The integrity-level advice would be a lie here, and it is the one
+        // sentence in this file that asks the player to restart the app.
+        assert!(!reason.contains("restart it as administrator"), "{reason}");
     }
 
     /// Handles are read in hex everywhere else (Spy++, `WinDbg`, a bug report), so
