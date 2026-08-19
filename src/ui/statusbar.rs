@@ -110,26 +110,10 @@ fn install_row(ui: &mut egui::Ui, url: &str, hint: &str, fetcher: &Fetcher) {
         Progress::Checking => {
             ui.add_enabled(false, egui::Button::new("Checking…"));
         }
-        Progress::Launched => {
-            // The relaunch is one click rather than "close this and open it
-            // again": the tap is opened once, inside the session that already
-            // died, so a fresh process is what picks Npcap up. See
-            // `install::relaunch` for why that is not a re-probe.
-            if ui
-                .button("Restart now")
-                .on_hover_text("starts a fresh copy and closes this window")
-                .clicked()
-            {
-                match crate::install::relaunch() {
-                    Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
-                    // Reported through the same cell as every other failure, so
-                    // a relaunch that did not happen cannot read as one that did.
-                    Err(err) => fetcher.fail(format!("could not restart: {err}")),
-                }
-            }
-            ui.add_space(theme::SP_SM);
-            ui.colored_label(theme::INK_MUTED, "once the Npcap setup is finished");
-        }
+        Progress::Launched => restart_row(ui, fetcher, None),
+        // Same button, because the same thing still has to happen. What changes
+        // is only what is said beside it.
+        Progress::RestartFailed(reason) => restart_row(ui, fetcher, Some(&reason)),
         Progress::Failed(reason) => {
             // The retry stays available: the common failures here are transient
             // (a proxy, a captive portal, a dropped connection), and a dead end
@@ -158,6 +142,52 @@ fn install_row(ui: &mut egui::Ui, url: &str, hint: &str, fetcher: &Fetcher) {
     });
     if matches!(fetcher.progress(), Progress::Fetching | Progress::Checking) {
         ui.ctx().request_repaint_after(REPAINT_WHILE_FETCHING);
+    }
+}
+
+/// The restart control, before and after a restart that did not work.
+///
+/// The relaunch is one click rather than "close this and open it again": the tap
+/// is opened once, inside the session that already died, so a fresh process is
+/// what picks Npcap up. See `install::relaunch` for why that is not a re-probe.
+///
+/// One function for both states because both want the same button. A failed
+/// restart used to fall through to [`Progress::Failed`], whose only control is
+/// `Retry download` — which on this path finds the verified installer still on
+/// disk, launches a *second* Npcap setup, and overwrites the restart error with
+/// `Launched` on the way. The remedy has to be the restart, so the state that
+/// carries the error keeps the restart's control and adds two things a second
+/// download would not have given: what went wrong, and the way out by hand for
+/// a failure that will not fix itself (`current_exe` failing is not weather).
+///
+/// The row stays one button plus text either way, which is all a status bar has
+/// room for.
+fn restart_row(ui: &mut egui::Ui, fetcher: &Fetcher, failure: Option<&str>) {
+    if ui
+        .button("Restart now")
+        .on_hover_text("starts a fresh copy and closes this window")
+        .clicked()
+    {
+        match crate::install::relaunch() {
+            Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+            // Reported through the same cell as every other failure, so a
+            // relaunch that did not happen cannot read as one that did.
+            Err(err) => fetcher.restart_failed(format!("could not restart: {err}")),
+        }
+    }
+    ui.add_space(theme::SP_SM);
+    match failure {
+        None => {
+            ui.colored_label(theme::INK_MUTED, "once the Npcap setup is finished");
+        }
+        Some(reason) => {
+            ui.colored_label(ui.visuals().error_fg_color, reason);
+            ui.add_space(theme::SP_SM);
+            ui.colored_label(
+                theme::INK_FAINT,
+                "or close this window and open the app again",
+            );
+        }
     }
 }
 
@@ -446,6 +476,49 @@ mod tests {
                 .is_none(),
             "the raw address should not be rendered beside the button"
         );
+    }
+
+    /// The state is set through `Fetcher`, never by clicking `Restart now`:
+    /// that button really does spawn a copy of the running executable, which in
+    /// a test binary is the test binary.
+    fn after_a_failed_restart() -> Fetcher {
+        let fetcher = Fetcher::new();
+        fetcher.restart_failed("could not restart: access denied".to_owned());
+        fetcher
+    }
+
+    /// A restart that did not happen must not be handed a download's remedy.
+    ///
+    /// `Retry download` on this path finds the verified installer still on disk,
+    /// takes the reuse fast path and launches a *second* Npcap setup — and sets
+    /// `Launched`, erasing the restart error that was the only thing on screen
+    /// saying anything had gone wrong.
+    #[test]
+    fn a_failed_restart_is_not_offered_another_download() {
+        let view = idle_view();
+        let fetcher = after_a_failed_restart();
+        let harness = Harness::new_ui(|ui| {
+            let _ = render_status_bar(ui, &view, Some(NPCAP_ERROR), true, &fetcher);
+        });
+        assert!(
+            harness.query_by_label("Retry download").is_none(),
+            "a failed restart must not offer the button that spawns another installer"
+        );
+    }
+
+    /// And what it *is* offered is the restart, again, with the reason beside it
+    /// — plus the way out by hand, since a relaunch that failed once will
+    /// usually fail again.
+    #[test]
+    fn a_failed_restart_keeps_the_restart_and_says_why() {
+        let view = idle_view();
+        let fetcher = after_a_failed_restart();
+        let harness = Harness::new_ui(|ui| {
+            let _ = render_status_bar(ui, &view, Some(NPCAP_ERROR), true, &fetcher);
+        });
+        harness.get_by_label("Restart now");
+        harness.get_by_label("could not restart: access denied");
+        harness.get_by_label("or close this window and open the app again");
     }
 
     #[test]

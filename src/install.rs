@@ -90,7 +90,19 @@ pub enum Progress {
     Checking,
     /// Handed to the shell. Npcap's own installer owns the screen now.
     Launched,
-    /// Gave up. The string is player-facing and names the step that failed.
+    /// Launched, and then the one-click restart the banner offers did not
+    /// happen. The string is player-facing and says why.
+    ///
+    /// Not [`Progress::Failed`], because the two want opposite remedies. The
+    /// download succeeded here; the file is still on disk and still verifies,
+    /// so `Failed`'s remedy — start the fetch again — takes
+    /// [`Fetcher::fetch_and_check`]'s reuse fast path and puts a *second* Npcap
+    /// setup window on screen, while the restart that actually failed is
+    /// overwritten by `Launched` and never reported. What this state owes the
+    /// player is the restart, again.
+    RestartFailed(String),
+    /// Gave up before anything was launched. The string is player-facing and
+    /// names the step that failed.
     Failed(String),
 }
 
@@ -118,11 +130,15 @@ impl Fetcher {
             .clone()
     }
 
-    /// Records a failure raised by the window rather than by the worker — the
-    /// relaunch is the only one, and it has nowhere else to be seen.
-    pub fn fail(&self, reason: String) {
-        warn!(reason = %reason, "the install flow failed at the window");
-        self.set(Progress::Failed(reason));
+    /// Records a failed relaunch — the one failure raised by the window rather
+    /// than by the worker, and one that has nowhere else to be seen.
+    ///
+    /// Lands in [`Progress::RestartFailed`], not `Failed`: see that variant for
+    /// why a restart that did not happen must not be offered a download's
+    /// remedy.
+    pub fn restart_failed(&self, reason: String) {
+        warn!(reason = %reason, "the relaunch failed at the window");
+        self.set(Progress::RestartFailed(reason));
     }
 
     fn set(&self, next: Progress) {
@@ -133,13 +149,20 @@ impl Fetcher {
     }
 
     /// Starts fetch → check → launch on a worker thread, unless one is already
-    /// in flight.
+    /// in flight or an installer has already been launched.
     ///
     /// Off the UI thread on purpose: the window repaints at 4 Hz and a blocking
     /// download would freeze it for as long as the network takes, which on the
     /// failure path this feature exists for is exactly when it would hurt.
+    ///
+    /// Refused after a launch, because this whole call ends in a `spawn` and
+    /// [`fetch_and_check`](Self::fetch_and_check)'s reuse fast path makes
+    /// reaching it cheap: Npcap's setup is already on the player's screen and a
+    /// second copy of it is not a remedy for anything. The banner offers no such
+    /// control, and the refusal here is what keeps that from being the only
+    /// thing standing between a click and a second elevated installer.
     pub fn start(&self) {
-        if matches!(self.progress(), Progress::Fetching | Progress::Checking) {
+        if !accepts_a_start(&self.progress()) {
             return;
         }
         let handle = self.clone();
@@ -233,6 +256,21 @@ impl Fetcher {
                 Err(reason)
             }
         }
+    }
+}
+
+/// Whether [`Fetcher::start`] may run from this state.
+///
+/// A predicate rather than a `matches!` inside `start`, so the rule can be
+/// asserted without spawning the worker — a test that let a refusal through
+/// would run the real thing: a download and an elevated `CreateProcess`.
+fn accepts_a_start(progress: &Progress) -> bool {
+    match progress {
+        Progress::Idle | Progress::Failed(_) => true,
+        // In flight: a second worker would race the first over one path.
+        Progress::Fetching | Progress::Checking => false,
+        // Already launched: see [`Fetcher::start`].
+        Progress::Launched | Progress::RestartFailed(_) => false,
     }
 }
 
@@ -552,9 +590,23 @@ mod tests {
         // be able to leave the banner claiming success.
         let fetcher = Fetcher::new();
         fetcher.set(Progress::Launched);
-        fetcher.fail("could not restart: access denied".to_owned());
-        assert!(matches!(fetcher.progress(), Progress::Failed(reason)
+        fetcher.restart_failed("could not restart: access denied".to_owned());
+        assert!(matches!(fetcher.progress(), Progress::RestartFailed(reason)
             if reason.contains("could not restart")));
+    }
+
+    #[test]
+    fn a_failed_restart_is_not_a_failed_download() {
+        // The two are told apart here so the banner can offer each its own
+        // remedy. Collapsed into one state they shared `Failed`'s, which is a
+        // second Npcap installer.
+        let fetcher = Fetcher::new();
+        fetcher.set(Progress::Launched);
+        fetcher.restart_failed("could not restart: access denied".to_owned());
+        assert!(
+            !matches!(fetcher.progress(), Progress::Failed(_)),
+            "a failed restart must not read as a failed download"
+        );
     }
 
     #[test]
@@ -563,5 +615,25 @@ mod tests {
         fetcher.set(Progress::Fetching);
         fetcher.start();
         assert_eq!(fetcher.progress(), Progress::Fetching);
+    }
+
+    #[test]
+    fn nothing_starts_a_second_installer_once_one_is_running() {
+        // Both post-launch states, because `fetch_and_check`'s reuse fast path
+        // means a start from either would reach the `spawn` with the file
+        // already on disk and already verified — an installer window the player
+        // did not ask for a second time.
+        for state in [
+            Progress::Launched,
+            Progress::RestartFailed("could not restart: access denied".to_owned()),
+        ] {
+            assert!(
+                !accepts_a_start(&state),
+                "a start from {state:?} must be refused"
+            );
+        }
+        // And the states that mean "nothing is running" still may.
+        assert!(accepts_a_start(&Progress::Idle));
+        assert!(accepts_a_start(&Progress::Failed("no network".to_owned())));
     }
 }
