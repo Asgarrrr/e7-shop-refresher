@@ -1,15 +1,13 @@
 //! The vocabulary the two pumps share, and nothing else.
 //!
-//! [`CaptureEvent`] is what crosses the metadata channel from the capture
-//! thread to reassembly; [`PressureResync`] is the marker protocol that keeps
-//! that crossing lossless when the queue or the byte budget says no. They are
-//! the *only* two items both `super::ingest` and `super::reassembly` need,
-//! which is why they live here rather than in the root: neither pump has to
-//! import half of the other's module to speak to it.
+//! [`CaptureEvent`] crosses the metadata channel from the capture thread to
+//! reassembly; [`PressureResync`] is the marker protocol keeping that crossing
+//! lossless when the queue or byte budget says no. They are the only two items
+//! `super::ingest` and `super::reassembly` both need, so they live here rather
+//! than in the root.
 //!
-//! This is also why the seam is safe. The two pumps run on different threads
-//! and share exactly these two types — one moved through an `mpsc` channel, one
-//! an `Arc<AtomicU8>`. There is no shared `&mut` state to split.
+//! The two pumps run on different threads and share exactly these two types —
+//! one via `mpsc`, one via `Arc<AtomicU8>` — with no shared `&mut` state.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -74,17 +72,16 @@ enum Resync {
 
 impl Resync {
     /// Decodes a value this type itself wrote. [`PressureResync`] is the only
-    /// writer and every store goes through `Self as u8`, so the fallback cannot
-    /// be reached today — but this runs once per captured packet on the capture
-    /// thread, which `spawn_capture_with_budget` wraps in `catch_unwind`, so a
-    /// panic here would cost a player the whole session for a developer's
-    /// mistake. It therefore follows the same policy `stream.rs` writes down for
-    /// `pending_after_release`: a conservative value plus a named report, with
-    /// the fail-fast kept in `debug_assert!` where an abort costs a stack trace
-    /// rather than a session.
+    /// writer and every store goes through `Self as u8`, so the fallback branch
+    /// cannot be reached today — but this runs once per captured packet on the
+    /// capture thread, wrapped in `catch_unwind` by `spawn_capture_with_budget`,
+    /// so a panic here would cost a player the whole session. It follows the
+    /// same policy `stream.rs` uses for `pending_after_release`: a conservative
+    /// value plus a named report, with the fail-fast kept in `debug_assert!` so
+    /// an abort costs a stack trace, not a session.
     ///
-    /// `Pending` is the conservative choice, not `Ack`: it keeps segments
-    /// blocked and a marker owed, where `Ack` would *drop* a resync marker and
+    /// `Pending`, not `Ack`, is the conservative choice: it keeps segments
+    /// blocked and a marker owed, where `Ack` would drop the resync marker and
     /// leave reassembly anchored on bytes that never arrived.
     fn from_u8(value: u8) -> Self {
         match value {

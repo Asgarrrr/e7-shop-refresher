@@ -1,8 +1,6 @@
 //! Bounded session journal: the same lines the console prints, kept for a
-//! view. The session loop writes, readers copy entries out.
-//!
-//! The journal also owns the session clock (`now_ms`): domain events and
-//! journal stamps read the same timeline by construction.
+//! view; the session loop writes, readers copy entries out. Also owns the
+//! session clock (`now_ms`), so domain events and journal stamps share it.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,18 +9,12 @@ use std::time::Instant;
 
 /// One journal entry: a console line stamped with the session clock.
 ///
-/// `text` is an `Arc<str>`, not a `String`, because of the asymmetry between the
-/// two operations on it: it is written once, by [`EventLog::push`], and copied out
-/// wholesale up to four times a second by [`EventLog::to_entries`], which the GUI
-/// calls to repaint. As a `String` that snapshot was up to [`JOURNAL_CAP`] heap
-/// allocations *and* the same number of memcpys, per repaint, for text nothing
-/// ever mutates; as an `Arc<str>` it is that many refcount bumps. `push` pays the
-/// one real allocation it already paid.
-///
-/// `Arc<str>` and not `Arc<String>`: one pointer-and-length, one allocation, no
-/// second indirection to reach the bytes. Every reader that only formats or
-/// searches the line is unaffected — `Deref<Target = str>` and `Display` serve
-/// `{}`, `.contains(..)` and `&line.text` unchanged.
+/// `text` is `Arc<str>`: written once by [`EventLog::push`], copied out
+/// wholesale up to four times a second by [`EventLog::to_entries`] for the
+/// GUI's repaint of text that never mutates. A `String` would cost up to
+/// [`JOURNAL_CAP`] allocations and memcpys per repaint; `Arc<str>` costs
+/// refcount bumps instead, `push` pays the one real allocation, and it skips
+/// `Arc<String>`'s second indirection to the bytes.
 #[derive(Debug, Clone)]
 pub struct LogLine {
     pub at_ms: u64,
@@ -33,22 +25,17 @@ pub struct LogLine {
 /// grow the journal without bound.
 const JOURNAL_CAP: usize = 500;
 
-/// The crate's single sink for player-facing lines: several writers (the
-/// session loop, the actuator executor, the watchdog) append, one reader (the
-/// window) copies entries out. Cloning it is another handle on the same
-/// journal, not another journal.
+/// Several writers (session loop, actuator executor, watchdog) append; one
+/// reader (the window) copies entries out. Clone for another handle on the
+/// same journal.
 #[derive(Clone)]
 pub struct EventLog {
     epoch: Instant,
     /// Bumped on every push so readers can cache [`EventLog::entries`] and
-    /// re-clone only when something actually changed.
-    ///
-    /// A change *hint*, not a publication, so both sides are `Relaxed`:
-    /// [`EventLog::entries`] takes the same `Mutex` as `push`, and that
-    /// unlock/lock pair is already the happens-before edge — a stronger one
-    /// than an atomic gives. A `Relaxed` load that returns a stale value costs
-    /// one frame of a 4 Hz repaint, which is exactly what `Acquire` would cost
-    /// too: an `Acquire` load carries no freshness guarantee either.
+    /// re-clone only when something changed. Both sides use `Relaxed`: the
+    /// `Mutex` shared with `push` already gives the happens-before edge. A
+    /// stale read costs one frame of a 4 Hz repaint at worst — no worse than
+    /// `Acquire`, which gives no freshness guarantee either.
     generation: Arc<AtomicU64>,
     entries: Arc<Mutex<VecDeque<LogLine>>>,
 }
@@ -69,36 +56,25 @@ impl EventLog {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Single sink for player-facing lines: the journal, the console and the
-    /// log file stay in step by construction — never print session lines
-    /// around it.
-    ///
-    /// The mirror to `tracing` is what makes these lines survive the process:
-    /// the in-memory ring dies with it, and the windowed build has no console
-    /// at all. `target: "journal"` keeps the player view isolable
-    /// (`RUST_LOG=journal=info`) while a single file interleaves technical and
-    /// player events chronologically.
-    ///
-    /// Records at `INFO`. A line that reports a failure — an actuator halt, an
-    /// aborted session, a config write the OS refused — belongs at
-    /// [`EventLog::emit_at`] instead, so the file stays triageable by level and
-    /// not only by prose.
+    /// Single sink for player-facing lines: never print session lines around
+    /// it. Mirrors to `tracing` so lines survive the process (the ring dies
+    /// with it; the windowed build has no console) under `target: "journal"`
+    /// (`RUST_LOG=journal=info` isolates the player view). Records at `INFO`;
+    /// failures (actuator halt, aborted session, a refused config write)
+    /// belong at [`EventLog::emit_at`] instead, for level-based triage.
     pub fn emit(&self, lines: &[String]) {
         self.emit_at(tracing::Level::INFO, lines);
     }
 
-    /// [`EventLog::emit`] with a severity for the log-file half.
-    ///
-    /// The player reads the same text either way; the level is for whoever
-    /// reads the file afterwards. Without it every line lands at `INFO`, so
-    /// narrowing `RUST_LOG` to `warn` deletes precisely the lines that say what
-    /// went wrong.
+    /// [`EventLog::emit`] with a severity for the log-file half. The player
+    /// reads the same text either way; the level is only for whoever reads
+    /// the file. Without it, narrowing `RUST_LOG` to `warn` would delete the
+    /// lines that say what went wrong.
     pub fn emit_at(&self, level: tracing::Level, lines: &[String]) {
         self.push(lines);
         for line in lines {
-            // A callsite's level is part of `tracing`'s static metadata, so a
-            // runtime level cannot be handed to one macro — the three the
-            // journal has a use for are spelled out.
+            // A callsite's level is static in `tracing`'s macros, so a runtime
+            // level can't be passed to one macro — hence the three-way match.
             if level == tracing::Level::ERROR {
                 tracing::error!(target: "journal", line, "journal");
             } else if level == tracing::Level::WARN {
@@ -113,23 +89,18 @@ impl EventLog {
         }
     }
 
-    /// Ring only: the line reaches the window and **nothing else** — no
-    /// `tracing` event, so no log file, so no record at all once the process is
-    /// gone.
-    ///
-    /// This is not the cheap `emit`, it is the forgetful one. Reserve it for
-    /// lines whose entire audience is the player looking at the window right
-    /// now; anything a support engineer would later go looking for must go
-    /// through [`EventLog::emit`] or [`EventLog::emit_at`].
+    /// Ring only — no `tracing` event, no log file, no record once the
+    /// process ends. Reserve for lines whose entire audience is the player
+    /// watching right now; anything worth later triage needs
+    /// [`EventLog::emit`] or [`EventLog::emit_at`] instead.
     pub fn push(&self, lines: &[String]) {
         if lines.is_empty() {
             return;
         }
         let at_ms = self.now_ms();
-        // Poison-tolerant like `to_entries`: `emit` is called from the session
-        // loop, the actuator executor and the watchdog, so panicking here
-        // after one poisoning would cascade across tasks and freeze the very
-        // history the GUI is meant to still show.
+        // Poison-tolerant like `to_entries`: `emit` runs on the session loop,
+        // the actuator executor and the watchdog, so panicking here would
+        // cascade and freeze the GUI's history.
         let mut entries = self
             .entries
             .lock()
@@ -137,18 +108,15 @@ impl EventLog {
         for text in lines {
             entries.push_back(LogLine {
                 at_ms,
-                // The one allocation on this path, exactly as `text.clone()` was:
-                // `Arc<str>` has to copy the bytes into its own allocation. What
-                // it buys is every *later* copy of this line — see `LogLine`.
+                // One allocation here, same as `text.clone()`; buys cheap
+                // copies later — see `LogLine`.
                 text: Arc::from(text.as_str()),
             });
         }
         while entries.len() > JOURNAL_CAP {
             entries.pop_front();
         }
-        // Bumped outside the lock: right for its own reason (never hold the
-        // lock longer than needed), not because the ordering needs it — see the
-        // `generation` field.
+        // Bumped outside the lock to keep it short — see the `generation` field.
         drop(entries);
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
@@ -158,16 +126,12 @@ impl EventLog {
     }
 
     /// Copies the whole ring out — up to [`JOURNAL_CAP`] `LogLine`s. The `to_`
-    /// prefix is the warning: this is not a getter, and calling it per frame is
-    /// what made the GUI grow [`EventLog::generation`] and a cache in front of it.
-    ///
-    /// It is no longer a *deep* copy: [`LogLine::text`] is an `Arc<str>`, so each
-    /// entry costs a refcount bump rather than a fresh `String`. The cache in
-    /// front stays — the lock, the `Vec`, and the 500 bumps are still real work
-    /// to do 4 times a second for a ring that usually has not changed.
-    ///
-    /// Poison-tolerant: the GUI reads this after a session panic and must
-    /// still show the history that led there.
+    /// prefix is the warning: this is not a getter, and calling it per frame
+    /// is what made the GUI add [`EventLog::generation`] and a cache in front
+    /// of it. No longer a deep copy — [`LogLine::text`] is `Arc<str>`, so each
+    /// entry costs a refcount bump, not a fresh `String`; the lock, the `Vec`,
+    /// and 500 bumps are still real work 4 times a second, hence the cache.
+    /// Poison-tolerant, so the GUI can still show history after a panic.
     pub fn to_entries(&self) -> Vec<LogLine> {
         self.entries
             .lock()
@@ -221,9 +185,8 @@ mod tests {
 
     #[test]
     fn emit_at_records_every_level_in_the_ring() {
-        // The level only steers the `tracing` half; the player-facing ring must
-        // hold the line whatever the severity, or a failure would be visible in
-        // the log file and invisible in the window.
+        // The level only steers the `tracing` half; the ring must hold the
+        // line regardless, or a failure would show in the log but not the window.
         let journal = EventLog::default();
         for level in [
             tracing::Level::ERROR,

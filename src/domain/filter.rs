@@ -7,13 +7,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::domain::shop::{Gold, ItemKind, ShopItem};
 
 /// The gear grades the game ships (`config.example.toml` documents the same
-/// closed domain). A floor outside it is a typo, and a costly one: `matches` is
-/// fail-closed on grade, so every item is dropped, while `is_unrestricted`
-/// counts any floor as a real criterion — the loop arms and then refreshes
-/// forever, debiting crystals, without ever matching. Rejected while
-/// deserializing so the invalid value never exists — the same shape, for the same
-/// reason, as [`hunt_kinds`] below, which is where the `[filter] kinds` rule now
-/// lives too (it used to be a clause in `Config::validate`).
+/// closed domain). A floor outside it is costly: `matches` fail-closes on
+/// grade (drops every item) while `is_unrestricted` counts it as a real
+/// criterion, so the loop arms and refreshes forever without ever matching.
+/// Rejected while deserializing — same shape as [`hunt_kinds`] below.
 const GRADE_MIN: u8 = 2;
 const GRADE_MAX: u8 = 4;
 
@@ -29,18 +26,18 @@ const GRADE_MAX: u8 = 4;
 /// criteria the refresh loop spends crystals against.
 ///
 /// The four never-`None` fields are skipped when empty, like `Timings`' eight
-/// ranges: `config/persist.rs` replaces the whole `[filter]` section on Apply,
-/// and without the skips the first edit of one criterion writes four inert lines
-/// into a file that module exists to leave as the player wrote it. The container
+/// ranges: `config/persist.rs` replaces the whole `[filter]` section on
+/// Apply, so without the skips one edit would write four inert lines into a
+/// file meant to stay as the player wrote it, and the container
 /// `#[serde(default)]` makes every omission round-trip.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Filter {
     /// Kept item kinds (any-of); empty keeps all, `Unknown` items included.
     ///
-    /// A `Vec<ItemKind>` and not a narrower hunt-only enum, deliberately — see
-    /// [`hunt_kinds`], which refuses the catch-all at the *file* boundary where
-    /// it is ambiguous, and explains why the field itself stays open.
+    /// A `Vec<ItemKind>`, deliberately not a narrower hunt-only enum — see
+    /// [`hunt_kinds`], which refuses the catch-all at the *file* boundary and
+    /// explains why the field itself stays open.
     #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "hunt_kinds")]
     pub kinds: Vec<ItemKind>,
     /// Kept items (any-of), by exact internal name (`ticketrare_name`, ...);
@@ -57,10 +54,10 @@ pub struct Filter {
     pub required_substats: Vec<SubstatReq>,
     /// Inclusive gold cap; an unknown price fails it.
     ///
-    /// A [`Gold`], so the cap and the price it is weighed against are one type
-    /// and a crystal budget cannot be written here by mistake. `Gold` is
-    /// `#[serde(transparent)]` in both directions, so `config.toml` still spells
-    /// this as a bare `max_price = 300000`.
+    /// A [`Gold`], so the cap and the price it is weighed against are one
+    /// type and a crystal budget cannot be written here by mistake.
+    /// `#[serde(transparent)]` in both directions, so `config.toml` still
+    /// spells this as a bare `max_price = 300000`.
     pub max_price: Option<Gold>,
     /// Inclusive minimum gear grade (2, 3, or 4); an unknown grade fails it.
     /// A floor outside that domain is refused at parse time — see `GRADE_MIN`.
@@ -91,46 +88,42 @@ where
 
 /// The kinds a criterion may name, in the order the Setup tab lists them.
 ///
-/// Public because the checkbox row is built from it: the list used to be spelled
-/// out there, which is how the fourth box — `Unknown`, the one whose only net
-/// effect was writing a `kinds = ["unknown"]` the next launch refused — got
-/// added in the first place.
+/// Public because the checkbox row is built from it — the list used to be
+/// spelled out there, which is how a fourth `Unknown` box (writing
+/// `kinds = ["unknown"]`, refused at the next launch) got added.
 pub const HUNTABLE_KINDS: [ItemKind; 3] = [ItemKind::Equipment, ItemKind::Hero, ItemKind::Token];
 
 /// Parses `[filter] kinds`, refusing the wire's catch-all.
 ///
 /// [`ItemKind`] is deliberately lenient: its `#[serde(other)] Unknown` keeps a
-/// *snapshot* decodable when the server adds a kind this build has never heard
-/// of, which is the forward-compatibility the whole inbound surface is designed
-/// for. Arriving as config text, that same leniency turns `kinds = ["equipement"]`
-/// into a criterion no item can satisfy while [`Filter::is_unrestricted`] counts
-/// it as a real one — so the loop arms and then refreshes forever, debiting
-/// crystals, without ever buying. Refused here, naming the value it could not
-/// read, so `toml` can point at the line.
+/// *snapshot* decodable when the server adds a kind this build has never
+/// heard of. Arriving as config text, that same leniency turns
+/// `kinds = ["equipement"]` into a criterion no item can satisfy while
+/// [`Filter::is_unrestricted`] counts it as real — the loop arms and
+/// refreshes forever, debiting crystals, without ever buying. Refused here,
+/// naming the value it could not read, so `toml` can point at the line.
 ///
-/// Refused at the *boundary*, and not by narrowing the field's type to a
-/// hunt-only enum — which is what the audit asked for, and which was written and
-/// then reverted. `ItemKind::Unknown` is a meaningful criterion *in the domain*:
-/// [`Filter::matches`] compares it against a kind the wire actually reported, and
-/// `Filter::matching_default_items` — the only restricted-yet-matching fixture
-/// 30 tests have, because a default [`ShopItem`] has kind `Unknown` — is built on
-/// exactly that. It is ambiguous only as text, where a typo and a deliberate
-/// "hunt the kind you cannot name" are the same six bytes. So the ambiguity is
-/// resolved where it exists.
+/// Refused at the *boundary*, not by narrowing the field's type to a
+/// hunt-only enum — tried and reverted. `ItemKind::Unknown` is a meaningful
+/// criterion *in the domain*: [`Filter::matches`] compares it against a kind
+/// the wire actually reported, and `Filter::matching_default_items` — the
+/// only restricted-yet-matching fixture 30 tests have, since a default
+/// [`ShopItem`] carries kind `Unknown` — is built on exactly that. It is
+/// ambiguous only as text, where a typo and a deliberate "hunt the kind you
+/// cannot name" are the same six bytes.
 ///
-/// Same shape and same reason as [`grade_floor`] above. It replaces a clause in
-/// `Config::validate`, which matters for more than tidiness: the Setup tab reaches
-/// the file through `persist::save` with no `Config` in the path, and that is the
-/// boundary the old clause never covered.
+/// Same shape as [`grade_floor`] above, and replaces a clause in
+/// `Config::validate`: the Setup tab reaches the file through `persist::save`
+/// with no `Config` in the path, a boundary the old clause never covered.
 fn hunt_kinds<'de, D>(de: D) -> Result<Vec<ItemKind>, D::Error>
 where
     D: Deserializer<'de>,
 {
     // Read as text first, then through `ItemKind`'s own `Deserialize`: the
-    // accepted spellings stay whatever its `rename_all = "snake_case"` produces
-    // (never re-listed here, so they cannot drift), and the raw string survives
-    // long enough for the error to quote what the player actually typed — which
-    // `serde(other)` would otherwise have swallowed.
+    // accepted spellings stay whatever `rename_all = "snake_case"` produces
+    // (never re-listed here, so they cannot drift), and the raw string
+    // survives long enough for the error to quote what the player typed —
+    // which `serde(other)` would otherwise swallow.
     let raw = Vec::<String>::deserialize(de)?;
     let mut kinds = Vec::with_capacity(raw.len());
     for name in raw {
@@ -180,11 +173,10 @@ impl Filter {
         {
             return false;
         }
-        // Both operands are `Gold` from the parse onward — the field is typed,
-        // so there is no lifting call here and no `u32`-against-`u32` moment for
-        // a crystal budget to slip into. `is_none_or` is the fail-closed half the
-        // type doc promises: an item whose price the server did not send never
-        // satisfies a cap.
+        // Both operands are `Gold` from the parse onward, so there is no
+        // `u32`-against-`u32` moment for a crystal budget to slip into.
+        // `is_none_or` is the fail-closed half the type doc promises: a
+        // price the server did not send never satisfies a cap.
         if let Some(max) = self.max_price
             && item.price.is_none_or(|price| price > max)
         {
@@ -520,10 +512,8 @@ mod tests {
             ..Filter::default()
         };
         assert!(!real.is_unrestricted());
-        // Any grade floor is a real constraint: matches() fail-closes on a
-        // gradeless item, so even `min_grade = 2` drops every token/hero (grade
-        // None) and keeps only grade-2+ gear. It must arm the loop, not read as
-        // "matches everything".
+        // Real constraint even at the floor: matches() fail-closes on a
+        // gradeless item, so `min_grade = 2` still drops every token/hero.
         let floor_two = Filter {
             min_grade: Some(2),
             ..Filter::default()
@@ -599,9 +589,9 @@ mod tests {
 
     #[test]
     fn min_grade_outside_the_game_domain_is_refused() {
-        // A typo'd floor is fail-closed in `matches` yet counts as a real
-        // criterion in `is_unrestricted`, so it arms a loop that refreshes
-        // forever and never matches. Refused at parse time instead.
+        // Refused at parse time: a typo'd floor is fail-closed in `matches`
+        // yet counts as real in `is_unrestricted` — an armed loop that never
+        // matches.
         for grade in ["0", "1", "5", "44"] {
             let err = toml::from_str::<Filter>(&format!("min_grade = {grade}"))
                 .expect_err("out-of-domain grade should be refused");
@@ -626,15 +616,13 @@ mod tests {
 
     #[test]
     fn a_kind_the_wire_would_tolerate_is_refused_in_a_config_file() {
-        // The rule used to be a clause in `Config::validate`, which left the Setup
-        // tab's write path (`persist::save`, no `Config` in it) uncovered — the
-        // path a checkbox once used to write a `kinds = ["unknown"]` that the next
-        // launch refused fatally. It lives on the field now.
+        // See hunt_kinds: this replaces the Config::validate clause that left
+        // the Setup tab's write path uncovered.
         let error = toml::from_str::<Filter>("kinds = [\"equipement\"]")
             .expect_err("a typo must not become a criterion nothing satisfies");
         let message = error.to_string();
-        // Names what was typed — which `ItemKind`'s `serde(other)` had already
-        // swallowed by the time the old check ran — and what is legal.
+        // Names what was typed, which `serde(other)` had already swallowed —
+        // and names what is legal.
         assert!(message.contains("equipement"), "{message}");
         for legal in ["equipment", "hero", "token"] {
             assert!(message.contains(legal), "{message}");
@@ -654,9 +642,7 @@ mod tests {
             assert_eq!(back.kinds, vec![kind]);
         }
 
-        // And `Unknown` stays a legal criterion *in memory*: it is what
-        // `matching_default_items` restricts on, and `matches` compares it against
-        // a kind the wire really reported.
+        // `Unknown` stays a legal criterion in memory — see hunt_kinds.
         let unknown_hunter = Filter::matching_default_items();
         assert_eq!(unknown_hunter.kinds, vec![ItemKind::Unknown]);
         assert!(!unknown_hunter.is_unrestricted());
@@ -665,9 +651,8 @@ mod tests {
 
     #[test]
     fn inert_filter_keys_are_not_serialized() {
-        // `config::persist` replaces the whole `[filter]` section on Apply, so
-        // without the skips the first edit of one criterion writes four no-op
-        // lines into a file that module exists to leave alone.
+        // See Filter's doc: without the skips, one edit would write four
+        // no-op lines into a file meant to be left alone.
         let filter = Filter {
             names: vec!["ticketrare_name".to_owned()],
             ..Filter::default()

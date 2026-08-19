@@ -1,20 +1,17 @@
 //! Link-layer stripping: a captured frame in, the IP packet inside it out.
 //!
-//! The one layer of this backend that names no `wpcap.dll` symbol and no raw
-//! pointer — pure functions over a byte slice — which is why it is the seam that
-//! could be cut without touching the soundness argument in [`super::sys`]. It is
-//! also where the next bug here will land: the VLAN path below is marked
-//! `⚠ Untested`, because no adapter on the machine this backend was measured on
-//! produces a tagged frame, and a wrong strip length does not fail loudly, it
-//! hands `parse_segment` bytes that are off by a few. Most of this backend's
-//! tests are in this file for that reason.
+//! Pure functions over a byte slice, no `wpcap.dll` symbol and no raw
+//! pointer — the seam that can be cut without touching the soundness
+//! argument in [`super::sys`]. It's also where the next bug will land: the
+//! VLAN path below is `⚠ Untested` (no adapter measured here produces a
+//! tagged frame), and a wrong strip length doesn't fail loudly — it hands
+//! `parse_segment` bytes off by a few. Most of this backend's tests live
+//! here for that reason.
 
 use std::ffi::c_int;
 
 // Link types this module knows how to strip. Anything else is skipped with a
-// named log line rather than guessed at: a wrong strip length does not fail, it
-// hands `parse_segment` bytes that are off by a few and produces a silent,
-// total parse failure that looks like a bug in the parser.
+// named log line rather than guessed at — see module doc for why.
 const DLT_NULL: c_int = 0;
 const DLT_EN10MB: c_int = 1;
 const DLT_RAW: c_int = 12;
@@ -41,9 +38,8 @@ const TPID_8021Q: u16 = 0x8100;
 const TPID_8021AD: u16 = 0x88A8;
 /// Bytes of Ethernet header before the `EtherType` field.
 const ETHERTYPE_OFFSET: usize = 12;
-/// How many stacked VLAN tags are tolerated before a frame is given up on. Two
-/// covers 802.1ad's outer tag plus an inner 802.1Q one, which is as deep as
-/// anything a consumer machine will produce.
+/// Stacked VLAN tags tolerated before giving up: two covers 802.1ad's outer
+/// tag plus an inner 802.1Q one, as deep as a consumer machine will produce.
 const MAX_VLAN_TAGS: usize = 2;
 
 /// A link type this module cannot strip to an IP packet. Carries the raw `DLT`
@@ -80,16 +76,14 @@ impl LinkStrip {
 /// Where the IP packet starts inside an Ethernet frame, accounting for VLAN
 /// tags.
 ///
-/// A tagged frame pushes the `EtherType` four bytes further along for each tag,
-/// so a fixed 14-byte strip would hand `parse_segment` the last four bytes of
-/// the tag stack followed by the IP header — garbage that parses as nothing and
-/// looks exactly like a broken capture.
+/// A tagged frame pushes `EtherType` four bytes further per tag, so a fixed
+/// 14-byte strip would hand `parse_segment` garbage — the tag stack's last
+/// four bytes followed by the IP header.
 ///
-/// ⚠ **Untested.** The machine this backend was measured on has `VlanSupport=0`
-/// on its adapters, so no tagged frame was ever observed; this path exists
-/// because a player who *does* run tagged VLANs would otherwise see a silent,
-/// total parse failure with no clue as to why. If it ever needs debugging, the
-/// symptom is `unparsed` climbing in lockstep with `delivered`.
+/// ⚠ **Untested.** The measured machine has `VlanSupport=0`, so no tagged
+/// frame was ever observed; this path exists so a player who does run
+/// tagged VLANs doesn't see a silent parse failure. Symptom if broken:
+/// `unparsed` climbing in lockstep with `delivered`.
 fn ethernet_payload_offset(frame: &[u8]) -> Option<usize> {
     let mut at = ETHERTYPE_OFFSET;
     // `<=` so that `MAX_VLAN_TAGS` tags are accepted and the (MAX+1)-th is what
@@ -135,8 +129,8 @@ mod tests {
 
     #[test]
     fn an_unknown_link_type_yields_no_strip_so_the_device_is_skipped_rather_than_guessed_at() {
-        // 105 is DLT_IEEE802_11 — real 802.11 framing, which is precisely the
-        // case the ADR rejected NIC capture over and which must not be guessed.
+        // 105 is DLT_IEEE802_11 — real 802.11 framing, the case the ADR
+        // rejected NIC capture over; must not be guessed.
         for datalink in [105, 127, 143, -1, 1000] {
             assert_eq!(
                 LinkStrip::try_from(datalink),
@@ -218,9 +212,8 @@ mod tests {
 
     #[test]
     fn the_stripped_bytes_of_a_real_ethernet_frame_parse_as_a_segment() {
-        // The end-to-end shape of this backend in one assertion: an Ethernet
-        // frame in, the app's own `parse_segment` out. Anything wrong with the
-        // strip length shows up here as a `None`.
+        // End-to-end shape of this backend: Ethernet frame in, `parse_segment`
+        // out. A wrong strip length shows up here as `None`.
         use etherparse::PacketBuilder;
 
         const GAME_PORT: u16 = 3333;

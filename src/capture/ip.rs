@@ -10,24 +10,17 @@ use super::{FlowKey, Segment};
 
 /// Extracts a server-to-client TCP segment from an IP packet.
 ///
-/// Takes the frame **by value and reuses its allocation**: the payload is that
-/// same buffer trimmed in place, never a fresh copy of a subslice of it. The
-/// capture thread already had to copy the frame out of the driver's ring
-/// (`pcap::capture_loop`, where the slice dies on the next receive), so that
-/// copy is unavoidable — this one was not, and it was not small either: the
-/// snaplen is 262 144 and a measured RSC/LRO frame was 48 870 bytes. The price
-/// of reusing the buffer is that `payload.capacity()` stays the whole frame's;
-/// [`Segment::payload`] says what that means for the byte budget.
+/// Takes the frame by value and trims its allocation in place, never a copy
+/// of a subslice: the capture thread already copies the frame out of the
+/// driver's ring (`pcap::capture_loop`), and a second copy would not be free
+/// (snaplen 262 144, a measured RSC/LRO frame was 48 870 bytes). The trade
+/// is that `payload.capacity()` stays the whole frame's; see
+/// [`Segment::payload`] for what that costs the byte budget.
 ///
-/// Returns `None` when the packet is malformed, or is not TCP *sent by*
-/// `game_port`. The port test is what identifies the server: only the side that
-/// owns `game_port` can be it, and only what that side sends carries the shop
-/// response this product decodes. A client-to-server segment is therefore not
-/// a segment with another label — it is not a segment at all, and stops here.
-/// The kernel filter (`tcp and src port {game_port}`, see `pcap`) already makes
-/// that the only traffic delivered; this is the same rule restated where the
-/// bytes are actually interpreted, so a backend with a laxer filter cannot
-/// smuggle the wrong half of a connection into reassembly.
+/// Returns `None` when malformed or not TCP sent by `game_port` — only the
+/// side owning `game_port` can be the server, so a client-to-server segment
+/// isn't a segment at all. The kernel filter (`tcp and src port {game_port}`,
+/// see `pcap`) should already exclude it; this guards against a laxer one.
 pub fn parse_segment(mut frame: Vec<u8>, game_port: NonZeroU16) -> Option<Segment> {
     let span = segment_span(&frame, game_port)?;
     // Neither call reallocates and neither shrinks the buffer: `truncate` drops
@@ -70,10 +63,10 @@ fn segment_span(bytes: &[u8], game_port: NonZeroU16) -> Option<SegmentSpan> {
                 IpAddr::V6(header.destination_addr()),
             )
         }
-        // ARP is not a shop stream. Named rather than wildcarded: `NetSlice` is
-        // not `#[non_exhaustive]`, so a variant can only appear in a major
-        // etherparse bump, and when it does this should stop compiling here
-        // rather than silently drop whatever it is.
+        // ARP carries no shop stream. Named, not wildcarded: `NetSlice` isn't
+        // `#[non_exhaustive]`, so a new variant only appears in a major
+        // etherparse bump and should fail to compile here rather than
+        // silently drop it.
         NetSlice::Arp(_) => return None,
     };
 
@@ -81,8 +74,8 @@ fn segment_span(bytes: &[u8], game_port: NonZeroU16) -> Option<SegmentSpan> {
         return None;
     };
 
-    // Skip control packets that carry no stream bytes (pure ACKs, and pure
-    // FINs — reassembly never tears a half-stream down on FIN). Only SYN, which
+    // Skip control packets with no stream bytes (pure ACKs and FINs;
+    // reassembly never tears a half-stream down on FIN). Only SYN, which
     // anchors the baseline, and data-bearing segments matter.
     if tcp.payload().is_empty() && !tcp.syn() {
         return None;
@@ -108,12 +101,11 @@ fn segment_span(bytes: &[u8], game_port: NonZeroU16) -> Option<SegmentSpan> {
 }
 
 /// The range `inner` occupies inside `outer`, or `None` when it is not a
-/// subslice of it.
+/// subslice.
 ///
-/// Addresses only, no `unsafe`. `etherparse` hands back subslices of the very
-/// buffer it was given, so neither the subtraction nor the bound can fail in
-/// practice; if a future version ever returned something else, this refuses the
-/// packet instead of trimming the frame down to the wrong bytes.
+/// Pointer arithmetic only, no `unsafe`. `etherparse` hands back subslices of
+/// the buffer it was given, so this practically cannot fail; if it ever did,
+/// this refuses the packet rather than trim the frame to the wrong bytes.
 fn subslice_range(outer: &[u8], inner: &[u8]) -> Option<Range<usize>> {
     let start = inner.as_ptr().addr().checked_sub(outer.as_ptr().addr())?;
     let end = start.checked_add(inner.len())?;
@@ -126,10 +118,9 @@ mod tests {
     use etherparse::PacketBuilder;
 
     const GAME_PORT: u16 = 3333;
-    /// The same port as the type `parse_segment` takes. `Config::game_port` is a
-    /// `NonZeroU16`, so this fixture cannot smuggle in the 0 that used to be a
-    /// runtime check in `Config::validate` — and with which every packet would
-    /// have been classified as client-sent.
+    /// `Config::game_port` is a `NonZeroU16`, so this fixture cannot smuggle
+    /// in the 0 that used to require a runtime check in `Config::validate`
+    /// (with which every packet would classify as client-sent).
     const GAME_PORT_NZ: NonZeroU16 = NonZeroU16::new(GAME_PORT).expect("3333 is not zero");
 
     /// Build an IPv4 TCP packet (IP layer down, no Ethernet) as raw bytes.
@@ -173,8 +164,6 @@ mod tests {
         let client = ([192, 168, 1, 10], 51000);
         let bytes = ipv4_tcp(server, client, 1000, false, b"AB");
         let seg = parse_segment(bytes, GAME_PORT_NZ).expect("should parse");
-        // The sender owns the game port, so it is the server; the peer is the
-        // client. Roles, not direction of travel — the flow key is symmetric.
         assert_eq!(seg.flow.server, SocketAddr::from((server.0, server.1)));
         assert_eq!(seg.flow.client, SocketAddr::from((client.0, client.1)));
         assert_eq!(seg.seq, 1000);
@@ -184,10 +173,8 @@ mod tests {
 
     #[test]
     fn the_payload_reuses_the_frame_allocation_instead_of_copying_out_of_it() {
-        // The whole point of taking the frame by value: one copy on the packet
-        // path, not two. A `Vec` keeps its capacity across `truncate`/`drain`, so
-        // "the payload is still the frame's own buffer" is observable as "the
-        // capacity is still the frame's" — and that is also the number
+        // `Vec` keeps its capacity across `truncate`/`drain`, so "same buffer"
+        // is observable as "same capacity" — the number
         // `PipelineBudget::admit_capture` charges.
         let bytes = ipv4_tcp(
             ([104, 116, 20, 111], GAME_PORT),
@@ -208,9 +195,8 @@ mod tests {
 
     #[test]
     fn a_segment_sent_to_the_game_port_is_not_a_segment_at_all() {
-        // The client -> server half of the very connection the test above
-        // parses. It used to be decoded and labelled, then discarded further
-        // down; nothing has ever decoded it, so it is refused here instead.
+        // Client -> server half of the connection above. Used to be decoded
+        // and labelled, then discarded downstream; now refused here.
         let bytes = ipv4_tcp(
             ([192, 168, 1, 10], 51000),
             ([104, 116, 20, 111], GAME_PORT), // dst port == game_port
@@ -306,10 +292,9 @@ mod tests {
         assert_eq!(r.push(&seg), b"AB");
     }
 
-    /// A deterministic 64-bit xorshift, the same shape `actuator::plan::Jitter`
-    /// uses. A *seeded* generator is the point: a failure found by this sweep is
-    /// reproducible from the test source alone, with no regressions file to
-    /// commit and no run-to-run variance in CI.
+    /// A deterministic 64-bit xorshift (same shape as `actuator::plan::Jitter`).
+    /// Seeded so a failure found by this sweep reproduces from the test
+    /// source alone, with no regressions file and no run-to-run CI variance.
     fn xorshift(state: &mut u64) -> u64 {
         *state ^= *state << 13;
         *state ^= *state >> 7;
@@ -319,35 +304,31 @@ mod tests {
 
     #[test]
     fn parse_segment_is_total_on_hostile_bytes() {
-        // Capture is port-wide: *any* host that sends from `game_port` reaches
-        // this function, so its input is adversary-adjacent and it must be total.
-        // The two things that could not be: `subslice_range`'s address
-        // arithmetic, and the `truncate` + `drain(..start)` pair in
-        // `parse_segment`, which panics if the range it was handed is not inside
-        // the frame — and which only exists because the payload is trimmed in
-        // place instead of copied out.
+        // Capture is port-wide: any host sending from `game_port` reaches
+        // this function, so its input is adversary-adjacent and must be
+        // total. Risk points: `subslice_range`'s address arithmetic, and the
+        // `truncate`/`drain(..start)` pair in `parse_segment`, which panics
+        // if the range isn't inside the frame (only possible because the
+        // payload is trimmed in place).
         //
-        // `20-test.md`'s `test-007` asked for `proptest` here. Declined, and this
-        // is what replaced it: the shrinking a fuzz property buys is worth little
-        // for a function whose whole contract is "returns `None` or a valid
-        // `Segment`, never panics" — there is no counterexample to minimise, only
-        // a seed to re-run — and it costs eight test-only crates on nine
-        // `--locked` lanes plus a committed `proptest-regressions/` file. Two
-        // seeded sweeps over structured *and* unstructured input cover the same
-        // property, deterministically, in the file that owns the function.
+        // `20-test.md`'s `test-007` asked for `proptest` here. Declined: the
+        // contract is "`None` or a valid `Segment`, never panics" — no
+        // counterexample to minimise, only a seed to re-run — and proptest
+        // costs eight test-only crates on nine `--locked` lanes plus a
+        // committed regressions file. Two seeded sweeps over structured and
+        // unstructured input cover the same property deterministically.
         let mut state = 0x5EED_1234_ABCD_0001_u64;
 
-        // (a) Unstructured: pure garbage, every length from empty to past an IPv6
-        //     header. Most of it never reaches the trim at all — the point is
-        //     that the ones that do are not a special case.
+        // (a) Unstructured: pure garbage, every length from empty to past an
+        //     IPv6 header. Most never reaches the trim; the point is that
+        //     what does isn't a special case.
         for len in 0..=80usize {
             for _ in 0..24 {
                 let bytes: Vec<u8> = (0..len)
                     .map(|_| (xorshift(&mut state) >> 24) as u8)
                     .collect();
                 if let Some(segment) = parse_segment(bytes, GAME_PORT_NZ) {
-                    // If it did parse, the trim produced a payload — a `SYN` may
-                    // legitimately carry none, and nothing else may be empty.
+                    // A parsed segment must have a payload unless it's a SYN.
                     assert!(
                         segment.syn || !segment.payload.is_empty(),
                         "a data segment with no payload got through"
@@ -356,11 +337,11 @@ mod tests {
             }
         }
 
-        // (b) Structured: a *valid* packet with one byte corrupted, which is
+        // (b) Structured: a valid packet with one byte corrupted — this is
         //     what actually walks the decoder deep enough to reach the trim.
-        //     Header-length and total-length fields land here, and those are the
-        //     ones that could make `etherparse` hand back a payload slice the
-        //     frame does not contain.
+        //     Corrupted header/total-length fields are what could make
+        //     `etherparse` hand back a payload slice the frame doesn't
+        //     contain.
         let valid = ipv4_tcp(
             ([104, 116, 20, 111], GAME_PORT),
             ([192, 168, 1, 10], 51_000),
@@ -375,25 +356,22 @@ mod tests {
                 mutated[index] = (xorshift(&mut state) >> 24) as u8;
                 if let Some(segment) = parse_segment(mutated, GAME_PORT_NZ) {
                     parsed += 1;
-                    // The payload is a subrange of the frame it came from, so it
-                    // can never be longer than one.
+                    // Payload is a subrange of the frame, so never longer than it.
                     assert!(segment.payload.len() <= valid.len());
-                    // And the port test is the classifier, whatever the mutation
-                    // did to the rest: the server side is the one that owns
-                    // `game_port`, or the segment would be the client's half.
+                    // Port test is the classifier regardless of the mutation.
                     assert_eq!(segment.flow.server.port(), GAME_PORT);
                 }
             }
         }
-        // A sweep that parses nothing proves nothing; this is the tripwire on the
-        // fixture, not on the function.
+        // A sweep that parses nothing proves nothing; tripwire on the
+        // fixture, not the function.
         assert!(
             parsed > 100,
             "only {parsed} mutations parsed — sweep is inert"
         );
 
-        // And truncation at every length, which is the one shape (a) reaches only
-        // by accident: a real capture yields these on a snaplen cut.
+        // Truncation at every length: a real capture yields these on a
+        // snaplen cut.
         for cut in 0..valid.len() {
             let _ = parse_segment(valid[..cut].to_vec(), GAME_PORT_NZ);
         }

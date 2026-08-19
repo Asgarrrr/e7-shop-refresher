@@ -22,13 +22,10 @@ fn parse_and_validate(text: &str) -> Result<Config> {
 /// **The regression this whole compatibility shim exists to prevent.**
 ///
 /// `config.example.toml` shipped `buffer_size = 65575` uncommented, and
-/// `main::seed_config_if_missing` writes that file to `%APPDATA%` on every
-/// first run — so this exact text is on disk for every player who has ever
-/// launched the app, and some of them uncommented `filter` too. With
-/// `deny_unknown_fields` on both structs, retiring the keys by deleting
-/// them turns the next launch into an "Invalid configuration" window and an
-/// app that will not start. Updating the example does nothing for files
-/// already written; only still parsing the keys does.
+/// `main::seed_config_if_missing` writes it to `%APPDATA%` on every first
+/// run, so this text is on disk for every player who has launched the app.
+/// `deny_unknown_fields` means deleting the keys outright would turn their
+/// next launch into "Invalid configuration" and an app that will not start.
 #[test]
 fn a_config_written_before_the_capture_keys_were_retired_still_loads() {
     let config = parse_and_validate(
@@ -44,11 +41,10 @@ fn a_config_written_before_the_capture_keys_were_retired_still_loads() {
 
 #[test]
 fn a_retired_filter_naming_another_port_is_no_longer_a_startup_failure() {
-    // It used to be refused, because a filter on another port delivered
-    // traffic nothing could classify. The backend builds its own filter
-    // from `game_port` now, so the value is inert — and refusing it would
-    // lock an upgrading player out of the app over a setting that has no
-    // effect at all.
+    // Used to be refused: a filter on another port delivered traffic
+    // nothing could classify. The backend builds its own filter from
+    // `game_port` now, so the value is inert, and refusing it would lock an
+    // upgrading player out over a setting with no effect.
     let config = parse_and_validate("[capture]\nfilter = \"tcp and tcp.SrcPort == 4444\"")
         .expect("an inert setting must not stop the app from starting");
     assert!(config.capture.filter.is_some());
@@ -85,14 +81,10 @@ fn the_retired_capture_keys_are_named_only_when_they_are_actually_set() {
     );
 }
 
-/// **The same regression, for the `[forward]` block.**
-///
-/// `config.example.toml` shipped this exact text uncommented, so it is on
-/// disk for every player who has ever launched the app — the user's live
-/// `%APPDATA%\arkyve-refresh-shop\config.toml` included. With
-/// `deny_unknown_fields` on both structs, retiring the keys by deleting
-/// them turns the next launch into an "Invalid configuration" window and an
-/// app that will not start.
+/// **The same regression, for the `[forward]` block.** `config.example.toml`
+/// shipped this text uncommented too, so it is on disk for every player who
+/// has launched the app — the user's live
+/// `%APPDATA%\arkyve-refresh-shop\config.toml` included.
 #[test]
 fn a_config_written_before_the_forward_keys_were_retired_still_loads() {
     let config = parse_and_validate("[forward]\nserver_to_client = true\nclient_to_server = false")
@@ -103,16 +95,15 @@ fn a_config_written_before_the_forward_keys_were_retired_still_loads() {
 
 #[test]
 fn a_retired_forward_combination_is_no_longer_a_startup_failure() {
-    // Both directions off used to be refused, because it described a relay
-    // that forwarded nothing. There is one direction now and neither key
-    // reaches the pipeline, so no combination can describe a broken relay —
-    // and refusing one would lock an upgrading player out of the app over a
-    // setting that has no effect at all.
+    // Both directions off used to be refused (it described a relay
+    // forwarding nothing). There is one direction now and neither key
+    // reaches the pipeline, so refusing any combination would lock an
+    // upgrading player out over a setting with no effect.
     assert!(
         parse_and_validate("[forward]\nserver_to_client = false\nclient_to_server = false").is_ok()
     );
-    // Asking for the client -> server stream is inert, not fatal: it is
-    // never captured, so it is simply not forwarded.
+    // The client -> server stream is inert, not fatal: never captured, so
+    // simply not forwarded.
     let config = parse_and_validate("[forward]\nclient_to_server = true")
         .expect("an inert setting must not stop the app from starting");
     assert_eq!(config.forward.client_to_server, Some(true));
@@ -194,12 +185,12 @@ fn reconnect_durations_enforce_floor_and_order() {
 
 #[test]
 fn misspelled_kind_value_is_rejected() {
-    // This used to *parse* — `ItemKind`'s `serde(other)` folded the typo into
-    // `Unknown` — and `validate()` was what caught it afterwards.
-    // `Filter::kinds` holds `HuntKind` now, which has no catch-all, so the
-    // refusal is serde's and names the three legal values at the offending
-    // line. A typo here silently matches nothing while `is_unrestricted`
-    // counts it as a criterion: the loop arms and burns crystals forever.
+    // Used to *parse* — `ItemKind`'s `serde(other)` folded the typo into
+    // `Unknown`, and `validate()` caught it afterwards. `Filter::kinds`
+    // holds `HuntKind` now, with no catch-all, so refusal is serde's,
+    // naming the three legal values at the offending line — a typo would
+    // otherwise match nothing while `is_unrestricted` counts it as a
+    // criterion, and the loop burns crystals forever.
     let error = parse_and_validate("[filter]\nkinds = [\"equipement\"]")
         .expect_err("a misspelled kind must not silently match nothing");
     assert!(matches!(error, crate::Error::ConfigParse(_)), "{error:?}");
@@ -264,14 +255,13 @@ fn full_filter_and_limits_sections_parse() {
 
 #[test]
 fn a_zero_game_port_is_rejected_by_the_type() {
-    // `game_port = 0` used to be a clause in `Config::validate`, and it had no
-    // test at all. It is `NonZeroU16` now, so the refusal is serde's and lands
-    // as a parse error with the offending line quoted — and, more to the point,
-    // the two consumers that have no `Config` in scope (the BPF filter string
-    // and `parse_segment`'s server-side test) can no longer be handed the zero.
-    // Port 0 would have built a filter matching nothing while classifying every
-    // packet as client-sent: a relay that runs, forwards nothing, and looks
-    // exactly like a mistyped port.
+    // `game_port = 0` used to be a clause in `Config::validate`, untested.
+    // It's `NonZeroU16` now, so the refusal is serde's, landing as a parse
+    // error with the offending line quoted — and the two consumers with no
+    // `Config` in scope (the BPF filter string, `parse_segment`'s
+    // server-side test) can no longer be handed the zero, which would have
+    // built a filter matching nothing while classifying every packet as
+    // client-sent.
     let error = parse_and_validate("game_port = 0").expect_err("port 0 is not a port");
     assert!(matches!(error, crate::Error::ConfigParse(_)), "{error:?}");
     assert!(error.report().contains("game_port"), "{}", error.report());
@@ -363,19 +353,14 @@ fn actuator_timings_parse_and_default_to_zero() {
 #[test]
 fn reversed_timing_range_is_rejected_and_names_both_values() {
     // `{ min_ms = 800, max_ms = 200 }` is a plausible typo in this inline
-    // form. Accepted, it is silently reread as a fixed 800 ms delay: the
-    // player gets none of the variability they configured.
-    //
-    // Refused by `DelayRange`'s `try_from` now, not by `validate`, so it is a
-    // *parse* error — which is why the key is asserted rather than the
-    // dotted path: `toml` quotes the offending line and points a caret at
-    // the value, which is more actionable in a file the player must edit.
+    // form; accepted, it would silently reread as a fixed 800 ms delay.
+    // Refused by `DelayRange`'s `try_from` now, so it is a *parse* error —
+    // `toml` quotes the offending line and points a caret at the value.
     let error =
         parse_and_validate("[actuator.timings]\nrefreshed = { min_ms = 800, max_ms = 200 }")
             .expect_err("a reversed range must not be silently reinterpreted");
-    // `report()`, not `to_string()`: `ConfigParse`'s own `Display` is one
-    // layer ("config.toml is not valid") and the chain walk is what the two
-    // report sites print, so that is the text a player actually reads.
+    // `report()`, not `to_string()`: the chain walk is what the two report
+    // sites actually print.
     let message = error.report();
     assert!(matches!(error, crate::Error::ConfigParse(_)), "{error:?}");
     assert!(message.contains("refreshed"), "{message}");
@@ -498,14 +483,11 @@ fn required_substat_without_name_is_rejected() {
 
 #[test]
 fn bundled_example_config_parses_validates_and_is_restrictive() {
-    // `main::seed_config_if_missing` writes this exact text to
-    // %APPDATA% on every player's first launch. Nothing else ever
-    // deserializes it: as a bare `&'static str` it can rot (a renamed Rust
-    // field, a key retired with a backend swap, a typo in a line someone
-    // uncomments) while CI stays green — and then the shipped exe hands
-    // 100% of new players an "Invalid configuration" window before they see
-    // the app. Every `deny_unknown_fields` in this file is a way for that
-    // to happen.
+    // `main::seed_config_if_missing` writes this exact text to %APPDATA% on
+    // every player's first launch. Nothing else deserializes it, so it can
+    // rot silently (a renamed field, a retired key, a typo) while CI stays
+    // green — and the shipped exe then hands every new player an "Invalid
+    // configuration" window before they see the app.
     let text = include_str!("../../config.example.toml");
     let config: Config = toml::from_str(text).expect("the bundled example must parse");
     config
@@ -524,19 +506,15 @@ fn bundled_example_config_parses_validates_and_is_restrictive() {
     assert_eq!(config.forward.retired_keys(), None);
 
     // The same thing proved on disk, through the real entry point: seeded
-    // and immediately offered to the stripper, the example comes back
-    // untouched — no rewrite, no log line, and its `[capture]`/`[forward]`
-    // headers (whose comments are where the retired keys are explained)
-    // still there. An empty table nobody touched is a commented section,
-    // not a leftover.
+    // and offered to the stripper, the example comes back untouched — no
+    // rewrite, no log line, headers still there. An untouched empty table is
+    // a commented section, not a leftover.
     let dir = TempDir::new("example-strip");
     let path = dir.join("config.toml");
-    // Through `seed_config_if_missing`, not a hand-rolled `fs::write` of the
-    // same `include_str!`: that is the function every player's first launch
-    // actually runs, and it also creates the parent directory — so this
-    // fixture no longer has to (the `create_dir_all` above it is gone), and a
-    // change to the real seeder cannot leave this test passing against a copy
-    // of what the seeder used to do.
+    // Through `seed_config_if_missing`, not a hand-rolled `fs::write`: that
+    // is what every player's first launch actually runs (it also creates
+    // the parent directory), so a change to the real seeder cannot leave
+    // this test passing against a stale copy of what it used to do.
     crate::seed_config_if_missing(&path);
     assert_eq!(
         std::fs::read_to_string(&path).expect("the seeder created it"),
@@ -555,11 +533,10 @@ fn bundled_example_config_parses_validates_and_is_restrictive() {
     );
 }
 
-/// Scratch directory removed on drop — *including* when an assertion
-/// panics, unlike the hand-rolled after-the-fact cleanup in `crash.rs`,
-/// which leaks files on every failure. The name mixes the pid with a
-/// process-local counter so neither two test binaries running at once nor
-/// two parallel tests in one binary can collide on it.
+/// Scratch directory removed on drop, including when an assertion panics
+/// (unlike the hand-rolled cleanup in `crash.rs`, which leaks on failure).
+/// The name mixes the pid with a process-local counter so two test binaries
+/// or two parallel tests in one binary cannot collide.
 struct TempDir(std::path::PathBuf);
 
 impl TempDir {
@@ -806,12 +783,11 @@ fn an_unreadable_config_reports_the_path_not_a_bare_os_error() {
 
 #[test]
 fn a_non_finite_substat_threshold_is_rejected() {
-    // `nan` and `inf` are TOML 1.0 float literals, so this is a legal parse.
-    // Accepted, it is the worst kind of silent failure: `value >= min` is
-    // false for every value so the filter matches nothing, while
-    // `is_unrestricted()` counts the requirement as a real criterion, so the
-    // loop arms and refreshes forever debiting crystals. `nan` adds a second
-    // symptom — `Filter`'s derived `PartialEq` recurses into the
+    // `nan`/`inf` are legal TOML 1.0 float literals. Accepted, `value >=
+    // min` is false for every value, so the filter matches nothing while
+    // `is_unrestricted()` still counts it as a criterion — the loop arms
+    // and refreshes forever, debiting crystals. `nan` adds a second
+    // symptom: `Filter`'s derived `PartialEq` recurses into the
     // `Option<f64>`, so the Setup tab's dirty check never clears and every
     // Apply rewrites `config.toml`.
     for literal in ["nan", "inf", "-inf", "-nan"] {
@@ -844,9 +820,9 @@ fn a_finite_substat_threshold_including_zero_and_negative_is_accepted() {
 #[test]
 fn a_configs_debug_redacts_the_server_url() {
     // `Config` is exactly the kind of value that ends up in a startup line.
-    // Its `Debug` is a plain derive again now that the field is a
-    // `ServerUrl`; this test is what says the derive is still safe, i.e. that
-    // the redaction is reached *through* the field and not re-implemented.
+    // `Debug` is a plain derive again now that the field is a `ServerUrl`;
+    // this pins that the derive stays safe — redaction reached through the
+    // field, not reimplemented.
     let rendered = format!(
         "{:?}",
         Config {

@@ -27,8 +27,8 @@ use crate::domain::filter::Filter;
 use crate::domain::shop::{CatalogId, Gold, ItemKind, PurchaseLimit, ShopItem, ShopSnapshot};
 
 /// A shutdown signal nobody ever raises: the loop must exit through its own
-/// paths. The sender is dropped straight away, which the loop reads as "no
-/// stop can ever arrive" (the branch disables itself), never as a stop.
+/// paths. The sender drops immediately, which the loop reads as "no stop
+/// can ever arrive" and disables the branch — not as a stop.
 fn never_shutdown() -> watch::Receiver<bool> {
     watch::channel(false).1
 }
@@ -58,9 +58,8 @@ fn recording(mode: Mode) -> (ActuatorHandle, mpsc::Receiver<plan::Job>) {
     )
 }
 
-/// A fixture catalog id. Panics on `0`, which is the whole point of
-/// [`CatalogId`]: the wire's "no id" spelling is `None`, not a magic number a
-/// test could pass by accident.
+/// A fixture catalog id; panics on `0`. [`CatalogId`] treats the wire's "no
+/// id" as `None`, not a magic number a test could pass by accident.
 fn cid(id: u32) -> CatalogId {
     CatalogId::new(id).expect("a fixture catalog id is never zero")
 }
@@ -127,10 +126,9 @@ async fn a_worker_panic_is_reported_when_the_uplink_channel_closes() {
     let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
     let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
     let (error_tx, error_rx) = mpsc::channel::<String>(1);
-    // The uplink task's message sender drops, so the loop takes the
-    // uplink-closed break. Its supervisor delivers the panic report a beat
-    // LATER — during the grace window, not before — so only the post-loop
-    // grace-drain can surface it. Without that drain the loop returns None.
+    // The message sender drops, so the loop takes the uplink-closed break.
+    // The supervisor delivers the panic report a beat LATER — during the
+    // grace window — so only the post-loop grace-drain can surface it.
     drop(message_tx);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -720,12 +718,11 @@ fn controller_with_named_item() -> Controller {
     controller
 }
 
-/// The balance is thousands-grouped here, and that is a fix, not a cosmetic
-/// drift: this line used to interpolate a bare `u32` and print `250000` while
-/// the slot table two panes over showed `250,000` for the same purse, against
-/// `render::grouped`'s own claim that every number in the app reads the same.
-/// A gold amount now groups itself (`impl Display for Gold`), so the journal
-/// cannot opt out of the convention by forgetting to call the formatter.
+/// The balance is thousands-grouped here: this line used to interpolate a
+/// bare `u32` and print `250000` while the slot table two panes over showed
+/// `250,000` for the same purse. A gold amount now groups itself
+/// (`impl Display for Gold`), so the journal cannot opt out by forgetting to
+/// call a formatter.
 #[test]
 fn purchase_line_names_item_from_snapshot_and_groups_the_balance() {
     let notice = PurchaseNotice {
@@ -1011,10 +1008,9 @@ fn buy_job_names_the_slot_it_cannot_click_and_still_clicks_the_rest() {
     let journal = EventLog::default();
     let (actuator, mut jobs) = recording(Mode::Live);
     let controller = armed();
-    // Seven slots: the first and the last match and are trackable, the five
-    // between them do not match. Slot 7 sits past the six clickable rows, so
-    // the batch is mixed — one row to click, one refusal to report. Losing the
-    // refusal is exactly the silence `Slot::row` was introduced to end.
+    // Seven slots: the first and last match and are trackable, the five
+    // between do not match. Slot 7 sits past the six clickable rows, so the
+    // batch is mixed — one row to click, one refusal to report.
     let mut slots = vec![ShopItem {
         id: Some(cid(42)),
         ..ShopItem::default()
@@ -1195,12 +1191,9 @@ fn full_job_queue_journals_the_drop() {
     );
 }
 
-/// A closed channel is not a full one, and must not be reported as one.
-///
-/// The two are one `false` apart if the submit result is collapsed to a bool,
-/// and the wrong label sends the player hunting a slow actuator while the real
-/// problem is that nobody is at the other end — a state no retry and no re-arm
-/// can fix.
+/// A closed channel is not a full one. Collapsing the submit result to a
+/// bool would merge them one `false` apart, sending the player hunting a
+/// slow actuator when nobody is at the other end.
 #[test]
 fn a_gone_executor_is_journaled_as_gone_not_as_a_full_queue() {
     let gate = WatchGate::new(true);

@@ -1,10 +1,6 @@
-//! Segment builders shared by more than one pump's test module.
-//!
-//! These three were the only fixtures in the old single `mod tests` that
-//! straddled the seam: `pressure`, `ingest` and `reassembly` all need to mint a
-//! [`Segment`], and duplicating the flow key in three files is how two of the
-//! copies eventually stop matching. Everything else a single concern's tests
-//! need lives beside those tests.
+//! Segment builders shared by `pressure`, `ingest` and `reassembly` tests: each
+//! needs to mint a [`Segment`], and duplicating the flow key risks the copies
+//! drifting apart. Everything else stays beside the tests that use it.
 
 use std::net::{Ipv4Addr, SocketAddr};
 

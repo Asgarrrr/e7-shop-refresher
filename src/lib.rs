@@ -20,9 +20,9 @@
 
 // Shipped code has none of these today (measured: 0 sites in --lib --bins).
 // `not(test)` keeps the ratchet off the test harness, where `unwrap` in a
-// fixture is the correct spelling — 257 sites and rising. The rest of the
-// lint policy lives in Cargo.toml's `[lints]`; these two cannot, because a
-// `[lints]` table applies to every target including the tests.
+// fixture is correct — 257 sites and rising. The rest of the lint policy
+// lives in Cargo.toml's `[lints]`; these two cannot, since a `[lints]` table
+// applies to every target including tests.
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::panic))]
 
 pub mod actuator;
@@ -91,12 +91,12 @@ pub fn config_path_from(appdata: Option<&Path>) -> PathBuf {
 /// file at the standard location — and a valid one: the example carries the
 /// default hunt `[filter]`, which the relay requires to start.
 ///
-/// Best-effort in the sense that a failure never stops startup — but never
-/// silent, because the outcome is *not* equivalent: `Config::default`'s filter
-/// is unrestricted and the relay refuses to hunt on an unrestricted filter, so a
-/// failed seed makes the console build exit naming a `config.toml` that was
-/// never written, and the GUI build boot into "Idle — define a filter first".
-/// Logging is already installed by the time `main` calls this, so say so.
+/// Best-effort: a failure never stops startup, but is never silent, since
+/// the outcome differs — `Config::default`'s filter is unrestricted and the
+/// relay refuses to hunt on one, so a failed seed makes the console build
+/// exit naming a `config.toml` that was never written, and the GUI build
+/// boot into "Idle — define a filter first". Logging is already installed
+/// by the time `main` calls this, so say so.
 pub fn seed_config_if_missing(path: &Path) {
     if path.exists() {
         return;
@@ -123,11 +123,11 @@ pub fn seed_config_if_missing(path: &Path) {
 /// then the same leaf under the temp dir.
 ///
 /// The second candidate is the whole point. `%LOCALAPPDATA%\<app>` being
-/// *set but unwritable* is a measured failure mode, not a hypothesis — it is
-/// exactly the admins-only protected DACL [`migrate`] exists to repair, plus the
-/// ordinary `OneDrive` / antivirus / quota cases — and the old single-candidate
-/// version degraded straight to an inert stdout there. A log in `%TEMP%` is
-/// worth far more than no log. Same ladder as [`crash`]'s.
+/// *set but unwritable* is a measured failure mode — exactly the admins-only
+/// protected DACL [`migrate`] exists to repair, plus the ordinary `OneDrive`
+/// / antivirus / quota cases — and the old single-candidate version degraded
+/// straight to an inert stdout there. A log in `%TEMP%` is worth far more
+/// than no log. Same ladder as [`crash`]'s.
 #[must_use]
 pub fn log_dirs() -> Vec<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
@@ -182,9 +182,9 @@ impl LogSetup {
                 dir = %dir.display(),
                 "the preferred log directory was unusable; this run's log file is in the fallback directory"
             ),
-            // Emitted anyway: it is real in the console lane, and in the windowed
-            // one it is the honest record of why the file the player was asked
-            // for does not exist. `crash.log` is unaffected — it has its own
+            // Emitted anyway: real in the console lane, and in the windowed
+            // one the honest record of why the file the player was asked for
+            // does not exist. `crash.log` is unaffected — it has its own
             // two-candidate ladder and does not go through the subscriber.
             None => tracing::error!(
                 "no log file: every candidate directory refused, so this session leaves no diagnostic trail beyond crash.log"
@@ -202,16 +202,17 @@ impl LogSetup {
 /// Installs the tracing subscriber over a daily-rotated file.
 ///
 /// The windowed build has no console — stdout and stderr are inert sinks —
-/// so a stdout subscriber loses every event the moment the app ships. The
-/// returned guard flushes the non-blocking writer on drop: it MUST live until
-/// the end of `main`, or the last (most interesting) lines never hit disk.
+/// so a stdout subscriber loses every event once the app ships. The
+/// returned guard flushes the non-blocking writer on drop: it MUST live
+/// until the end of `main`, or the last (most interesting) lines never hit
+/// disk.
 ///
-/// The [`LogSetup`] beside it must be `report`ed once this call has returned;
+/// The [`LogSetup`] beside it must be `report`ed once this call returns;
 /// nothing it has to say can be logged from inside.
 ///
 /// Not covered by a unit test on purpose: it installs a *process-global*
-/// subscriber, so a second call — which is what a second test would be —
-/// panics. [`log_dirs_from`] carries the part worth testing.
+/// subscriber, so a second call — what a second test would be — panics.
+/// [`log_dirs_from`] carries the part worth testing.
 #[must_use = "the worker guard flushes the log on drop; keep it alive, and `report` the setup"]
 pub fn install_logging() -> (
     Option<tracing_appender::non_blocking::WorkerGuard>,
@@ -249,10 +250,10 @@ pub fn install_logging() -> (
     let writer = match file_writer {
         Some(writer) => {
             // The console-only lane is the one with a real terminal —
-            // `windows_subsystem = "windows"` is gated on `gui` — and it is the
-            // lane where someone is actually watching, so tee: otherwise
-            // `RUST_LOG=arkyve_refresh_shop=trace` in a terminal produces zero
-            // terminal output and the developer has to go find a file under
+            // `windows_subsystem = "windows"` is gated on `gui` — and
+            // someone is actually watching, so tee: otherwise
+            // `RUST_LOG=arkyve_refresh_shop=trace` in a terminal produces
+            // zero output and the developer has to go find a file under
             // `%LOCALAPPDATA%` (or `/var/folders/…/T` on a mac).
             #[cfg(not(feature = "gui"))]
             let writer = {
@@ -262,8 +263,8 @@ pub fn install_logging() -> (
             BoxMakeWriter::new(writer)
         }
         // Every candidate refused: stdout rather than no subscriber at all —
-        // inert in the windowed build, real in the console one. `setup.report()`
-        // is what makes this state visible when it is not.
+        // inert in the windowed build, real in the console one.
+        // `setup.report()` makes this state visible when it is not.
         None => BoxMakeWriter::new(std::io::stdout),
     };
 
@@ -271,7 +272,7 @@ pub fn install_logging() -> (
         .with_env_filter(
             // `try_from_default_env`, not `from_default_env`: a malformed
             // RUST_LOG must not kill the app. `journal=info` keeps the
-            // player-facing lines (emitted on that target) in the file — the
+            // player-facing lines (on that target) in the file — the
             // crate-level directive does not cover them.
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("arkyve_refresh_shop=debug,journal=info,warn")),
@@ -284,15 +285,15 @@ pub fn install_logging() -> (
     (guard, setup)
 }
 
-/// Config keys that still parse but no longer do anything, in the order they are
-/// reported.
+/// Config keys that still parse but no longer do anything, in report order.
 ///
 /// The capture filter is a BPF expression built from `game_port` inside the
-/// Npcap backend, the receive buffer is the snaplen that backend picks, and the
-/// forward directions stopped being a choice when the pipeline dropped the
-/// client -> server half it never decoded. They are still *accepted* because
-/// deleting the fields would make `Config::load` fail on every config file
-/// written by an earlier release, which is every config file that exists.
+/// Npcap backend, the receive buffer is the snaplen that backend picks, and
+/// the forward directions stopped being a choice when the pipeline dropped
+/// the client -> server half it never decoded. They are still *accepted*
+/// because deleting the fields would make `Config::load` fail on every
+/// config file written by an earlier release — which is every config file
+/// that exists.
 #[must_use]
 pub fn retired_keys(config: &Config) -> Vec<String> {
     [config.capture.retired_keys(), config.forward.retired_keys()]
@@ -303,10 +304,10 @@ pub fn retired_keys(config: &Config) -> Vec<String> {
 
 /// Which of the three things happened when the retired keys were stripped.
 ///
-/// A value rather than three `warn!` calls in place so the decision table is
-/// testable: its whole point is that a player reads the right one of the three,
-/// and the difference between them is past tense, present tense, and "somebody
-/// else got there first".
+/// A value rather than three `warn!` calls in place, so the decision table
+/// is testable: a player must read the right one of the three, and the
+/// difference is past tense, present tense, or "somebody else got there
+/// first".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetiredKeys {
     /// Nothing retired in the loaded config: say nothing. Every install from
@@ -371,10 +372,10 @@ impl RetiredKeys {
 /// Strips the retired keys from `path` and reports which of the three things
 /// happened.
 ///
-/// Called after `Config::load` on purpose. We only ever rewrite a file the app
-/// has just parsed *and* validated — a run that is about to die on an invalid
-/// config touches nothing — and the loaded `Config` is what tells us whether
-/// there is anything to strip at all.
+/// Called after `Config::load` on purpose: we only ever rewrite a file the
+/// app has just parsed *and* validated — a run about to die on an invalid
+/// config touches nothing — and the loaded `Config` tells us whether there
+/// is anything to strip.
 ///
 /// "Once" used to be a lie: nothing removed the keys, and `persist::save`
 /// rewrites only the GUI-editable sections, so the warning came back every
@@ -472,9 +473,9 @@ mod tests {
 
     #[test]
     fn the_seeded_example_is_what_config_load_then_reads() {
-        // The pairing `config.rs`'s `bundled_example_config_parses_validates_and_is_restrictive`
-        // had to hand-reimplement because this function used to live in the
-        // binary: the real writer, then the real loader.
+        // The pairing `config.rs` test had to hand-reimplement this before
+        // the function moved out of the binary: the real writer, then the
+        // real loader.
         let dir = TempDir::new("roundtrip");
         let path = dir.join("config.toml");
         seed_config_if_missing(&path);

@@ -28,12 +28,12 @@ pub enum HaltSource {
 }
 
 impl HaltSource {
-    /// Lowest set bit first. The mask carries no arrival order, and taking the
-    /// lower discriminant keeps the historical first-cause order for the usual
-    /// "player stops, then something fails" sequence.
+    /// Lowest set bit first. The mask carries no arrival order, so taking the
+    /// lower discriminant keeps the historical first-cause order for the
+    /// usual "player stops, then something fails" sequence.
     ///
     /// Reads the cause bits out of a whole gate state, so every non-cause bit
-    /// (that is, [`OFF`]) is ignored.
+    /// ([`OFF`]) is ignored.
     fn lowest_in(mask: u8) -> Option<Self> {
         [Self::PlayerStopped, Self::ActuatorFailed]
             .into_iter()
@@ -46,9 +46,9 @@ const HALT_MASK: u8 = HaltSource::PlayerStopped as u8 | HaltSource::ActuatorFail
 
 /// The gate's own position, stored **inverted**: set means shut.
 ///
-/// Inverted so that `request_halt` is a single unconditional `fetch_or` —
-/// closing the gate and latching the cause are then one indivisible update, and
-/// the safety path carries no retry loop.
+/// Inverted so `request_halt` is a single unconditional `fetch_or` — closing
+/// the gate and latching the cause become one indivisible update, and the
+/// safety path carries no retry loop.
 const OFF: u8 = 1 << 7;
 
 // A cause bit overlapping `OFF` would make a latched halt read as an armed
@@ -61,18 +61,18 @@ struct Inner {
     /// position ([`OFF`]) in **one** atomic.
     ///
     /// These were two fields, and the handshake between them was a
-    /// store-then-load protocol over two locations whose comments had to argue
-    /// that no interleaving could re-arm a halted gate. It could: a re-arming
-    /// store and a halting store could both be in flight, and whichever landed
-    /// last won — leaving the gate armed with a cause latched. One location
-    /// removes the question. "A latched cause implies a shut gate" is now an
-    /// invariant of a single value that every update preserves atomically, so it
-    /// holds at every instant rather than eventually.
+    /// store-then-load protocol over two locations whose comments had to
+    /// argue no interleaving could re-arm a halted gate. It could: a
+    /// re-arming store and a halting store could both be in flight, and
+    /// whichever landed last won — leaving the gate armed with a cause
+    /// latched. One location removes the question: "a latched cause implies
+    /// a shut gate" is now an invariant of a single value every update
+    /// preserves atomically, holding at every instant rather than eventually.
     ///
-    /// That also makes `Relaxed` sufficient throughout: modification order on
-    /// one location is total, a read-modify-write always sees the latest value
-    /// in it, and the gate publishes no memory besides itself — the position and
-    /// the cause *are* the whole message.
+    /// That also makes `Relaxed` sufficient throughout: modification order
+    /// on one location is total, a read-modify-write always sees the latest
+    /// value in it, and the gate publishes no memory besides itself — the
+    /// position and cause are the whole message.
     state: AtomicU8,
     halt_notify: Notify,
 }
@@ -80,9 +80,9 @@ struct Inner {
 /// The capture and action gate: while it is shut, captured bytes are not
 /// forwarded and the actuator refuses jobs.
 ///
-/// One `Arc` behind a cheap clone, shared by the GUI thread, the session loop,
-/// the capture thread and the actuator task. It is the crate's only safety
-/// cutoff, which is why a halt latches (see [`WatchGate::request_halt`]) and
+/// One `Arc` behind a cheap clone, shared by the GUI thread, the session
+/// loop, the capture thread and the actuator task. It is the crate's only
+/// safety cutoff, so a halt latches (see [`WatchGate::request_halt`]) and
 /// cannot be undone by the controller's ordinary status projection.
 #[derive(Clone)]
 pub struct WatchGate {
@@ -128,14 +128,15 @@ impl WatchGate {
     /// Forces the gate off and durably latches the cause alongside any other
     /// already pending.
     ///
-    /// Every distinct cause survives until it is acknowledged: a fatal actuator
-    /// failure raised while the loop is still dispatching a player Stop reaches
-    /// the controller instead of being dropped behind it. A repeat of a cause
-    /// already latched is idempotent — the domain event it maps to is too.
+    /// Every distinct cause survives until acknowledged: a fatal actuator
+    /// failure raised while the loop is still dispatching a player Stop
+    /// reaches the controller instead of being dropped behind it. A repeat
+    /// of a cause already latched is idempotent — the domain event it maps
+    /// to is too.
     ///
-    /// This operation does not allocate, block, or depend on queue capacity — it
-    /// is one `fetch_or`, so it cannot even spin against a concurrent re-arm.
-    /// Once it returns, the gate is shut and stays shut until
+    /// Does not allocate, block, or depend on queue capacity — one
+    /// `fetch_or`, so it cannot even spin against a concurrent re-arm. Once
+    /// it returns, the gate is shut and stays shut until
     /// [`WatchGate::acknowledge_halt`] clears this cause: nothing can re-arm
     /// behind the player's back.
     pub fn request_halt(&self, source: HaltSource) {
@@ -148,10 +149,10 @@ impl WatchGate {
     /// Waits — indefinitely — for a pending cause, and returns it *without*
     /// consuming it; [`WatchGate::acknowledge_halt`] is what clears it.
     ///
-    /// The name says `next_`, not `is_`, because this is not a predicate: it is
-    /// the first `biased` arm of the session `select!` and it parks the loop
-    /// until a halt exists. Reading it as a cheap `bool` is how a caller ends up
-    /// awaiting a halt where it meant to test for one.
+    /// The name says `next_`, not `is_`: this is not a predicate, it is the
+    /// first `biased` arm of the session `select!` and it parks the loop
+    /// until a halt exists. Reading it as a cheap `bool` is how a caller
+    /// ends up awaiting a halt where it meant to test for one.
     pub async fn next_halt(&self) -> HaltSource {
         loop {
             if let Some(source) = HaltSource::lowest_in(self.inner.state.load(Ordering::Relaxed)) {
@@ -264,23 +265,24 @@ mod tests {
         assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
     }
 
-    /// The one test in this module that is not sequential, and the only shape
-    /// that can observe the halt/re-arm race at all. The three roles really do
-    /// run on three different threads in the shipped build: `set(true)` from
-    /// `apply()` on the session-loop task, `request_halt(PlayerStopped)` from
-    /// the egui main thread, `request_halt(ActuatorFailed)` from the actuator
-    /// task.
+    /// The one test in this module that is not sequential, and the only
+    /// shape that can observe the halt/re-arm race at all. The three roles
+    /// really do run on three different threads in the shipped build:
+    /// `set(true)` from `apply()` on the session-loop task,
+    /// `request_halt(PlayerStopped)` from the egui main thread,
+    /// `request_halt(ActuatorFailed)` from the actuator task.
     ///
-    /// What is asserted is `request_halt`'s documented contract, checked from
-    /// the thread that just called it — once it returns, the gate is shut and
-    /// stays shut until *that* caller acknowledges its own cause.
+    /// What is asserted is `request_halt`'s documented contract, checked
+    /// from the thread that just called it — once it returns, the gate is
+    /// shut and stays shut until that caller acknowledges its own cause.
     ///
-    /// This fails within milliseconds on the two-atomic version of this file,
-    /// and it still fails if that version is merely promoted to `SeqCst`
-    /// throughout: an all-`SeqCst` Dekker handshake only makes `false` the last
-    /// store in the total order, so a reader can still catch the gate armed
-    /// while a cause is latched. Only folding both fields into one atomic makes
-    /// the state unrepresentable, which is why that is the shape shipped.
+    /// This fails within milliseconds on the two-atomic version of this
+    /// file, and still fails if that version is merely promoted to `SeqCst`
+    /// throughout: an all-`SeqCst` Dekker handshake only makes `false` the
+    /// last store in the total order, so a reader can still catch the gate
+    /// armed while a cause is latched. Only folding both fields into one
+    /// atomic makes the state unrepresentable, which is why that's the
+    /// shape shipped.
     #[test]
     fn a_concurrent_rearm_can_never_reopen_a_latched_halt() {
         // Enough rounds to lose the race many times over on a loaded box, and

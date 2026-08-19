@@ -2,10 +2,9 @@
 //!
 //! On a machine without the capture backend (`pcap-backend` is Windows-only;
 //! mac dev), no shop snapshot ever arrives, so the live window only shows the
-//! welcome screen. This example builds the *real* `ShopApp` over a hand-seeded
-//! controller — same rendering path as production, just fed fixtures — so the
-//! redesigned status bar, slot table, currencies and journal can be seen and
-//! clicked.
+//! welcome screen. This example builds the real `ShopApp` over a hand-seeded
+//! controller — same rendering path as production, fed fixtures — so the
+//! status bar, slot table, currencies and journal can be seen and clicked.
 //!
 //! Run:
 //!
@@ -95,15 +94,12 @@ fn main() -> eframe::Result {
     let gate = WatchGate::new(false);
 
     // Seed a live run: arm, deliver the shop, then echo purchases so the haul
-    // reads Covenant 1 / Mystic 0 / +1 other and a gold balance shows. The
-    // covenant token (id 101) is bought; the mystic (102) stays unbought so a
-    // still-green matched row remains on show.
+    // reads Covenant 1 / Mystic 0 / +1 other. Token 101 (covenant) is bought;
+    // 102 (mystic) stays unbought so a still-green matched row shows.
     {
         let mut ctrl = controller.lock().expect("controller mutex");
-        // Each `handle` returns the actions the session would run; the preview
-        // has no actuator, so every one is dropped on purpose. Spelled out
-        // rather than implied, so these do not read like the accidental drops
-        // they would be on a real call path.
+        // Each `handle` returns the actions the session would run; the
+        // preview has no actuator, so every result is dropped on purpose.
         let _ = ctrl.handle(Event::Start {
             now_ms: journal.now_ms(),
         });

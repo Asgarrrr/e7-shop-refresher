@@ -1,23 +1,23 @@
 //! One-time cleanup of state older versions left on the player's machine.
 //!
 //! Nothing here serves a running feature. Until the `WinDivert` backend was
-//! removed, the app embedded a kernel driver plus its user-mode DLL, extracted
-//! both into `%LOCALAPPDATA%\arkyve-refresh-shop\`, and — because an elevated
-//! process was about to load a driver out of that directory — locked the
-//! directory itself down to Administrators and SYSTEM with a *protected* DACL.
+//! removed, the app embedded a kernel driver plus its user-mode DLL,
+//! extracted both into `%LOCALAPPDATA%\arkyve-refresh-shop\`, and — because
+//! an elevated process was about to load a driver from that directory —
+//! locked it down to Administrators and SYSTEM with a *protected* DACL.
 //!
-//! Both of those outlive the code that created them. The stranded files are
-//! merely litter; the DACL is not. That directory is also the parent of `logs\`
-//! and `crash.log`, and a protected admins-only DACL is inherited by both, so a
+//! Both outlive the code that created them. The stranded files are litter;
+//! the DACL is not: that directory is also the parent of `logs\` and
+//! `crash.log`, and a protected admins-only DACL is inherited by both, so a
 //! machine that ever ran one of those builds silently loses its log file on
-//! every run that is not elevated. Measured on the development machine after
-//! the fact: owner `BUILTIN\Administrateurs`, inheritance off, two ACEs
-//! (SYSTEM, Administrators), and an unelevated build with no log at all.
+//! every unelevated run. Measured on the dev machine: owner
+//! `BUILTIN\Administrateurs`, inheritance off, two ACEs (SYSTEM,
+//! Administrators), and an unelevated build with no log at all.
 //!
-//! So the cleanup ships with the removal rather than after it. It is
-//! best-effort from end to end — the app is elevated (for the actuator, see
-//! `build.rs`), which is what makes it able to undo an admins-only DACL at all,
-//! but a failure here must never stop the relay from running.
+//! So the cleanup ships with the removal, and is best-effort end to end —
+//! the app is elevated (for the actuator, see `build.rs`), which is what
+//! makes it able to undo an admins-only DACL at all, but a failure here must
+//! never stop the relay from running.
 
 // `Path` is only ever taken by the two Win32 helpers below; on a dev machine
 // (mac) the cleanup still deletes the files, there is simply no DACL to undo.
@@ -38,12 +38,10 @@ const EXTRACTED_SUBDIR: &str = "runtime";
 /// What [`clean_windivert_leftovers`] did, so `main` can log it *after* the
 /// subscriber exists.
 ///
-/// The ordering is the whole reason this is a value rather than a set of
-/// `warn!` calls in place. The DACL being undone here is precisely what stops
-/// `install_logging` from opening its file, so the cleanup has to run first —
-/// and everything it has to say would then be emitted into a process with no
-/// subscriber and vanish. One run's worth of findings is small enough to carry
-/// across those few lines.
+/// A value rather than `warn!` calls in place, because of the ordering: the
+/// DACL being undone here is precisely what stops `install_logging` from
+/// opening its file, so the cleanup has to run first, and anything logged
+/// directly would be emitted into a process with no subscriber and vanish.
 #[derive(Default)]
 pub struct Leftovers {
     reset_dacl: bool,
@@ -224,16 +222,14 @@ fn dacl_is_protected(dir: &Path) -> std::io::Result<bool> {
 /// auto-inheritance from the parent switched back on. Children whose DACL is
 /// auto-inherited (`logs\`, `crash.log`) are recomputed by the same call.
 ///
-/// The ACL passed in is deliberately **empty but not null**, and that
-/// distinction is the whole point of this function. `SetSecurityInfo`'s
-/// documentation is explicit: `DACL_SECURITY_INFORMATION` with a `NULL` `pDacl`
-/// does not mean "no DACL to set", it installs a *null DACL*, which grants FULL
-/// ACCESS TO EVERYONE. Doing that here would leave the directory holding the
-/// player's logs and crash log world-writable — strictly worse than the
-/// over-broad DACL we are undoing. A zero-ACE ACL plus
-/// `UNPROTECTED_DACL_SECURITY_INFORMATION` is the actual "reset to inherited"
-/// spelling: nothing granted explicitly, everything granted by inheritance.
-/// Do not "simplify" the ACL away.
+/// The ACL passed in is deliberately **empty but not null** — the whole
+/// point of this function. `SetSecurityInfo`'s documentation is explicit:
+/// `DACL_SECURITY_INFORMATION` with a `NULL` `pDacl` does not mean "no DACL
+/// to set", it installs a *null DACL*, granting FULL ACCESS TO EVERYONE.
+/// That would leave the directory holding the player's logs and crash log
+/// world-writable — strictly worse than the over-broad DACL being undone. A
+/// zero-ACE ACL plus `UNPROTECTED_DACL_SECURITY_INFORMATION` is the actual
+/// "reset to inherited" spelling. Do not "simplify" the ACL away.
 #[cfg(windows)]
 fn reset_dacl_to_inherited(dir: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;

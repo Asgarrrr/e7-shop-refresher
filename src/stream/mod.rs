@@ -1,29 +1,26 @@
 //! TCP reassembly.
 //!
 //! Capture observes traffic below TCP, so segments may arrive out of order,
-//! duplicated (retransmissions), or overlapping. This layer reconstructs, per
-//! connection, the ordered byte stream the TCP stack would deliver — which is
-//! what the analysis server expects.
+//! duplicated (retransmissions), or overlapping. This layer reconstructs,
+//! per connection, the ordered byte stream the TCP stack would deliver.
+//! Only the server-to-client half is ever captured, so "the stream of a
+//! flow" is unambiguous and `FlowKey` is the whole reassembly identity.
 //!
-//! Only the server-to-client half of a connection is ever captured, so "the
-//! stream of a flow" is unambiguous: there is no second half to disambiguate
-//! against, and a `FlowKey` is the whole reassembly identity.
-//!
-//! All work is done in *relative offsets* from the stream origin (the first
+//! Work is done in relative offsets from the stream origin (the first
 //! observed segment). TCP sequence numbers are `u32` and wrap; a segment's
-//! offset is derived from its distance to the *currently expected* byte, not
-//! to the fixed origin, so the signed `i32` sequence window tracks the stream
-//! as it advances. Anchoring the distance to the origin instead would break
-//! once a half-stream delivered 2 GiB: the distance would exceed `i32` range
-//! and every later segment would look like an already-delivered retransmission.
+//! offset is derived from its distance to the currently expected byte, not
+//! the fixed origin, so the signed `i32` sequence window tracks the stream
+//! as it advances. Anchoring to the origin instead would break once a
+//! half-stream delivered 2 GiB: the distance would exceed `i32` range and
+//! every later segment would look like an already-delivered retransmission.
 //!
-//! Two submodules, one seam. [`budget`] owns the byte accounting — the shared
-//! `Mutex<Usage>` pool, the per-stage quotas, and the move-only
+//! Two submodules, one seam. [`budget`] owns byte accounting — the shared
+//! `Mutex<Usage>` pool, per-stage quotas, and the move-only
 //! `BudgetedChunk`/`PayloadLease` pair that makes a double release
 //! unrepresentable; nothing in it knows what TCP is. [`reassembly`] owns
-//! everything the paragraphs above describe and treats a budgeted payload as an
-//! opaque carrier. This file keeps the quota *numbers* and the compile-time
-//! relation between them, because it is the only module that sees both halves.
+//! everything above and treats a budgeted payload as an opaque carrier. This
+//! file keeps the quota numbers and their compile-time relation, being the
+//! only module that sees both halves.
 
 mod budget;
 mod reassembly;
@@ -47,16 +44,13 @@ pub(crate) const INITIAL_ANCHOR_MAX_BYTES: usize = 256 * 1024;
 pub(crate) const INITIAL_ANCHOR_MAX_SEGMENTS: usize = 128;
 
 /// Per-stage byte quotas. `pub(crate)` only so the test-only
-/// `PipelineBudget::with_test_limits` can be *named* by the two sibling test
-/// suites that override the production constants; nothing outside this module
-/// can build a budget from it on a production path.
+/// `PipelineBudget::with_test_limits` can be named by the two sibling test
+/// suites that override the production constants; nothing outside this
+/// module can build a budget from it on a production path.
 ///
-/// Declared here rather than in [`budget`] for one mechanical reason: it is
-/// named from outside `stream` only under `cfg(test)`, so a `pub(crate) use`
-/// re-export of it would be an unused import in a shipped build, and `-D
-/// warnings` makes that a broken build. Keeping the declaration beside the four
-/// quota constants it describes costs nothing and reads better than a
-/// `cfg`-gated re-export.
+/// Declared here, not in [`budget`]: it's named from outside `stream` only
+/// under `cfg(test)`, so a `pub(crate) use` re-export would be an unused
+/// import in a shipped build — a broken build under `-D warnings`.
 #[derive(Clone, Copy)]
 pub(crate) struct BudgetLimits {
     pub(crate) global: usize,
@@ -65,13 +59,11 @@ pub(crate) struct BudgetLimits {
     pub(crate) outbound: usize,
 }
 
-// These four numbers are the only defence against unbounded memory on a capture
-// path that runs for hours, and they are what a later tuning pass edits by hand.
-// On the production path their relation is pure arithmetic over constants, so it
-// is checked here rather than on the player's machine — `with_limits` keeps the
-// runtime asserts because `with_test_limits` passes arbitrary values. The two
-// caps declared above are part of the same relation and are named here
-// deliberately; item order is irrelevant inside a `const` block.
+// These four numbers are the only defence against unbounded memory on a
+// capture path that runs for hours, and what a later tuning pass edits by
+// hand. Their relation is pure arithmetic over constants, checked here
+// rather than on the player's machine — `with_limits` still keeps runtime
+// asserts because `with_test_limits` passes arbitrary values.
 const _: () = {
     assert!(CAPTURE_STAGE_BYTES <= PIPELINE_GLOBAL_BYTES);
     assert!(REASSEMBLY_STAGE_BYTES <= PIPELINE_GLOBAL_BYTES);
@@ -84,11 +76,9 @@ const _: () = {
     assert!(INITIAL_ANCHOR_MAX_BYTES <= CAPTURE_STAGE_BYTES);
 };
 
-// Fixtures shared by the two submodules' test suites. They live here rather than
-// duplicated on both sides of the seam because a flow key and a capacity-vs-
-// length segment are the vocabulary of *both* halves: `budget` charges the
-// capacity, `reassembly` orders by the sequence number, and a test that
-// disagreed with its sibling about either would be testing two pipelines.
+// Fixtures shared by both submodules' test suites, not duplicated: a flow
+// key and a capacity-vs-length segment are the vocabulary of both halves —
+// `budget` charges the capacity, `reassembly` orders by sequence number.
 #[cfg(test)]
 use std::net::{Ipv4Addr, SocketAddr};
 

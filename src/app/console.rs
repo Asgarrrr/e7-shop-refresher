@@ -1,9 +1,8 @@
 //! Console input: stdin lines in, [`Command`]s out.
 //!
-//! The narrowest of the five seams, and the reason it is one at all: this module
-//! touches exactly an `mpsc::Sender<Command>` and a `watch::Receiver<bool>`. It
-//! knows nothing about capture, reassembly or the session state, and nothing
-//! knows about it except the one `workers.spawn("stdin", …)` call in the root.
+//! Touches only `mpsc::Sender<Command>` and `watch::Receiver<bool>` — it knows
+//! nothing about capture, reassembly or session state, and only the
+//! `workers.spawn("stdin", …)` call in the root knows about it.
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, watch};
@@ -31,10 +30,9 @@ pub(super) async fn stdin_loop(
 /// Input-independent select core, injectable in tests so a pending read can be
 /// cancelled without touching process stdin.
 ///
-/// Unknown input goes through `journal`, not `println!`: it is player feedback,
-/// and `journal.rs` owns the single sink for those. Printed straight to stdout it
-/// reached the player in the console lane and nobody at all in the windowed one,
-/// where stdout is inert and the log file is what we are sent.
+/// Unknown input goes through `journal`, not `println!`: stdout is inert in the
+/// windowed build, so a bare print would reach nobody there while the log file
+/// still would.
 async fn input_loop(
     input: impl AsyncBufRead + Unpin,
     commands: mpsc::Sender<Command>,
@@ -60,8 +58,8 @@ async fn input_loop(
                             break; // session loop gone.
                         }
                     }
-                    // The wording is `ParseCommandError`'s, not this site's: it
-                    // lists the aliases, so it belongs next to the alias table.
+                    // Wording belongs to `ParseCommandError`, next to the alias
+                    // table it lists.
                     Err(err) => journal.emit(&[format!(">> {err}")]),
                 },
                 Ok(None) | Err(_) => break,

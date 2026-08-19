@@ -1,12 +1,8 @@
 //! Sequence-space reassembly: ordering, deduplication, gaps, SYN incarnations,
-//! and the one-shot initial anchor burst.
-//!
-//! This is the half the parent module's doc comment describes — the relative
-//! offset rule and why the distance is measured to the currently expected byte
-//! rather than to the origin is stated there, once. Everything here treats a
-//! payload as an opaque [`BudgetedChunk`] and asks [`super::budget`] whether it
-//! may be held: this half decides *what* to buffer, that half decides *if there
-//! is room*.
+//! and the one-shot initial anchor burst. The relative-offset rule is
+//! documented on the parent module. This half treats a payload as an opaque
+//! [`BudgetedChunk`] and decides *what* to buffer; [`super::budget`] decides
+//! *if there is room*.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
@@ -21,19 +17,16 @@ use crate::capture::FlowKey;
 #[cfg(test)]
 use crate::capture::Segment;
 
-/// Cap on the number of tracked streams. One armed game connection needs one;
-/// reconnections and — since capture is port-wide — any host sending from the
-/// game port would otherwise mint keys without bound, each able to buffer up to
-/// `MAX_PENDING_BYTES`. Well above legitimate need; the stalest entry is
-/// evicted past it.
+/// Cap on tracked streams: reconnections or a port-wide flood could mint keys
+/// without bound, each buffering up to `MAX_PENDING_BYTES`. Stalest entry evicted once reached.
 const MAX_STREAMS: usize = 64;
 
 /// Segments held during the one-shot initial anchor window.
 ///
-/// Ordering is isolated per flow. Replacing each flow's original slots with its
-/// sequence-ordered segments preserves the observed inter-flow cadence while
-/// letting [`Reassembler`] remain the sole authority for overlap,
-/// deduplication, gaps, and SYN incarnations.
+/// Ordering is isolated per flow: each flow's slots are replaced with its
+/// sequence-ordered segments, preserving inter-flow cadence while leaving
+/// [`Reassembler`] the sole authority for overlap, dedup, gaps, and SYN
+/// incarnations.
 pub(crate) struct InitialBurst {
     segments: Vec<BudgetedSegment>,
     payload_bytes: usize,
@@ -59,12 +52,8 @@ impl InitialBurst {
     ///
     /// # Panics
     ///
-    /// Panics if the segment would exceed either burst cap. That is a caller
-    /// contract, not a runtime condition: check [`Self::would_exceed`] first and
-    /// flush the burst instead. The assert is deliberate — silently accepting
-    /// the segment would let one post-resync burst grow past the 256 KiB /
-    /// 128-segment bound the whole anchor decision is predicated on, and the
-    /// caller that skipped the check is the bug.
+    /// Panics if the segment would exceed either cap — check
+    /// [`Self::would_exceed`] first. Guards the 256 KiB / 128-segment bound.
     pub(crate) fn push(&mut self, segment: BudgetedSegment) {
         assert!(
             !self.would_exceed(&segment),
@@ -83,29 +72,23 @@ impl InitialBurst {
         );
     }
 
-    /// Whether the burst has reached either cap. `>=` on both terms: the
-    /// segment count lands on its cap exactly, but a byte counter almost never
-    /// hits 262 144 on the nose, so an equality test there would leave the byte
-    /// bound resting entirely on `would_exceed` catching the next segment.
+    /// Whether the burst has reached either cap. `>=` on both terms: segment
+    /// count lands on its cap exactly, but bytes rarely hit 262 144 exactly,
+    /// so equality would leave the bound resting on `would_exceed` alone.
     pub(crate) fn is_at_limit(&self) -> bool {
         self.segments.len() >= INITIAL_ANCHOR_MAX_SEGMENTS
             || self.payload_bytes >= INITIAL_ANCHOR_MAX_BYTES
     }
 
     pub(crate) fn into_ordered(self) -> Vec<BudgetedSegment> {
-        // `collect` over a slice iterator is already exact-size (TrustedLen):
-        // one allocation, no growth. Only the map needs a hint — a nominal
-        // burst is the single armed game connection.
+        // Slice-iterator `collect` is exact-size (TrustedLen): one allocation; the map just needs a capacity hint.
         let slots: Vec<_> = self.segments.iter().map(|segment| segment.flow).collect();
         let mut flows: HashMap<_, Vec<BudgetedSegment>> = HashMap::with_capacity(1);
         for segment in self.segments {
             flows.entry(segment.flow).or_default().push(segment);
         }
         for segments in flows.values_mut() {
-            // A valid TCP receive window spans less than the signed sequence
-            // half-space; the byte cap bounds memory, not sequence gaps. Select
-            // an origin first so wrap sorting has a transitive key under that
-            // TCP invariant.
+            // A valid TCP window is smaller than the signed half-space — select an origin first for a transitive sort key.
             let origin = segments
                 .iter()
                 .map(segment_data_seq)
@@ -118,9 +101,7 @@ impl InitialBurst {
                 })
                 .expect("a burst flow is never empty");
             segments.sort_by_key(|segment| seq_diff(segment_data_seq(segment), origin));
-            // Sorted in place and reversed so the replay below can `pop` from the
-            // back: a second, differently-typed map purely to gain `pop_front`
-            // would re-hash every key for a container change.
+            // Reversed so the replay below can `pop` from the back, instead of a second map just for `pop_front`.
             segments.reverse();
         }
 
@@ -149,19 +130,13 @@ impl Reassembler {
         Self::default()
     }
 
-    /// Integrates a segment, returning the bytes that became contiguous.
+    /// Integrates a segment, returning the bytes that became contiguous. See
+    /// [`ReassemblyOutcome`] for what `Chunks` vs `Pressure` means.
     ///
-    /// [`ReassemblyOutcome::Chunks`] may be empty: the segment was a duplicate,
-    /// partially filled a gap, or still waits on a missing predecessor. FIN is
-    /// not modelled — a stream is never torn down, so a segment reordered ahead
-    /// of a gap (a FIN-flagged one included) keeps its buffered payload until the
-    /// gap fills.
-    ///
-    /// [`ReassemblyOutcome::Pressure`] is *not* "nothing yet": the pending-byte
-    /// quota was exhausted, **every** tracked flow's anchor and buffer have
-    /// already been cleared, and this segment was dropped and counted. The caller
-    /// must re-anchor (`AnchorState::AwaitingFirst`) rather than wait for a gap
-    /// fill that can never arrive — waiting freezes the half-stream for good.
+    /// FIN is not modelled: a segment reordered ahead of a gap keeps its
+    /// buffered payload until the gap fills. On `Pressure`, the caller must
+    /// re-anchor (`AnchorState::AwaitingFirst`) instead of waiting on a gap
+    /// fill that can never arrive.
     pub(crate) fn push_budgeted(&mut self, segment: BudgetedSegment) -> ReassemblyOutcome {
         let key = segment.flow;
         let dropped_capacity = segment.capacity();
@@ -170,9 +145,8 @@ impl Reassembler {
         if segment.syn && self.syn_starts_new_incarnation(&segment) {
             self.streams.remove(&key);
         }
-        // A genuinely new flow past the cap evicts the stalest one first, so a
-        // reconnect churn or a flood of forged source ports cannot grow the
-        // map without bound. An existing flow never triggers eviction.
+        // A new flow past the cap evicts the stalest one first, so reconnect
+        // churn or a forged-source-port flood cannot grow the map unbounded.
         if self.streams.len() >= MAX_STREAMS && !self.streams.contains_key(&key) {
             self.evict_stalest();
         }
@@ -180,19 +154,16 @@ impl Reassembler {
         let half = self.streams.entry(key).or_default();
         half.last_active = clock;
         let outcome = half.push(segment.seq, segment.syn, segment.into_payload());
-        // Exhaustive by construction: a variant added to `HalfOutcome` becomes
-        // a compile error here rather than a runtime panic that would kill the
-        // reassembly task and the whole session.
+        // Exhaustive by construction: a new `HalfOutcome` variant becomes a
+        // compile error here, not a runtime panic that kills the session.
         match outcome {
             HalfOutcome::Chunks(chunks) => ReassemblyOutcome::Chunks(chunks),
             HalfOutcome::Pressure => {
-                // Never jump across a known gap. All anchors are invalid after
-                // a shared pending-quota failure; the next segment starts
-                // cleanly.
+                // All anchors are invalid after a shared pending-quota
+                // failure; clearing lets the next segment start cleanly.
                 self.clear();
-                // Drop metrics identify the packet that caused recovery;
-                // pending chunks discarded by the global clear are collateral
-                // state, not additional captured packets.
+                // Drop metrics identify only the packet that caused recovery;
+                // chunks discarded by the clear are collateral, not extra captures.
                 budget.record_drop(dropped_capacity);
                 budget.record_resync();
                 warn_reassembly_pressure(&budget);
@@ -209,14 +180,12 @@ impl Reassembler {
         flatten_chunks(self.push_budgeted(admitted))
     }
 
-    /// Returns whether this SYN starts a new incarnation of an already tracked
-    /// connection, in which case the caller drops the stale sequence space.
+    /// Returns whether this SYN starts a new incarnation of an already
+    /// tracked connection (the caller then drops the stale sequence space).
     ///
-    /// Only two of this connection's SYNs can ever reach here — the server's
-    /// handshake SYN-ACK and its retransmissions — because the client's own SYN
-    /// travels the direction that is never captured. So the question is purely
-    /// "is this the same incarnation as the one already tracked": a SYN on a
-    /// flow nothing has been seen on yet starts nothing, it simply anchors.
+    /// Only two SYNs of a connection reach here — the handshake SYN-ACK and
+    /// its retransmissions, since the client's own SYN travels the uncaptured
+    /// direction. A SYN on an untracked flow simply anchors.
     fn syn_starts_new_incarnation(&self, segment: &BudgetedSegment) -> bool {
         debug_assert!(segment.syn);
 
@@ -235,8 +204,8 @@ impl Reassembler {
         true
     }
 
-    /// Drops the least-recently-active stream. Called only when a new key
-    /// would exceed `MAX_STREAMS`; the scan is over a small, capped map.
+    /// Drops the least-recently-active stream; called only when a new key
+    /// would exceed `MAX_STREAMS`.
     fn evict_stalest(&mut self) {
         if let Some(&key) = self
             .streams
@@ -248,24 +217,20 @@ impl Reassembler {
         }
     }
 
-    /// Resets all state so the next segment of each flow re-anchors a new
-    /// origin. Used after a Shop Watch pause to restart from a clean resync
-    /// point rather than a stale `next_off`.
+    /// Resets all state so each flow re-anchors on its next segment. Used
+    /// after a Shop Watch pause to avoid resyncing from a stale `next_off`.
     pub fn clear(&mut self) {
         self.streams.clear();
     }
 }
 
-/// Reassembly state of the captured half of a connection — the server-to-client
-/// one, the only half that reaches this layer — in relative offsets.
+/// Reassembly state of the captured (server-to-client) half of a connection, in relative offsets.
 #[derive(Default)]
 struct HalfStream {
-    /// Last `Reassembler::clock` value at which this stream saw a segment;
-    /// the eviction key.
+    /// Last `Reassembler::clock` value this stream was active; eviction key.
     last_active: u64,
     /// Stream origin (sequence number of the first byte); `None` until first seen.
     baseline: Option<u32>,
-    /// Initial SYN sequence number for this connection incarnation, if seen.
     syn_seq: Option<u32>,
     /// Offset (from `baseline`) of the next expected byte.
     next_off: i64,
@@ -276,41 +241,30 @@ struct HalfStream {
 
 impl HalfStream {
     fn push(&mut self, seq: u32, syn: bool, payload: BudgetedChunk) -> HalfOutcome {
-        // Recorded before the baseline below, so `syn_starts_new_incarnation`
-        // can tell a retransmitted SYN from a fresh incarnation on the next
-        // segment.
+        // Recorded before `baseline` so `syn_starts_new_incarnation` can tell retransmission from a fresh incarnation.
         if syn {
             self.syn_seq.get_or_insert(seq);
         }
         // SYN consumes a sequence number: data starts at seq + 1.
         let data_seq = if syn { seq.wrapping_add(1) } else { seq };
         self.baseline.get_or_insert(data_seq);
-        // Measure from the currently expected byte, then shift back to an
-        // absolute offset. The distance stays within the TCP window (small),
-        // so the i32 span in `seq_diff` never overflows however far the stream
-        // has advanced.
+        // Offset is measured from the currently expected byte, then shifted
+        // back to absolute. The distance stays within the TCP window, so the
+        // i32 span in `seq_diff` never overflows.
         let expected_seq = self.expected_seq();
         let offset = self.next_off + seq_diff(data_seq, expected_seq);
 
-        // One exact slot rather than `Vec::new()`: the in-order case — the whole
-        // point of the path — carries a single chunk, and for a 48-byte element
-        // the first `push` on an empty `Vec` jumps straight to capacity 4, so it
-        // was allocating 192 bytes per packet to hold 48. More than one chunk
-        // only happens when `drain` flushes a filled gap, which grows from here.
-        // The trade is stated plainly: the cases that deliver *nothing* (a
-        // retransmission, a segment buffered behind a gap, a bare SYN) now
-        // allocate one slot where `Vec::new()` allocated none. They are the rare
-        // ones — `capture::ip` already drops empty non-SYN payloads upstream.
+        // `Vec::with_capacity(1)`, not `Vec::new()`, whose first `push` on a
+        // 48-byte element jumps to capacity 4 (192 bytes to hold 48). The
+        // common in-order case needs one chunk; only `drain` flushing a gap
+        // needs more. Nothing-delivering cases (retransmission, gap-buffered,
+        // bare SYN) now allocate one slot instead of none, but are rare —
+        // `capture::ip` drops empty non-SYN payloads upstream.
         //
-        // A `SmallVec<[BudgetedChunk; 1]>` would remove even that one allocation,
-        // and it was weighed and declined rather than deferred. It costs a
-        // dependency, and it would inline 48 bytes into `HalfOutcome` and
-        // `ReassemblyOutcome`, both of which are returned by value up two call
-        // frames per packet — trading a malloc for a memcpy of the same order,
-        // with no measurement either way. Nothing in this crate has been profiled
-        // (`Cargo.toml`'s `[profile.release]` says so, at length, about `lto`), and
-        // `mem-smallvec` itself asks for a profile first. The exact `Vec` keeps the
-        // whole win that is provable from the numbers above.
+        // `SmallVec<[BudgetedChunk; 1]>` was declined: it costs a dependency
+        // and inlines 48 bytes into `HalfOutcome`/`ReassemblyOutcome`, both
+        // returned by value twice per packet — an unmeasured malloc-for-memcpy
+        // trade. Nothing here is profiled, and `mem-smallvec` asks for one first.
         let mut out = Vec::with_capacity(1);
         if !self.absorb(offset, payload, &mut out) {
             return HalfOutcome::Pressure;
@@ -335,17 +289,13 @@ impl HalfStream {
             return self.buffer_future(offset, payload);
         }
 
-        // offset <= next_off: the segment starts at or before the expected byte,
-        // so the distance is non-negative and bounded by the sequence window.
-        // Let the conversion carry that invariant instead of an `as` cast: a
-        // negative difference would silently become ~1.8e19, make the length
-        // test below false, and drop the segment — freezing this half-stream
-        // for good with no panic, no log and no metric.
+        // offset <= next_off: the distance is non-negative, bounded by the
+        // sequence window. `try_from`, not `as`: a negative difference would
+        // silently become ~1.8e19, fail the length check, and drop the
+        // segment — freezing this half-stream forever, silently.
         let Ok(already) = usize::try_from(self.next_off - offset) else {
             report_absorb_invariant(self.next_off, offset);
-            // Same observable behaviour as the retransmission case below:
-            // deliver nothing, but do not claim pressure — a spurious `false`
-            // here would clear every anchor of every flow.
+            // Deliver nothing, but don't report pressure — a spurious `false` here would clear every anchor of every flow.
             return true;
         };
         if already < payload.as_slice().len() {
@@ -355,18 +305,13 @@ impl HalfStream {
             self.next_off += payload.as_slice().len() as i64;
             out.push(payload);
         }
-        // else: fully delivered already (retransmission) — ignored.
         true
     }
 
     fn buffer_future(&mut self, offset: i64, mut payload: BudgetedChunk) -> bool {
         let capacity = payload.capacity();
-        // One probe of the key instead of `get` + `remove` + `insert`. Beyond the
-        // two saved `O(log n)` walks, the `entry` form is what makes the ordering
-        // below safe: a displaced chunk is only uncounted *and* removed once the
-        // new one has cleared the quota, so a rejection can never leave the map
-        // and `pending_bytes` disagreeing. The old shape relied on `false`
-        // propagating to `HalfOutcome::Pressure`, which wipes every stream anyway.
+        // One `entry` probe, not `get`+`remove`+`insert`, saves two `O(log n)`
+        // walks and displaces a chunk only once the new one clears the quota.
         match self.pending.entry(offset) {
             Entry::Occupied(mut slot) => {
                 // Keep only the largest segment seen at a given offset.
@@ -414,21 +359,17 @@ impl HalfStream {
     }
 
     /// Sequence number of the next expected byte: `baseline + next_off`, back
-    /// in the wrapping `u32` space. `baseline` is always set by the time this
-    /// runs (`push` inserts it first).
+    /// in the wrapping `u32` space (`baseline` is always set by the time this
+    /// runs — `push` inserts it first).
     fn expected_seq(&self) -> u32 {
-        // `next_off` is non-negative and the sequence space is mod 2^32:
-        // keeping the low 32 bits of the offset IS the intended conversion, the
-        // same modular arithmetic the explicit `wrapping_*` calls do elsewhere.
-        // The detour through `u64` spells out that the truncation happens in an
-        // unsigned space, so no sign extension is involved.
+        // `next_off` is non-negative, mod 2^32: keeping the low 32 bits is the
+        // intended conversion, same as `wrapping_*` elsewhere. `u64` detour keeps truncation unsigned, avoiding sign extension.
         let offset = (self.next_off as u64) as u32;
         self.baseline.unwrap_or(0).wrapping_add(offset)
     }
 }
 
-/// The rare branch of [`HalfStream::absorb`]'s offset invariant, kept out of a
-/// body that runs once per captured segment.
+/// The rare branch of [`HalfStream::absorb`]'s offset invariant, kept off the hot path.
 #[cold]
 #[inline(never)]
 fn report_absorb_invariant(next_off: i64, offset: i64) {
@@ -436,9 +377,7 @@ fn report_absorb_invariant(next_off: i64, offset: i64) {
     debug_assert!(offset <= next_off, "absorb offset exceeds next_off");
 }
 
-/// The rare branch of [`Reassembler::push_budgeted`]'s pressure arm: taking the
-/// budget mutex for a snapshot and building seven fields belongs off the
-/// per-packet path.
+/// The rare branch of [`Reassembler::push_budgeted`]'s pressure arm: the budget mutex and seven fields belong off the per-packet path.
 #[cold]
 #[inline(never)]
 fn warn_reassembly_pressure(budget: &PipelineBudget) {
@@ -462,11 +401,11 @@ enum HalfOutcome {
 
 /// What [`Reassembler::push_budgeted`] did with a segment.
 pub(crate) enum ReassemblyOutcome {
-    /// The bytes that became contiguous, in order. Empty is normal: a duplicate,
-    /// a partial gap fill, or a segment still waiting on a predecessor.
+    /// The bytes that became contiguous, in order. Empty is normal: a
+    /// duplicate, a partial gap fill, or a segment still waiting on a predecessor.
     Chunks(Vec<BudgetedChunk>),
-    /// The pending-byte quota was exhausted: every flow's state has been cleared
-    /// and the caller must re-anchor. Not a "nothing yet".
+    /// The pending-byte quota was exhausted: every flow's state has been
+    /// cleared and the caller must re-anchor. Not a "nothing yet".
     Pressure,
 }
 
@@ -512,7 +451,6 @@ mod tests {
         seg_in(flow(), seq, syn, payload)
     }
 
-    /// A plain data segment on a given flow (no SYN): for multi-flow tests.
     fn seg_on(flow: FlowKey, seq: u32, payload: &[u8]) -> Segment {
         seg_in(flow, seq, false, payload)
     }
@@ -669,9 +607,7 @@ mod tests {
         assert_eq!(collect_anchored(&overlap, [1, 2, 0]), b"ABCDEFGH");
     }
 
-    /// Sorting is per flow, but the *slots* are global: a burst interleaving
-    /// two connections must come back with each connection ordered and the
-    /// observed alternation between them untouched.
+    /// Sorting is per flow, but the *slots* are global: interleaved connections must come back each ordered, alternation intact.
     #[test]
     fn initial_anchor_burst_preserves_inter_flow_slots() {
         let first = flow();
@@ -721,19 +657,12 @@ mod tests {
     /// The suffix rule for **every** arrival order of six segments, at four
     /// origins — including two that straddle the `u32` wrap.
     ///
-    /// This is the generalization `20-test.md`'s `test-007` asked `proptest` for,
-    /// and it is done without the dependency because the space is *small enough to
-    /// exhaust*: 6! = 720 orders × 4 origins = 2 880 cases, in a few
-    /// milliseconds. Exhaustion is strictly stronger than sampling — there is no
-    /// order left for a random generator to have missed, and no
-    /// `proptest-regressions/` file to commit for a suite that cannot find a case
-    /// the next run would not also find. The two properties are the documented
-    /// rule from `docs/initial-stream-anchor.md`, which the hand-written
-    /// six-permutation table above proves for n = 3 only.
+    /// Exhaustive (6! × 4 origins = 2 880 cases), not `proptest`-sampled: the
+    /// space is small enough to exhaust in milliseconds. Proves the two
+    /// properties from `docs/initial-stream-anchor.md` that the
+    /// six-permutation table above only covers for n = 3.
     #[test]
     fn every_arrival_order_yields_the_immediate_suffix_of_the_stream() {
-        // Origins: an ordinary one, the last sequence before the wrap, one
-        // straddling it exactly, and zero.
         for origin in [1_000_u32, u32::MAX - 5, u32::MAX - 11, 0] {
             let payloads: [&[u8]; 6] = [b"AB", b"CD", b"EF", b"GH", b"IJ", b"KL"];
             let whole: Vec<u8> = payloads.concat();
@@ -741,8 +670,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, bytes)| {
-                    // `wrapping_add`: the point of the near-`u32::MAX` origins is
-                    // that the sequence space wraps under the segments.
+                    // `wrapping_add`: near-`u32::MAX` origins wrap the sequence space under the segments.
                     seg(origin.wrapping_add(index as u32 * 2), false, bytes)
                 })
                 .collect();
@@ -753,18 +681,16 @@ mod tests {
                 for index in order.iter().copied() {
                     delivered.extend(reassembler.push(&segments[index]));
                 }
-                // 1. Whatever the order, what comes out is a *suffix* of the
-                //    original byte stream — never a permutation of it, never a
-                //    gap in the middle. That is the guarantee the analysis server
-                //    decodes against: it can resync from any point, but it cannot
+                // 1. What comes out is a *suffix* of the byte stream — never a
+                //    permutation, never a gap. The analysis server decodes
+                //    against this: it can resync from any point but not
                 //    survive reordered or hole-punched bytes.
                 assert!(
                     whole.ends_with(&delivered),
                     "origin {origin}, order {order:?} delivered {delivered:?}, not a suffix"
                 );
-                // 2. And the suffix starts exactly at the first segment to
-                //    arrive: that arrival is what anchors the stream, and
-                //    everything before it is already history.
+                // 2. The suffix starts at the first segment to arrive: that
+                //    arrival anchors the stream.
                 let anchor = order[0];
                 assert_eq!(
                     delivered.len(),
@@ -775,16 +701,14 @@ mod tests {
         }
     }
 
-    /// The three algebraic properties `seq_diff` is defined by, over a lattice of
-    /// bases that includes every wrap boundary.
+    /// The three algebraic properties `seq_diff` is defined by, over a
+    /// lattice of bases including every wrap boundary.
     ///
-    /// `test-007`'s third named target. Dependency-free for the same reason as the
-    /// permutation sweep: the interesting inputs are *exactly* the boundaries —
-    /// `0`, `u32::MAX`, `i32::MAX` (where the signed reading flips), and their
-    /// neighbours — which a lattice names and a uniform generator reaches with
-    /// probability ~0. `seq_diff` is `const fn`, so this could in principle be a
-    /// `const _: () = assert!(…)`; it is a test instead because the loop covers
-    /// 1 000+ pairs and a const block would have to spell each one out.
+    /// Dependency-free like the permutation sweep: interesting inputs are
+    /// exactly the boundaries — `0`, `u32::MAX`, `i32::MAX` (where signed
+    /// reading flips) — which a uniform generator reaches with probability
+    /// ~0. `seq_diff` is `const fn`, so this could be a `const _: () =
+    /// assert!(…)`; it's a test instead because the loop covers 1 000+ pairs.
     #[test]
     fn seq_diff_is_antisymmetric_and_wrap_relative() {
         let bases = [
@@ -799,22 +723,16 @@ mod tests {
         ];
         let deltas: [i64; 9] = [-1_000, -2, -1, 0, 1, 2, 1_000, 65_535, 1_048_576];
         for base in bases {
-            // 1. Reflexive: a sequence number is zero from itself, at every base
-            //    including both sides of the wrap.
+            // 1. Reflexive: zero distance from itself, at every base.
             assert_eq!(seq_diff(base, base), 0, "base {base}");
             for delta in deltas {
                 let other = base.wrapping_add(delta as u32);
-                // 2. It reads the *relative* distance, so a wrap between the two
-                //    is invisible. This is the property `HalfStream::push` relies
-                //    on: the offset is derived from the distance to the currently
-                //    expected byte, never to the fixed origin, so the signed
-                //    window tracks a stream that has advanced past 2 GiB.
+                // 2. Relative distance: a wrap is invisible — `HalfStream::push`
+                //    tracks a stream past 2 GiB by measuring from the expected byte.
                 assert_eq!(seq_diff(other, base), delta, "base {base}, delta {delta}");
-                // 3. Antisymmetric. `i32::MIN` is the one value that cannot be
-                //    negated, and no `delta` here reaches it — deliberately: at
-                //    exactly half the space apart, "ahead" and "behind" are the
-                //    same answer, which is a property of the circle and not of
-                //    this function.
+                // 3. Antisymmetric. No `delta` reaches `i32::MIN` (it can't
+                //    be negated): at exactly half the space apart, "ahead"
+                //    and "behind" are the same answer, a circle property.
                 assert_eq!(
                     seq_diff(base, other),
                     -delta,
@@ -822,16 +740,14 @@ mod tests {
                 );
             }
         }
-        // The half-space edge, stated rather than left implicit: 2^31 apart reads
-        // as `i32::MIN` in both directions, which is why `MAX_PENDING_BYTES` and
-        // the anchor logic bound how far out of order a segment may be.
+        // 2^31 apart reads as `i32::MIN` both ways — why `MAX_PENDING_BYTES`
+        // and the anchor logic bound how far out of order a segment may be.
         assert_eq!(seq_diff(0, 0x8000_0000), i64::from(i32::MIN));
         assert_eq!(seq_diff(0x8000_0000, 0), i64::from(i32::MIN));
     }
 
-    /// Every permutation of `0..n`, in lexicographic order. Ten lines, no
-    /// dependency, and deterministic — the alternative was a random generator
-    /// that would sample a space this test exhausts.
+    /// Every permutation of `0..n`, lexicographic, dependency-free — the
+    /// alternative was a random generator sampling a space this exhausts.
     fn permutations(n: usize) -> Vec<Vec<usize>> {
         if n == 0 {
             return vec![Vec::new()];
@@ -882,10 +798,9 @@ mod tests {
         assert_eq!(output, b"CDEFGH");
     }
 
-    /// Each flow anchors on its own first segment: a mid-stream start on one
-    /// connection must neither hold back nor re-anchor another. The `1000`
-    /// segment arriving after `1002` on `first` is already-delivered history for
-    /// *that* flow only, while the identical sequence on `second` is its origin.
+    /// Each flow anchors on its own first segment: the `1000` segment after
+    /// `1002` on `first` is history for that flow, while the same seq on
+    /// `second` is its origin.
     #[test]
     fn initial_anchor_is_isolated_by_flow() {
         let mut reassembler = Reassembler::new();
@@ -909,12 +824,9 @@ mod tests {
     #[test]
     fn reordering_flushes_multiple_buffered_segments() {
         let mut r = Reassembler::new();
-        // Baseline is set by the first observed segment.
         assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
-        // Two future segments arrive out of order: nothing deliverable yet.
         assert!(r.push(&seg(1006, false, b"GH")).is_empty());
         assert!(r.push(&seg(1004, false, b"EF")).is_empty());
-        // Filling the gap flushes everything buffered, in order.
         assert_eq!(r.push(&seg(1002, false, b"CD")), b"CDEFGH");
     }
 
@@ -929,15 +841,13 @@ mod tests {
     fn overlapping_segment_keeps_only_fresh_tail() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(1000, false, b"ABCD")), b"ABCD");
-        // Overlaps "CD" (already seen) and brings "EF".
-        assert_eq!(r.push(&seg(1002, false, b"CDEF")), b"EF");
+        assert_eq!(r.push(&seg(1002, false, b"CDEF")), b"EF"); // "CD" already seen.
     }
 
     #[test]
     fn syn_sets_the_baseline() {
         let mut r = Reassembler::new();
-        // The SYN (seq 999, no data) anchors the origin at 1000.
-        assert!(r.push(&seg(999, true, b"")).is_empty());
+        assert!(r.push(&seg(999, true, b"")).is_empty()); // SYN anchors origin at 1000.
         assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
     }
 
@@ -945,33 +855,29 @@ mod tests {
     fn gap_filled_out_of_order() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
-        assert!(r.push(&seg(1004, false, b"EF")).is_empty()); // gap.
+        assert!(r.push(&seg(1004, false, b"EF")).is_empty());
         assert_eq!(r.push(&seg(1002, false, b"CD")), b"CDEF");
     }
 
     #[test]
     fn reassembles_across_sequence_wrap() {
         let mut r = Reassembler::new();
-        // Baseline just before the u32 sequence space wraps.
         assert_eq!(r.push(&seg(0xFFFF_FFFE, false, b"AB")), b"AB");
-        // The next segment is at 0x0000_0000 (wrap): still contiguous.
-        assert_eq!(r.push(&seg(0x0000_0000, false, b"CD")), b"CD");
+        assert_eq!(r.push(&seg(0x0000_0000, false, b"CD")), b"CD"); // wraps, still contiguous.
     }
 
     #[test]
     fn reordering_across_wrap_is_ordered_correctly() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(0xFFFF_FFFE, false, b"AB")), b"AB");
-        // A post-wrap future segment is buffered, then the gap is filled.
         assert!(r.push(&seg(0x0000_0002, false, b"EF")).is_empty());
         assert_eq!(r.push(&seg(0x0000_0000, false, b"CD")), b"CDEF");
     }
 
     #[test]
     fn delivers_far_past_two_gigabytes() {
-        // A half-stream that has already delivered 2^31 bytes: the next
-        // in-order segment must still be recognised, not dropped as a phantom
-        // retransmission (the old origin-anchored offset overflowed i32 here).
+        // A half-stream that already delivered 2^31 bytes: the next in-order
+        // segment must still be recognised — the old offset overflowed i32.
         let mut half = HalfStream {
             baseline: Some(0),
             next_off: (1i64 << 31) + 1000,
@@ -984,7 +890,6 @@ mod tests {
             .unwrap()
             .into_payload();
         assert_eq!(flatten_half(half.push(expected, false, first)), b"AB");
-        // And the following contiguous segment keeps flowing.
         let second = budget
             .admit_capture(seg(expected.wrapping_add(2), false, b"CD"))
             .unwrap()
@@ -998,8 +903,7 @@ mod tests {
     #[test]
     fn tracked_stream_count_is_bounded() {
         let mut r = Reassembler::new();
-        // Far more distinct flows than the cap (e.g. a forged-source-port
-        // flood on the game port): the map must not grow without bound.
+        // A forged-source-port flood on the game port must not grow the map.
         for port in 0..(MAX_STREAMS as u32 * 3) {
             r.push(&seg_on(flow_from(port as u16), 1000, b"AB"));
         }
@@ -1010,12 +914,11 @@ mod tests {
     fn eviction_keeps_the_active_flow() {
         let mut r = Reassembler::new();
         let hot = flow_from(1);
-        // Fill to the cap, keeping `hot` continuously active as newcomers
-        // arrive, so it is never the stalest and survives eviction.
+        // `hot` stays active as newcomers fill the cap, so it survives eviction.
         r.push(&seg_on(hot, 1000, b"AB"));
         for port in 100..(100 + MAX_STREAMS as u32 * 2) {
             r.push(&seg_on(flow_from(port as u16), 1000, b"XY"));
-            r.push(&seg_on(hot, 1002, b"CD")); // keep hot fresh
+            r.push(&seg_on(hot, 1002, b"CD"));
         }
         assert_eq!(r.streams.len(), MAX_STREAMS);
         assert!(r.streams.contains_key(&hot));
@@ -1025,8 +928,6 @@ mod tests {
     fn clear_resets_baseline_for_resync() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
-        // After a pause the state is wiped: a far-ahead segment becomes a new
-        // origin instead of being buffered forever.
         r.clear();
         assert_eq!(r.push(&seg(9000, false, b"XY")), b"XY");
     }
@@ -1039,8 +940,7 @@ mod tests {
 
         assert!(r.push(&seg(999, true, b"")).is_empty());
         assert_eq!(r.push(&seg(1000, false, b"AB")), b"AB");
-        // Buffered behind a gap: bytes of the incarnation about to be replaced.
-        assert!(r.push(&seg(1004, false, b"EF")).is_empty());
+        assert!(r.push(&seg(1004, false, b"EF")).is_empty()); // buffered, gap-bound.
         assert_eq!(r.push(&seg_on(unrelated, 3000, b"UV")), b"UV");
 
         assert!(r.push(&seg(8999, true, b"")).is_empty());

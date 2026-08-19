@@ -6,15 +6,10 @@ use eframe::egui;
 use super::theme;
 use super::view::{SlotRow, ViewState};
 
-/// The Shop tab: the slot table, or the welcome screen while nothing is
-/// captured yet.
-///
-/// `rows` is borrowed from the shell's cache rather than carried in `view`,
-/// because it is re-derived only when the shop moves — see `view::SlotRows`.
-///
-/// `detail` yields one row's full console line for the hover tooltip. It is a
-/// callback rather than a `SlotRow` field because egui only asks for the row
-/// under the pointer — see `view::slot_detail`.
+/// `rows` is borrowed from the shell's cache, re-derived only when the shop
+/// moves — see `view::SlotRows`. `detail` is a callback rather than a
+/// `SlotRow` field, since egui only asks for the hovered row — see
+/// `view::slot_detail`.
 pub(super) fn render_shop_tab(
     ui: &mut egui::Ui,
     view: &ViewState,
@@ -36,9 +31,8 @@ pub(super) fn render_shop_tab(
     shop_table(ui, rows, detail);
 }
 
-/// The slot table, Linear-style: quiet uppercase header over a hairline rule,
-/// no zebra fill — rows separate by breathing room and light up on hover, with
-/// the full item detail as the row tooltip.
+/// The slot table: uppercase header over a hairline rule, no zebra fill —
+/// rows light up on hover, with the full item detail as the tooltip.
 fn shop_table(ui: &mut egui::Ui, rows: &[SlotRow], detail: &dyn Fn(usize) -> String) {
     let width = ui.available_width();
     // Text columns sit inside this inset; the row band the columns are laid in
@@ -50,8 +44,7 @@ fn shop_table(ui: &mut egui::Ui, rows: &[SlotRow], detail: &dyn Fn(usize) -> Str
     cell(ui, h_slot, false, theme::section("Slot"));
     cell(ui, h_kind, false, theme::section("Kind"));
     cell(ui, h_name, false, theme::section("Name"));
-    // The unit rides in the header so the value cells stay bare numbers, which
-    // read cleaner right-aligned than a "184,000 gold" repeated down the column.
+    // The unit rides in the header so the value cells stay bare, right-aligned numbers.
     cell(ui, h_price, true, theme::section("Price (gold)"));
     ui.painter().hline(
         header.x_range(),
@@ -60,16 +53,14 @@ fn shop_table(ui: &mut egui::Ui, rows: &[SlotRow], detail: &dyn Fn(usize) -> Str
     );
     ui.add_space(theme::SP_XS);
 
-    // Grow the hover fill into half the inter-row gap on each side, so it covers
-    // the full row band (text centred) instead of a tight strip.
+    // Grow the hover fill into half the inter-row gap on each side to cover the full row band.
     let pad = ui.spacing().item_spacing.y / 2.0;
     for (index, row) in rows.iter().enumerate() {
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
-        // `contains_pointer`, not `hovered`: the cell labels sit on top of the
-        // row and a truncating label senses hover for its own tooltip, which
-        // would otherwise steal the row's `hovered` when the pointer is over
-        // the text. Square corners so the fill reads full-width, no side inset.
+        // `contains_pointer`, not `hovered`: a truncating cell label senses
+        // hover for its own tooltip, which would otherwise steal the row's
+        // `hovered` while the pointer is over the text.
         if response.contains_pointer() {
             ui.painter().rect_filled(
                 rect.expand2(egui::vec2(0.0, pad)),
@@ -88,33 +79,29 @@ fn shop_table(ui: &mut egui::Ui, rows: &[SlotRow], detail: &dyn Fn(usize) -> Str
         );
         let price = crate::render::amount_or_dash(row.price);
         cell(ui, c_price, true, styled(row, price));
-        // `on_hover_ui`, not `on_hover_text`: egui runs the closure only for the
-        // widget the pointer is over, so the item line is formatted for the one
-        // hovered row instead of all six on every frame.
+        // `on_hover_ui`, not `on_hover_text`: egui runs the closure only for
+        // the hovered widget, so the item line is formatted for one row, not all six, per frame.
         response.on_hover_ui(|ui| {
-            // The one thing `on_hover_text` does that `on_hover_ui` does not,
-            // and it is not cosmetic: a tooltip `Area` is sized on its first
-            // pass and then caches that size (egui's own note on
-            // `Area::default_width`, filed as emilk/egui#5167). Each row's
-            // tooltip carries its own id, so a slot first hovered while its
-            // line was short ("slot 3 · Equipment") would keep that width when
-            // the next roll fills the same slot with name, set, grade, price,
-            // substats and limit — and wrap or squeeze it. Setting the max
-            // width per hover restores the bound egui applies for us.
+            // A tooltip `Area` is sized on its first pass and caches that
+            // size (egui's own note on `Area::default_width`, filed as
+            // emilk/egui#5167). Each row's tooltip has its own id, so a slot
+            // first hovered with a short line ("slot 3 · Equipment") would
+            // keep that width on a later roll with a longer one, wrapping or
+            // squeezing it. Setting the max width per hover restores egui's
+            // own bound.
             ui.set_max_width(ui.spacing().tooltip_width);
             ui.label(detail(index));
         });
     }
 }
 
-/// One cell's text in its row's ink: matched-and-unbought rows read as body text
-/// in the wanted green, sold-out rows mute and strike through — both signals
-/// survive the hover fill because the text paints on top of it.
+/// One cell's text in its row's ink: matched-and-unbought rows read in the
+/// wanted green, sold-out rows mute and strike through — both survive the
+/// hover fill since the text paints on top of it.
 ///
-/// Takes `impl Into<String>` to match `RichText::new`, so a caller may pass an
-/// owned value or a borrow without pre-allocating either. A free function rather
-/// than a closure only because a closure cannot be generic over its argument.
-/// Not measured, and not worth measuring at four columns of six rows.
+/// Takes `impl Into<String>` to match `RichText::new`, so a caller may pass
+/// an owned value or a borrow without pre-allocating either. A free function
+/// rather than a closure because a closure cannot be generic over its argument.
 fn styled(row: &SlotRow, text: impl Into<String>) -> egui::RichText {
     let mut text = egui::RichText::new(text);
     if row.wanted {
@@ -223,8 +210,7 @@ mod tests {
         (ctrl, view, rows)
     }
 
-    /// The tooltip source the live shell builds from the controller lock; no
-    /// test here hovers a row, so the rows only need it to exist.
+    /// The tooltip source the live shell builds; no test here hovers a row, so it only needs to exist.
     fn details(ctrl: &Controller) -> impl Fn(usize) -> String + '_ {
         |index| slot_detail(ctrl, index)
     }

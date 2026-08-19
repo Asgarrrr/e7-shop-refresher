@@ -9,18 +9,15 @@ use super::theme;
 
 /// The journal's title bar: a caret (right = closed, down = open), the
 /// "JOURNAL" label, and — while collapsed — a muted peek of the most recent
-/// line so "what just happened" shows without expanding. Returns true on click.
+/// line. Returns true on click.
 ///
-/// One interactive widget spans the whole bar: while collapsed the hit + hover
-/// area grows into the panel's inner `margin` so the *entire* bar toggles (the
+/// One interactive widget spans the whole bar: while collapsed the hit+hover
+/// area grows into the panel's inner `margin` so the entire bar toggles (the
 /// panel's content ui inherits the panel's outer clip rect, so this isn't
-/// clipped away). The hover fill is the full symmetric bar in both states so
+/// clipped away). The hover fill is the full symmetric bar in both states, so
 /// the text stays centred; open, the click area drops the top margin only,
-/// leaving the panel's top edge free for the resize handle. It carries the
-/// accessible name (peek folded in).
-/// The content is *painted*, not nested widgets — a nested interactive label
-/// would steal hover over the text. egui's custom-widget idiom: allocate +
-/// sense + `widget_info` + paint.
+/// leaving the panel's resize handle reachable. Painted, not nested widgets —
+/// a nested interactive label would steal hover over the text.
 pub(super) fn render_journal_header(
     ui: &mut egui::Ui,
     open: bool,
@@ -31,11 +28,8 @@ pub(super) fn render_journal_header(
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
     let ml = f32::from(margin.left);
     let mt = f32::from(margin.top);
-    // The hover fill is the full symmetric bar (top margin + text row + bottom
-    // margin) in both states, so the text sits centred. The caller reserves
-    // that same bottom margin below the header, so open the fill lands in real
-    // space, not over the log. `hit` (what toggles) drops the top margin only
-    // when open, leaving the panel's resize handle reachable.
+    // The caller reserves this same bottom margin below the header, so the
+    // open fill lands in real space, not over the log.
     let highlight = content.expand2(egui::vec2(ml, mt));
     let hit = if open {
         egui::Rect::from_min_max(
@@ -47,10 +41,9 @@ pub(super) fn render_journal_header(
     };
     let response = ui.interact(hit, ui.id().with("journal_toggle"), egui::Sense::click());
 
-    // The peek rides in the accessible name too, so assistive tooling (and the
-    // tests) read the latest line, not just "Journal". Built inside the closure
-    // — egui only calls it when AccessKit is live, a harness is reading, or the
-    // bar was just clicked; outside, the `format!` would be paid every frame.
+    // Built inside the closure: `widget_info` only calls it when AccessKit is
+    // live, a harness is reading, or the bar was just clicked. Outside, the
+    // `format!` would be paid every frame.
     let enabled = ui.is_enabled();
     response.widget_info(|| {
         let name = if !open && let Some(latest) = latest {
@@ -197,9 +190,6 @@ mod tests {
 
     #[test]
     fn journal_header_click_reports_a_toggle() {
-        // The header toggles the panel open/closed; the caller flips its
-        // `journal_open` on a reported click. The whole row is the single
-        // interactive widget, named "Journal".
         // `Harness::new_ui` takes `impl FnMut`, so the flag is captured mutably;
         // `drop(harness)` releases the borrow before the assert reads it.
         let mut toggled = false;
@@ -216,9 +206,6 @@ mod tests {
 
     #[test]
     fn journal_header_peeks_latest_only_while_collapsed() {
-        // Collapsed: the most recent line rides in the accessible name so the
-        // player (and assistive tooling) sees it without expanding. Open: the
-        // log below carries everything, so the name drops back to "Journal".
         let margin = egui::Margin::symmetric(16, 10);
         let collapsed = Harness::new_ui(|ui| {
             render_journal_header(ui, false, Some("bought a thing"), margin);

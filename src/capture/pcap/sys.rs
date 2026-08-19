@@ -4,17 +4,17 @@
 //! # Why these three are one module
 //!
 //! They are separable on paper, and `docs/tech-debt/24-proj.md` proposed
-//! separating them. They share one invariant that is only worth anything if a
-//! reader can check it in one place: [`unsafe impl Send for Handle`](Handle)
-//! claims that nothing but the owning `Handle` retains the `*mut PcapT`. Every
-//! line in this crate that names a libpcap object pointer is in this file, and
-//! the field holding it is private to this file — the only widened field is the
-//! `device` string the parent uses for a thread name — so the claim is checkable
-//! against this module rather than against the whole `pcap` tree. Splitting
-//! `open_device` from `capture_loop` would have made `Handle::handle`
-//! `pub(super)` and spread that check over three files, which is the one cost the
-//! report named for this move; it is not worth paying. [`super::link`] is the
-//! layer that carries no pointer, and it is the one that left.
+//! separating them. They share one invariant only checkable in one place:
+//! [`unsafe impl Send for Handle`](Handle) claims that nothing but the
+//! owning `Handle` retains the `*mut PcapT`. Every line in this crate that
+//! names a libpcap object pointer is in this file, and the field holding it
+//! is private to this file — the only widened field is the `device` string
+//! the parent uses for a thread name — so the claim is checkable against
+//! this module rather than the whole `pcap` tree. Splitting `open_device`
+//! from `capture_loop` would have made `Handle::handle` `pub(super)` and
+//! spread that check over three files, the one cost the report named for
+//! this move; not worth paying. [`super::link`] is the layer that carries
+//! no pointer, and it is the one that left.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::sync::Arc;
@@ -33,15 +33,14 @@ const PCAP_ERRBUF_SIZE: usize = 256;
 
 /// Bytes captured per packet.
 ///
-/// Deliberately not the wire MTU, and deliberately not the 65 575 the removed
-/// `WinDivert` backend used either. Receive-side coalescing (RSC/LRO) hands the
-/// stack a single "packet" made of many wire frames, and the probe measured one
-/// of **48 870 bytes** on this machine — 32 times the MTU. 65 575 happened to be
-/// above that here; there is no reason it is above it everywhere, and a
-/// too-small snaplen does not fail, it silently truncates, which reaches
-/// `parse_segment` as a malformed packet and reads as a parser bug. 262 144 is
-/// libpcap's own documented ceiling, so this is simply "as much as it will
-/// give".
+/// Deliberately not the wire MTU, nor the 65 575 the removed `WinDivert`
+/// backend used. Receive-side coalescing (RSC/LRO) hands the stack a single
+/// "packet" made of many wire frames — the probe measured one of **48 870
+/// bytes** on this machine, 32 times the MTU. 65 575 happened to be enough
+/// here; there is no reason it is everywhere, and a too-small snaplen does
+/// not fail, it silently truncates, reaching `parse_segment` as a malformed
+/// packet that reads like a parser bug. 262 144 is libpcap's own documented
+/// ceiling: as much as it will give.
 pub(super) const SNAPLEN: c_int = 262_144;
 
 /// Read timeout, in milliseconds. Bounds how long a capture thread can sit
@@ -177,11 +176,11 @@ pub(super) struct Wpcap {
 /// Where `wpcap.dll` is looked for, in order.
 ///
 /// The plain name resolves only when Npcap was installed in WinPcap-compatible
-/// mode (the installer default, but the player may have unchecked it); the
-/// second path is the private directory Npcap always writes to and is not on
-/// any DLL search path. Which one answered is logged, because "the plain name
-/// did not resolve" is the difference between a working and a broken install on
-/// a machine we cannot inspect.
+/// mode (the installer default, though the player may have unchecked it); the
+/// second path is the private directory Npcap always writes to, not on any
+/// DLL search path. Which one answered is logged: "the plain name did not
+/// resolve" is the difference between a working and a broken install on a
+/// machine we cannot inspect.
 pub(super) const DLL_CANDIDATES: [&str; 2] = ["wpcap.dll", r"C:\Windows\System32\Npcap\wpcap.dll"];
 
 /// What to tell a player who has no Npcap at all.
@@ -207,12 +206,12 @@ impl Wpcap {
                     continue;
                 }
             };
-            // Deliberately scope-local and unhygienic by design: the body reads
-            // `lib`, `path` and `failures` from this loop body, and its `continue`
+            // Deliberately scope-local and unhygienic: the body reads `lib`,
+            // `path` and `failures` from this loop, and its `continue`
             // abandons this DLL candidate — all twelve sibling resolutions
-            // included — for the next one. That caller-scope `continue` is the
-            // reason this is a macro and not a function, and it is also why
-            // hoisting it to module scope will not compile.
+            // included — for the next one. That caller-scope `continue` is
+            // why this is a macro, not a function, and why hoisting it to
+            // module scope would not compile.
             macro_rules! sym {
                 ($name:literal) => {
                     // SAFETY: `get` resolves one exported symbol and the
@@ -346,18 +345,18 @@ const SNAPLEN_CAPLEN: c_uint = SNAPLEN.cast_unsigned();
 
 /// One opened, filtered adapter, owned by exactly one capture thread.
 ///
-/// A `pcap_t` is not thread-safe, and this type is what makes that safe by
-/// construction: it is created on the opening thread, moved wholesale into its
-/// capture thread, and closed by [`Drop`] on whichever thread ends up owning it
-/// last. No two threads ever hold the same one.
+/// A `pcap_t` is not thread-safe; this type makes that safe by construction:
+/// created on the opening thread, moved wholesale into its capture thread,
+/// and closed by [`Drop`] on whichever thread ends up owning it last. No two
+/// threads ever hold the same one.
 pub(super) struct Handle {
     wpcap: Arc<Wpcap>,
     handle: *mut PcapT,
     /// The `\Device\NPF_{...}` name, kept for log lines.
     ///
-    /// The one field visible outside this file — [`super::PcapSource::open`] names
-    /// each capture thread after it — and deliberately the only one: the raw
-    /// pointer beside it stays private here, which is what keeps the `unsafe impl
+    /// The one field visible outside this file — [`super::PcapSource::open`]
+    /// names each capture thread after it — deliberately the only one: the
+    /// raw pointer beside it stays private here, keeping the `unsafe impl
     /// Send` below auditable within one module.
     pub(super) device: String,
     strip: LinkStrip,
@@ -388,8 +387,8 @@ impl Drop for Handle {
 
 /// Every capture device the driver will admit to, by name.
 ///
-/// An empty list is not an error here — [`super::no_usable_device_error`] is what
-/// turns it into one, because it is also the signature of `AdminOnly=1` and
+/// An empty list is not an error here — [`super::no_usable_device_error`]
+/// turns it into one, since it is also the signature of `AdminOnly=1` and
 /// deserves a message that says so.
 pub(super) fn enumerate(wpcap: &Wpcap) -> Result<Vec<String>> {
     let mut errbuf = [0 as c_char; PCAP_ERRBUF_SIZE];
@@ -703,9 +702,8 @@ mod tests {
         assert!(!is_plausible_caplen(0));
         assert!(!is_plausible_caplen(SNAPLEN_CAPLEN + 1));
         // What a 64-bit `timeval` would produce: a microsecond count read as a
-        // length. Most of that range is out of bounds and caught here; the part
-        // below the snaplen is not, which is why this is a canary rather than a
-        // proof (see `plausible_caplen`).
+        // length, mostly out of bounds and caught here (see `plausible_caplen`
+        // for why this is a canary, not a proof).
         assert!(!is_plausible_caplen(999_999));
         assert!(!is_plausible_caplen(0)); // a zero-length "packet" cannot exist
     }
@@ -713,11 +711,11 @@ mod tests {
     #[test]
     fn the_windows_pcap_pkthdr_is_sixteen_bytes_because_its_timeval_is_two_longs() {
         // The single most dangerous constant in this file: a 24-byte header
-        // would put `caplen` where `tv_usec` is and report nonsense lengths
-        // instead of crashing. The real gate is the `const _` beside the struct
-        // — this build lane is feature- and OS-gated, so a release build here
-        // would never have evaluated a test. Kept because it costs nothing and
-        // states the same fact where a reader running the suite will see it.
+        // would put `caplen` where `tv_usec` is, reporting nonsense lengths
+        // instead of crashing. The real gate is the `const _` beside the
+        // struct (this build lane is feature- and OS-gated, so a release
+        // build never evaluates a test); kept because it costs nothing and
+        // states the fact where the test suite will show it.
         assert_eq!(size_of::<PcapPktHdr>(), 16);
         assert_eq!(size_of::<PcapStat>(), 24);
     }
@@ -729,9 +727,8 @@ mod tests {
             *slot = byte.cast_signed();
         }
         assert_eq!(errbuf_text(&errbuf), "pcap_open_live failed");
-        // A buffer libpcap filled to the last byte without terminating it is
-        // truncated rather than read past — which is the whole reason this is a
-        // safe function taking the array by reference.
+        // A buffer filled to the last byte without a terminator is truncated,
+        // not read past — the reason this is safe taking the array by reference.
         let unterminated = [b'x'.cast_signed(); PCAP_ERRBUF_SIZE];
         assert_eq!(errbuf_text(&unterminated).len(), PCAP_ERRBUF_SIZE);
         assert_eq!(errbuf_text(&[0 as c_char; PCAP_ERRBUF_SIZE]), "");

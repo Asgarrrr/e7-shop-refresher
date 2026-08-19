@@ -1,14 +1,11 @@
 //! Format-preserving persistence of the GUI-editable config sections back to
 //! config.toml. Only `[filter]`, `[limits]`, and `[actuator.timings]` are
-//! rewritten; every other section (network, capture, actuator mode) is left
-//! exactly as the player wrote it. Whole-section replacement: a section's
-//! inner commented-out example lines are dropped on first save, but the
-//! comments above each header survive (the replaced table's decor is kept).
+//! rewritten; every other section is left exactly as the player wrote it.
+//! Whole-section replacement drops a section's inner commented-out example
+//! lines on first save, but keeps the comments above each header.
 //!
-//! The one exception to "every other section is left alone" is
-//! [`strip_retired_keys`], which deletes the retired `[capture]` / `[forward]`
-//! keys once — see its documentation for why that has to happen here rather
-//! than by asking the player to hand-edit a file the app owns.
+//! The one exception is [`strip_retired_keys`], which deletes the retired
+//! `[capture]` / `[forward]` keys once — see its docs for why.
 
 use std::path::Path;
 
@@ -20,12 +17,10 @@ use crate::domain::control::Limits;
 use crate::domain::filter::Filter;
 use crate::error::{Error, Result};
 
-/// One GUI-editable section to persist. Built per Apply from the commands that
-/// actually changed, so a limits-only edit never rewrites `[filter]`.
+/// One GUI-editable section to persist. Built per Apply from the commands
+/// that actually changed, so a limits-only edit never rewrites `[filter]`.
 ///
-/// `Debug` because [`save`] is best-effort and its failure is journaled: without
-/// it the line cannot name which section was being written. Every payload here
-/// already carries all three derives.
+/// `Debug` because [`save`] is best-effort and journals its failure by name.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Section {
     Filter(Filter),
@@ -69,18 +64,18 @@ pub fn save(path: impl AsRef<Path>, edits: &[Section]) -> Result<()> {
     replace_file(path, &updated)
 }
 
-/// Put `contents` at `path`, atomically, creating the parent directory first.
+/// Put `contents` at `path`, atomically, creating the parent directory
+/// first.
 ///
-/// Shared by [`save`] and [`strip_retired_keys`] so there is exactly one way
-/// this crate writes `config.toml`: a second write path is how one of the two
-/// ends up non-atomic, and the file it would truncate on failure is the one the
-/// player hand-wrote.
+/// Shared by [`save`] and [`strip_retired_keys`] so there is exactly one
+/// write path for `config.toml`: a second one is how it ends up non-atomic,
+/// truncating the file the player hand-wrote.
 ///
 /// # Errors
 ///
-/// [`Error::ConfigWrite`] — creating the parent directory, writing the sibling
-/// temp file, or renaming it over the target failed. The target is left
-/// untouched in every one of those cases.
+/// [`Error::ConfigWrite`] — creating the parent directory, writing the
+/// sibling temp file, or renaming it over the target failed. The target is
+/// left untouched in every case.
 fn replace_file(path: &Path, contents: &str) -> Result<()> {
     // The config lives in a per-user app-data subdir that may not exist yet on
     // first run (nothing created it before this first Apply); make it so the
@@ -107,12 +102,10 @@ fn replace_file(path: &Path, contents: &str) -> Result<()> {
 
 /// The retired-but-still-parsed keys, grouped by the table that holds them.
 ///
-/// The mirror image of [`CaptureConfig::retired_keys`] and
-/// [`ForwardConfig::retired_keys`]: those two name what a loaded config *sets*,
-/// this names what can be taken out of the file. The two lists have to stay in
-/// step — a key named there but not here would warn forever, and a key named
-/// here but not there would be deleted from the player's file with nothing in
-/// the log to say so.
+/// Mirrors [`CaptureConfig::retired_keys`] / [`ForwardConfig::retired_keys`]:
+/// those name what a loaded config *sets*, this names what can be taken out.
+/// The two lists must stay in step, or a key warns forever or gets silently
+/// deleted with nothing logged.
 ///
 /// [`CaptureConfig::retired_keys`]: super::CaptureConfig::retired_keys
 /// [`ForwardConfig::retired_keys`]: super::ForwardConfig::retired_keys
@@ -126,38 +119,29 @@ const RETIRED_KEYS: &[(&str, &[&str])] = &[
 /// Returns the keys it removed (`"capture.filter, forward.client_to_server"`),
 /// or `None` when the file held none and was therefore not written at all.
 ///
-/// Both keys of each section were retired but kept parsed-and-ignored, because
-/// `Config` and its sub-structs are `deny_unknown_fields`: deleting the fields
-/// outright turns the next launch of every existing installation into
-/// "Invalid configuration". The compatibility shim came with a startup warning
-/// — and that warning could never stop, because [`save`] is format-preserving
-/// and only ever rewrites `[filter]`, `[limits]` and `[actuator.timings]`, so
-/// the keys survived every Apply. A one-time nudge became permanent noise whose
-/// only cure was hand-editing a file the README says the app owns. Removing the
-/// keys ourselves is what makes the nudge one-time.
-///
-/// Both `CaptureConfig` and `ForwardConfig` consist *only* of retired keys, so
-/// stripping them empties the table; the emptied table's header goes too,
-/// because a bare `[capture]` left behind is a worse artefact than the key was.
-/// What does *not* go with it is any comment the player wrote around it — see
-/// [`tidy`], which is where that distinction is made and why it costs a text
-/// pass. A table this pass did not touch is never removed, empty or not:
-/// `config.example.toml` ships both headers with every key commented out, and a
-/// fresh install must come back `None` here.
+/// The keys are `deny_unknown_fields`, kept parsed-and-ignored because
+/// deleting them outright would turn every existing installation's next
+/// launch into "Invalid configuration". [`save`] only ever rewrites
+/// `[filter]`, `[limits]` and `[actuator.timings]`, so without this the
+/// startup warning would never stop firing. `CaptureConfig` and
+/// `ForwardConfig` hold *only* retired keys, so stripping always empties —
+/// and removes — the header too, but never a comment the player wrote (see
+/// [`tidy`]), and never a table this pass did not touch
+/// (`config.example.toml` ships both headers with every key commented out).
 ///
 /// # Errors
 ///
-/// - [`Error::ConfigRead`] — the file could not be read. A *missing* file is
-///   not an error: there is nothing to strip, so it yields `None`.
+/// - [`Error::ConfigRead`] — the file could not be read. A *missing* file
+///   yields `None`, not an error.
 /// - [`Error::ConfigReparse`] — the file is not valid TOML. Unreachable from
-///   the startup path, which only calls this after `Config::load` parsed the
-///   same bytes, and kept typed rather than silently skipped.
+///   the startup path (`Config::load` already parsed the same bytes), kept
+///   typed rather than silently skipped.
 /// - [`Error::ConfigWrite`] — the rewrite failed (read-only file, antivirus
-///   lock). The file is left exactly as it was, retired keys included, which is
-///   why the caller must keep warning about them in that case.
+///   lock). The file is left as-is, retired keys included, so the caller
+///   must keep warning about them.
 ///
-/// Callers treat every one of these as non-fatal: the keys are inert, so
-/// failing to delete them costs a log line, not a startup.
+/// All non-fatal for callers: the keys are inert, so a failed delete costs a
+/// log line, not a startup.
 pub fn strip_retired_keys(path: impl AsRef<Path>) -> Result<Option<String>> {
     let path = path.as_ref();
     let text = match std::fs::read_to_string(path) {
@@ -193,9 +177,9 @@ fn strip_sections(text: &str) -> Result<Option<Stripped>> {
     let mut doc: DocumentMut = text.parse()?;
     let root = doc.as_table_mut();
     let mut removed = Vec::new();
-    // Headers whose table this pass emptied, and the retired key names of every
-    // table it edited. Both are finished off by `tidy`, on the rendered text —
-    // see there for why the tree cannot do it.
+    // Headers this pass emptied, and the retired keys of every table it
+    // edited — both finished off by `tidy` on the rendered text (see there
+    // for why the tree cannot do it).
     let mut headers = Vec::new();
     let mut orphaned = Vec::new();
     for (table, keys) in RETIRED_KEYS {
@@ -216,21 +200,20 @@ fn strip_sections(text: &str) -> Result<Option<Stripped>> {
     }))
 }
 
-/// Remove `keys` from `root[table]`, appending each removal to `removed` as a
-/// dotted name. Returns true when the table is now empty *and* this pass is
-/// what emptied it — the caller takes its header line out in [`tidy`].
+/// Remove `keys` from `root[table]`, appending each removal to `removed` as
+/// a dotted name. Returns true when the table is now empty *and* this pass
+/// emptied it — the caller drops its header line in [`tidy`].
 ///
-/// Every spelling a player's file can use is handled: the header table
-/// (`[capture]`) the example ships, the inline one (`capture = { .. }`), and
-/// the dotted `capture.filter = ".."` — `toml_edit` models the last as a table
-/// too, which is why it is told apart by `is_dotted` rather than by its type.
-/// The two that have no header line of their own are removed here and now; the
-/// header table is left in the tree for `tidy`, which can drop the header
-/// without taking the comments above it along.
+/// Handles every spelling a player's file can use: the header table
+/// (`[capture]`), the inline one (`capture = { .. }`), and the dotted
+/// `capture.filter = ".."` (`toml_edit` models the last as a table too,
+/// told apart by `is_dotted`). Inline/dotted forms are removed immediately;
+/// the header table is left for [`tidy`], which drops the header without
+/// its leading comments.
 ///
-/// The emptiness check is deliberately gated on having removed something: an
-/// untouched empty table is somebody's commented-out section — the shape
-/// `config.example.toml` seeds — not our leftover.
+/// Gated on having removed something: an untouched empty table is a
+/// commented-out section (the shape `config.example.toml` seeds), not our
+/// leftover.
 fn strip_table(root: &mut Table, table: &str, keys: &[&str], removed: &mut Vec<String>) -> bool {
     let before = removed.len();
     let (empty, has_header) = match root.get_mut(table) {
@@ -259,41 +242,36 @@ fn strip_table(root: &mut Table, table: &str, keys: &[&str], removed: &mut Vec<S
     emptied && has_header
 }
 
-/// Finish the removal on the rendered text: drop each header in `headers`, drop
-/// every line that is a commented-out assignment of one of `keys`, and absorb
-/// the blank line a dropped header no longer needs.
+/// Finish the removal on the rendered text: drop each header in `headers`,
+/// drop every commented-out assignment of a key in `keys`, and absorb the
+/// blank line a dropped header no longer needs.
 ///
-/// A text pass, because neither of those two lines is reachable from the tree.
-/// `toml_edit` attaches a comment to whatever *follows* it, so a section's
-/// leading comments are not its own — they are the header's decor, and the
-/// commented-out example lines at its end belong to the *next* header (or, for
-/// a last section, to the document's trailer). Removing `[capture]` through
-/// `Table::remove` therefore does both halves of the wrong thing at once, and
-/// the live `%APPDATA%` file demonstrates both:
+/// A text pass, because neither line is reachable from the tree: `toml_edit`
+/// attaches a comment to whatever *follows* it, so a section's leading
+/// comments are the header's decor, and its trailing commented-out lines
+/// belong to the *next* header. `Table::remove` on `[capture]` does both
+/// halves of the wrong thing at once — observed on the live `%APPDATA%`
+/// file:
 ///
-/// - it deletes the `# server_url = "ws://127.0.0.1:3001/refresh-shop"` line
-///   sitting above `[forward]`, which is the player's own commented-out
-///   alternative for a live key — silently editing settings, the one thing this
-///   whole pass must not do;
-/// - it keeps `# filter = "tcp and tcp.SrcPort == 3333"` from the end of
-///   `[capture]` and re-homes it under `[reconnect]`, where it reads as a
-///   commented `reconnect.filter`.
+/// - deletes the player's own commented-out
+///   `# server_url = "ws://127.0.0.1:3001/refresh-shop"` above `[forward]`,
+///   silently editing a setting;
+/// - keeps `# filter = "tcp and tcp.SrcPort == 3333"` from the end of
+///   `[capture]` and re-homes it under `[reconnect]`, reading as a commented
+///   `reconnect.filter`.
 ///
-/// Dropping the header line and nothing else leaves every comment exactly where
-/// its author put it, which is why the emptied table is rendered before being
-/// removed rather than removed before being rendered.
+/// So the emptied table is rendered before being removed, leaving every
+/// comment where its author put it.
 ///
-/// The commented-key match is deliberately narrow — `#`, key, `=` — so prose
-/// survives even when it names a retired key, and it runs only for the keys of
-/// a table this pass edited. A prose comment that was *inside* a removed
-/// section outlives it; that is the accepted cost of never touching a comment
-/// we are not sure about.
+/// The commented-key match is narrow — `#`, key, `=` — so prose survives
+/// even when it names a retired key, and it runs only for the keys of a
+/// table this pass edited. A comment *inside* a removed section outlives it:
+/// the accepted cost of never touching a comment we are not sure about.
 fn tidy(text: &str, headers: &[&str], keys: &[&str]) -> String {
     let mut out = String::with_capacity(text.len());
-    // A dropped header leaves the blank line that separated it from the section
-    // before *and* the one before the section after; swallow one of them, but
-    // only when the file had both, so the pass never invents or removes spacing
-    // anywhere else.
+    // A dropped header leaves the blank line before it *and* the one before
+    // the next section; swallow one, but only when both existed, so the
+    // pass never invents or removes spacing elsewhere.
     let mut header_dropped = false;
     let mut previous_blank = true;
     for line in text.split_inclusive('\n') {
@@ -349,14 +327,12 @@ fn write_sections(text: &str, edits: &[Section]) -> Result<String> {
             Section::Filter(filter) => set_table(root, "filter", section_table(filter)?),
             Section::Limits(limits) => set_table(root, "limits", section_table(limits)?),
             Section::Timings(timings) => {
-                // This is the write boundary the loader's `validate` never sees:
-                // the Setup tab hands `Timings` straight to this module, with no
-                // `Config` in the path. It used to call `config::validate_timings`
-                // for exactly that reason; it does not need to any more, because
-                // `plan::DelayRange` carries `min_ms <= max_ms <= MAX_TIMING_MS`
-                // by construction. A `Timings` that reaches here at all is one
-                // the next `Config::load` will accept — the guarantee is in the
-                // argument type now, not in this call.
+                // The write boundary the loader's `validate` never sees: the
+                // Setup tab hands `Timings` here directly, with no `Config` in
+                // the path. It used to call `config::validate_timings` for
+                // that reason; no longer needed, since `plan::DelayRange`
+                // carries `min_ms <= max_ms <= MAX_TIMING_MS` by construction
+                // — any `Timings` reaching here is one `Config::load` accepts.
                 let mut table = section_table(timings)?;
                 inline_ranges(&mut table);
                 set_nested_table(root, "actuator", "timings", table);
@@ -587,12 +563,11 @@ backend = \"input\"
 
     #[test]
     fn inert_filter_keys_are_not_written() {
-        // The `Timings` twin, at the layer that actually writes the file. Four
-        // of `Filter`'s five never-`None` fields are inert when empty, and
-        // whole-section replacement meant the first Apply after typing one item
-        // name wrote `kinds = []`, `sets = []`, `required_substats = []` and
-        // `include_sold_out = false` into a file this module exists to leave as
-        // the player wrote it.
+        // The `Timings` twin, at the layer that writes the file: four of
+        // `Filter`'s five never-`None` fields would otherwise write
+        // `kinds = []`, `sets = []`, `required_substats = []` and
+        // `include_sold_out = false` on the first Apply after typing one
+        // item name.
         let out = write_sections("", &[Section::Filter(hunt_filter())]).expect("write");
         assert!(out.contains("names = [\"ticketrare_name\"]"));
         for inert in ["kinds", "sets", "required_substats", "include_sold_out"] {
@@ -605,16 +580,12 @@ backend = \"input\"
 
     #[test]
     fn a_persisted_substat_requirement_reloads() {
-        // Nothing covered persisting a filter that carries one, and it is the
-        // one `Filter` field that is not a scalar or a string list.
-        //
-        // Note the shape: `toml_edit` renders it as the inline
-        // `required_substats = [{ name = "speed", min = 8.0 }]`, not the
-        // `[[filter.required_substats]]` array-of-tables `config.example.toml`
-        // documents. Both are the same document to any TOML parser, so this is a
-        // house-style divergence and not a defect — recorded here rather than
-        // "fixed", because `inline_ranges` shows the crate does care, and
-        // matching the example is a separate, cosmetic change.
+        // The one `Filter` field that is not a scalar or a string list.
+        // `toml_edit` renders it as the inline `required_substats = [{ name =
+        // "speed", min = 8.0 }]`, not the `[[filter.required_substats]]`
+        // array-of-tables `config.example.toml` documents — both are the same
+        // document to any parser, so this is a cosmetic house-style
+        // divergence, not a defect.
         let filter = Filter {
             required_substats: vec![crate::domain::filter::SubstatReq {
                 name: "speed".to_owned(),
@@ -630,15 +601,12 @@ backend = \"input\"
 
     #[test]
     fn the_widest_writable_timings_reload_through_the_loader() {
-        // The second write boundary, pinned from the writing side. `Config::load`
-        // guards the loader, but the Setup tab reaches this module with no
-        // `Config` in the path, so an unclamped `Timings` used to land on disk and
-        // take out the *next* launch — an error window with hand-editing the only
-        // way out. This used to be `a_timing_range_the_loader_would_refuse_is_
-        // never_written`, asserting that `write_sections` refused a reversed and
-        // an over-ceiling range; neither is constructible now, so the assertion
-        // moved to `plan`'s `try_new` tests and what is left to prove here is the
-        // other direction: the extreme a `Timings` *can* hold still survives the
+        // The second write boundary, pinned from the writing side:
+        // `Config::load` guards the loader, but the Setup tab reaches this
+        // module with no `Config` in the path, so an unclamped `Timings`
+        // used to land on disk and break the *next* launch. That is no
+        // longer constructible, so what is left to prove is the other
+        // direction: the extreme a `Timings` *can* hold still survives the
         // round trip through the file this module writes.
         let widest = Timings {
             refreshed: range(0, crate::actuator::plan::MAX_TIMING_MS),
@@ -761,9 +729,9 @@ buffer_size = 65535
 
     #[test]
     fn an_emptied_retired_table_leaves_no_bare_header() {
-        // `CaptureConfig` and `ForwardConfig` are made of retired keys only, so
-        // stripping always empties the table. A leftover `[capture]` header
-        // would be a worse artefact than the key it used to hold.
+        // Both structs hold only retired keys, so stripping always empties
+        // the table; a leftover `[capture]` header would be worse than the
+        // key it used to hold.
         let text = "\
 [capture]
 buffer_size = 65575
@@ -783,9 +751,8 @@ max_spend = 300
 
     #[test]
     fn a_config_without_retired_keys_is_left_byte_identical() {
-        // The normal case for every install from here on, and the reason the
-        // pure core reports `None` rather than "the same text": no rewrite at
-        // all means no log line and no mtime change on the player's file.
+        // The normal case for every install from here on: no rewrite means no
+        // log line and no mtime change on the player's file.
         let text = "\
 # top of file
 game_port = 3333
@@ -794,9 +761,9 @@ game_port = 3333
 names = [\"ticketrare_name\"]
 ";
         assert!(strip_sections(text).expect("valid TOML").is_none());
-        // Including the shape `config.example.toml` seeds: both headers there,
-        // every key inside them commented out. An empty table we did not touch
-        // is the player's commented section, not our leftover.
+        // Including the shape `config.example.toml` seeds: both headers
+        // present, every key commented out. An untouched empty table is the
+        // player's commented section, not our leftover.
         let seeded = "\
 [forward]
 # server_to_client = true
@@ -809,11 +776,11 @@ names = [\"ticketrare_name\"]
 
     #[test]
     fn a_retired_table_that_still_holds_another_key_keeps_that_key_and_its_header() {
-        // Defensive: no such case exists today — both structs are made only of
-        // retired keys, and `deny_unknown_fields` refuses anything else — so
-        // this pins the rule as "remove the table when it is *empty*" rather
-        // than "remove the retired table", which is what a later release adding
-        // a live `[capture]` key would otherwise silently delete.
+        // Defensive: no such case exists today (both structs hold only
+        // retired keys, and `deny_unknown_fields` refuses anything else) —
+        // this pins "remove the table when empty" rather than "remove the
+        // retired table", so a later release adding a live `[capture]` key
+        // is not silently deleted by this pass.
         let text = "[capture]\nbuffer_size = 65575\nsomething_live = 7\n";
         let stripped = strip_sections(text).expect("valid TOML").expect("rewrites");
         assert!(
@@ -862,11 +829,11 @@ names = [\"ticketrare_name\"]
     }
 
     /// **The regression that made this a text pass.** `Table::remove` on the
-    /// emptied `[forward]` takes its decor with it — and a table's decor is not
-    /// its own contents, it is every comment line above the header. In the
-    /// user's live `%APPDATA%` file that is their commented-out loopback
-    /// `server_url`: a setting of theirs, deleted by a pass whose whole promise
-    /// is that it changes no setting.
+    /// emptied `[forward]` takes its decor with it — a table's decor is every
+    /// comment line above the header, not its contents. In the live
+    /// `%APPDATA%` file that decor is the player's own commented-out
+    /// loopback `server_url`: deleted by a pass whose whole promise is that
+    /// it changes no setting.
     #[test]
     fn a_comment_above_a_removed_header_belongs_to_the_line_before_it() {
         let text = "\
@@ -897,10 +864,10 @@ initial_ms = 1000
 
     #[test]
     fn a_commented_out_retired_key_does_not_outlive_its_section() {
-        // The other half: a commented example line at the end of `[capture]` is
-        // `toml_edit`-attached to the *next* header, so removing the section
-        // re-homes it — `# filter = ..` would resurface under `[reconnect]`,
-        // reading as a commented `reconnect.filter`.
+        // The other half: a commented example line at the end of `[capture]`
+        // is `toml_edit`-attached to the *next* header, so removing the
+        // section re-homes it — `# filter = ..` would resurface under
+        // `[reconnect]`, reading as a commented `reconnect.filter`.
         let text = "\
 [reconnect]
 initial_ms = 1000

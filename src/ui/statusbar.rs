@@ -12,10 +12,10 @@ use super::theme;
 use super::view::ViewState;
 use crate::render::amount_or_dash;
 
-/// Top chrome: the error banner, then two rows — the status (dot + word +
-/// clause) alone on the left with the one contextual button on the right, and
-/// under it a row of stat tiles (balances | refreshes + the per-token haul).
-/// Returns the clicked command.
+/// Top chrome: the error banner, then two rows — status (dot + word + clause)
+/// with the one contextual button on the right, and under it a row of stat
+/// tiles (balances | refreshes + the per-token haul). Returns the clicked
+/// command.
 #[must_use]
 pub(super) fn render_status_bar(
     ui: &mut egui::Ui,
@@ -32,15 +32,14 @@ pub(super) fn render_status_bar(
     ui.add_space(theme::SP_XS);
     let color = theme::status_color(view.status_kind);
     let armed = matches!(view.status_kind, Status::Watching | Status::Paused);
-    // Row 1: the button takes its width at the right first, then the status
-    // group fills the whole leftover width — so the clause has the room it
-    // needs and no longer truncates once the currencies moved off this row.
+    // Row 1: button width first (right-aligned), then status fills the rest,
+    // so the clause has room and does not truncate.
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // One contextual button sending the explicit command, never
-            // Toggle: the 4 Hz poll can show a label up to 250 ms stale, and
-            // a toggle raced by an auto-stop would re-arm the loop. The
-            // domain no-ops a redundant Stop and refuses a redundant Start.
+            // Sends the explicit command, never Toggle: the 4 Hz poll can show
+            // a label up to 250 ms stale, and a toggle raced by an auto-stop
+            // would re-arm the loop (the domain no-ops a redundant Stop and
+            // refuses a redundant Start).
             let (label, command) = if armed {
                 ("Stop", Command::Stop)
             } else {
@@ -52,8 +51,7 @@ pub(super) fn render_status_bar(
                 }
             });
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                // The dot carries the color; the word stays ink so the two do
-                // not double up on hue (Linear's quiet status treatment).
+                // The dot carries the color; the word stays ink.
                 status_dot(ui, color);
                 ui.add_space(theme::SP_SM);
                 ui.add(
@@ -67,28 +65,24 @@ pub(super) fn render_status_bar(
             });
         });
     });
-    // Row 2: stat tiles — balances, then the run's readouts, as label-over-value
-    // blocks grouped (balances | run) so the two families read apart. The run
-    // group joins once a run exists; while Idle it would be all zeros, noise. A
-    // hairline splits the metrics off the status/action row above them.
+    // Row 2: balance tiles, then the run's readouts once a run exists (while
+    // Idle they'd be all zeros, noise).
     ui.add_space(theme::SP_SM);
     row_separator(ui);
     ui.add_space(theme::SP_SM);
     // Wrapped, not a flat row: a large Gold balance plus the haul tiles can
-    // exceed the panel at its minimum width, and clipping would drop the
-    // rightmost tiles off-screen. Wrapping folds them to a second line instead.
+    // exceed the panel's minimum width; wrapping folds the overflow to a
+    // second line instead of clipping tiles off-screen.
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = theme::SP_SM;
         skystone_tile(ui, view.crystal_balance);
         gold_tile(ui, view.gold_balance);
         if !matches!(view.status_kind, Status::Idle) {
-            // Size the divider to the tiles already laid, not a re-derived
-            // guess of their height.
+            // Size the divider to the tiles already laid.
             let tile_height = ui.min_size().y;
             group_divider(ui, tile_height);
-            // Refreshes is the loop's throttle; then the haul takes the place of
-            // the old generic Spent/Matches counters — the per-token buy tally
-            // 90% of players actually watch, with the rest bucketed into Other.
+            // The haul replaces the old generic Spent/Matches counters with the
+            // per-token buy tally, bucketing the rest into Other.
             stat_tile(
                 ui,
                 "Refreshes",
@@ -106,20 +100,16 @@ pub(super) fn render_status_bar(
     clicked
 }
 
-/// The crystal balance tile. "Skystones" is the word the game uses; the code —
-/// and the `RefreshMeta` that feeds this — says crystals.
+/// The crystal balance tile. "Skystones" is the game's word; the code and the
+/// `RefreshMeta` that feeds it say crystals.
 ///
-/// A function per currency rather than two `stat_tile(ui, "…", …)` calls, and
-/// that is the label↔value pairing fix the currency finding asked for. The row
-/// used to read `stat_tile(ui, "Skystones", grouped_or_dash(view.crystal_balance))`
-/// with `stat_tile(ui, "Gold", grouped_or_dash(view.gold_balance))` directly
-/// under it: two calls to the same function differing only in a string literal
-/// and which field of `view` was named, so swapping the two arguments compiled
-/// and mislabelled both balances. It falls out of the newtypes and could not
-/// have been written before them — `Option<Crystals>` and `Option<Gold>` are
-/// not interchangeable, so the label and the ledger it names are now one fact
-/// the compiler checks. The generic tiles below (Refreshes, the haul tokens) are
-/// left alone: their values are plain counts with no ledger to bind to.
+/// A function per currency, not two `stat_tile(ui, "…", …)` calls: the old code
+/// called `stat_tile` for both balances directly, differing only by a string
+/// literal and which `view` field was passed, so swapping the two arguments
+/// compiled and mislabelled both balances. `Option<Crystals>` and `Option<Gold>`
+/// are not interchangeable, so each currency now has its own typed helper.
+/// The generic tiles below (Refreshes, haul tokens) stay plain counts with no
+/// ledger to bind to.
 fn skystone_tile(ui: &mut egui::Ui, balance: Option<Crystals>) {
     stat_tile(ui, "Skystones", amount_or_dash(balance));
 }
@@ -141,10 +131,9 @@ fn stat_tile(ui: &mut egui::Ui, label: &str, value: String) {
 
 /// A full-bleed hairline splitting the status/action row from the metrics row
 /// below it. Reserves a 1px strip for layout, then paints across the panel's
-/// clip rect — the full window width, past the panel's side margin — so it
-/// reaches the edges like the tab and table rules, not the inset text width.
-/// Dimmed below the plain hairline: it divides two rows of the same chrome
-/// block, so it must read quieter than the rules that separate whole zones.
+/// clip rect (the full window width, past the side margin) so it reaches the
+/// edges like the tab and table rules. Dimmed below the plain hairline, since
+/// it divides two rows of the same chrome block rather than whole zones.
 fn row_separator(ui: &mut egui::Ui) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
@@ -166,8 +155,8 @@ fn group_divider(ui: &mut egui::Ui, height: f32) {
     );
 }
 
-/// A small painted status dot. Painted rather than a `●` glyph so it never
-/// depends on the stock font carrying the symbol.
+/// A small painted status dot, not a `●` glyph, so it never depends on the
+/// stock font carrying the symbol.
 fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 3.5, color);
@@ -224,8 +213,6 @@ mod tests {
         let harness = Harness::new_ui(|ui| {
             let _ = render_status_bar(ui, &view, None, true);
         });
-        // The balance tiles show always (uppercase KPI labels), the state word
-        // is title-cased, and its clause is a plain hint.
         harness.get_by_label("SKYSTONES");
         harness.get_by_label("GOLD");
         harness.get_by_label("Idle");
@@ -234,9 +221,6 @@ mod tests {
 
     #[test]
     fn run_tiles_hidden_only_while_idle() {
-        // The run group would read all zeros while Idle, pure noise, so it
-        // waits for a run; the balance tiles always show. "REFRESHES" is a
-        // run-tile label that only exists once the group renders.
         let idle = idle_view();
         let idle_bar = Harness::new_ui(|ui| {
             let _ = render_status_bar(ui, &idle, None, true);
@@ -244,8 +228,6 @@ mod tests {
         idle_bar.get_by_label("SKYSTONES");
         assert!(idle_bar.query_by_label("REFRESHES").is_none());
 
-        // Watching: Refreshes plus the haul tiles show; the old generic Spent
-        // and Matches counters are gone, replaced by the per-token haul.
         let limits = Limits {
             max_refreshes: Some(10),
             ..Limits::default()
@@ -262,8 +244,8 @@ mod tests {
         assert!(armed_bar.query_by_label("SPENT").is_none());
         assert!(armed_bar.query_by_label("MATCHES").is_none());
 
-        // Stopped: the final totals survive the stop (an auto-stop is exactly
-        // when the player wants to read them).
+        // The final totals survive a stop (an auto-stop is exactly when the
+        // player wants to read them).
         let mut controller = Controller::new(Filter::matching_default_items(), Limits::default());
         let _ = controller.handle(Event::Start { now_ms: 0 });
         let _ = controller.handle(Event::Stop);

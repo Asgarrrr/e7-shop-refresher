@@ -2,10 +2,8 @@
 //! renders it, and pushes player commands through the existing channel. No
 //! egui type crosses into the app layer or the domain.
 //!
-//! Layout: permanent chrome (status bar on top, a collapsible journal at the
-//! bottom — closed by default so the shop table owns the height) around a
-//! tabbed center — the state the player watches is always on screen, the
-//! editors never push it away. The surfaces live in their own modules
+//! Layout: a status bar on top, a collapsible journal at the bottom (closed
+//! by default), and a tabbed center. Surfaces live in their own modules
 //! (`statusbar`, `shop`, `journal`); this file is the shell and the tab strip.
 
 mod editor;
@@ -34,9 +32,8 @@ use view::{SlotRow, SlotRows, ViewState, slot_detail, view_state};
 /// end): written once by the spawn wrapper in `main`, shown as a banner.
 pub type SessionErrorSlot = Arc<Mutex<Option<String>>>;
 
-/// A poisoned lock means the session panicked. The view keeps rendering the
-/// last state (the banner reports the crash) instead of tearing the window
-/// down with a second panic.
+/// A poisoned lock means the session panicked. Keep rendering the last
+/// state (the banner reports the crash) rather than double-panic the window.
 fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -88,16 +85,12 @@ pub struct ShopApp {
     error: SessionErrorSlot,
     editor: EditorState,
     tab: Tab,
-    /// Journal snapshot re-cloned only when the generation changes: the
-    /// journal grows at human pace, repaints at display rate.
+    /// Journal snapshot re-cloned only when the generation changes.
     journal_cache: Vec<LogLine>,
     journal_generation: u64,
-    /// The slot table's rows, under the same rule as `journal_cache` above and
-    /// for the same reason: a shop rolls over every few seconds, the window
-    /// repaints far more often than that. See [`SlotRows`].
+    /// The slot table's rows, cached under the same rule. See [`SlotRows`].
     slots: SlotRows,
-    /// The journal is secondary; it starts collapsed to its title bar so the
-    /// shop table owns the height, and expands on a click.
+    /// Starts collapsed to its title bar so the shop table owns the height.
     journal_open: bool,
 }
 
@@ -110,15 +103,12 @@ impl ShopApp {
         config_path: PathBuf,
     ) -> Self {
         theme::apply(&cc.egui_ctx);
-        // Seed the drafts from the controller itself — the single source of
-        // the criteria actually running. Timings aren't domain state, so their
-        // seed is the startup config value (the running value before any
-        // retune).
+        // Seed the drafts from the controller; Timings aren't domain state,
+        // so they seed from the startup config value instead.
         let (editor, slots) = {
             let ctrl = lock_ignoring_poison(&handles.controller);
             let mut slots = SlotRows::default();
-            // Seeded here for the same reason `journal_cache` is: the first
-            // frame then finds both caches current and rebuilds neither.
+            // Seeded here so the first frame finds the cache already current.
             slots.sync(&ctrl);
             (
                 EditorState::new(ctrl.filter().clone(), *ctrl.limits(), timings),
@@ -143,15 +133,12 @@ impl ShopApp {
 
 impl eframe::App for ShopApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Poll-based repaint: state changes arrive from the session loop at
-        // human pace; 4 Hz keeps the window fresh without coupling app.rs to
-        // egui.
+        // Poll-based repaint: state arrives at human pace; 4 Hz keeps the
+        // window fresh without coupling app.rs to egui.
         ui.ctx().request_repaint_after(Duration::from_millis(250));
-        // One short hold for both: the projection reads `Copy` state only, and
-        // the rows are re-derived inside it *only* if the shop or the checklist
-        // moved. That lock is the one the session loop takes to turn a captured
-        // shop into a click job, so what a repaint costs it is the whole point —
-        // see `view::SlotRows`.
+        // One short hold for both: the projection reads `Copy` state, and
+        // rows re-derive only if the shop or checklist moved. See
+        // `view::SlotRows`.
         let view = {
             let ctrl = lock_ignoring_poison(&self.handles.controller);
             self.slots.sync(&ctrl);
@@ -163,14 +150,11 @@ impl eframe::App for ShopApp {
             self.journal_generation = generation;
         }
         let outcome = lock_ignoring_poison(&self.error).clone();
-        // A terminal outcome means the command channel is dead: disable every
-        // control whose click would otherwise vanish into a closed channel.
+        // A terminal outcome disables every control: its click would hit a dead channel.
         let session_alive = outcome.is_none();
 
-        // Roomier margins than egui's stock 8px: the chrome needs to breathe.
-        // The side inset is `theme::EDGE` itself, not a second copy of 16 — the
-        // table text is inset by that same constant so the columns line up
-        // under the status bar.
+        // Roomier margins than egui's stock 8px, using `theme::EDGE` as the
+        // side inset so the table text lines up under the status bar.
         let margin = egui::Margin::symmetric(theme::EDGE, 10);
         let clicked = egui::Panel::top("status_bar")
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
@@ -178,10 +162,8 @@ impl eframe::App for ShopApp {
                 statusbar::render_status_bar(ui, &view, outcome.as_deref(), session_alive)
             })
             .inner;
-        // Journal: collapsed to its title bar by default so the shop table
-        // owns the height; a click expands it to a resizable log. When open it
-        // may grow but must never crush the center — the tab strip and a few
-        // rows always survive the divider drag.
+        // Collapsed to its title bar by default; expands on click. The tab
+        // strip and a few rows always survive the divider drag.
         let open = self.journal_open;
         // The peek only matters while collapsed; borrow it (no per-frame clone).
         let latest = if open {
@@ -193,8 +175,7 @@ impl eframe::App for ShopApp {
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
             .resizable(open);
         if open {
-            // Floor the max at the min (80) so a very short window can't invert
-            // the range.
+            // Floor the max at the min (80) so a short window can't invert the range.
             let journal_max = (ui.available_rect_before_wrap().height() - 160.0).max(80.0);
             panel = panel
                 .default_size(200.0)
@@ -205,30 +186,22 @@ impl eframe::App for ShopApp {
                 self.journal_open = !open;
             }
             if open {
-                // Reserve the header's bottom margin so its symmetric hover
-                // fill lands in real space, not over the first log line.
+                // Reserve the header's bottom margin so its hover fill doesn't cover the first log line.
                 ui.add_space(f32::from(margin.bottom));
                 journal::render_journal_body(ui, &self.journal_cache);
             }
         });
-        // Tab strip in its own zero-margin top panel: the tabs and their
-        // underline span the full width, flush to the window edges, instead of
-        // sitting inset inside the content margin. Its own baseline hairline is
-        // the divider, so egui's panel separator would double it — suppress it.
+        // Zero-margin panel so the tab strip spans full width, flush to the
+        // edges. Its own hairline is the divider, so egui's separator is
+        // suppressed to avoid doubling it.
         egui::Panel::top("tabs")
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::ZERO))
             .show_separator_line(false)
             .show(ui, |ui| render_tabs(ui, &mut self.tab));
-        // The central panel always comes last: it takes whatever space the
-        // chrome left over. Only the top margin survives — the content spans
-        // full width so the shop table's hover fill and rules reach the window
-        // edges; text is inset per-tab (`theme::EDGE`) instead. No vertical
-        // margin: the tab strip's own SP_XS below the underline is the only gap
-        // to the content, and the journal's separator sits flush below.
-        // The slot table's tooltip is built through this, not carried in the
-        // projection: egui calls it for the hovered row only, so the item line
-        // costs one short lock per hovered frame instead of one `format_item`
-        // per row inside the frame's own lock hold (see `view::slot_detail`).
+        // Only the top margin survives here: content spans full width for
+        // the hover fill, other tabs inset text via `theme::EDGE`. Tooltip
+        // source built here, not carried in the projection — see
+        // `view::slot_detail`.
         let controller = &self.handles.controller;
         let detail = |index: usize| slot_detail(&lock_ignoring_poison(controller), index);
         let rows = self.slots.rows();
@@ -246,11 +219,9 @@ impl eframe::App for ShopApp {
                 )
             })
             .inner;
-        // Dispatch first, then record. Everything downstream — the editor's
-        // "applied" state and the on-disk copy — is keyed on what the session
-        // actually took, so a click the bounded queue dropped leaves no trace
-        // claiming otherwise. Stop bypasses that queue so saturation can never
-        // suppress the immediate gate cutoff or its durable notification.
+        // Dispatch first, then record: "applied" state and persistence both
+        // key off what the session actually took. Stop bypasses the queue so
+        // saturation can't suppress it.
         let mut delivered = Vec::new();
         for command in clicked.into_iter().chain(applied) {
             if deliver_command(&self.handles, command.clone()) {
@@ -259,19 +230,15 @@ impl eframe::App for ShopApp {
         }
         // Only now is a draft "applied": Apply goes dark and the peek clears.
         self.editor.mark_applied(&delivered);
-        // Persist what the session accepted. Best-effort: a write failure only
-        // costs the on-disk copy — the live retune already went through — so it
-        // is journaled and moved past.
+        // Persist what the session accepted; best-effort — a write failure
+        // only costs the on-disk copy, so it's journaled and moved past.
         let sections = persisted_sections(&delivered);
         if !sections.is_empty()
             && let Err(err) = config::persist::save(&self.config_path, &sections)
         {
-            // The journal is a 500-entry in-memory ring that dies with the
-            // window, and this is exactly the failure a player comes back to ask
-            // about ("my Setup changes keep reverting") — so it also goes to the
-            // subscriber, which is what reaches the log file they are asked to
-            // send. The journal line names the sections so the banner says
-            // *what* was lost, not only that something was.
+            // The journal is a 500-entry ring that dies with the window, so
+            // this also goes to the subscriber reaching the log file. Names
+            // the sections lost.
             let labels = section_labels(&sections);
             tracing::warn!(
                 error = ?err,
@@ -279,12 +246,8 @@ impl eframe::App for ShopApp {
                 sections = %labels,
                 "config.toml not saved"
             );
-            // `push`, not `emit_at(WARN, …)`, deliberately: the file half is the
-            // structured `warn!` immediately above, with `error`, `path` and
-            // `sections` as fields. Routing this through `emit_at` would mirror
-            // the prose a second time and *replace* those three fields with it.
-            // `push` is the forgetful one, and here that is correct — the line it
-            // would forget is already recorded, better, one statement up.
+            // `push`, not `emit_at`: the file half is the `warn!` above with
+            // its fields; `emit_at` would duplicate the prose and drop them.
             self.handles.journal.push(&[format!(
                 "config.toml not saved ({labels}): {}",
                 err.report()
@@ -295,14 +258,10 @@ impl eframe::App for ShopApp {
 
 /// Hands one command to the session; `true` when it was taken.
 ///
-/// `Stop` is a safety cutoff and never rides the bounded queue — the gate's
-/// durable halt latch takes it, so it cannot be dropped and always counts as
-/// delivered. Everything else goes through the capacity-16 channel, which a
-/// dying or throttled session can leave full or closed. In the shipped build
-/// stdin is inert and this window is the only interface, so a swallowed
-/// `try_send` would make a click a perfectly silent no-op. The same rule the
-/// session already applies to actuator jobs holds here: a lost click must not be
-/// silent, so the drop is journaled *and* reported back to the caller.
+/// `Stop` bypasses the capacity-16 queue via the gate's halt latch, so it
+/// can never be dropped. Everything else rides the queue, which a dying or
+/// throttled session can leave full or closed; a dropped `try_send` is
+/// journaled and reported back rather than silently swallowed.
 #[must_use]
 fn deliver_command(handles: &SessionHandles, command: Command) -> bool {
     if command == Command::Stop {
@@ -310,14 +269,11 @@ fn deliver_command(handles: &SessionHandles, command: Command) -> bool {
         return true;
     }
     if handles.commands.try_send(command).is_err() {
-        // Journalled for the player and logged for us: the ring is gone once the
-        // window closes, and "the button did nothing" is only diagnosable after
-        // the fact from the file.
+        // Journalled and logged: the ring dies with the window, so a silent
+        // drop would be undiagnosable afterward.
         tracing::debug!("a player command was dropped: the session queue is full or closed");
-        // `push` for the same reason as `persist_sections`' line above: the file
-        // half is the `debug!` on the line before, at the level this belongs at
-        // (a full queue is not a failure of the app), which `emit_at` cannot
-        // express — it offers INFO, WARN and ERROR only.
+        // `push`, same reason as above: the file half is the `debug!`
+        // above, at a level `emit_at` can't express (INFO/WARN/ERROR only).
         handles
             .journal
             .push(&[">> command dropped — the session is busy, try again".to_owned()]);
@@ -326,12 +282,9 @@ fn deliver_command(handles: &SessionHandles, command: Command) -> bool {
     true
 }
 
-/// The tab strip: flush selectable labels over a full-width hairline with the
-/// active segment underlined in accent. Lives in a zero-margin panel, so its
-/// underline spans the whole window.
+/// The tab strip: labels over a full-width hairline, active segment underlined.
 fn render_tabs(ui: &mut egui::Ui, tab: &mut Tab) {
-    // Tabs read as tabs, not buttons: the pill fills are stripped within the
-    // scope, the active tab is marked by an accent underline instead.
+    // Tabs read as tabs, not buttons: pill fills are stripped, the active tab marked by an underline instead.
     let tabs = ui.horizontal(|ui| {
         let visuals = &mut ui.style_mut().visuals;
         visuals.selection.bg_fill = egui::Color32::TRANSPARENT;
@@ -344,8 +297,7 @@ fn render_tabs(ui: &mut egui::Ui, tab: &mut Tab) {
         let setup = ui.selectable_value(tab, Tab::Setup, "Setup").rect;
         if *tab == Tab::Shop { shop } else { setup }
     });
-    // The accent underline shares the hairline's y and paints second, so the
-    // two read as one baseline with the active segment on top.
+    // The accent underline shares the hairline's y and paints second, so both read as one baseline.
     let baseline = tabs.response.rect.bottom();
     ui.painter().hline(
         ui.max_rect().x_range(),
@@ -357,21 +309,18 @@ fn render_tabs(ui: &mut egui::Ui, tab: &mut Tab) {
         baseline,
         egui::Stroke::new(2.0, theme::ACCENT),
     );
-    // The underline is a 2px stroke centred on the baseline: reserve its lower
-    // half so the zero-margin panel doesn't clip it.
+    // The underline is a 2px stroke centred on the baseline; reserve its lower half so it isn't clipped.
     ui.add_space(theme::SP_XS);
 }
 
 /// The persistable sections for a batch of Apply commands — only the three
 /// `Set*` producers; Start/Stop and friends are skipped.
 ///
-/// The non-`Set*` arm is spelled out rather than a `_`, like the sibling
-/// [`EditorState::mark_applied`]: this function is the *only* bridge from a
-/// delivered Apply to `config.toml`, so a fourth `Set*` falling into a wildcard
-/// would retune the live session and then silently vanish on the next launch.
-/// Nothing else would catch it — `persist::write_sections` is exhaustive over
-/// `Section`, so the compiler would demand the new section be *written* while
-/// never demanding it be collected here.
+/// The non-`Set*` arm is spelled out rather than `_`: this is the only
+/// bridge from Apply to `config.toml`, so a wildcard would let a new `Set*`
+/// retune the session and silently vanish on next launch. `write_sections`
+/// is exhaustive over `Section`, so the compiler catches a missed write —
+/// but never a missed collection here.
 fn persisted_sections(commands: &[Command]) -> Vec<config::persist::Section> {
     commands
         .iter()
@@ -385,8 +334,7 @@ fn persisted_sections(commands: &[Command]) -> Vec<config::persist::Section> {
 }
 
 /// The Setup section titles behind a batch of sections, for the "not saved"
-/// report. Same words the collapsible bars and the commit-bar peek use, so the
-/// message points straight at the block whose edit did not reach disk.
+/// report — same words the UI uses, so the message points at the block.
 fn section_labels(sections: &[config::persist::Section]) -> String {
     sections
         .iter()
@@ -399,9 +347,8 @@ fn section_labels(sections: &[config::persist::Section]) -> String {
         .join(", ")
 }
 
-/// The active tab's content. Returns the commands the player committed (Setup's
-/// single Apply lives here, and may send several). One scroll state per tab —
-/// Setup's offset must not bleed into the table.
+/// The active tab's content; returns the commands the player committed. One
+/// scroll state per tab, so Setup's offset can't bleed into the table.
 #[must_use]
 fn render_tab_content(
     ui: &mut egui::Ui,
@@ -413,8 +360,7 @@ fn render_tab_content(
     detail: &dyn Fn(usize) -> String,
 ) -> Vec<Command> {
     match tab {
-        // The shop table bleeds its hover fill to the edges itself, so it takes
-        // no inset and commits nothing.
+        // The shop table bleeds hover fill to the edges itself: no inset, and commits nothing.
         Tab::Shop => {
             egui::ScrollArea::vertical()
                 .id_salt("tab-shop")
@@ -426,11 +372,9 @@ fn render_tab_content(
     }
 }
 
-/// The Setup tab, split into a pinned commit bar over a scrolling body: the bar
-/// is a bottom sub-panel (shown first so it reserves its strip), the sections
-/// scroll in whatever height is left. This keeps Apply reachable at any scroll
-/// offset instead of trailing the last section off-screen. Its `side_top_panel`
-/// frame draws the hairline that separates it from the body.
+/// The Setup tab: a pinned commit bar (bottom sub-panel, shown first) over a
+/// scrolling body, keeping Apply reachable at any scroll offset instead of
+/// trailing off-screen.
 #[must_use]
 fn render_setup_tab(
     ui: &mut egui::Ui,
@@ -457,9 +401,8 @@ fn render_setup_tab(
     clicked
 }
 
-/// Inset tab content by the side padding so text sits off the window edges.
-/// The shop table opts out of this to bleed its hover fill and rules full
-/// width; everything else (editors, the quick-start screen) takes the inset.
+/// Insets tab content by the side padding. The shop table opts out, to
+/// bleed its hover fill full width; everything else takes the inset.
 pub(super) fn content_inset<R>(
     ui: &mut egui::Ui,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
@@ -480,9 +423,8 @@ mod tests {
 
     use super::*;
 
-    /// Test shim: the shell renders the strip and the content as two panels;
-    /// the harness stacks them in one ui so a test can click a tab and then
-    /// assert on the content it reveals.
+    /// Test shim: shell renders the strip and content as two panels so a
+    /// test can click a tab and assert on the content it reveals.
     fn render_center(
         ui: &mut egui::Ui,
         view: &ViewState,
@@ -492,15 +434,13 @@ mod tests {
         session_alive: bool,
     ) -> Vec<Command> {
         render_tabs(ui, tab);
-        // No test here hovers a row, so the tooltip source is never called;
-        // `view::tests` covers what the live shell passes in its place.
+        // No test here hovers a row; `view::tests` covers the tooltip source.
         render_tab_content(ui, view, rows, *tab, editor, session_alive, &|_| {
             String::new()
         })
     }
 
-    /// One frame's projection, exactly as `ShopApp::ui` takes it: the cheap
-    /// state and the gated rows, from one borrow of the controller.
+    /// One frame's projection, as `ShopApp::ui` takes it: cheap state plus gated rows, one borrow.
     fn project(controller: &Controller) -> (ViewState, SlotRows) {
         let mut slots = SlotRows::default();
         slots.sync(controller);
@@ -528,7 +468,6 @@ mod tests {
     fn only_setup_commands_become_persisted_sections() {
         let commands = vec![Command::Start, Command::SetLimits(Limits::default())];
         let sections = persisted_sections(&commands);
-        // Start is not persisted; the limits edit is.
         assert_eq!(
             sections,
             vec![config::persist::Section::Limits(Limits::default())]
@@ -537,10 +476,8 @@ mod tests {
         assert_eq!(section_labels(&sections), "Stop");
     }
 
-    /// Live handles built the way `main` builds them, so a field added to
-    /// `SessionHandles` never breaks this file. The `Session` half must stay
-    /// alive for the caller: it owns the command receiver, and dropping it
-    /// would close the channel instead of filling it.
+    /// Live handles built as `main` builds them. `Session` must stay alive
+    /// for the caller — dropping it closes the channel instead of filling it.
     fn session_handles() -> (crate::app::Session, SessionHandles) {
         let (session, handles, _shutdown) = crate::app::setup(config::Config::default());
         (session, handles)
@@ -559,8 +496,7 @@ mod tests {
             handles.commands.try_send(Command::Toggle),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_))
         ));
-        // Arm the gate first, so the assert below reads the halt, not the
-        // startup state.
+        // Arm the gate first so the assert below reads the halt, not the startup state.
         handles.gate.set(true);
 
         assert!(deliver_command(&handles, Command::Stop));
@@ -571,8 +507,7 @@ mod tests {
 
     #[test]
     fn a_dropped_command_is_journaled_and_reported() {
-        // The window is the only interface in the shipped build: a click the
-        // saturated queue refuses must reach the player, not vanish.
+        // The window is the only interface: a click the saturated queue refuses must reach the player.
         let (_session, handles) = session_handles();
         fill_command_queue(&handles);
         let before = handles.journal.to_entries().len();
@@ -587,10 +522,8 @@ mod tests {
 
     #[test]
     fn a_dropped_apply_is_persisted_nowhere() {
-        // The other half of the honesty rule (the editor's own twins are
-        // covered in `editor::tests`): what the session refused never reaches
-        // config.toml either, because the persisted batch is the *delivered*
-        // commands, not the emitted ones.
+        // What the session refused never reaches config.toml: the persisted
+        // batch is the *delivered* commands, not the emitted ones.
         let (_session, handles) = session_handles();
         fill_command_queue(&handles);
         let command = Command::SetLimits(Limits {
@@ -675,8 +608,7 @@ mod tests {
 
     #[test]
     fn slotless_snapshot_does_not_resurrect_the_quick_start() {
-        // A tolerated degraded shop message (slots dropped by lenient
-        // decoding) counts as captured: mid-session onboarding would lie.
+        // A tolerated degraded shop message counts as captured: mid-session onboarding would lie.
         let mut controller = Controller::new(Filter::default(), Limits::default());
         let _ = controller.handle(Event::Snapshot {
             snapshot: ShopSnapshot {

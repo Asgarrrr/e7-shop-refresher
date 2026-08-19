@@ -13,9 +13,9 @@
 #![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
 // Shipped code has none of these today (measured: 0 sites in --lib --bins).
 // `not(test)` keeps the ratchet off the test harness, where `unwrap` in a
-// fixture is the correct spelling — 257 sites and rising. The rest of the
-// lint policy lives in Cargo.toml's `[lints]`; these two cannot, because a
-// `[lints]` table applies to every target including the tests.
+// fixture is correct — 257 sites and rising. The rest of the lint policy
+// lives in Cargo.toml's `[lints]`; these two cannot, since a `[lints]` table
+// applies to every target including tests.
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::panic))]
 
 use std::path::PathBuf;
@@ -27,20 +27,19 @@ use arkyve_refresh_shop::{
 };
 
 fn main() -> ExitCode {
-    // Ahead of `install_logging`, and that ordering is the point: an install
-    // that ever ran the WinDivert backend left `%LOCALAPPDATA%\<app>` locked to
-    // administrators, and the log directory sits inside it. Undo that first and
-    // this run keeps its log; undo it afterwards and the first post-upgrade run
-    // writes into a directory it cannot open and loses everything. The findings
-    // are logged below, once there is a subscriber to log them to.
+    // Ahead of `install_logging`, deliberately: an install that ever ran the
+    // WinDivert backend left `%LOCALAPPDATA%\<app>` locked to
+    // administrators, and the log directory sits inside it. Undo that first
+    // and this run keeps its log; undo it after and the first post-upgrade
+    // run writes into a directory it cannot open. Findings are logged below,
+    // once there is a subscriber to log them to.
     let leftovers = migrate::clean_windivert_leftovers();
 
     // Before anything can panic: capture panics to a file. In the windowed
-    // build stdout/stderr are inert, and a panic on a worker task or the
-    // capture thread would otherwise vanish (surfacing only as a bare
-    // "session ended"). The hook also emits a `tracing` line, which is a no-op
-    // until the subscriber below exists — deliberately, the file is the primary
-    // record.
+    // build stdout/stderr are inert, so a panic on a worker or the capture
+    // thread would otherwise vanish (surfacing only as "session ended"). The
+    // hook also emits a `tracing` line — a no-op until the subscriber below
+    // exists, deliberately: the file is the primary record.
     crash::install();
 
     // Held to the end of `main`: dropping it flushes the log writer. The
@@ -54,14 +53,14 @@ fn main() -> ExitCode {
     log_setup.report();
 
     // rustls 0.23 needs a process-level CryptoProvider installed before the
-    // first TLS handshake, or connect_async panics on any wss:// URL. Install
-    // it explicitly (the enabled feature set alone doesn't auto-select one).
-    // Placed after `install_logging` so the failure below can be *reported*:
-    // this used to `.expect()`, which in the windowed build meant a
-    // double-clicked exe that did nothing at all, unlike its two neighbouring
-    // startup failures which both route through `fatal`. `install_default`
-    // fails only if a provider is already installed, so this is a programming
-    // invariant — it just does not need to be a silent one.
+    // first TLS handshake, or `connect_async` panics on any wss:// URL —
+    // installed explicitly since the enabled feature set alone doesn't
+    // auto-select one. Placed after `install_logging` so a failure can be
+    // *reported*: this used to `.expect()`, which in the windowed build
+    // meant a double-clicked exe doing nothing, unlike its two neighbouring
+    // startup failures, which route through `fatal`. `install_default`
+    // fails only if a provider is already installed — a programming
+    // invariant, just not a silent one any more.
     if rustls::crypto::ring::default_provider()
         .install_default()
         .is_err()
@@ -197,12 +196,11 @@ fn run_mode(
     // the window's timing editor (no controller home for them).
     let seed_timings = config.actuator.timings;
     let (session, handles, shutdown) = app::setup(config);
-    // The journal half of the no-log-file report. `LogSetup::report` already said
-    // it at `error` level — into a subscriber writing to a stdout this build does
-    // not have, which is the whole problem: the one failure that hides itself is
-    // the failure of the channel it would be reported on. The journal panel is
-    // the only surface a windowed build has, and this is the earliest point it
-    // exists. Emitted here rather than inside `app::setup` because it is a
+    // The journal half of the no-log-file report. `LogSetup::report` already
+    // logged it at `error` — into a subscriber writing to a stdout this
+    // build does not have, which is the whole problem. The journal panel is
+    // the only surface a windowed build has, and this is the earliest point
+    // it exists. Emitted here rather than in `app::setup` because it is a
     // property of *this* process's startup, not of a session.
     if log_file.is_none() {
         handles.journal.emit_at(
@@ -256,20 +254,20 @@ fn run_mode(
             )))
         }),
     );
-    // The window is gone but the session still runs on its task, and nothing
-    // has told it so: without this, `shutdown_background` (which signals
-    // nothing and waits for nothing) would kill the process mid-flight and
-    // skip the whole teardown — leaving an orphaned live capture session in
-    // the driver on every launch/close cycle.
+    // The window is gone but the session still runs on its task, and
+    // nothing has told it so: without this, `shutdown_background` (which
+    // signals nothing and waits for nothing) would kill the process
+    // mid-flight, leaving an orphaned live capture session on every
+    // launch/close cycle.
     shutdown.request();
     let joined = runtime.block_on(async {
-        // `&mut session_task`, not `session_task`: `timeout` takes its future by
-        // value, so handing the `JoinHandle` over would *detach* the task on the
-        // timeout arm rather than cancel it — and the next line
-        // (`shutdown_background`) leaks blocking threads, which is exactly the
-        // "a capture session may outlive the process" outcome the warning below
-        // describes. `JoinHandle` is `Unpin + Future`, so a borrow is a valid
-        // branch; aborting turns that accident into the intended path.
+        // `&mut session_task`, not `session_task`: `timeout` takes its future
+        // by value, so handing over the `JoinHandle` would *detach* the task
+        // on the timeout arm rather than cancel it, and the next line
+        // (`shutdown_background`) would leak blocking threads — exactly the
+        // outcome the warning below describes. `JoinHandle` is
+        // `Unpin + Future`, so a borrow is a valid branch; aborting turns
+        // that accident into the intended path.
         let outcome = tokio::time::timeout(TEARDOWN_GRACE, &mut session_task).await;
         if outcome.is_err() {
             session_task.abort();
@@ -285,10 +283,10 @@ fn run_mode(
             "session teardown timed out; the task was aborted, and a capture session may briefly outlive the process"
         );
     }
-    // Still not a plain drop, and still last: tokio::io::stdin parks a
-    // blocking thread, so dropping the runtime would hang window close until
-    // the player presses Enter. That justifies skipping the *runtime* drop,
-    // never the cooperative teardown above.
+    // Still not a plain drop, and still last: `tokio::io::stdin` parks a
+    // blocking thread, so dropping the runtime would hang window close
+    // until the player presses Enter — true of skipping the *runtime* drop
+    // only, never of the cooperative teardown above.
     runtime.shutdown_background();
     match result {
         Ok(()) => exit_code(true, failed.load(Ordering::Relaxed)),

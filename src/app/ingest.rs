@@ -1,10 +1,10 @@
 //! The capture pump: the blocking receive loop, and the three cold reports it
 //! keeps out of its own body.
 //!
-//! Runs on a dedicated OS thread (`super::workers` owns that thread and the
-//! `catch_unwind` around this loop). It talks to reassembly through exactly two
-//! things, both from `super::pressure`: the [`CaptureEvent`] channel and the
-//! [`PressureResync`] marker. That, and not a shared buffer, is the seam.
+//! Runs on a dedicated OS thread (`super::workers` owns the thread and the
+//! `catch_unwind` around this loop) and talks to reassembly through exactly
+//! two things from `super::pressure`: the [`CaptureEvent`] channel and the
+//! [`PressureResync`] marker.
 
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, warn};
@@ -23,13 +23,12 @@ const CAPTURE_PROGRESS_EVERY: u64 = 1000;
 /// The three rare reports of the per-packet loop, out of line.
 ///
 /// `#[cold]` + `#[inline(never)]` keeps only the branch test in
-/// [`capture_loop_budgeted`]'s body: with `codegen-units = 1` LLVM would happily
-/// inline the tracing callsite machinery *and* the `PipelineStats` construction
-/// (which takes the budget mutex) into the one function that runs per captured
-/// packet, for branches that fire once a session or never. The honest scale is
-/// small — the kernel filter is one port and the feasibility probe saw 82 matched
-/// packets end to end — so the return here is hot-body layout and readability,
-/// not throughput.
+/// [`capture_loop_budgeted`]'s body: with `codegen-units = 1`, LLVM would
+/// otherwise inline the tracing callsite machinery and the `PipelineStats`
+/// construction (which takes the budget mutex) into the per-packet hot path,
+/// for branches that fire once a session or never. Scale is small — one port,
+/// 82 matched packets in the feasibility probe — so this is about hot-body
+/// layout and readability, not throughput.
 #[cold]
 #[inline(never)]
 fn report_backend_loss(budget: &PipelineBudget) {
@@ -98,9 +97,8 @@ pub(super) fn capture_loop_budgeted(
             Ok(segment) => segment,
             Err(err) => {
                 if !*shutdown.borrow() {
-                    // `Error::Capture`'s own `Display` opens with "network
-                    // capture: ", so a call-site prefix here doubled the kind in
-                    // the one line the player is asked to send us.
+                    // `Error::Capture`'s `Display` already opens with "network
+                    // capture: "; a prefix here would double the kind.
                     error!(error = ?err, "capture interrupted");
                     let _ = fatal.blocking_send(err.to_string());
                 }
@@ -115,12 +113,10 @@ pub(super) fn capture_loop_budgeted(
         }
 
         let enabled = gate.is_enabled();
-        // Off -> on transition: the reassembler must re-anchor before any later
-        // byte reaches it, otherwise it treats the sequence jump as an
-        // unfillable gap and never delivers anything again. The marker is
-        // retried on later iterations instead of blocking for queue space:
-        // parking this thread would back up the backend's own callback queue,
-        // which costs captured packets.
+        // Off -> on: the reassembler must re-anchor before the next byte, or
+        // it treats the jump as an unfillable gap and stops delivering. The
+        // marker retries later instead of blocking for space — parking this
+        // thread would back up the backend's callback queue.
         if enabled && !was_enabled {
             pending_player_resync = true;
         }
@@ -147,9 +143,8 @@ pub(super) fn capture_loop_budgeted(
             }
         }
 
-        // A backend-side loss breaks byte continuity exactly as byte pressure
-        // does, so it reuses the counted, lossless resync protocol rather than
-        // leaving reassembly to stall on a gap no retransmission can fill.
+        // A backend-side loss breaks continuity like byte pressure, so it
+        // reuses the counted, lossless resync protocol instead of stalling.
         if source.take_capture_loss() && pressure_resync.request(&budget) {
             report_backend_loss(&budget);
         }
@@ -184,14 +179,13 @@ pub(super) fn capture_loop_budgeted(
                     );
                 }
             }
-            // Matched on the error, not on the variant inside it. Destructuring
-            // `Full(CaptureEvent::Budgeted(segment))` here to read
-            // `segment.capacity()` left a second `Full(_)` arm that could only
-            // ever be `unreachable!` — a panic macro on the per-packet path of a
-            // thread wrapped in `catch_unwind`, i.e. a dead session for an
-            // impossibility. `capacity` is the same number: it is this segment's
-            // payload capacity, taken above, and `admit_capture` charges the
-            // lease exactly that (`BudgetedSegment::capacity` == `lease.bytes`).
+            // Matched on the error, not the variant: destructuring
+            // `Full(CaptureEvent::Budgeted(segment))` to read `segment.capacity()`
+            // left a second `Full(_)` arm that could only be `unreachable!` — a
+            // panic on the per-packet path of a `catch_unwind`-wrapped thread, for
+            // an impossibility. `capacity`, taken above, is the same number
+            // `admit_capture` charges the lease (`BudgetedSegment::capacity` ==
+            // `lease.bytes`).
             Err(mpsc::error::TrySendError::Full(event)) => {
                 budget.record_drop(capacity);
                 if pressure_resync.request(&budget) {
@@ -302,9 +296,9 @@ mod tests {
         let (fatal_tx, _fatal_rx) = mpsc::channel(1);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let budget = PipelineBudget::new();
-        // Occupy the only slot the resync marker could take. A blocking send
-        // here used to park the capture thread, which backs up the backend's
-        // own callback queue until it starts losing packets.
+        // Occupy the only slot the resync marker could take: a blocking send
+        // here used to park the capture thread and back up the backend's
+        // callback queue until it lost packets.
         event_tx.try_send(CaptureEvent::PressureResync).unwrap();
         let source = EnableOnFirstSegment {
             gate: gate.clone(),

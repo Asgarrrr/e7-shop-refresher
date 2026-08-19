@@ -1,26 +1,19 @@
 //! Crash logging: a global panic hook that records every panic to a file.
 //!
-//! In the windowed build stdout/stderr are inert, and a panic on a worker task
-//! or the capture thread is swallowed by the runtime — it would otherwise
-//! surface only as a bare "session ended". The hook appends each panic (thread,
-//! location, message, backtrace) to `crash.log`, preferring the per-user
-//! app-data dir and falling back to the temp dir when that isn't writable.
-//!
-//! The file is the primary record. A `tracing` event is emitted *beside* it so
-//! that `logs\` and `crash.log` cross-reference each other: without it the
-//! rotated log — the artefact a player is actually asked to send — simply stops
-//! mid-session with no marker, and nobody knows a second file exists.
+//! stdout/stderr are inert in the windowed build, so a panic on a worker or
+//! capture thread would otherwise surface only as "session ended". The hook
+//! appends each panic (thread, location, message, backtrace) to `crash.log`
+//! (per-user app-data dir, falling back to temp) and emits a matching
+//! `tracing` event so `logs\` and `crash.log` cross-reference each other.
 
 use std::path::{Path, PathBuf};
 
-/// Cap on `crash.log`. It is append-only across runs, unlike `logs\` which keeps
-/// five rotated files, so a crash loop would otherwise grow it without bound.
-/// Rotation here is "start over with a marker" rather than a numbered set: the
-/// interesting entry is the most recent one, and the hook must stay simple.
+/// Cap on `crash.log`: append-only across runs (unlike `logs\`'s five
+/// rotated files), so it restarts with a marker instead of growing forever.
 const MAX_CRASH_LOG_BYTES: u64 = 1 << 20;
 
-/// Installs the global panic hook. Call once, before anything can panic. Chains
-/// the previous hook so the console build still gets its stderr output.
+/// Installs the global panic hook (call once, before anything can panic);
+/// chains the previous hook so the console build still gets its stderr output.
 pub fn install() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -38,13 +31,9 @@ pub fn install() {
         let entry = crash_entry(epoch, &thread, &location, &message, &backtrace);
         let candidates = crash_log_paths();
         let written = write_first_writable(&candidates, &entry);
-        // Strictly additive, and safe on the hook's own terms: the non-blocking
-        // writer is a channel send, and before `install_logging` has run there is
-        // no subscriber, which makes the macro a no-op (the hook is installed
-        // first on purpose). `epoch_s` is repeated from the file record on
-        // purpose: it is the join key between this line's formatted timestamp and
-        // `crash.log`'s raw epoch stamp, so the two files can be correlated
-        // without any date arithmetic in the hook.
+        // Safe pre-`install_logging`: the writer is a non-blocking channel
+        // send that's a no-op with no subscriber yet. `epoch_s` repeats the
+        // file entry's epoch, joining this line to `crash.log` without dates.
         match &written {
             Some(path) => tracing::error!(
                 thread = %thread,
@@ -95,18 +84,14 @@ fn crash_entry(
     )
 }
 
-/// Candidate log paths, most-preferred first: the per-user app-data dir, then
-/// the temp dir as a guaranteed-writable fallback.
+/// Candidate log paths, most-preferred first: per-user app-data dir, then temp dir as a guaranteed-writable fallback.
 fn crash_log_paths() -> Vec<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     crash_log_paths_from(local.as_deref(), &std::env::temp_dir())
 }
 
-/// Pure ordering: per-user app-data first (kept out of the user's face and off
-/// shared dirs), the temp dir as a guaranteed-writable fallback.
-///
-/// Borrowed, not owned: both inputs are only ever `join`ed, so a caller — and
-/// the tests, which is why this split exists at all — can hand over a literal.
+/// Pure version of [`crash_log_paths`] taking borrowed paths — lets callers,
+/// including the tests this split exists for, hand over a literal.
 fn crash_log_paths_from(local_appdata: Option<&Path>, temp: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(local) = local_appdata {
@@ -116,24 +101,22 @@ fn crash_log_paths_from(local_appdata: Option<&Path>, temp: &Path) -> Vec<PathBu
     paths
 }
 
-/// Appends the entry to the first writable candidate and returns which one it
-/// was, so the `tracing` line in the hook can name the file. Best-effort: the
-/// panic hook must never itself panic, so every failure is swallowed.
+/// Appends to the first writable candidate, returning which one so the
+/// hook's `tracing` line can name it. Best-effort: every failure is
+/// swallowed, since the panic hook must never itself panic.
 fn write_first_writable<'a>(paths: &'a [PathBuf], entry: &str) -> Option<&'a PathBuf> {
     paths.iter().find(|path| append(path, entry).is_ok())
 }
 
 fn append(path: &Path, entry: &str) -> std::io::Result<()> {
     use std::io::Write;
-    // Best-effort: create the app-data parent so the preferred path is usable
-    // even before capture has created the folder. Ignore the result — the panic
-    // hook must never itself panic, and the open below reports real failures.
+    // Best-effort: create the app-data parent so the path works before
+    // capture creates the folder; the open below reports real failures.
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // Truncate rather than append once the cap is reached: see
-    // `MAX_CRASH_LOG_BYTES`. A metadata error (the usual case: the file does not
-    // exist yet) means "not oversized", never "start over".
+    // Truncate rather than append past `MAX_CRASH_LOG_BYTES`; a metadata
+    // error (file doesn't exist yet) means "not oversized", never "start over".
     let oversized = std::fs::metadata(path).is_ok_and(|meta| meta.len() >= MAX_CRASH_LOG_BYTES);
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -154,12 +137,9 @@ fn append(path: &Path, entry: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// RAII scratch file: removed on drop, *including* when an assertion panics.
-    /// The hand-rolled after-the-fact cleanup this replaces leaked on every
-    /// failing run, and a leaked *good* file was worse than a leaked blocker —
-    /// `append` opens for append, so a stale file made the next broken run pass.
-    /// Named by test and pid so parallel tests and parallel `cargo test`
-    /// invocations cannot collide.
+    /// RAII scratch file: removed on drop, including on an assertion panic.
+    /// Named by test and pid so parallel tests and `cargo test` runs don't
+    /// collide; a leaked stale file previously let a broken run pass silently.
     struct TempFile(PathBuf);
 
     impl TempFile {
@@ -220,11 +200,9 @@ mod tests {
 
     #[test]
     fn write_first_writable_falls_back_past_an_unwritable_path() {
-        // First candidate is under a path that cannot exist as a directory
-        // (a real file sits in the middle), so `append`'s best-effort
-        // `create_dir_all` fails, the open fails, and the fallback temp file is
-        // used instead. The middle component is materialized as a file below so
-        // the premise holds now that `append` creates parents.
+        // First candidate sits under a path that can't exist as a directory
+        // (a real file occupies the middle component below), so `append`'s
+        // best-effort `create_dir_all` fails and the fallback temp file is used.
         let blocker = TempFile::new("nope");
         std::fs::write(blocker.path(), b"not a directory").unwrap();
         let bad = blocker.path().join("inner/crash.log");

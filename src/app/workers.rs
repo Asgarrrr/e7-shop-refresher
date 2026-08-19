@@ -2,11 +2,10 @@
 //! Tokio tasks, and in what order they are wound down.
 //!
 //! This module holds *handles*, never payloads — it never looks inside a
-//! [`CaptureEvent`], which is why it can be split away from the two pumps
-//! without touching either. The one direct call across the seam is
+//! [`CaptureEvent`]. The one direct call across the seam is
 //! [`spawn_capture_with_budget`] invoking `super::ingest::capture_loop_budgeted`
-//! on the thread it just created; everything else it touches is a channel end,
-//! a `watch::Receiver` or a `JoinHandle`.
+//! on the thread it just created; everything else is a channel end, a
+//! `watch::Receiver` or a `JoinHandle`.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -40,9 +39,8 @@ impl CaptureWorker {
     /// Wakes and joins the OS thread synchronously. A timeout here would only
     /// detach an unabortable thread, so shutdown capability is the finite join.
     fn stop_and_join(&mut self) {
-        // No `if let Err(…)` around this: `CaptureStop::stop` is infallible, and
-        // the branch that used to be here was unreachable in all three
-        // implementors — see the trait.
+        // No `if let Err(…)`: `CaptureStop::stop` is infallible — the branch
+        // that used to be here was unreachable in all three implementors.
         self.stop.stop();
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
@@ -73,12 +71,11 @@ impl SessionWorkers {
         }
     }
 
-    /// The panic catcher is the owned worker itself: there is no detached
-    /// supervisor holding a second child handle.
+    /// The panic catcher is the owned worker itself: no detached supervisor
+    /// holds a second child handle.
     ///
-    /// The span is entered here rather than inside each worker: four tasks
-    /// interleave into one log file, and `name` is the correlation field they all
-    /// need. One `.instrument()` covers every event any of them emits.
+    /// The span is entered here, not inside each worker: four tasks interleave
+    /// into one log file, and `name` is the correlation field they all need.
     pub(super) fn spawn(
         &mut self,
         name: &'static str,
@@ -108,10 +105,10 @@ impl SessionWorkers {
         self.shutdown.request();
         drop(actuator);
 
-        // `stop_and_join` parks its caller in `Thread::join`. Doing that on a
-        // runtime worker would deny the scheduler the very tasks whose exit is
-        // being waited on — with a single worker, that is a deadlock. The
-        // blocking pool exists to be parked.
+        // `stop_and_join` parks its caller in `Thread::join`. On a runtime
+        // worker that would deny the scheduler the tasks whose exit is being
+        // waited on — a deadlock with a single worker. The blocking pool
+        // exists to be parked.
         let mut capture = self.capture;
         if tokio::task::spawn_blocking(move || capture.stop_and_join())
             .await
@@ -187,8 +184,8 @@ pub(super) fn spawn_capture_with_budget(
         })
         // Not `?`: the blanket `From<io::Error>` would surface an exhausted
         // thread limit as a bare "i/o: <os error>" with nothing saying what
-        // failed. This is the earliest thing that can break after the config
-        // loads, and the one failure the player can act on.
+        // failed — the earliest thing that can break after config load, and
+        // the one failure the player can act on.
         .map_err(|source| {
             crate::Error::Capture(format!("starting the capture thread: {source}"))
         })?;

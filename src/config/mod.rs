@@ -46,51 +46,44 @@ const DEFAULT_SERVER_URL: &str = "wss://ingest.arkyve.dev/refresh-shop";
 pub(crate) const RECONNECT_FLOOR: Duration = Duration::from_millis(100);
 
 /// Everything `config.toml` can say, in one value: a section per subsystem,
-/// each of them `default` + `deny_unknown_fields`, so an absent file is a valid
-/// configuration and a misspelled key is a parse error quoting the offending
-/// line rather than a setting that silently does nothing.
+/// each `default` + `deny_unknown_fields`, so an absent file is valid and a
+/// misspelled key is a parse error quoting the offending line.
 ///
-/// It is produced in exactly two places outside the test modules:
-/// [`Config::load`], which returns [`Config::default`] verbatim when the file is
-/// missing, and [`persist`], which rewrites named sections through `toml_edit`
-/// so the player's own comments and key order survive a save from the Setup tab.
+/// Produced in exactly two places outside the test modules: [`Config::load`],
+/// which returns [`Config::default`] verbatim when the file is missing, and
+/// [`persist`], which rewrites named sections through `toml_edit` so the
+/// player's own comments and key order survive a Setup-tab save.
 ///
-/// **Most of its invariants are no longer enforced here, and that is the
-/// point.** [`Config::validate`] used to be the single gate; today it checks one
-/// thing — that a `required_substats[].min` is finite, because TOML 1.0 spells
-/// `nan` and `Option<f64>` is the one field type left that can hold a value no
-/// comparison will ever satisfy. Every other rule moved *into* a type, where it
-/// holds for a struct literal and a mutated [`Config::default`] just as much as
-/// for the load path: [`ServerUrl`] carries the cleartext rule, [`NonZeroU16`]
+/// **Most of its invariants are no longer enforced here, on purpose.**
+/// [`Config::validate`] used to be the single gate; today it checks only that
+/// a `required_substats[].min` is finite (TOML 1.0 spells `nan`, and
+/// `Option<f64>` is the one field type left that can hold a value no
+/// comparison satisfies). Every other rule moved *into* a type, holding for a
+/// struct literal or a mutated [`Config::default`] just as much as for the
+/// load path: [`ServerUrl`] carries the cleartext rule, [`NonZeroU16`]
 /// carries `game_port != 0`, [`DelayRange`](crate::actuator::plan::DelayRange)
-/// carries `min_ms <= max_ms <= MAX_TIMING_MS`, and `filter::hunt_kinds` — the
-/// `deserialize_with` behind [`Filter`]'s `kinds`, and unlinkable here because
-/// it is private to its own module — refuses the wire's catch-all `ItemKind` at
-/// the boundary where that ambiguity actually exists.
+/// carries `min_ms <= max_ms <= MAX_TIMING_MS`, and `filter::hunt_kinds` (the
+/// `deserialize_with` behind [`Filter`]'s `kinds`) refuses the wire's
+/// catch-all `ItemKind`.
 ///
-/// The move is not tidiness. A clause in `validate` can only ever cover the
-/// loader, and the loader is not the only writer: the Setup tab reaches the file
-/// through [`persist::save`] with no `Config` anywhere in the path, which is how
-/// a checkbox once wrote a `kinds = ["unknown"]` that the next launch refused
-/// fatally. So `validate`'s body is now largely a record of which rule left and
-/// where it went — kept, so that none of them comes back as a second
+/// The move matters because the loader is not the only writer: the Setup tab
+/// reaches the file through [`persist::save`] with no `Config` in the path,
+/// which is how a checkbox once wrote `kinds = ["unknown"]` that the next
+/// launch refused fatally. `validate`'s body is now a record of which rule
+/// left and where — kept so none of them comes back as a second
 /// implementation of a proof the type already holds.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// TCP port of the game server, remote side.
     ///
-    /// A [`NonZeroU16`], not a `u16`, for the same reason [`server_url`] is a
-    /// [`ServerUrl`]: `game_port = 0` was refused by a clause in
-    /// [`Config::validate`], which made the loader the only producer that could
-    /// not express it. It reaches two places that have no `Config` in scope — the
-    /// BPF filter string (`tcp and src port {game_port}`) and `parse_segment`'s
-    /// server-side test — and port 0 is not a port in either: the filter would
-    /// match nothing and the test would classify every packet as client-sent, so
-    /// the relay would run, forward nothing, and look exactly like a wrong port.
-    /// `serde` refuses the zero at parse time with the offending line quoted.
-    ///
-    /// [`server_url`]: Config::server_url
+    /// A [`NonZeroU16`], not a `u16`: `game_port = 0` used to be refused by a
+    /// clause in [`Config::validate`], which made the loader the only
+    /// producer able to enforce it. The value reaches two places with no
+    /// `Config` in scope — the BPF filter string (`tcp and src port
+    /// {game_port}`) and `parse_segment`'s server-side test — where port 0
+    /// would run, forward nothing, and look exactly like a wrong port rather
+    /// than fail. `serde` now refuses the zero at parse time, line quoted.
     pub game_port: NonZeroU16,
 
     /// Analysis server URL (`ws://` or `wss://`).
@@ -124,45 +117,38 @@ pub struct Config {
     pub actuator: ActuatorConfig,
 }
 
-// `Config`'s `Debug` is a plain derive, and safely so: `server_url` is a
-// `ServerUrl`, whose own `Debug` prints `scheme://host[:port]` and nothing
-// else. A `wss://` URL may carry a `user:pass@` credential, and `Config` is
-// exactly the kind of value that ends up in a startup line or an
-// `#[instrument]` argument list — so the promise in `README.md` ("the log never
-// contains the server URL's credentials") is kept by the type, not by
-// remembering to call a helper. This was a hand-written impl for exactly one
-// release, while the field was still a `String`.
+// `Config`'s `Debug` is a plain derive, safely: `server_url` is a
+// `ServerUrl`, whose own `Debug` prints `scheme://host[:port]` only. A
+// `wss://` URL may carry a `user:pass@` credential, and `Config` is exactly
+// the kind of value that ends up in a startup line or `#[instrument]`
+// argument list, so README's "the log never contains the server URL's
+// credentials" promise is kept by the type. (Hand-written for one release,
+// while the field was still a `String`.)
 
 /// Vestigial. Both keys are parsed and both are ignored.
 ///
-/// They described a choice the pipeline no longer has. Only the server's half
-/// of a connection was ever decoded — the analysis server reads shop responses,
-/// and nothing has ever read the client's requests — so `server_to_client` was
-/// a knob whose only useful position was `true`, and `client_to_server` a knob
-/// for a feature that does not exist. `parse_segment` now refuses anything the
-/// game server did not send, which leaves the two keys describing a distinction
-/// the code cannot express.
+/// Only the server's half of a connection was ever decoded — the analysis
+/// server reads shop responses, and nothing has ever read the client's
+/// requests — so `server_to_client` was a knob whose only useful position
+/// was `true`, and `client_to_server` a knob for a feature that does not
+/// exist. `parse_segment` now refuses anything the game server did not send,
+/// leaving the two keys describing a distinction the code cannot express.
 ///
-/// **They are still parsed on purpose, and removing them is not a cleanup.**
-/// The reasoning is the same as for [`CaptureConfig`], and the evidence is
-/// stronger: `config.example.toml` shipped the whole `[forward]` block
-/// uncommented, and `main::seed_config_if_missing` writes that file to
-/// `%APPDATA%` on every first run. With `deny_unknown_fields` on this struct
-/// and on [`Config`], deleting the fields turns the next launch of every
-/// existing installation into `Config::load` failing, an "Invalid
-/// configuration" window, and an app that no longer starts. Editing
-/// `config.example.toml` does nothing for files already written.
+/// **Kept accepted-and-ignored on purpose — do not delete the fields.**
+/// `config.example.toml` shipped the whole `[forward]` block uncommented,
+/// and `main::seed_config_if_missing` writes that file to `%APPDATA%` on
+/// every first run. With `deny_unknown_fields` on this struct and on
+/// [`Config`], deleting the fields turns the next launch of every existing
+/// installation into `Config::load` failing and an app that no longer
+/// starts. Editing `config.example.toml` does nothing for files already
+/// written.
 ///
 /// Plan: keep them accepted-and-ignored for this release, with the startup
-/// warning `main` emits from [`ForwardConfig::retired_keys`], then delete both
-/// fields (and this struct with them) in a later one, once a player upgrading
-/// across two releases is no longer plausible.
-///
-/// The warning is one-time in fact and not just in intent:
-/// [`persist::strip_retired_keys`] deletes these keys from `config.toml` at the
-/// same startup that warns about them, so a file that has been through one
-/// launch of this release no longer sets them. That is also what makes the
-/// deletion above safe *sooner* than "never touched" files would allow.
+/// warning `main` emits from [`ForwardConfig::retired_keys`], then delete
+/// both fields (and this struct) once a player upgrading across two
+/// releases is no longer plausible. [`persist::strip_retired_keys`] already
+/// deletes the keys from `config.toml` at the same startup that warns about
+/// them, so the warning only ever fires once per installation.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ForwardConfig {
@@ -216,36 +202,22 @@ pub enum ActuatorBackend {
     Message,
 }
 
-/// Vestigial. Both keys are parsed and both are ignored.
+/// Vestigial. Both keys are parsed and both are ignored — same shape as
+/// [`ForwardConfig`], and for the same reason: `config.example.toml` shipped
+/// `buffer_size` uncommented, so the key is on disk for every installation,
+/// and `deny_unknown_fields` makes deleting the field a startup failure for
+/// all of them. See [`ForwardConfig`] for the full removal plan; the warning
+/// here comes from [`CaptureConfig::retired_keys`].
 ///
-/// They stopped meaning anything when the capture filter stopped being a
-/// string this file could supply. The backend builds its own BPF expression
-/// from the validated `u16` `game_port` (`tcp and src port {game_port}`), and
-/// sizes its buffer from its own snaplen. The filter *had* to stop being
-/// configurable while capture still ran a kernel driver: this file lives in
-/// per-user roaming app-data, where any medium-integrity process on the machine
-/// can rewrite it, and its contents were handed to that driver's filter
-/// compiler inside an administrator process. The driver is gone; the reason not
-/// to reopen the key is now simply that nothing needs it.
-///
-/// **They are still parsed on purpose, and removing them is not a cleanup.**
-/// This struct and [`Config`] are both `deny_unknown_fields`, and
-/// `config.example.toml` shipped `buffer_size` *uncommented* — a file
-/// `main::seed_config_if_missing` writes to `%APPDATA%` on every first run. So
-/// the key is on disk for every player who has ever launched this app, and
-/// deleting the field turns their next launch into `Config::load` failing, an
-/// "Invalid configuration" window, and an app that no longer starts. Editing
-/// `config.example.toml` does nothing for files already written.
-///
-/// Plan: keep them accepted-and-ignored for this release, with the startup
-/// warning `main` emits from [`CaptureConfig::retired_keys`], then delete both
-/// fields (and this struct with them) in a later one, once a player upgrading
-/// across two releases is no longer plausible.
-///
-/// The warning is one-time in fact and not just in intent:
-/// [`persist::strip_retired_keys`] deletes these keys from `config.toml` at the
-/// same startup that warns about them, so a file that has been through one
-/// launch of this release no longer sets them.
+/// They stopped meaning anything once the capture filter stopped being
+/// something this file could supply: the backend builds its own BPF
+/// expression from the validated `game_port` (`tcp and src port
+/// {game_port}`) and sizes its buffer from its own snaplen. The filter *had*
+/// to stop being configurable while capture still ran a kernel driver, since
+/// this file lives in per-user roaming app-data that any medium-integrity
+/// process can rewrite, and its contents were handed to that driver's filter
+/// compiler inside an administrator process. The driver is gone; nothing
+/// needs the key any more.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
@@ -329,25 +301,18 @@ impl ForwardConfig {
 // reachable only through `as_str()`; keeping the fields private to that one file
 // rather than to this whole module is what makes the promise checkable.
 
-// There is no `validate_timings` here any more, and the absence is the fix.
+// `validate_timings` is gone on purpose. `[actuator.timings]` used to be
+// bounded by a loop here, called from `Config::validate` and separately from
+// `persist::write_sections` (the Setup tab hands a `Timings` to
+// `config::persist` with no `Config` in the path) — enforced at the loader
+// alone, the GUI was one missing clamp away from writing a file the next
+// launch refused, the same shape as the `kinds = ["unknown"]` incident above.
 //
-// `[actuator.timings]` used to be bounded by a loop in this file that walked
-// `Timings::named_ranges()` — first from `Config::validate` alone, then from
-// `persist::write_sections` too, because there are **two** write boundaries and
-// only one of them has a `Config`: the loader, and the Setup tab, which hands a
-// `Timings` straight to `config::persist` with no `Config` anywhere in the path.
-// Enforced at the loader alone, the GUI was one missing clamp away from writing a
-// file the *next* launch refuses — the exact shape of the `kinds = ["unknown"]`
-// checkbox that shipped, whose only cure was hand-editing the file the app owns.
-//
-// Both boundaries are now closed by the type instead of by two callers
-// remembering to call one function: `plan::DelayRange` has private fields, a
-// `try_new` carrying `min_ms <= max_ms <= plan::MAX_TIMING_MS`, and a
-// `#[serde(try_from)]` hook, so an invalid range cannot be deserialized, built,
-// or dragged into existence. The ceiling constant moved down to `plan` with the
-// check — see `plan::MAX_TIMING_MS` for why the value is one minute, and
-// `plan::DelayRangeError` for the two messages, which still say what a bad value
-// *would have done* rather than merely that it is invalid.
+// Both boundaries are now closed by the type: `plan::DelayRange` has private
+// fields, a `try_new` carrying `min_ms <= max_ms <= plan::MAX_TIMING_MS`, and
+// a `#[serde(try_from)]` hook, so an invalid range cannot be built at all.
+// See `plan::MAX_TIMING_MS` for why the ceiling is one minute, and
+// `plan::DelayRangeError` for its two messages.
 
 impl Config {
     /// Loads the configuration from `path`. A missing file yields the defaults.
@@ -369,15 +334,13 @@ impl Config {
     ///   - a non-finite `[[filter.required_substats]] min` (`nan`/`inf` are
     ///     legal TOML floats), which no substat value can ever satisfy.
     ///
-    /// Four rules are absent from that list because they are enforced where the
-    /// value is *built*, so they surface as [`Error::ConfigParse`] with the
-    /// offending line quoted rather than as [`Error::Config`]: `server_url`'s
-    /// cleartext rule ([`ServerUrl`]), `game_port = 0` ([`NonZeroU16`]),
-    /// `[actuator.timings]`'s reversed / over-ceiling ranges
+    /// Four rules are absent from that list because they are enforced where
+    /// the value is *built*, so they surface as [`Error::ConfigParse`] (line
+    /// quoted) rather than [`Error::Config`]: `server_url`'s cleartext rule
+    /// ([`ServerUrl`]), `game_port = 0` ([`NonZeroU16`]), the reversed /
+    /// over-ceiling `[actuator.timings]` ranges
     /// ([`plan::DelayRange`](crate::actuator::plan::DelayRange)), and an
-    /// unrecognized `[filter] kinds` entry, which the wire-tolerant `ItemKind`
-    /// would otherwise fold into `Unknown` and match nothing
-    /// (`filter::hunt_kinds`).
+    /// unrecognized `[filter] kinds` entry (`filter::hunt_kinds`).
     ///
     /// [`Error::Config`]: crate::Error::Config
     /// [`Error::ConfigParse`]: crate::Error::ConfigParse
@@ -401,40 +364,30 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        // No `game_port` clause here, deliberately, and for the same reason as
-        // `server_url` and `[actuator.timings]` below: the field is a
-        // `NonZeroU16`, so the zero this used to refuse cannot be built — on the
-        // load path *or* in a struct literal — and both consumers (the BPF filter
-        // and `parse_segment`) now receive the proof rather than a bare `u16`.
-        // No `server_url` clause here, deliberately. It receives the reassembled
-        // game stream, which can carry session tokens, so it must be TLS
-        // (`wss://`) unless the host is loopback — and that rule is now carried
-        // by the field's type: a `ServerUrl` exists only if `ServerUrl::parse`
-        // accepted it, on the load path *and* in a struct literal. Re-checking
-        // it here would be a second implementation of a proof we already hold.
+        // `game_port`, `server_url` and `[actuator.timings]` need no clause
+        // here: each is a type that cannot hold an invalid value on any path,
+        // load or struct literal (see their field docs above and
+        // `plan::DelayRange`), so a check here would be a second
+        // implementation of a proof already held.
+        //
         // No `[filter] kinds` clause either. `ItemKind` is wire-tolerant
-        // (`serde(other)` -> `Unknown`), which in a config file would let a typo
-        // silently match nothing — so the ambiguity is resolved where it exists,
-        // in the text. `filter::hunt_kinds`, the field's `deserialize_with`,
-        // reads each entry through `ItemKind`'s own `Deserialize` and then
-        // refuses the catch-all, so `kinds = ["equipement"]` is a parse error
-        // quoting what the player typed and naming the three that are legal, and
-        // the typo cannot survive as far as this function. A narrowed
-        // hunt-only enum was written and reverted instead — `ItemKind::Unknown`
-        // is a meaningful criterion *in the domain*, and the reasoning for that
-        // sits at `hunt_kinds` itself rather than being restated here. That also
-        // closes the boundary this clause never covered: the
-        // Setup tab writes `[filter]` through `persist::save` with no `Config` in
-        // the path, which is how a checkbox once wrote a `kinds = ["unknown"]`
-        // that the next launch refused fatally.
-        // The same failure mode as `kinds`, by a different route, and TOML 1.0
-        // supplies the literal: `min = nan` parses. Nothing can then satisfy
-        // `value >= min`, so the filter matches nothing while `is_unrestricted`
-        // reports it restricted and the loop arms and burns crystals — and
-        // `Filter`'s derived `PartialEq` (the Setup tab's dirty check) recurses
-        // into this `Option<f64>`, so `NaN != NaN` leaves Apply lit forever,
-        // rewriting `config.toml` on every click. `+inf` gives the first half
-        // without the second.
+        // (`serde(other)` -> `Unknown`), which in a config file would let a
+        // typo silently match nothing — so `filter::hunt_kinds`, the field's
+        // `deserialize_with`, refuses the catch-all itself and quotes the
+        // offending entry (`kinds = ["equipement"]` names what the player
+        // typed and the three legal values). A narrowed hunt-only enum was
+        // tried and reverted: `ItemKind::Unknown` is meaningful *in the
+        // domain* too (see `hunt_kinds`). This also covers the Setup tab's
+        // write path, which has no `Config` in scope — the boundary that once
+        // let a checkbox write `kinds = ["unknown"]` and get refused fatally
+        // on the next launch.
+        //
+        // TOML 1.0 lets `min = nan` parse, and nothing satisfies `value >=
+        // min`, so a non-finite min matches nothing while `is_unrestricted`
+        // reports it restricted — and `Filter`'s derived `PartialEq` (the
+        // Setup tab's dirty check) recurses into this `Option<f64>`, so `NaN
+        // != NaN` leaves Apply lit forever, rewriting `config.toml` on every
+        // click. `+inf` gives the first half without the second.
         for req in &self.filter.required_substats {
             if req.min.is_some_and(|min| !min.is_finite()) {
                 return Err(crate::Error::Config(format!(
@@ -444,28 +397,13 @@ impl Config {
                 )));
             }
         }
-        // `capture.filter` used to be checked here for naming `game_port`,
-        // because a filter on another port delivered traffic nothing could
-        // classify. That check went away with the thing it guarded: the
-        // backend builds its own filter from `game_port` itself, so the
-        // mismatch it caught can no longer be expressed. Note
-        // that this rejection must NOT come back in another form — a config
-        // written before the change may well carry a filter naming a different
-        // port, and refusing it would lock that player out of the app on
-        // upgrade for a setting that no longer has any effect.
-        //
-        // `[forward]` with both directions off was refused here for the same
-        // kind of reason — it asked for a capture that forwarded nothing — and
-        // it is gone for the same reason: there is one direction now, the keys
-        // are inert, and no combination of them can express a broken relay.
-        // Refusing any `[forward]` value would only lock out a player whose
-        // file predates the change, which is every player's file.
-        //
-        // No `[actuator.timings]` clause either, for the same reason as
-        // `server_url`: `plan::DelayRange` cannot hold a reversed or
-        // over-ceiling pair, on the load path *and* in a struct literal, so a
-        // check here would be a second implementation of a proof we already
-        // hold — and it would only cover the loader, not the GUI's write.
+        // `capture.filter` (naming `game_port`) and `[forward]` (both
+        // directions off) used to be refused here; both checks are gone with
+        // the things they guarded, since the backend now builds its own
+        // filter and there is only one capture direction. Do NOT reintroduce
+        // either: a config written before the change may carry a stale value
+        // for a setting that no longer has any effect, and refusing it would
+        // lock that player out of the app on upgrade.
         Ok(())
     }
 

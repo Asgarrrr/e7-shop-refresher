@@ -1,33 +1,30 @@
 //! Unified error type for the relay.
 //!
-//! **The convention in this file: `Display` is this error's own layer, and the
-//! cause is reached through [`std::error::Error::source`].** No message
-//! interpolates its own `#[source]`, so nothing double-prints, and
-//! [`Error::report`] — the one spelling a report site should use — walks the
-//! chain and joins it.
+//! **`Display` is this error's own layer; the cause is reached through
+//! [`std::error::Error::source`].** No message interpolates its own
+//! `#[source]`, so nothing double-prints, and [`Error::report`] — the
+//! spelling every report site uses — walks the chain and joins it.
 //!
-//! It used to be the other way round: each message inlined its cause so that a
-//! bare `{err}` never lost it. That worked only as long as every author
-//! remembered, and it made `#[source]` decorative — a variant added with a
-//! `#[source]` and no interpolation would lose its cause everywhere at once,
-//! silently, which is precisely the trap the convention was meant to close. With
-//! the reporter doing the walking, a new `#[source]` variant is correct by
-//! default and `Error::ConfigRead`'s path finally pays off in the crash log too.
+//! Earlier, each message inlined its cause so a bare `{err}` never lost it.
+//! That relied on every author remembering, and made `#[source]` decorative:
+//! a variant added with `#[source]` and no interpolation would lose its
+//! cause everywhere at once, silently. With the reporter doing the walking,
+//! a new `#[source]` variant is correct by default.
 //!
-//! Every player-facing report site therefore says `err.report()`, not `{err}`:
+//! Every player-facing report site says `err.report()`, not `{err}`:
 //! `main`'s two `fatal`/`eprintln!` arms, `app::supervise`, `ui::App`'s
 //! "config.toml not saved" journal line, and `RetiredKeys::NotRewritten`. A
 //! `tracing` field spelled `error = ?err` is unaffected — `Debug` on a
 //! `thiserror` enum prints the nested source structurally.
 //!
-//! The two TOML payloads are boxed: `toml::de::Error` and `toml_edit::TomlError`
-//! are 88 bytes each and can only ever be built once, at startup, while `Error`
-//! is the `E` of every `Result` in the crate — including
-//! `PacketSource::next_segment` on the capture loop. Boxing them takes `Error`
-//! from 96 bytes to 48 (measured on Windows; see the `const` assertion at the
-//! bottom, which keeps it there). Neither clippy threshold catches this
-//! (`result_large_err` fires at 128, `large_enum_variant` at a 200-byte spread),
-//! so the check has to be explicit.
+//! The two TOML payloads are boxed: `toml::de::Error` and
+//! `toml_edit::TomlError` are 88 bytes each, built once at startup, while
+//! `Error` is the `E` of every `Result` in the crate — including
+//! `PacketSource::next_segment` on the capture loop. Boxing them takes
+//! `Error` from 96 bytes to 48 (measured on Windows; see the `const`
+//! assertion at the bottom). Neither clippy threshold catches this
+//! (`result_large_err` fires at 128, `large_enum_variant` at a 200-byte
+//! spread), so the check is explicit.
 
 use std::path::PathBuf;
 
@@ -53,9 +50,9 @@ pub enum Error {
 
     /// The config file exists but could not be read (locked, permission
     /// denied, a directory). A missing file is not an error — it yields the
-    /// defaults — so this never covers `NotFound`. The path is carried because
-    /// the file lives out of the way in `%APPDATA%`: a bare
-    /// "Access is denied. (os error 5)" would leave the player nothing to fix.
+    /// defaults — so this never covers `NotFound`. The path is carried
+    /// because the file lives out of the way in `%APPDATA%`: a bare "Access
+    /// is denied. (os error 5)" would leave the player nothing to fix.
     #[error("could not read {}", path.display())]
     ConfigRead {
         path: PathBuf,
@@ -101,16 +98,16 @@ pub enum Error {
     Fatal(String),
 }
 
-// There is deliberately no context-free `Io(#[from] std::io::Error)` variant above.
-// It had exactly one reachable producer — a blanket `?` on
-// `std::thread::Builder::spawn` in `app::workers::spawn_capture_with_budget` — and that
-// site now says what it was doing (`Error::Capture("starting the capture thread:
-// …")`), because "i/o: The system cannot find the file specified." is a message no
-// player can act on. A `#[from] std::io::Error` is what makes that outcome the
-// *default* for every future `?`: it converts silently, at any depth, and the path
-// or call that failed is gone by the time anyone reads it.
-// `ConfigRead`/`ConfigWrite` carry a path; anything else should name its operation
-// the way `Capture` does. Re-adding this variant would re-open that door.
+// There is deliberately no context-free `Io(#[from] std::io::Error)` variant
+// above. It had exactly one reachable producer — a blanket `?` on
+// `std::thread::Builder::spawn` in `app::workers::spawn_capture_with_budget`
+// — and that site now names what it was doing (`Error::Capture("starting
+// the capture thread: …")`), because "i/o: The system cannot find the file
+// specified." is a message no player can act on. A `#[from] std::io::Error`
+// would make silent conversion the default for every future `?`, at any
+// depth, losing the path or call that failed. `ConfigRead`/`ConfigWrite`
+// carry a path; anything else should name its operation the way `Capture`
+// does. Re-adding this variant reopens that door.
 
 impl Error {
     /// This error and every cause behind it, joined with `": "` — the spelling
@@ -118,9 +115,9 @@ impl Error {
     ///
     /// Walks [`std::error::Error::source`], so it picks up the layer a variant's
     /// own `Display` deliberately leaves out: `could not write
-    /// C:\Users\…\config.toml: Access is denied. (os error 5)` is the path (which
-    /// only this crate knows) followed by the reason (which only the OS knows).
-    /// A variant with no `#[source]` reports exactly its own message.
+    /// C:\Users\…\config.toml: Access is denied. (os error 5)` is the path
+    /// followed by the reason. A variant with no `#[source]` reports exactly
+    /// its own message.
     #[must_use]
     pub fn report(&self) -> String {
         let mut out = self.to_string();
@@ -152,9 +149,8 @@ impl From<toml_edit::TomlError> for Error {
     }
 }
 
-// The boxing above is the only thing keeping this type small, and nothing else
-// would notice if a future variant inlined another 88-byte payload: both clippy
-// size lints sit far above this range (see the module header).
+// The boxing above is the only thing keeping this type small: no clippy lint
+// would catch a future 88-byte payload added inline (see the module header).
 //
 // 48 is the measured size on Windows, where the largest remaining variant is
 // `ConfigRead`/`ConfigWrite` at 40 bytes: `PathBuf` is 32 there rather than 24,
@@ -177,8 +173,8 @@ mod tests {
             path: PathBuf::from("C:/Users/x/config.toml"),
             source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         };
-        // One layer each, and neither repeated: this is the whole point of
-        // dropping `{source}` from the message.
+        // One layer each, neither repeated — the whole point of dropping
+        // `{source}` from the message.
         let displayed = err.to_string();
         assert_eq!(displayed, "could not write C:/Users/x/config.toml");
         let reported = err.report();

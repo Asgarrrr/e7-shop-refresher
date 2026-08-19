@@ -2,10 +2,9 @@
 //!
 //! The root holds the *wiring*: the session state handed out before any fallible
 //! work runs, the channels that join the five concerns below, and the two entry
-//! points `main.rs` calls. Each submodule owns one of those concerns, and they
-//! reach each other only through the channel ends and `Arc` handles created in
-//! [`Session::run`] — there is no shared `&mut` state between them, which is
-//! what made this split a move rather than a refactor.
+//! points `main.rs` calls. Each submodule owns one of those concerns, reaching
+//! each other only through the channel ends and `Arc` handles created in
+//! [`Session::run`] — there is no shared `&mut` state between them.
 //!
 //! - [`pressure`] — the vocabulary the two pumps share (`CaptureEvent`, the
 //!   resync marker protocol).
@@ -13,9 +12,9 @@
 //! - [`reassembly`] — the post-resync anchor window and the forwarding ladder.
 //! - [`workers`] — who owns the threads and tasks, and teardown order.
 //! - [`console`] — stdin lines in, [`Command`]s out.
-//! - `session` — the session loop itself, which predates this split and keeps
-//!   its own structure (it is also the only place in the crate that nests two
-//!   locks, `controller` -> `timings`, and no lock acquisition moved here).
+//! - `session` — the session loop itself, predates this split and keeps its
+//!   own structure (the only place in the crate that nests two locks,
+//!   `controller` -> `timings`).
 
 mod console;
 #[cfg(test)]
@@ -51,14 +50,15 @@ use reassembly::reassemble_loop_with_pressure;
 use session::session_loop;
 use workers::{SessionWorkers, spawn_capture_with_budget};
 
-/// Reassembled chunks awaiting the uplink, and inbound server messages awaiting
-/// the session loop. Both stages are byte-capped by [`PipelineBudget`]; the slot
-/// count only bounds how far ahead a producer may run.
+/// Reassembled chunks awaiting the uplink, and inbound server messages
+/// awaiting the session loop. Both stages are byte-capped by
+/// [`PipelineBudget`]; the slot count only bounds how far a producer runs
+/// ahead.
 const PIPELINE_QUEUE: usize = 256;
 
-/// Fatal-failure reports. Several producers, one consumer, and only the first
-/// message is ever used — the depth exists so a racing second report cannot
-/// block the task that is already unwinding.
+/// Fatal-failure reports. Several producers, one consumer, first message
+/// wins — the depth exists so a racing second report can't block the task
+/// that's already unwinding.
 const FATAL_QUEUE: usize = 4;
 
 /// Player commands awaiting the session loop. Safety stops do not ride this
@@ -70,9 +70,8 @@ const COMMAND_QUEUE: usize = 16;
 const JOB_QUEUE: usize = 8;
 
 /// A non-safety command into the session loop, decoupled from its source: the
-/// stdin task and the GUI push the same values through the same channel (stdin
-/// never produces the `Set*` variants). Safety stops use [`WatchGate`]'s
-/// durable halt latch instead of this bounded queue.
+/// stdin task and the GUI push the same values through the same channel
+/// (stdin never produces the `Set*` variants).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Start,
@@ -98,16 +97,15 @@ pub struct SessionHandles {
     pub journal: EventLog,
 }
 
-/// Cooperative stop for a session that runs on a detached task.
+/// Cooperative stop for a session running on a detached task.
 ///
-/// The GUI build closes its window on the OS main thread while the pipeline
-/// lives on the runtime; without this the process would simply exit and skip
-/// every teardown — leaving an orphaned live capture session in the driver.
-/// [`Command::Stop`] is not a substitute: it only disarms the hunt, it never
-/// leaves the session loop.
+/// The GUI closes its window on the OS main thread while the pipeline lives on
+/// the runtime; without this the process would exit and skip teardown, leaving
+/// an orphaned live capture session in the driver. [`Command::Stop`] only
+/// disarms the hunt — it never leaves the session loop.
 ///
-/// Cloneable (the sender is shared, not duplicated) so the owner of the window
-/// and the session can each hold one.
+/// Cloneable (the sender is shared) so the window and the session can each
+/// hold one.
 #[derive(Clone)]
 pub struct ShutdownSignal(Arc<watch::Sender<bool>>);
 
@@ -138,21 +136,17 @@ pub struct Session {
 
 /// Builds the shared session state and hands out clones before any fallible
 /// work runs: a view keeps live handles even when [`Session::run`] fails
-/// later (bad filter, no capture backend).
-///
-/// The third value is the cooperative stop: whoever outlives the session task
-/// (the window, in the GUI build) must be able to ask for teardown.
+/// later (bad filter, no capture backend). The third value is the cooperative
+/// stop — see [`ShutdownSignal`].
 pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
-    // Gate off at startup: the session starts Idle and the player arms it
-    // with `start`.
+    // Session starts Idle; the player arms it with `start`.
     let gate = WatchGate::new(false);
     let journal = EventLog::default();
     let (command_tx, command_rx) = mpsc::channel::<Command>(COMMAND_QUEUE);
     let mut controller = Controller::new(config.filter.clone(), config.limits);
     if actuator_mode(&config) == Mode::Live {
-        // Only real clicking gets watchdog deadlines: Off is player-paced
-        // advice and DryRun never produces wire feedback — a deadline would
-        // self-halt both.
+        // Only real clicking gets watchdog deadlines: Off and DryRun produce
+        // no wire feedback, so a deadline would self-halt both.
         controller.enable_recovery();
     }
     let controller = Arc::new(Mutex::new(controller));
@@ -209,9 +203,8 @@ fn actuator_mode(_config: &Config) -> Mode {
 /// failing fast beats booting a watch that can never arm. Otherwise whatever
 /// [`Session::run`] returns.
 pub async fn run(config: Config) -> Result<()> {
-    // The console has no filter editor: an unrestricted filter can only be
-    // fixed in config.toml, so fail fast. The GUI path (setup +
-    // `Session::run`) boots instead and refuses arming until a filter is set.
+    // The GUI path (setup + `Session::run`) boots instead and refuses arming
+    // until a filter is set.
     if config.filter.is_unrestricted() {
         return Err(crate::Error::Config(
             "no [filter] criteria in config.toml — define what to hunt (see config.example.toml)"
@@ -253,17 +246,16 @@ impl Session {
         let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(CAPTURE_EVENT_QUEUE);
         let (raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(PIPELINE_QUEUE);
         let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(PIPELINE_QUEUE);
-        // One fatal-failure channel, several producers. The session loop
-        // freezes the first message before teardown starts.
+        // One fatal-failure channel, several producers (see FATAL_QUEUE).
         let (fatal_tx, fatal_rx) = mpsc::channel::<String>(FATAL_QUEUE);
         // Every receiver is taken before the signal moves into the worker set;
         // a window close reaches the session loop and the workers alike.
         let shutdown_rx = shutdown.subscribe();
         let loop_shutdown_rx = shutdown.subscribe();
 
-        // Blocking capture receiver on a dedicated thread.
-        // Wrapped in catch_unwind so a panic surfaces as a fatal message instead
-        // of a silently dropped sender (which reads as a clean "session ended").
+        // Blocking capture receiver on a dedicated thread, wrapped in
+        // catch_unwind so a panic surfaces as a fatal message instead of a
+        // silently dropped sender (which reads as a clean "session ended").
         let source = build_source(&config)?;
         let capture = spawn_capture_with_budget(
             source,
@@ -281,18 +273,17 @@ impl Session {
             "uplink",
             &fatal_tx,
             crate::uplink::run(
-                // The whole proof, not the dial string out of it: `uplink::run`
-                // takes the `ServerUrl`, so the redacted form travels with the
-                // URL and the credential-bearing spelling is reachable there
-                // only through `as_str()`, at the one line that dials.
+                // The whole `ServerUrl`, not the dial string: the redacted form
+                // travels with it, and the credential-bearing spelling is
+                // reachable only through `as_str()`, at the one line that dials.
                 config.server_url.clone(),
                 raw_rx,
                 message_tx,
                 config.reconnect_initial(),
                 config.reconnect_max(),
-                // The uplink was the one worker with no cooperative stop: it was
-                // reached only by `abort` after the grace deadline. It now races
-                // this against the handshake, the connected pump and the backoff.
+                // Races against the handshake, the connected pump and the
+                // backoff (previously reached only by `abort` after the grace
+                // deadline).
                 shutdown_rx.clone(),
             ),
         );
@@ -373,8 +364,7 @@ impl Session {
         .catch_unwind()
         .await;
 
-        // Freeze the selected outcome before any cancellation or join result
-        // can occur. Teardown diagnostics are secondary by construction.
+        // Freeze the outcome before any cancellation or join result can occur.
         workers.shutdown(&gate, actuator).await;
         info!("relay stopped");
         let primary_failure = match loop_outcome {
@@ -391,15 +381,15 @@ impl Session {
 /// Awaits the session future (spawned so a panic is caught, not propagated)
 /// and translates its end into a banner line plus a failed flag.
 ///
-/// The gate is forced off on every path: a panicking session never reaches
-/// the loop's own teardown, and capture must not keep streaming game traffic
-/// under a crash banner. Idempotent after a clean teardown.
+/// The gate is forced off on every path: a panicking session skips its own
+/// teardown, and capture must not keep streaming under a crash banner.
+/// Idempotent after a clean teardown.
 ///
-/// The task lives in a single-element [`tokio::task::JoinSet`] rather than a
-/// bare `JoinHandle`: dropping a handle *detaches*, so a cancelled `supervise`
-/// used to leave the session running with nobody holding it and `gate.set(false)`
-/// never reached — capture still forwarding, the actuator still clicking, under a
-/// session that is officially gone. `JoinSet` aborts on drop instead.
+/// The task lives in a single-element [`tokio::task::JoinSet`], not a bare
+/// `JoinHandle`: dropping a handle detaches, so a cancelled `supervise` used
+/// to leave the session running unheld and `gate.set(false)` never reached —
+/// capture still forwarding, the actuator still clicking, under a session
+/// that is officially gone. `JoinSet` aborts on drop instead.
 pub async fn supervise(
     session: impl Future<Output = Result<()>> + Send + 'static,
     gate: WatchGate,
@@ -416,8 +406,8 @@ pub async fn supervise(
         Some(Ok(Err(err))) => (format!("session error: {}", err.report()), true),
         Some(Err(panic)) => (format!("session crashed: {panic}"), true),
         // Unreachable: the set holds exactly the task spawned above. Reported as
-        // a failure rather than panicked on — this is the function whose whole
-        // job is to turn a dead session into a line the player can read.
+        // a failure, not panicked on: this function's whole job is turning a
+        // dead session into a line the player can read.
         None => (
             "session crashed: the session task vanished".to_owned(),
             true,
@@ -428,9 +418,8 @@ pub async fn supervise(
 /// A line that names no command, carrying the trimmed input so the message can
 /// quote it.
 ///
-/// Its `Display` is the whole point: the alias list used to be spelled out at
-/// the one call site instead of beside the table it describes, so the two could
-/// drift apart silently.
+/// Its `Display` carries the alias list, kept beside the table that
+/// produces it rather than spelled out again at the call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseCommandError(String);
 
@@ -446,10 +435,10 @@ impl std::fmt::Display for ParseCommandError {
 
 impl std::error::Error for ParseCommandError {}
 
-/// Parses the *typeable* subset of [`Command`]. The three `Set*` variants carry
-/// live retune payloads (a [`Filter`], [`Limits`], [`plan::Timings`]) that no
-/// console line can express, and the GUI constructs those directly — which the
-/// missing arms below document better than a private helper could.
+/// Parses the *typeable* subset of [`Command`]. The three `Set*` variants
+/// carry live retune payloads (a [`Filter`], [`Limits`], [`plan::Timings`])
+/// that no console line can express; the GUI constructs those directly, and
+/// the missing match arms below document that.
 impl std::str::FromStr for Command {
     type Err = ParseCommandError;
 
@@ -464,30 +453,24 @@ impl std::str::FromStr for Command {
     }
 }
 
-/// Opens the compiled capture backend.
-///
-/// Two arms, so every feature combination builds and exactly one of them
-/// applies:
+/// Opens the compiled capture backend. Two arms, so every feature combination
+/// builds and exactly one applies:
 ///
 /// - **Npcap**, when `pcap-backend` is on — the shipped default. It taps every
-///   adapter through `wpcap.dll` in this very process: no driver of ours to
-///   load, no second process, no UAC prompt of its own. The process *is*
-///   elevated (the exe is manifested `requireAdministrator`), but for the
-///   actuator, not for this — see `build.rs`, and do not read this arm as
-///   needing the token.
-/// - **No backend** — an error the caller can show, never a panic. This is the
+///   adapter through `wpcap.dll` in this process: no driver of ours to load,
+///   no second process, no UAC prompt of its own. The process *is* elevated
+///   (manifested `requireAdministrator`), but for the actuator, not this —
+///   see `build.rs`.
+/// - **No backend** — an error the caller can show, never a panic; the
 ///   `--no-default-features` build, where the rest of the pipeline still
 ///   compiles and tests.
 ///
-/// What arrives is an IP-layer copy either way: `PcapSource` strips each
-/// adapter's own link framing before handing anything up, so the pipeline is
-/// indifferent to the medium underneath — which is why it keeps working on a
-/// Wi-Fi adapter, where a raw NIC tap would deliver 802.11 frames this crate
-/// does not decode.
-///
-/// Blocking, and quick: device enumeration plus one open and one filter compile
-/// per adapter. It is called from `Session::run` on a runtime worker, and
-/// nothing in it waits on a human.
+/// Either way what arrives is an IP-layer copy: `PcapSource` strips each
+/// adapter's link framing before handing anything up, so it keeps working on
+/// a Wi-Fi adapter, where a raw NIC tap would deliver 802.11 frames this
+/// crate does not decode. Blocking, and quick: device enumeration plus one
+/// open and one filter compile per adapter, called from `Session::run` with
+/// nothing in it waiting on a human.
 #[cfg(all(windows, feature = "pcap-backend"))]
 fn build_source(config: &Config) -> Result<CaptureSource> {
     use crate::capture::PcapSource;
@@ -575,9 +558,8 @@ mod tests {
         assert!(outcome.contains("session ended"));
     }
 
-    // The redaction this module used to own now lives in `config::ServerUrl`,
-    // with the userinfo-bypass tests it always had; the duplicate here (and its
-    // `redacted_server_url_keeps_only_scheme_and_host` test) is gone.
+    // Redaction now lives in `config::ServerUrl` with its own tests; the
+    // duplicate here is gone.
 
     #[test]
     fn parse_command_maps_aliases() {
@@ -606,8 +588,6 @@ mod tests {
         assert!("r".parse::<Command>().is_err());
     }
 
-    /// The alias list travels with the error, so the journal line the player
-    /// reads cannot drift from the table that produced it.
     #[test]
     fn parse_command_error_quotes_the_trimmed_input_and_lists_the_aliases() {
         let err = "  Refresh \t"

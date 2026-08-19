@@ -2,10 +2,10 @@
 //! ladder that keeps a byte-pressure event from being reported as a closed
 //! pipeline.
 //!
-//! Runs as a Tokio task. Its whole input is the [`CaptureEvent`] channel and its
-//! whole output is the outbound `BudgetedChunk` channel, so the only state it
-//! shares with the capture pump is the [`PressureResync`] marker it
-//! acknowledges — the seam is the channel, not a buffer.
+//! Runs as a Tokio task. Its whole input is the [`CaptureEvent`] channel and
+//! its whole output is the outbound `BudgetedChunk` channel; the only state
+//! shared with the capture pump is the [`PressureResync`] marker it
+//! acknowledges.
 
 use std::time::Duration;
 
@@ -19,9 +19,9 @@ use crate::stream::{BudgetedChunk, BudgetedSegment, InitialBurst, Reassembler, R
 
 use super::pressure::{CaptureEvent, PressureResync};
 
-/// Conservative one-shot allowance for reordered predecessors immediately
-/// after capture resumes. Ten milliseconds is the documented hard cap: it
-/// bounds latency even though no server-side timing evidence is available.
+/// One-shot allowance for reordered predecessors right after capture resumes.
+/// Ten milliseconds is a documented hard cap on latency, chosen without
+/// server-side timing evidence.
 const INITIAL_ANCHOR_WINDOW: Duration = Duration::from_millis(10);
 
 enum AnchorState {
@@ -100,9 +100,9 @@ pub(super) async fn reassemble_loop_with_pressure(
         };
 
         // A SYN is never held behind the anchor deadline: it re-anchors the
-        // sequence space, so buffering it would make the burst's own ordering
+        // sequence space, so buffering it would make the burst's ordering
         // meaningless. Commit any older burst first, then let `Reassembler`
-        // classify/reset the connection incarnation immediately
+        // reset the connection incarnation immediately
         // (`Reassembler::syn_starts_new_incarnation`).
         if segment.syn {
             if !flush_anchor(&mut anchor, &mut reassembler, &raw_tx).await {
@@ -195,17 +195,16 @@ async fn flush_anchor(
     true
 }
 
-/// Forwards `segment`, re-arming the anchor if either form of byte pressure
-/// invalidated the origin those bytes belonged to. `false` means the downstream
-/// closed and the caller must `break`.
+/// Forwards `segment`, re-arming the anchor if byte pressure invalidated the
+/// origin those bytes belonged to. `false` means the downstream closed and the
+/// caller must `break`.
 ///
-/// A plain function rather than a macro on purpose: the four call sites in
-/// `reassemble_loop_with_pressure` are the crate's most correctness-critical
-/// transitions (a wrong `anchor` here stalls reassembly forever), and a
-/// `macro_rules!` would hide them from rust-analyzer, the debugger and the error
-/// messages while buying nothing but the same line count. Only the *post*-forward
-/// transition lives here — two call sites set `AnchorState::Steady` immediately
-/// before calling, and that ordering is theirs to keep.
+/// A plain function, not a macro: the four call sites are the crate's most
+/// correctness-critical transitions (a wrong `anchor` stalls reassembly
+/// forever), and `macro_rules!` would hide them from rust-analyzer, the
+/// debugger and error messages for no line-count savings. Only the
+/// *post*-forward transition lives here — two call sites set
+/// `AnchorState::Steady` immediately before calling; that ordering is theirs.
 async fn forward_or_rearm(
     reassembler: &mut Reassembler,
     segment: BudgetedSegment,
@@ -242,10 +241,10 @@ enum ForwardStatus {
 /// Moves reassembled chunks into the outbound stage.
 ///
 /// A chunk larger than the whole outbound quota can never be retagged, so it
-/// is dropped. That is a hole in the forwarded byte stream, not a closed
-/// pipeline: reassembly state is cleared so the next segment re-anchors,
-/// exactly as under pending-byte pressure. Reporting it as a closed downstream
-/// used to tear the session down and call it a clean end.
+/// is dropped: a hole in the byte stream, not a closed pipeline. Reassembly
+/// state is cleared so the next segment re-anchors, exactly as under
+/// pending-byte pressure. This used to tear the session down and report it as
+/// a clean end.
 async fn forward_chunks(
     chunks: Vec<BudgetedChunk>,
     reassembler: &mut Reassembler,
@@ -576,9 +575,9 @@ mod tests {
         tokio::task::yield_now().await;
 
         // The paused clock advances whenever nothing is runnable, so
-        // `task.await` resolves with or without the `raw_tx.closed()` branch:
-        // the deadline arm would reach the same `break` 10 ms later. The elapsed
-        // time is the only thing that tells the two apart.
+        // `task.await` resolves with or without the `raw_tx.closed()` branch —
+        // the deadline arm reaches the same `break` 10 ms later. Elapsed time
+        // is the only way to tell the two apart.
         let before = Instant::now();
         drop(raw_rx);
         task.await.unwrap();

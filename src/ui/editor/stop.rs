@@ -1,14 +1,12 @@
 //! Stop: the run's safety rails — the section's summary and the ledger-row
-//! widgets the rails are drawn from (the shared row chrome, the two rail kinds,
-//! the compact value chip). A seam by shell state, not by topic: everything here
-//! works on a `Limits` field handed in by the caller, so none of it needs
-//! `EditorState`. `stop_body` itself still lives in the shell — see
+//! widgets they're drawn from (shared row chrome, the two rail kinds, the
+//! compact value chip). Works on a `Limits` field handed in by the caller,
+//! needing no `EditorState`. `stop_body` stays in the shell — see
 //! `_HANDOFF.md` for the draft-grouping prerequisite that would let it move.
 //!
-//! The arming semantics and the shared drag field stay in the shell
-//! ([`super::arm_optional`], [`super::optional_field`]) because Hunt's grid
-//! cells route through the same two; keeping them one level up is what keeps
-//! the `clamp_existing_to_range(false)` fix single-site.
+//! Arming and the shared drag field stay in the shell ([`super::arm_optional`],
+//! [`super::optional_field`]) since Hunt's grid cells route through the same
+//! two, keeping the `clamp_existing_to_range(false)` fix single-site.
 
 use eframe::egui;
 
@@ -47,10 +45,9 @@ pub(super) fn stop_summary(limits: &Limits) -> String {
     }
 }
 
-/// One ledger row: `☑ unit …… value`. The checkbox arms the cap, the unit sits
-/// in the left column, and the value is pushed flush-right so every cap lines up
-/// in its own column. Arming is [`arm_optional`]'s, the field is
-/// [`optional_field`]'s; an unset rail reads a faint "none".
+/// One ledger row: `☑ unit …… value` — checkbox arms the cap, unit in the left
+/// column, value flush-right in its own column. Arming is [`arm_optional`]'s,
+/// the field is [`optional_field`]'s; an unset rail reads a faint "none".
 pub(super) fn limit_row<T: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     unit: &str,
@@ -70,16 +67,14 @@ pub(super) fn limit_row<T: egui::emath::Numeric>(
 }
 
 /// The duration rail, edited in whole minutes (stored as ms) — a [`limit_row`]
-/// twin kept apart for its minute↔ms conversion, exactly as
-/// [`super::hunt::optional_value`] and the old `duration_minutes` were split
-/// before. Arming is shared ([`arm_optional`]); the field is not, because it
-/// drags a derived value.
+/// twin kept apart for its minute↔ms conversion. Arming is shared
+/// ([`arm_optional`]); the field is not, because it drags a derived value.
 pub(super) fn duration_row(ui: &mut egui::Ui, value: &mut Option<u64>) {
     limit_ledger_row(ui, "minutes", value.is_some(), |on, ui| {
         arm_optional(on, value, 60 * 60_000);
         if let Some(ms) = value {
-            // Ceil so a sub-minute config value never reads as 0; edits are whole
-            // minutes and only rewrite the stored ms on a real drag.
+            // Ceil so a sub-minute config value never reads as 0; only a real
+            // drag rewrites the stored ms.
             let mut minutes = ms.div_ceil(60_000);
             compact_drag(ui, |ui| {
                 let r = ui.add(egui::DragValue::new(&mut minutes).range(1..=u64::MAX / 60_000));
@@ -93,11 +88,10 @@ pub(super) fn duration_row(ui: &mut egui::Ui, value: &mut Option<u64>) {
     });
 }
 
-/// The shared ledger-row chrome: the arming checkbox and unit label on the left,
-/// then the caller's value flush-right in its own column. `armed` seeds the
-/// checkbox and the unit's ink (muted when live, faint when off); `value` paints
-/// the right column after the toggle has been resolved. Splitting the chrome out
-/// keeps the two rail kinds (numeric / duration) down to just their value widget.
+/// The shared ledger-row chrome: arming checkbox and unit label on the left,
+/// the caller's value flush-right in its own column. `armed` seeds the
+/// checkbox and the unit's ink (muted when live, faint when off); `value`
+/// paints the right column after the toggle resolves.
 fn limit_ledger_row(
     ui: &mut egui::Ui,
     unit: &str,
@@ -112,9 +106,8 @@ fn limit_ledger_row(
         } else {
             theme::INK_FAINT
         };
-        // Fixed-width label cell so the value column starts at the same x on every
-        // row (aligned like a ledger) without flushing to the far edge — which
-        // opened a dead gap between label and value.
+        // Fixed-width label cell so the value column starts at the same x on
+        // every row, without flushing to the far edge (which opened a dead gap).
         let (rect, _) = ui.allocate_exact_size(egui::vec2(130.0, 20.0), egui::Sense::hover());
         ui.painter().with_clip_rect(rect).text(
             egui::pos2(rect.left(), rect.center().y),
@@ -127,10 +120,8 @@ fn limit_ledger_row(
     });
 }
 
-/// A compact drag field for the ledger's value column: the default filled box —
-/// so it still reads plainly as an editable input — but with tightened padding
-/// and a 3px corner, so each value sits as a small chip instead of the bulky
-/// default pill that would dominate the column.
+/// A compact drag field for the ledger's value column: the default filled box,
+/// with tightened padding and a 3px corner so each value reads as a small chip.
 fn compact_drag(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ui.scope(|ui| {
         ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);

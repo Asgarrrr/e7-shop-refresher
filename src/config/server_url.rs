@@ -1,15 +1,14 @@
 //! The `server_url` key's type, and the cleartext rule it carries.
 //!
-//! This is a seam because of what the type promises rather than because of its
-//! size: [`ServerUrl`]'s two fields are private *to this file*, so "the dial
+//! [`ServerUrl`]'s two fields are private *to this file*, so "the dial
 //! string is reachable through exactly one `as_str()`, and `Debug`/`Display`
-//! print the redacted form only" is a claim a reader can check by reading one
-//! 170-line file instead of the whole schema module. Nothing in the config
-//! schema touches these fields; it only calls [`ServerUrl::parse`].
+//! print the redacted form only" is a claim a reader can check by reading
+//! one file rather than the whole schema module. Nothing in the config
+//! schema touches these fields directly; it only calls [`ServerUrl::parse`].
 //!
-//! The authority-splitting helpers below are here rather than in the schema
-//! because `parse` is their only caller and the userinfo subtlety they encode is
-//! the reason the type exists.
+//! The authority-splitting helpers below live here rather than in the schema
+//! because `parse` is their only caller, and the userinfo subtlety they
+//! encode is the reason the type exists.
 
 use std::fmt;
 
@@ -78,12 +77,12 @@ fn is_loopback_host(host: &str) -> bool {
 /// the authority split it needs are written, and a `ServerUrl` that exists is
 /// the evidence that they passed.
 ///
-/// It also carries the redacted `scheme://host[:port]` form, because the same
-/// split that defeats `ws://127.0.0.1@evil.com` is the one that keeps a
-/// `user:pass@` credential out of the log the player is asked to send us. Those
-/// two used to be written twice — here and in `app::redacted_server_url`, now
-/// deleted — and only this copy had the userinfo tests, so the next parsing
-/// subtlety had to be found twice.
+/// It also carries the redacted `scheme://host[:port]` form: the same split
+/// that defeats `ws://127.0.0.1@evil.com` is what keeps a `user:pass@`
+/// credential out of the log the player is asked to send us. (This used to
+/// be written twice — here and in the now-deleted
+/// `app::redacted_server_url` — with only one copy carrying the userinfo
+/// tests.)
 ///
 /// `Debug` and `Display` print the redacted form **only**, so no `?url`, `%url`
 /// or `#[instrument]` argument list can put a credential in the log. The dial
@@ -191,11 +190,10 @@ impl TryFrom<String> for ServerUrl {
 mod tests {
     use super::*;
 
-    // The cleartext-rule tests below used to build a whole `Config` with the URL
-    // overwritten and call `validate()`. They now call `ServerUrl::parse`
-    // directly, because that *is* the load path: the field's type is the check,
-    // and `Config::validate` has no `server_url` clause left to reach. Every
-    // input is unchanged, including the two userinfo bypasses.
+    // The cleartext-rule tests below used to build a whole `Config` with the
+    // URL overwritten and call `validate()`. They call `ServerUrl::parse`
+    // directly now, since that *is* the load path — `Config::validate` has
+    // no `server_url` clause left to reach.
 
     #[test]
     fn wss_is_accepted() {
