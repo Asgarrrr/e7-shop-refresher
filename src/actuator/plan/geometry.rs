@@ -390,6 +390,62 @@ mod tests {
         );
     }
 
+    /// The `Center` arm's offset term, on a point that is not the centre.
+    ///
+    /// Every other `Anchor::Center` assertion in this module passes `x = 640.0`,
+    /// which is exactly `DESIGN_W / 2.0` — so `(point.x - DESIGN_W / 2.0)` is
+    /// `0.0` at all of them and the whole offset term is unobservable. Mutation
+    /// proved it: flipping the `+` to `-` and to `/` in
+    /// `view_w / 2.0 + (point.x - DESIGN_W / 2.0)` leaves the entire suite green
+    /// on the shipped feature lane. Neither zone that actually uses this anchor
+    /// sits at the centre — `CONFIRM_REFRESH` is at 747.5 and `CONFIRM_BUY` at
+    /// 750.0 — so under the sign flip the buy confirmation is aimed 220 design
+    /// pixels left of its button, on a modal the executor clicks with the
+    /// player's gold already committed.
+    ///
+    /// This is `const-003`'s failure mode with a different constant: a test that
+    /// covers the line, asserts a true thing, and cannot fail. Both real zone
+    /// abscissae are used below so the pin is on the values that ship, and a
+    /// mirrored point on the other side of the centre catches an `abs` as well
+    /// as a sign.
+    #[test]
+    fn to_screen_places_an_off_centre_center_anchor() {
+        // Design resolution: the transform is the identity, so the expected
+        // value is the design abscissa itself and any change to the offset
+        // term's sign, operator or operand order moves it.
+        let design = rect(0, 0, 1280, 720);
+        // Genuinely pillarboxed, so the view centre and the window centre are
+        // different points and the offset must ride the former. 1800×720 is
+        // aspect 2.5, past the 2.194 cap, so `view_w` is 1579.68 with a 110.16
+        // bar each side: 1579.68 / 2 + (750 - 640) + 110.16 = 1010.
+        let wide = rect(0, 0, 1800, 720);
+        assert_eq!(
+            to_screen(
+                design,
+                point(CONFIRM_BUY.cx, CONFIRM_BUY.cy, Anchor::Center)
+            ),
+            Ok((750, 508))
+        );
+        assert_eq!(
+            to_screen(
+                design,
+                point(CONFIRM_REFRESH.cx, CONFIRM_REFRESH.cy, Anchor::Center)
+            ),
+            Ok((748, 462))
+        );
+        // Mirrored about the centre: 640 - 110 must land 110 left of it, not
+        // right of it, which an `abs` or a swapped subtraction would get wrong
+        // while still passing the two above.
+        assert_eq!(
+            to_screen(design, point(530.0, 360.0, Anchor::Center)),
+            Ok((530, 360))
+        );
+        assert_eq!(
+            to_screen(wide, point(CONFIRM_BUY.cx, CONFIRM_BUY.cy, Anchor::Center)),
+            Ok((1010, 508))
+        );
+    }
+
     #[test]
     fn to_screen_scales_and_offsets_at_16_9() {
         // 1920×1080 at (100, 50): s = 1.5, no pillarbox.
