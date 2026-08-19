@@ -20,8 +20,8 @@ Npcap tap ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket
   injected, dropped or rewritten, by this code or by any later addition to it,
   because a capture handle physically cannot send. The kernel-side filter is
   fixed (`tcp and src port 3333`, built from `game_port`), so no other traffic
-  on the machine is even copied — and the `src` is the point: only what the game
-  *server* sends is copied at all, the client → server half never leaves the
+  on the machine is even copied. The `src` narrows it further: only what the
+  game *server* sends is copied, and the client → server half never leaves the
   driver.
 - **Reassembly**: captured segments (possibly out of order or retransmitted) are
   recomposed into an ordered byte stream, per connection.
@@ -49,15 +49,16 @@ the session, **Stop** when done.
 
 ## What you need to install, and why the app asks for administrator
 
-Two things are worth being upfront about before you launch it.
+Two things before you launch it: you install Npcap yourself, and Windows will
+ask for administrator.
 
 ### You install Npcap, once. We ship no driver.
 
 Capture needs to see the game's packets, and on Windows that means a packet
 capture driver. **We do not ship one.** Nothing is embedded in the exe, nothing
 is extracted, no service is registered by this tool. Instead the app uses
-**Npcap** — the standard Windows packet-capture library, the one Wireshark
-installs — which you install yourself:
+**Npcap** (the standard Windows packet-capture library, the one Wireshark
+installs), which you install yourself:
 
 1. Download it from **https://npcap.com** and run the installer.
 2. **Keep the default options.** In particular:
@@ -78,10 +79,10 @@ the download page — it does not crash and it does not fail silently.
 over TLS to the configured `server_url`. Nothing else on the network is read,
 and nothing is uploaded about your machine.
 
-### The app asks for administrator — not to capture, but to click
+### Administrator is for the clicking, not the capture
 
-Windows shows a UAC prompt when you launch the exe. That is **not** for the
-capture side, which needs no privilege of its own. It is for the clicking.
+Windows shows a UAC prompt when you launch the exe. Capture needs no privilege
+of its own; the clicking does.
 
 Epic Seven is launched by STOVE, and STOVE runs as administrator. Windows will
 not let an ordinary program send mouse clicks to a window belonging to an
@@ -92,9 +93,8 @@ game's side: STOVE is the launcher Epic Seven ships with, and it always
 elevates.
 
 So **approve the prompt**, or the refresh loop will do nothing at all. (An
-earlier version of this file told you the exact opposite. It was written when
-capture needed a kernel driver and clicking was an afterthought; both halves of
-that are now the other way round.)
+earlier version of this file said the opposite. It was written when capture
+needed a kernel driver and clicking was an afterthought.)
 
 ## Distribution — a single exe
 
@@ -103,7 +103,7 @@ nothing, and writes nothing beside itself, so it runs cleanly from the Desktop.
 The only files it ever creates are its config under `%APPDATA%` and its logs and
 crash log under `%LOCALAPPDATA%` (see *Troubleshooting*).
 
-`wpcap.dll` — Npcap's library — is resolved **at runtime**, by plain name and
+`wpcap.dll`, Npcap's library, is resolved **at runtime**: by plain name and
 then by full path in `C:\Windows\System32\Npcap\`. It is deliberately not linked
 at build time: a linked import would make Windows demand the DLL before `main`
 runs, so the exe would die in the loader, with no message at all, on every
@@ -169,9 +169,9 @@ message instead of panicking:
 cargo test --no-default-features
 ```
 
-Why Npcap and not a driver of our own — including the two measured claims that
-overturned the previous decision — is in
-[`docs/capture-backend-choice.md`](docs/capture-backend-choice.md).
+[`docs/capture-backend-choice.md`](docs/capture-backend-choice.md) explains why
+Npcap replaced a driver of our own, including the two measurements that
+overturned the previous decision.
 
 ## Configuration
 
@@ -180,8 +180,8 @@ The app reads and writes its config at a per-user location, not beside the exe:
 - **Windows:** `%APPDATA%\arkyve-refresh-shop\config.toml`
 - **Other (dev):** `config.toml` in the working directory
 
-The GUI owns this file — the Setup tab's Apply writes the edited sections back
-to it — so it normally isn't hand-edited. On first run the bundled
+The GUI owns this file: the Setup tab's Apply writes the edited sections back
+to it, so it normally isn't hand-edited. On first run the bundled
 `config.example.toml` (compiled into the exe) is written to that path, so a
 real, commented, valid file is always there to inspect or edit; later runs
 leave it untouched — with one exception: a file still carrying the retired keys
@@ -206,8 +206,8 @@ file to regenerate the example on the next launch.
 cargo run --release   # opens the window (default features)
 ```
 
-Windows asks for consent at launch — see *why the app asks for administrator*
-above — and the window opens straight after.
+Windows asks for consent at launch (see *why the app asks for administrator*
+above), and the window opens straight after.
 
 Control from the window: one contextual Start/Stop button in the status bar,
 filter & limits editors under the Setup tab. Close the window to quit.
@@ -239,15 +239,15 @@ system temp directory.
 
 Reading it yourself:
 
-- `arkyve-refresh-shop starting` missing → either the app never got to run —
-  check that no antivirus quarantined the exe, and that the UAC prompt at launch
-  was approved rather than dismissed — or it ran fine and could not create the
+- `arkyve-refresh-shop starting` missing → either the app never got to run
+  (check that no antivirus quarantined the exe, and that the UAC prompt at launch
+  was approved rather than dismissed), or it ran fine and could not create the
   log file at all. The second case looks identical from here, because there is no
   file to look in: if `%LOCALAPPDATA%\arkyve-refresh-shop\logs` is not writable
   (a leftover admins-only ACL from an old build, antivirus, a roaming-profile
   policy, a full disk) logging falls back to a console this build does not have.
-  A panic report does have a second candidate — `arkyve-crash.log` in the system
-  temp directory — so one of those with no session log beside it means the app
+  A panic report does have a second candidate, `arkyve-crash.log` in the system
+  temp directory, so one of those with no session log beside it means the app
   definitely ran.
 - `wpcap.dll loaded` missing → Npcap is not installed, or its driver is not
   running. The error that follows says which, and names https://npcap.com. If it
@@ -291,6 +291,6 @@ capture internals. `debug` is as detailed as it gets: nothing in the app logs at
 `trace`, so asking for that level changes nothing.
 
 Narrowing all the way to `RUST_LOG=warn` is safe for triage: the lines that say
-the product stopped doing its job — `session aborted` and `actuator: … stopping
-the loop` — are recorded at `error`, and `server link down` and an aborted job at
+the product stopped doing its job (`session aborted` and `actuator: … stopping
+the loop`) are recorded at `error`, and `server link down` and an aborted job at
 `warn`, so they survive. Only the routine player narration is dropped.
