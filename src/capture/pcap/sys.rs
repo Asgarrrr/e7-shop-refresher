@@ -20,12 +20,12 @@ use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, SyncSender, TrySendError};
 
 use tracing::{debug, info_span, warn};
 
 use super::link::{LinkStrip, UnsupportedDatalink};
-use super::short_device_name;
+use super::{AdapterFailure, short_device_name};
 use crate::error::{Error, Result};
 
 /// Size libpcap requires of every error buffer it is handed. Not negotiable:
@@ -649,12 +649,16 @@ pub(super) fn open_device(
 /// once, for every adapter, on the [`super::PcapSource`] side of the channel.
 ///
 /// Returns when the stop flag is set, when the receiver has gone away, or when
-/// the handle reports an error. An error kills only this adapter: the others
+/// the handle reports an error. An error kills only this adapter — the others
 /// keep capturing, which matters precisely because this backend opens adapters
-/// it has no reason to believe in.
+/// it has no reason to believe in — but it is no longer *silent*: the last act
+/// of a thread ending on an error is an [`AdapterFailure`] to the parent, which
+/// is the only thing that can tell an idle adapter's death apart from the death
+/// of the one the game was talking through.
 pub(super) fn capture_loop(
     handle: Handle,
-    packets: &Sender<Vec<u8>>,
+    packets: &SyncSender<Vec<u8>>,
+    failed: &Sender<AdapterFailure>,
     stop: &AtomicBool,
     capture_loss: &AtomicBool,
 ) {
@@ -666,6 +670,7 @@ pub(super) fn capture_loop(
     let mut delivered: u64 = 0;
     let mut unstrippable: u64 = 0;
     let mut dropped: c_uint = 0;
+    let mut overflowed: u64 = 0;
     let mut error: Option<String> = None;
 
     while !stop.load(Ordering::Relaxed) {
@@ -710,7 +715,8 @@ pub(super) fn capture_loop(
                     unstrippable += 1;
                     continue;
                 };
-                if packets.send(ip.to_vec()).is_err() {
+                let forwarded = forward(packets, ip, capture_loss, &mut overflowed);
+                if matches!(forwarded, Forwarded::SourceGone) {
                     break; // The source is gone; nothing left to feed.
                 }
                 if delivered.is_multiple_of(STATS_EVERY_PACKETS) {
@@ -730,16 +736,94 @@ pub(super) fn capture_loop(
     }
 
     match error {
-        Some(error) => warn!(
+        Some(error) => {
+            warn!(
+                delivered,
+                unstrippable,
+                dropped,
+                overflowed,
+                error = %error,
+                "adapter capture ended on an error"
+            );
+            // The last thing this thread does, and the only news of it the
+            // parent can get: it is parked on a funnel that this thread's
+            // siblings keep alive, so the disconnect it would otherwise wait
+            // for never arrives. `delivered` travels with it because that is
+            // what decides whether this death is the session's — every frame
+            // counted there passed `tcp and src port {game_port}`. A failed
+            // send means the source is already gone, which is the one case
+            // where nobody needs telling.
+            let _ = failed.send(AdapterFailure {
+                device: handle.device.clone(),
+                delivered,
+                error,
+            });
+        }
+        None => debug!(
             delivered,
-            unstrippable,
-            dropped,
-            error = %error,
-            "adapter capture ended on an error"
+            unstrippable, dropped, overflowed, "adapter capture ended"
         ),
-        None => debug!(delivered, unstrippable, dropped, "adapter capture ended"),
     }
     // `handle` drops here, on the thread that owned it, closing the `pcap_t`.
+}
+
+/// What [`forward`] did with a frame.
+enum Forwarded {
+    Queued,
+    /// The funnel was full. Counted and flagged, never waited on.
+    Dropped,
+    SourceGone,
+}
+
+/// Hands one stripped IP packet to the funnel, and decides what happens when
+/// the funnel is full.
+///
+/// `try_send`, and a dropped frame, rather than a blocking send, for two
+/// separate reasons. The first is the one the old unbounded channel's comment
+/// gave for having no bound at all: parking here parks this thread *outside*
+/// `pcap_next_ex`, where the kernel ring behind it keeps filling, so a consumer
+/// stall becomes driver-side loss — which is strictly worse, being unbounded
+/// and invisible. The second is teardown: the receiver is a field of
+/// [`super::PcapSource`], and a struct's fields drop *after* its [`Drop`] body,
+/// which joins these threads. A producer parked in `send` would therefore be
+/// joined by a thread that is holding the only thing that could ever wake it.
+///
+/// Dropping the newest frame costs nothing the resync would not discard
+/// anyway, and it is reported through the same `capture_loss` flag the
+/// driver's own `ps_drop` uses: a hole is a hole, and `app::ingest` already
+/// turns that flag into a counted, lossless re-anchor rather than a stall.
+fn forward(
+    packets: &SyncSender<Vec<u8>>,
+    ip: &[u8],
+    capture_loss: &AtomicBool,
+    overflowed: &mut u64,
+) -> Forwarded {
+    match packets.try_send(ip.to_vec()) {
+        Ok(()) => Forwarded::Queued,
+        Err(TrySendError::Full(frame)) => {
+            *overflowed += 1;
+            capture_loss.store(true, Ordering::Relaxed);
+            if *overflowed == 1 {
+                warn_funnel_full(frame.len());
+            }
+            Forwarded::Dropped
+        }
+        Err(TrySendError::Disconnected(_)) => Forwarded::SourceGone,
+    }
+}
+
+/// Said once per thread rather than once per dropped frame, and out of line
+/// like the other rare reports here: a full funnel is either absent or
+/// sustained, and a log line per drop is the one thing guaranteed to make a
+/// congested one worse. The running total goes out in the closing line.
+#[cold]
+#[inline(never)]
+fn warn_funnel_full(bytes: usize) {
+    warn!(
+        bytes,
+        "the capture funnel is full; dropping frames and asking the pipeline to resync — \
+         the byte stream has a hole in it"
+    );
 }
 
 /// The one FFI mistake in this module that would not crash, reported out of line:
@@ -798,7 +882,65 @@ fn warn_capture_loss(lost: c_uint, stats: PcapStat) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+
     use super::*;
+
+    #[test]
+    fn a_full_funnel_drops_the_frame_and_flags_capture_loss_without_parking_the_thread() {
+        let (sender, packets) = sync_channel(1);
+        let sender = Arc::new(sender);
+        let capture_loss = Arc::new(AtomicBool::new(false));
+        let mut overflowed = 0;
+        assert!(matches!(
+            forward(&sender, b"first", &capture_loss, &mut overflowed),
+            Forwarded::Queued
+        ));
+        assert_eq!(overflowed, 0);
+        assert!(!capture_loss.load(Ordering::Relaxed));
+
+        // The funnel is full and nothing is draining it. This is the moment
+        // the unbounded channel grew instead — one frame is up to SNAPLEN,
+        // and nothing charged any of it against the pipeline's byte budget
+        // until the consumer had already dequeued it — and the moment a
+        // blocking bounded send would park this thread outside the driver.
+        // Run on its own thread so that parking fails the test instead of
+        // hanging the suite.
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let sender = Arc::clone(&sender);
+            let capture_loss = Arc::clone(&capture_loss);
+            move || {
+                let mut overflowed = 0;
+                let forwarded = forward(&sender, b"second", &capture_loss, &mut overflowed);
+                let _ = done.send((matches!(forwarded, Forwarded::Dropped), overflowed));
+            }
+        });
+        let (was_dropped, counted) = outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a full funnel must not park a capture thread between two pcap_next_ex calls");
+
+        assert!(was_dropped, "the newest frame is what gives way");
+        assert_eq!(counted, 1, "and it is counted, not silently gone");
+        assert!(
+            capture_loss.load(Ordering::Relaxed),
+            "a dropped frame is a hole in the byte stream, and the pipeline must resync \
+             rather than wait for a retransmission a passive tap never sees"
+        );
+        // Exactly what it accepted, and no more: the bound is a bound.
+        assert_eq!(
+            packets.try_recv().expect("the first frame"),
+            b"first".to_vec()
+        );
+        assert!(packets.try_recv().is_err());
+
+        drop(packets);
+        assert!(matches!(
+            forward(&sender, b"third", &capture_loss, &mut overflowed),
+            Forwarded::SourceGone
+        ));
+    }
 
     #[test]
     fn a_caplen_outside_the_snaplen_is_rejected_as_a_pkthdr_layout_error() {

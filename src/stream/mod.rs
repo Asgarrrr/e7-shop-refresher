@@ -59,10 +59,15 @@ pub(crate) struct BudgetLimits {
     pub(crate) outbound: usize,
 }
 
-// These four numbers are the only defence against unbounded memory on a
+// These four numbers are the pipeline's defence against unbounded memory on a
 // capture path that runs for hours, and what a later tuning pass edits by
-// hand. Their relation is pure arithmetic over constants, checked here
-// rather than on the player's machine — `with_limits` still keeps runtime
+// hand. They are not the *whole* defence, and the gap is worth naming here
+// rather than leaving a reader to trust this list: a captured frame is charged
+// only at `admit_capture`, so the queue between the capture threads and
+// `PcapSource::next_segment` holds memory nothing below can see.
+// `capture::pcap::FRAME_QUEUE_DEPTH` bounds that queue separately and argues
+// its number there. Their relation is pure arithmetic over constants, checked
+// here rather than on the player's machine — `with_limits` still keeps runtime
 // asserts because `with_test_limits` passes arbitrary values.
 const _: () = {
     assert!(CAPTURE_STAGE_BYTES <= PIPELINE_GLOBAL_BYTES);
