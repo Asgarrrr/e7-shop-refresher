@@ -44,8 +44,9 @@ re-proved after the split.
 
 ### The 2026-08-19 wave — measurement, currency, CI
 
-Four parallel passes with disjoint file ownership. Tests **593 → 599**, nothing weakened
-or removed; clippy 0 on all six lanes, `cargo doc` 0, `cargo fmt --check` clean.
+Twelve parallel passes with disjoint file ownership, in two waves. Tests **593 → 607**,
+nothing weakened or removed; clippy 0 on all six lanes, `cargo doc` 0, `cargo fmt --check`
+clean, and the 63 `// SAFETY:` blocks still 63.
 
 - **Measurement.** [`30-measurement.md`](30-measurement.md) answers the sentence this
   file used to end on ("No reviewer measured test coverage, because no CI lane does").
@@ -56,12 +57,16 @@ or removed; clippy 0 on all six lanes, `cargo doc` 0, `cargo fmt --check` clean.
   survivors, of which **8 are real holes and 5 were reduced-lane artefacts that die on
   the lane that ships**. `just coverage` / `just mutants` and a weekly, deliberately
   non-blocking `quality.yml`.
-- **The first hole is fixed.** `to_screen`'s `Anchor::Center` arm was `const-003` again:
+- **All eight holes are now fixed.** `to_screen`'s `Anchor::Center` arm was `const-003` again:
   every test point was `x = 640.0`, exactly `DESIGN_W / 2.0`, so the offset term was
   `0.0` at all of them and flipping its sign left the suite green. Both real Center
   zones are off-centre (747.5, 750.0), so the flip aims the buy confirmation 220 design
-  px left of its button. Now mutation-proved red in three directions. **Seven holes
-  remain open** and are listed in `30-measurement.md`.
+  px left of its button. Now mutation-proved red in three directions. The other
+  seven followed, each proved red by the exact defect it targets; 593 → 607 tests
+  across the wave. Two of the report's own diagnoses turned out to be wrong and
+  were corrected by the people closing them — see `30-measurement.md`'s status
+  section, which also records a `sed` harness bug that made three mutants look
+  like survivors when they had simply failed to compile.
 - **`type-004` is closed.** `Gold` and `Crystals`, the last open finding with money on
   it. See the ledger line for the design decisions (no `Add`/`Sub`, no `0`-fold,
   `Display` through `render::grouped`) and for what was declined.
@@ -77,6 +82,20 @@ or removed; clippy 0 on all six lanes, `cargo doc` 0, `cargo fmt --check` clean.
   `24-proj.md` and `_SPLIT_BRIEF.md` carried the same inversion and are corrected.
 - **Two ledger items were already done** (`proj-005`'s stale paths, `error.rs:106`),
   closed by `7906768` and filed open by mistake. Recorded rather than re-claimed.
+- **Comment volume.** The crate was 28.1% comments — 7,719 lines against 19,738 of code,
+  `build.rs` alone 142 over 32. An editing pass cut 722 lines with no code touched. That
+  is 9.4%, not the half that was asked for, and the shortfall is real: most of what
+  remains is measurements and rejected alternatives, which outrank the target. The
+  `X, not Y` construction (86 occurrences, the crate's most visible habit) was left
+  alone on inspection — most of them prevent a specific misreading, so the instruction
+  to cut it conflicted with the instruction to keep what disambiguates.
+- **Npcap cannot be installed for the player**, and the licence is not close about it:
+  redistribution is forbidden, the silent installer is an OEM feature starting at
+  $39,980, and winget has no Npcap package (measured). The licensor recommends exactly
+  what the README already does. See [`../npcap-provisioning.md`](../npcap-provisioning.md).
+  The research's real yield was two defects in what a player without Npcap sees: the
+  download URL sat past 300 characters of DLL paths in a non-selectable label, and the
+  `AdminOnly` branch advised running the app elevated — which it already is, by manifest.
 
 ### Validated on real hardware
 

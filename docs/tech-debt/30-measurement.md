@@ -5,6 +5,54 @@
 **Measured at:** `592d304`, on a pinned `git worktree` so three concurrent agents
 editing `src/` could not move the tree under a run.
 
+## Status — all eight holes closed, two of this report's claims wrong
+
+Closed in `e8d5a61` (§3.1) and `e3f722b` (the rest). Every test was proved red by
+applying the exact defect it targets and green again on restore. 599 → 607 tests.
+
+| Hole | Test | Proved red by |
+|---|---|---|
+| §3.1 `Anchor::Center` | `to_screen_places_an_off_centre_center_anchor` | sign flip, reversed subtraction, `abs` |
+| §3.2 delay salt | `every_builder_maps_distinct_seeds_to_distinct_delay_streams` | all 6 `^`→`&`/`\|` mutants across the 3 builders |
+| §3.3 `max_spend` | `a_budget_that_divides_by_the_cost_is_fully_spent` | `>` → `>=` |
+| C-1 outage protocol | `a_reconnect_reports_the_outage_and_its_end` | deleting `LinkUp`; muting `LinkDown` |
+| C-2 outbound lease | `a_completed_send_returns_its_budget` | `drop(lease)` → `mem::forget` |
+| C-3 recoverable acquire | `executor_aborts_without_halt_when_acquire_fails_recoverably` | `abort` → `fail`; merging the two arms |
+| C-4 dry-run scroll | `executor_dry_run_journals_a_scroll_without_touching_the_surface` | silencing the `Scroll` arm |
+| C-5 timeout arm | `an_elapsed_duration_halts_at_the_refresh_gate` | `if false && has_duration_elapsed(..)` |
+
+**Two diagnoses in this report were wrong, and the implementers proved it rather
+than working around it.**
+
+- **C-2's defect is not reachable the way it is described.** Deleting the literal
+  `drop(lease)` is a behavioural no-op — `lease` is a local binding in the
+  `while let` body and drops at scope end regardless; the test stays green with
+  the line removed. The real guarantee is that the iteration must not *retain*
+  the lease (batching, parking a chunk for retry, moving it into the message),
+  which is what `mem::forget` simulates honestly. The line-coverage claim was
+  sound; the failure story was not.
+- **C-5's arm is not defensive.** This report calls it a duplicate of a check
+  `on_tick` catches within one tick. It is on two live routes: `on_tick`'s first
+  arm (`Status::Watching` with no expectation armed) falls through to it, which
+  is the mainline timeout for a run without recovery, and so does
+  `refresh_or_halt`. The suite missed both by accident of fixture — one existing
+  test is `Paused`, the other arms an expectation.
+
+**A methodology warning worth more than any single finding.** The first pass on
+§3.2 reported the three `^`→`&` mutants as *surviving*. They were not: `&` is the
+whole-match backreference in a `sed` replacement, so the mutation never compiled,
+and "no `test result: FAILED` line" was read as "the mutant lived". Escaping it
+gave six reds. Anyone re-running these must discriminate *did not compile* from
+*compiled and passed* — otherwise the harness reproduces the exact defect this
+report exists to find: a result that held for a reason unrelated to its claim.
+
+Also settled while closing §3.2: pinning the salt's bijection at
+`DELAY_SEED_SALT` — which this report's brief suggested — **kills none of the
+five mutants.** The mutated expression is at three call sites in `jobs.rs`;
+`jitter.rs` has no operator to mutate, so a theorem about XOR asserted beside the
+constant stays true whatever the builders do with it. The property has to be
+observed through the builder's output.
+
 ## Why this report exists
 
 `README.md`'s "Method and its limits" ends on a sentence that is really a filed
