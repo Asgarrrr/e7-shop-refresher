@@ -62,10 +62,11 @@ fn without_error_prefixes(text: &str) -> &str {
 /// the sentence continuing past it — still instructing the player to restart
 /// the app the button was offering to restart.
 ///
-/// So [`split_help_url`]'s three parts become three rows: what happened, what to
-/// press, and the detail that follows. Only the first is drawn in the error
-/// colour; the trailing hint is faint, because it is guidance rather than a
-/// fault.
+/// So [`split_help_url`]'s three parts become a headline, an action row and a
+/// faint trailing hint. Nothing frames them and the button is the stock one:
+/// this module's header states that hierarchy comes from size and colour alone,
+/// with a single saturated element per screen, and that element is already the
+/// Start button one row below.
 fn error_banner(ui: &mut egui::Ui, text: &str, fetcher: &Fetcher) {
     let text = without_error_prefixes(text);
     let color = ui.visuals().error_fg_color;
