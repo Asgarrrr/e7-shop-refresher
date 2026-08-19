@@ -210,6 +210,9 @@ windows-sys = { version = "0.61", features = [
     # Reading and rewriting the app-data directory's DACL (`migrate`).
     "Win32_Security",
     "Win32_Security_Authorization",
+    # `BCryptHash`, for the SHA-256 that verifies the Npcap installer before an
+    # elevated process is allowed to run it (`install`).
+    "Win32_Security_Cryptography",
     # `GetModuleHandleW`, for the window class the actuator drives.
     "Win32_System_LibraryLoader",
     # `HKLM\...\npcap\Parameters\AdminOnly`: the one read that tells "Npcap is

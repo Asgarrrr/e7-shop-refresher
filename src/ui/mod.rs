@@ -92,6 +92,10 @@ pub struct ShopApp {
     slots: SlotRows,
     /// Starts collapsed to its title bar so the shop table owns the height.
     journal_open: bool,
+    /// Drives the error banner's Download button. Idle unless a player without
+    /// Npcap presses it, and its worker outlives no session — it is a property
+    /// of the window, not of a run.
+    fetcher: crate::install::Fetcher,
 }
 
 impl ShopApp {
@@ -127,6 +131,7 @@ impl ShopApp {
             journal_generation,
             slots,
             journal_open: false,
+            fetcher: crate::install::Fetcher::new(),
         }
     }
 }
@@ -159,7 +164,13 @@ impl eframe::App for ShopApp {
         let clicked = egui::Panel::top("status_bar")
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
             .show(ui, |ui| {
-                statusbar::render_status_bar(ui, &view, outcome.as_deref(), session_alive)
+                statusbar::render_status_bar(
+                    ui,
+                    &view,
+                    outcome.as_deref(),
+                    session_alive,
+                    &self.fetcher,
+                )
             })
             .inner;
         // Collapsed to its title bar by default; expands on click. The tab

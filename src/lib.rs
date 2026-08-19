@@ -33,6 +33,9 @@ pub mod crash;
 pub mod domain;
 pub mod error;
 pub mod journal;
+// Only the window offers the Download button, so only the window needs it.
+#[cfg(feature = "gui")]
+pub mod install;
 pub mod migrate;
 mod render;
 pub mod stream;

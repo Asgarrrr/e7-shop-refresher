@@ -7,10 +7,15 @@ use eframe::egui;
 use crate::app::Command;
 use crate::domain::control::Status;
 use crate::domain::shop::{Crystals, Gold};
+use crate::install::{Fetcher, Progress};
 
 use super::theme;
 use super::view::ViewState;
 use crate::render::amount_or_dash;
+
+/// How often to look again while a download is running. The window idles at
+/// 4 Hz; a button that says "Downloading…" needs to notice when it stops.
+const REPAINT_WHILE_FETCHING: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Splits an error line around the first URL in it: `(before, url, after)`.
 ///
@@ -44,7 +49,7 @@ fn split_help_url(text: &str) -> Option<(&str, &str, &str)> {
 ///
 /// `horizontal_wrapped` so the parts still flow as one sentence at the panel's
 /// width.
-fn error_banner(ui: &mut egui::Ui, text: &str) {
+fn error_banner(ui: &mut egui::Ui, text: &str, fetcher: &Fetcher) {
     let color = ui.visuals().error_fg_color;
     if split_help_url(text).is_none() {
         ui.colored_label(color, text);
@@ -63,9 +68,7 @@ fn error_banner(ui: &mut egui::Ui, text: &str) {
             ui.colored_label(color, before.trim_end());
             if url.to_ascii_lowercase().ends_with(".exe") {
                 ui.add_space(theme::SP_XS);
-                if ui.button("Download").on_hover_text(url).clicked() {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                }
+                install_button(ui, url, fetcher);
                 ui.add_space(theme::SP_XS);
             } else {
                 ui.hyperlink_to(url, url);
@@ -74,6 +77,54 @@ fn error_banner(ui: &mut egui::Ui, text: &str) {
         }
         ui.colored_label(color, rest.trim_start());
     });
+}
+
+/// The `Download` button and whatever the fetch is currently doing.
+///
+/// The label carries the state rather than a separate spinner or line: the
+/// banner is one wrapped sentence and a second moving element in it would be
+/// noise. While a fetch is in flight the button is disabled, so a second click
+/// cannot start a second worker — [`Fetcher::start`] refuses that anyway, and
+/// this makes the refusal visible instead of silent.
+fn install_button(ui: &mut egui::Ui, url: &str, fetcher: &Fetcher) {
+    match fetcher.progress() {
+        Progress::Fetching => {
+            ui.add_enabled(false, egui::Button::new("Downloading…"));
+            ui.ctx().request_repaint_after(REPAINT_WHILE_FETCHING);
+        }
+        Progress::Checking => {
+            ui.add_enabled(false, egui::Button::new("Checking…"));
+            ui.ctx().request_repaint_after(REPAINT_WHILE_FETCHING);
+        }
+        Progress::Launched => {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "installer opened — finish it, then restart this app",
+            );
+        }
+        Progress::Failed(reason) => {
+            // The retry stays available: the common failures here are transient
+            // (a proxy, a captive portal, a dropped connection), and a dead end
+            // is what this whole feature exists to remove.
+            if ui
+                .button("Retry download")
+                .on_hover_text(reason.clone())
+                .clicked()
+            {
+                fetcher.start();
+            }
+            ui.colored_label(ui.visuals().error_fg_color, format!(" — {reason}"));
+        }
+        Progress::Idle => {
+            if ui
+                .button("Download")
+                .on_hover_text(format!("{url}\nverified before it is run"))
+                .clicked()
+            {
+                fetcher.start();
+            }
+        }
+    }
 }
 
 /// Top chrome: the error banner, then two rows — status (dot + word + clause)
@@ -86,10 +137,11 @@ pub(super) fn render_status_bar(
     view: &ViewState,
     outcome: Option<&str>,
     session_alive: bool,
+    fetcher: &Fetcher,
 ) -> Option<Command> {
     let mut clicked = None;
     if let Some(outcome) = outcome {
-        error_banner(ui, outcome);
+        error_banner(ui, outcome, fetcher);
         ui.separator();
     }
 
@@ -296,7 +348,7 @@ mod tests {
                    the same signed installer is at \
                    https://dev-libs.wireshark.org/windows/packages/Npcap/ ), then restart";
         let harness = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &view, Some(two), true);
+            let _ = render_status_bar(ui, &view, Some(two), true, &Fetcher::new());
         });
         harness.get_by_label("https://npcap.com/#download");
         harness.get_by_label("https://dev-libs.wireshark.org/windows/packages/Npcap/");
@@ -314,7 +366,7 @@ mod tests {
     fn the_npcap_banner_offers_the_download_as_a_link() {
         let view = idle_view();
         let harness = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &view, Some(NPCAP_ERROR), true);
+            let _ = render_status_bar(ui, &view, Some(NPCAP_ERROR), true, &Fetcher::new());
         });
         // The address is its own widget, so it is clickable rather than a run of
         // characters to be selected out of a 270-character line.
@@ -331,7 +383,7 @@ mod tests {
                    https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe \
                    Keep the installer's defaults, then restart this app.";
         let harness = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &view, Some(msg), true);
+            let _ = render_status_bar(ui, &view, Some(msg), true, &Fetcher::new());
         });
         harness.get_by_label("Download");
         // The address itself is not on screen; it is the button's hover text.
@@ -350,7 +402,7 @@ mod tests {
         let view = idle_view();
         let plain = "session error: the game window vanished";
         let harness = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &view, Some(plain), true);
+            let _ = render_status_bar(ui, &view, Some(plain), true, &Fetcher::new());
         });
         harness.get_by_label(plain);
     }
@@ -359,7 +411,7 @@ mod tests {
     fn idle_status_bar_hides_stop_and_toggle() {
         let view = idle_view();
         let harness = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &view, None, true);
+            let _ = render_status_bar(ui, &view, None, true, &Fetcher::new());
         });
         assert!(harness.query_by_label("Stop").is_none());
         assert!(harness.query_by_label("Toggle").is_none());
@@ -369,7 +421,7 @@ mod tests {
     fn status_bar_shows_currencies_and_a_clean_status() {
         let view = idle_view();
         let harness = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &view, None, true);
+            let _ = render_status_bar(ui, &view, None, true, &Fetcher::new());
         });
         harness.get_by_label("SKYSTONES");
         harness.get_by_label("GOLD");
@@ -381,7 +433,7 @@ mod tests {
     fn run_tiles_hidden_only_while_idle() {
         let idle = idle_view();
         let idle_bar = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &idle, None, true);
+            let _ = render_status_bar(ui, &idle, None, true, &Fetcher::new());
         });
         idle_bar.get_by_label("SKYSTONES");
         assert!(idle_bar.query_by_label("REFRESHES").is_none());
@@ -394,7 +446,7 @@ mod tests {
         let _ = controller.handle(Event::Start { now_ms: 0 });
         let armed = view_state(&controller);
         let armed_bar = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &armed, None, true);
+            let _ = render_status_bar(ui, &armed, None, true, &Fetcher::new());
         });
         for label in ["REFRESHES", "0/10", "COVENANT", "MYSTIC"] {
             armed_bar.get_by_label(label);
@@ -409,7 +461,7 @@ mod tests {
         let _ = controller.handle(Event::Stop);
         let stopped = view_state(&controller);
         let stopped_bar = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &stopped, None, true);
+            let _ = render_status_bar(ui, &stopped, None, true, &Fetcher::new());
         });
         stopped_bar.get_by_label("REFRESHES");
     }
@@ -421,7 +473,7 @@ mod tests {
         // `clicked` mutably; `drop(harness)` releases the borrow before the read.
         let mut clicked = None;
         let mut harness = Harness::new_ui(|ui| {
-            if let Some(command) = render_status_bar(ui, &view, None, true) {
+            if let Some(command) = render_status_bar(ui, &view, None, true, &Fetcher::new()) {
                 clicked = Some(command);
             }
         });
@@ -435,7 +487,7 @@ mod tests {
     fn armed_status_bar_hides_start_and_toggle() {
         let view = watching_view();
         let harness = Harness::new_ui(|ui| {
-            let _ = render_status_bar(ui, &view, None, true);
+            let _ = render_status_bar(ui, &view, None, true, &Fetcher::new());
         });
         assert!(harness.query_by_label("Start").is_none());
         assert!(harness.query_by_label("Toggle").is_none());
@@ -446,7 +498,7 @@ mod tests {
         let view = watching_view();
         let mut clicked = None;
         let mut harness = Harness::new_ui(|ui| {
-            if let Some(command) = render_status_bar(ui, &view, None, true) {
+            if let Some(command) = render_status_bar(ui, &view, None, true, &Fetcher::new()) {
                 clicked = Some(command);
             }
         });
