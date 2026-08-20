@@ -1,9 +1,10 @@
 //! Fetching the Npcap installer for a player who has none.
 //!
 //! One pinned file, checked byte for byte, then launched. It cannot install
-//! anything itself — Npcap's silent installer is the paid OEM product
-//! (`docs/npcap-provisioning.md` quotes the licence). Build, URL and hash live
-//! in [`crate::npcap`].
+//! anything itself — Npcap's silent installer is the paid OEM product (the
+//! Npcap LICENSE at <https://npcap.com>, LICENSE GRANT: the OEM edition
+//! "also includes a silent installer for unattended installation"). Build,
+//! URL and hash live in [`crate::npcap`].
 //!
 //! A pin only binds if the bytes hashed and the bytes executed are the same
 //! bytes, and any medium-integrity process of the same user can write `%TEMP%`.
