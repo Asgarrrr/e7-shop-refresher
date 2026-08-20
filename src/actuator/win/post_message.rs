@@ -310,17 +310,191 @@ pub(super) fn post(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
     use windows_sys::Win32::Foundation::HWND;
 
     use crate::actuator::win::tests::{
         GAME_HWND, OTHER_HWND, dead_handle, game_rect, uipi_refusal,
     };
 
+    // The specification the order tests below assert — read off the live
+    // `click`/`scroll` above, not copied from the plan that asked for this
+    // module, because the two are checked to agree independently:
+    //
+    // `click`:
+    //   1. `verify`  — `client_rect(hwnd)`, compared to `target.rect`
+    //   2. `shield::raise(hwnd, rect)` — `Sleep(SHIELD_DRAIN_MS)` follows
+    //      *only* when it returned `true`
+    //   3. `Post(WM_MOUSEMOVE, 0, lparam)`, `lparam` the **client** point
+    //   4. `Sleep(MOVE_SETTLE_MS)`
+    //   5. `Post(WM_LBUTTONDOWN, MK_LBUTTON, lparam)`
+    //   6. `Sleep(press_ms)`
+    //   7. `release_twice` → `Post(WM_LBUTTONUP, 0, lparam)`, retried once on
+    //      a failed first attempt (see `release_twice`'s own contract)
+    //
+    // `scroll`:
+    //   1. `verify` — same as `click`'s step 1
+    //   2. `shield::raise` — same as `click`'s step 2
+    //   3. `Post(WM_MOUSEMOVE, 0, lparam)`, `lparam` the **client** point
+    //   4. `Sleep(MOVE_SETTLE_MS)`
+    //   5. `Post(WM_MOUSEWHEEL, wheel_wparam(notches), lparam)` — this
+    //      `lparam` is the **screen** point (`at`, unconverted): `WM_MOUSEWHEEL`
+    //      takes screen coordinates by Win32 convention, unlike every other
+    //      message this backend posts. Confirmed against the live code: this
+    //      asymmetry is real, not a plan assumption.
+    //
+    // Verified against `MessageSurface::click`/`::scroll` above as they stood
+    // before this test module existed: the live order matches what the plan
+    // predicted, with no divergence.
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum MessageCall {
+        FindWindow,
+        Probe(Hwnd),
+        ClientRect(Hwnd),
+        Post(Hwnd, u32, usize, isize),
+        ShieldRaise(Hwnd, ClientRect),
+        ShieldHide,
+        Sleep(u64),
+    }
+
+    struct FakeState {
+        calls: Vec<MessageCall>,
+        window: Hwnd,
+        rect: ClientRect,
+        find_results: VecDeque<Result<Hwnd, SurfaceError>>,
+        probe_results: VecDeque<std::io::Result<()>>,
+        rect_results: VecDeque<Result<ClientRect, SurfaceError>>,
+        post_results: VecDeque<Result<(), SurfaceError>>,
+        shield_raise_results: VecDeque<Result<bool, String>>,
+    }
+
+    impl Default for FakeState {
+        fn default() -> Self {
+            Self {
+                calls: Vec::new(),
+                window: GAME_HWND,
+                rect: game_rect(),
+                find_results: VecDeque::new(),
+                probe_results: VecDeque::new(),
+                rect_results: VecDeque::new(),
+                post_results: VecDeque::new(),
+                shield_raise_results: VecDeque::new(),
+            }
+        }
+    }
+
+    struct FakeMessageDriver {
+        state: Arc<Mutex<FakeState>>,
+    }
+
+    impl MessageDriver for FakeMessageDriver {
+        fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(MessageCall::FindWindow);
+            if let Some(result) = state.find_results.pop_front() {
+                result
+            } else {
+                Ok(state.window)
+            }
+        }
+
+        fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(MessageCall::Probe(hwnd));
+            state.probe_results.pop_front().unwrap_or(Ok(()))
+        }
+
+        fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(MessageCall::ClientRect(hwnd));
+            if let Some(result) = state.rect_results.pop_front() {
+                result
+            } else {
+                Ok(state.rect)
+            }
+        }
+
+        fn post(
+            &mut self,
+            hwnd: Hwnd,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> Result<(), SurfaceError> {
+            let mut state = self.state.lock().unwrap();
+            state
+                .calls
+                .push(MessageCall::Post(hwnd, msg, wparam, lparam));
+            state.post_results.pop_front().unwrap_or(Ok(()))
+        }
+
+        fn shield_raise(&mut self, hwnd: Hwnd, rect: ClientRect) -> Result<bool, String> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(MessageCall::ShieldRaise(hwnd, rect));
+            state.shield_raise_results.pop_front().unwrap_or(Ok(false))
+        }
+
+        fn shield_hide(&mut self) {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push(MessageCall::ShieldHide);
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push(MessageCall::Sleep(duration.as_millis() as u64));
+        }
+    }
+
+    fn moved_rect() -> ClientRect {
+        ClientRect {
+            left: 11,
+            ..game_rect()
+        }
+    }
+
+    fn fake_surface() -> (MessageSurface, Arc<Mutex<FakeState>>) {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let surface = MessageSurface::with_driver(FakeMessageDriver {
+            state: state.clone(),
+        });
+        (surface, state)
+    }
+
+    /// Hands back the window every later call has to present, and clears the
+    /// acquire's own calls out of the log so each test's assertion is about
+    /// what it triggered, not `acquire`'s.
+    fn acquire_and_clear(surface: &mut MessageSurface, state: &Arc<Mutex<FakeState>>) -> Target {
+        let (target, rect) = surface.acquire().expect("the fake acquires");
+        assert_eq!(rect, game_rect());
+        state.lock().unwrap().calls.clear();
+        target
+    }
+
+    fn calls(state: &Arc<Mutex<FakeState>>) -> Vec<MessageCall> {
+        state.lock().unwrap().calls.clone()
+    }
+
+    fn posts(state: &Arc<Mutex<FakeState>>) -> Vec<MessageCall> {
+        calls(state)
+            .into_iter()
+            .filter(|call| matches!(call, MessageCall::Post(..)))
+            .collect()
+    }
+
     /// `release` can be reached two or three times over one job with no shield
     /// ever raised, and `shield::hide` has to tolerate all of it.
     #[test]
     fn message_surface_cleanup_is_idempotent_without_a_shield() {
-        let mut surface = MessageSurface::default();
+        let (mut surface, state) = fake_surface();
         let target = Target {
             hwnd: GAME_HWND,
             rect: game_rect(),
@@ -328,8 +502,204 @@ mod tests {
 
         surface.release(&target);
         surface.release(&target);
-
         drop(surface);
+
+        assert_eq!(
+            calls(&state)
+                .into_iter()
+                .filter(|call| *call == MessageCall::ShieldHide)
+                .count(),
+            3,
+            "the two explicit `release`s plus the one from `Drop` must each lower the shield"
+        );
+    }
+
+    #[test]
+    fn a_click_posts_move_then_down_then_up_in_that_order() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+        state
+            .lock()
+            .unwrap()
+            .shield_raise_results
+            .push_back(Ok(true));
+
+        assert_eq!(surface.click(&target, (400, 500), 25), Ok(()));
+
+        let lparam = pack_point(target.to_client((400, 500))).unwrap();
+        assert_eq!(
+            calls(&state),
+            vec![
+                MessageCall::ClientRect(GAME_HWND),
+                MessageCall::ShieldRaise(GAME_HWND, game_rect()),
+                MessageCall::Sleep(SHIELD_DRAIN_MS),
+                MessageCall::Post(GAME_HWND, WM_MOUSEMOVE, 0, lparam),
+                MessageCall::Sleep(MOVE_SETTLE_MS),
+                MessageCall::Post(GAME_HWND, WM_LBUTTONDOWN, MK_LBUTTON as usize, lparam),
+                MessageCall::Sleep(25),
+                MessageCall::Post(GAME_HWND, WM_LBUTTONUP, 0, lparam),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_shield_is_raised_before_any_message_is_posted() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+
+        assert_eq!(surface.click(&target, (30, 40), 5), Ok(()));
+
+        let recorded = calls(&state);
+        let shield_at = recorded
+            .iter()
+            .position(|call| matches!(call, MessageCall::ShieldRaise(..)))
+            .expect("the shield must be raised for every click");
+        let first_post = recorded
+            .iter()
+            .position(|call| matches!(call, MessageCall::Post(..)))
+            .expect("a click must post something");
+        assert!(
+            shield_at < first_post,
+            "never click shieldless: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn a_freshly_placed_shield_gets_the_drain_beat() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+        state
+            .lock()
+            .unwrap()
+            .shield_raise_results
+            .push_back(Ok(true));
+
+        assert_eq!(surface.click(&target, (30, 40), 5), Ok(()));
+
+        assert!(
+            calls(&state).contains(&MessageCall::Sleep(SHIELD_DRAIN_MS)),
+            "a (re)placed shield must drain before the move is posted"
+        );
+    }
+
+    #[test]
+    fn an_already_raised_shield_gets_no_drain_beat() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+        state
+            .lock()
+            .unwrap()
+            .shield_raise_results
+            .push_back(Ok(false));
+
+        assert_eq!(surface.click(&target, (30, 40), 5), Ok(()));
+
+        assert!(
+            !calls(&state).contains(&MessageCall::Sleep(SHIELD_DRAIN_MS)),
+            "a shield already seated must not stretch the click with a drain beat"
+        );
+    }
+
+    #[test]
+    fn a_failed_shield_raise_is_fatal_and_posts_nothing() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+        state
+            .lock()
+            .unwrap()
+            .shield_raise_results
+            .push_back(Err("raise the input shield: access denied".to_owned()));
+
+        assert!(matches!(
+            surface.click(&target, (30, 40), 5),
+            Err(SurfaceError::Fatal(reason)) if reason.contains("access denied")
+        ));
+        assert!(posts(&state).is_empty());
+    }
+
+    #[test]
+    fn a_moved_window_is_refused_before_the_shield_goes_up() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+        state
+            .lock()
+            .unwrap()
+            .rect_results
+            .push_back(Ok(moved_rect()));
+
+        assert!(matches!(
+            surface.click(&target, (30, 40), 5),
+            Err(SurfaceError::Recoverable(reason)) if reason.contains("moved or resized")
+        ));
+        assert_eq!(
+            calls(&state),
+            vec![MessageCall::ClientRect(GAME_HWND)],
+            "a moved window must be refused before the shield is touched or anything is posted"
+        );
+    }
+
+    /// The invariant `engage`'s doc comment states plainly: never leave the
+    /// left button held in the game window. `release_twice` is what enforces
+    /// it, and this is the one scenario where enforcing it matters — the
+    /// first `WM_LBUTTONUP` is refused.
+    #[test]
+    fn the_button_is_released_even_when_the_first_release_post_fails() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+        state.lock().unwrap().post_results.extend([
+            Ok(()),                                                  // MOUSEMOVE
+            Ok(()),                                                  // LBUTTONDOWN
+            Err(SurfaceError::Recoverable("queue full".to_owned())), // first LBUTTONUP
+            Ok(()),                                                  // retried LBUTTONUP
+        ]);
+
+        // `release_twice` reports the *first* failure once the button is
+        // provably up, so this is `Err`, not `Ok` — what matters here is that
+        // the retry happened at all.
+        assert!(matches!(
+            surface.click(&target, (30, 40), 5),
+            Err(SurfaceError::Recoverable(reason)) if reason.contains("queue full")
+        ));
+
+        let lparam = pack_point(target.to_client((30, 40))).unwrap();
+        let up_posts = calls(&state)
+            .into_iter()
+            .filter(|call| *call == MessageCall::Post(GAME_HWND, WM_LBUTTONUP, 0, lparam))
+            .count();
+        assert_eq!(
+            up_posts, 2,
+            "a refused release must be retried, never left held"
+        );
+    }
+
+    #[test]
+    fn a_scroll_posts_move_then_wheel_with_screen_coordinates() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+
+        assert_eq!(surface.scroll(&target, (300, 600), -2), Ok(()));
+
+        let client_lparam = pack_point(target.to_client((300, 600))).unwrap();
+        let screen_lparam = pack_point((300, 600)).unwrap();
+        assert_ne!(
+            client_lparam, screen_lparam,
+            "the test target must actually distinguish client from screen coordinates"
+        );
+        assert_eq!(
+            calls(&state),
+            vec![
+                MessageCall::ClientRect(GAME_HWND),
+                MessageCall::ShieldRaise(GAME_HWND, game_rect()),
+                MessageCall::Post(GAME_HWND, WM_MOUSEMOVE, 0, client_lparam),
+                MessageCall::Sleep(MOVE_SETTLE_MS),
+                MessageCall::Post(
+                    GAME_HWND,
+                    WM_MOUSEWHEEL,
+                    wheel_wparam(-2).unwrap(),
+                    screen_lparam
+                ),
+            ]
+        );
     }
 
     #[test]
