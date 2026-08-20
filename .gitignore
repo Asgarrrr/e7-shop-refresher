@@ -29,10 +29,12 @@ Thumbs.db
 # Runtime panic log (crash.log; app-data first, temp-dir fallback)
 crash.log
 
-# Packet captures. `pktmon start --capture` with no `-f` writes PktMon.etl into
-# the working directory and grows it to 512 MB, so a capture session run from
-# the repo root leaves one here. These hold real network traffic and must never
-# reach a commit.
+# Packet captures. The capture backend is Npcap (see src/capture/pcap), and a
+# manual debugging session — dumping with Wireshark/dumpcap or exporting a
+# capture from it — writes a `.pcap`/`.pcapng` next to wherever it was run,
+# which is often the repo root. `.etl` stays too: Windows' built-in tracing
+# (Event Trace Log) produces the same hazard through a different tool. These
+# hold real network traffic and must never reach a commit.
 *.etl
 *.pcap
 *.pcapng
