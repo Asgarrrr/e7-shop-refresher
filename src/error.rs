@@ -10,11 +10,15 @@
 //! loses its cause everywhere at once, silently. A `tracing` field spelled
 //! `error = ?err` is unaffected.
 //!
-//! The two TOML payloads are boxed: 88 bytes each, built once at startup, while
-//! `Error` is the `E` of every `Result` in the crate including the capture
-//! loop's — boxing takes it from 96 bytes to 48. No clippy threshold catches
-//! this (`result_large_err` fires at 128, `large_enum_variant` at a 200-byte
-//! spread), so the `const` assertion at the bottom is the check.
+//! The two TOML payloads are boxed: a `toml::de::Error` is 88 bytes even with
+//! its `input` cleared (see [`Error::ConfigParse`]'s documentation — clearing
+//! a field doesn't shrink the type), built once at startup, while `Error` is
+//! the `E` of every `Result` in the crate including the capture loop's —
+//! boxing takes it from 96 bytes to 48. [`ReparseMessage`] is small enough on
+//! its own not to need it, but is boxed anyway for the same margin. No
+//! clippy threshold catches this (`result_large_err` fires at 128,
+//! `large_enum_variant` at a 200-byte spread), so the `const` assertion at
+//! the bottom is the check.
 
 use std::path::PathBuf;
 
@@ -33,7 +37,17 @@ pub enum Error {
     Config(String),
 
     /// `config.toml` is not valid TOML, or does not match `Config`'s shape.
-    /// Boxed: see the module header.
+    ///
+    /// The boxed `toml::de::Error` has its `input` cleared before it is
+    /// stored (see the `From` impl below) — that field is the *entire* file,
+    /// which is what a derived `Debug` would otherwise print in full, and
+    /// what `Display` renders one line of under a caret. `server_url` can
+    /// carry a `user:pass@` credential, and this error is logged to the file
+    /// the player is asked to send in. Clearing `input` has a second effect,
+    /// not just incidental: `toml::de::Error`'s `Display` only prints the
+    /// dotted key path (`in` followed by the field name in backticks) when it
+    /// has *no* excerpt to show instead, so this also promotes the field
+    /// name into the message the player sees. Boxed: see the module header.
     #[error("config.toml is not valid")]
     ConfigParse(#[source] Box<toml::de::Error>),
 
@@ -60,11 +74,12 @@ pub enum Error {
     },
 
     /// The on-disk `config.toml` could not be re-parsed by the format-preserving
-    /// editor before splicing the managed sections in. Kept as the source type
-    /// rather than a `String` because `toml_edit::TomlError` carries the
-    /// offending span. Boxed: see the module header.
+    /// editor before splicing the managed sections in. Carries a
+    /// [`ReparseMessage`] rather than the upstream `toml_edit::TomlError`
+    /// itself: see that type's documentation for why. Boxed: see the module
+    /// header.
     #[error("config.toml could not be re-parsed to be edited")]
-    ConfigReparse(#[source] Box<toml_edit::TomlError>),
+    ConfigReparse(#[source] Box<ReparseMessage>),
 
     /// A managed section could not be serialized back to TOML. Distinct from
     /// [`Error::ConfigReparse`] on purpose: only one of the two is the player's
@@ -108,18 +123,61 @@ impl Error {
     }
 }
 
+/// The `message()` half of a `toml_edit::TomlError`, carrying nothing else.
+///
+/// `Error::ConfigParse` closes its leak by clearing `toml::de::Error`'s
+/// `input` field in place — that type's `set_input` is `pub`
+/// (`toml` 1.1.2, `src/de/error.rs:78`) — and keeps the upstream error
+/// itself boxed as the `#[source]`. `toml_edit::TomlError` cannot take the
+/// same path: its `set_input` exists but is `pub(crate)`
+/// (`toml_edit` 0.25.12, `src/error.rs:76`), so there is no way to blank the
+/// excerpt on the type from outside its crate. Carrying only `message()`
+/// forward — built fresh, with no `input` field of its own to derive `Debug`
+/// over — is the alternative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReparseMessage(String);
+
+impl std::fmt::Display for ReparseMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReparseMessage {}
+
 // Hand-written rather than `#[from]`: `#[from] Box<T>` would generate
 // `From<Box<toml::de::Error>>`, and the `?` on `toml::from_str` in `config`
 // needs `From<toml::de::Error>`.
+//
+// `set_input(None)` before boxing is the fix, not incidental: `Display`
+// renders the offending line of `config.toml` under a caret only inside the
+// branch gated on having *both* an `input` and a `span`; clearing `input`
+// takes that branch out, for both `Display` and the derived `Debug` (which
+// prints every field, `input` included — a derive cannot skip one). What is
+// left after that branch is gone is `self.message`, plus — only reached when
+// the excerpt branch does not fire — `in \`dotted.key.path\``. So this does
+// not just delete information: it promotes the field name from a branch that
+// used to be dead whenever a source excerpt was available.
+//
+// Residual risk this does not close: `message()` is `toml`'s own text, and
+// for a plain type mismatch it can echo the offending *value* verbatim
+// (`invalid type: integer \`123\`, expected a string`). `server_url` cannot
+// hit that path: `#[serde(try_from = "String")]` means the string half
+// always deserializes cleanly, so a `ServerUrl` failure is always
+// `ServerUrl::parse`'s own message, which never repeats its input
+// (`config::server_url`). A future field deserialized straight from a
+// scalar, without a validating `try_from` in front of it, would not have
+// that protection.
 impl From<toml::de::Error> for Error {
-    fn from(source: toml::de::Error) -> Self {
+    fn from(mut source: toml::de::Error) -> Self {
+        source.set_input(None);
         Self::ConfigParse(Box::new(source))
     }
 }
 
 impl From<toml_edit::TomlError> for Error {
     fn from(source: toml_edit::TomlError) -> Self {
-        Self::ConfigReparse(Box::new(source))
+        Self::ConfigReparse(Box::new(ReparseMessage(source.message().to_owned())))
     }
 }
 
@@ -163,6 +221,29 @@ mod tests {
         let err = Error::Capture("no adapter".to_owned());
         assert_eq!(err.report(), err.to_string());
         assert_eq!(err.report(), "network capture: no adapter");
+    }
+
+    #[test]
+    fn a_toml_parse_error_reports_a_location_without_the_source_line() {
+        // Deliberately malformed TOML; the marker sits on the offending line
+        // itself, in the excerpt `Display` would otherwise render under a
+        // caret and the derived `Debug` would otherwise print via `input`.
+        let text = "fake-secret = not valid toml here][";
+        let toml_err =
+            toml::from_str::<toml::Value>(text).expect_err("this text is not valid TOML");
+        let err: Error = toml_err.into();
+        for rendered in [format!("{err:?}"), err.to_string(), err.report()] {
+            assert!(!rendered.contains("fake-secret"), "{rendered}");
+        }
+        // Positive assertion: the fix must not degenerate into "print
+        // nothing" — `report()` still carries `toml`'s own diagnosis (just
+        // not the source), so it is strictly longer than the bare variant
+        // message alone.
+        assert!(
+            err.report().len() > err.to_string().len(),
+            "{}",
+            err.report()
+        );
     }
 
     /// The trap the convention closes: a `#[source]` whose message does *not*
