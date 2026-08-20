@@ -178,6 +178,60 @@ jobs:
         run: cargo test --locked --no-default-features --features pcap-backend
       - name: Test shipped default features (non-elevated tests)
         run: cargo test --locked
+      # The `#[cfg(not(debug_assertions))]` arm of `stream::budget`'s accounting
+      # tests only compiles here: it is the assertion behind `Cargo.toml`'s
+      # `overflow-checks = true`, that a shipped build saturates and logs a
+      # byte-accounting bug rather than panicking, because a panic from a `Drop`
+      # during an unwind aborts with no `crash.log`. Run on both toolchain arms,
+      # same as the four test steps above and with no `if:` gate, because debug
+      # and release genuinely test different code and there is no
+      # toolchain-specific reason to skip either arm.
+      - name: Test release configuration (release-only accounting test)
+        run: cargo test --locked --release --no-default-features --features gui,actuator
+
+  macos-portable:
+    name: Portable suite on macOS
+    runs-on: macos-latest
+    # Declared per job rather than left to inherit the workflow-level block
+    # above, matching this file's habit of declaring what a job needs instead
+    # of assuming it. Redundant with the `contents: read` already set at
+    # workflow level today, but this job's own requirement (checkout, compile,
+    # test — nothing that writes) should stay legible on its own if the
+    # workflow-level block above ever changes to differ per job, the way
+    # `release.yml`'s does.
+    permissions:
+      contents: read
+    # The only Rust-building job above runs on `windows-latest`, and
+    # `dependency-policy`'s `ubuntu-24.04` job installs a toolchain but never
+    # builds the crate — so the eight `#[cfg(not(windows))]` sites in
+    # `install.rs`, `lib.rs` and `migrate.rs` are compiled by nothing, and
+    # `justfile`'s `verify` recipe bills itself as "the lanes that run on any
+    # OS, no native backend, no elevation" without anything testing that claim.
+    # This job is that test: a compile-and-test gate for the portable lanes,
+    # on the one other OS this crate claims to run on.
+    #
+    # macOS, not Linux: `Cargo.toml:105-106` disables `winit`'s x11/wayland
+    # features on `eframe`'s `glow` backend ("targets are Windows and macOS,
+    # so wgpu/x11/wayland is build time spent on nothing"), so a `gui` lane on
+    # `ubuntu-*` is expected to fail to build for a reason that says nothing
+    # about this crate's own portability. macOS is the project's actual
+    # second target.
+    #
+    # Only the portable lanes: the same four commands `just verify` runs on
+    # any OS. No `pcap-backend`, no `backends` recipe, no elevation.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.92.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: macos-1.92.0
+      - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+      - run: cargo clippy --locked --no-default-features --features gui,actuator --all-targets -- -D warnings
+      - run: cargo test --locked --no-default-features
+      - run: cargo test --locked --no-default-features --features gui,actuator
 
   dependency-policy:
     name: Dependency policy
