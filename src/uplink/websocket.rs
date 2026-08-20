@@ -40,8 +40,11 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// than the OS would.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How long a connection has to stay up before it counts as a *link* rather
-/// than a completed handshake.
+/// How long the link has to stay up before it counts as a *link* rather than a
+/// completed handshake — accumulated across one outage's reconnects, not
+/// demanded of a single one of them. The last two paragraphs are why the
+/// accounting is cumulative; the ones before them are why there is a window at
+/// all.
 ///
 /// A peer can accept the WebSocket upgrade and close the socket in the same
 /// millisecond: an auth reject that answers on the wire instead of in the status
@@ -70,15 +73,36 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// accept-then-close cases above, which end within an RTT of the upgrade, so
 /// the two are separated by a wide margin rather than by a hair.
 ///
-/// What it costs: a genuinely flaky-but-usable link — one that carries traffic
-/// in bursts shorter than this — no longer earns its delay back, so the delay
-/// climbs to `reconnect.max_ms` (30 s by default) and the link is sampled far
-/// less often than it could be used. That is the deliberate half of the trade,
-/// because the two errors are not symmetrical: waiting too long costs at most
-/// one `max_ms` of extra downtime once the network heals, while resetting too
-/// eagerly costs an unbounded hot loop that also spams the journal and blinds
-/// the watchdog. And a link too poor to hold ten seconds is too poor to let a
-/// purchase be confirmed, which is the operation those retries are for.
+/// Why the ten seconds accumulate instead of being demanded in one unbroken
+/// stretch: read per connection, this window had a terminal state. A link that
+/// keeps coming back and keeps dying at, say, six seconds — a proxy with an
+/// idle timeout shorter than this one, a load balancer recycling connections, a
+/// congested uplink — reports its first `LinkDown` and then nothing, ever,
+/// because `LinkUp` is emitted from here and `Controller::link_up` is set by
+/// that event and by nothing else. `Controller::watchdog` then returns early on
+/// every tick for the rest of the session: no confirm re-click, no re-issue,
+/// and no honest `Unresponsive` halt either. A hunt paused on a missed purchase
+/// echo stays paused forever, over a wire that was carrying traffic six seconds
+/// out of every six-and-a-bit. That is strictly worse than the flapping the
+/// window exists to prevent, and it is not what the argument above bought.
+///
+/// Counting connected time across the outage keeps both halves. The
+/// accept-then-close peers contribute one round-trip apiece, so ten seconds of
+/// them is thousands of retries at a delay that has long since climbed to
+/// `reconnect.max_ms` — days of it — and they still never report a recovery. A
+/// link that is genuinely up most of the time reports one every `LINK_SETTLED`
+/// of *uptime*, which is the rate the anti-flap argument was really about: what
+/// made the old reset intolerable was a handshake re-granting the watchdog's
+/// deadline every second, and uptime cannot be spent faster than it is earned.
+///
+/// What it still costs: a link too poor to accumulate ten seconds across a
+/// whole outage is sampled at `reconnect.max_ms` (30 s by default) and reports
+/// no recovery at all. That half stays deliberate — such a link cannot carry a
+/// purchase confirmation, which is the operation those retries are for, and the
+/// standing `LinkDown` is the honest report for it. The watchdog stays
+/// suspended there on purpose: no proof can arrive over a wire that is not
+/// there, and halting the hunt with `Unresponsive` would blame the game for the
+/// network.
 const LINK_SETTLED: Duration = Duration::from_secs(10);
 
 /// Normalized, bounded exponential reconnect delay.
@@ -171,10 +195,14 @@ async fn run_with_connector<C, S>(
 {
     let mut backoff = Backoff::new(initial_backoff, max_backoff);
     // The player only hears transitions: the first failure reports the outage,
-    // each retry stays a tracing detail, recovery reports once — and only once a
-    // connection has held for `LINK_SETTLED`, since a peer that accepts the
+    // each retry stays a tracing detail, recovery reports once — and only once
+    // the link has been up for `LINK_SETTLED`, since a peer that accepts the
     // upgrade and hangs up is a retry, not a recovery.
     let mut outage_reported = false;
+    // Connected time this outage has accumulated towards `LINK_SETTLED`, across
+    // however many reconnects it took. Cleared when the link settles: a settled
+    // link's own uptime is spent, and the next outage starts from zero.
+    let mut connected_for = Duration::ZERO;
     // `server` is `url`'s **redacted** `scheme://host[:port]` form, and it cannot
     // be anything else: `%url` goes through `ServerUrl`'s `Display`, which prints
     // only that. The dial string — userinfo and query intact, either able to
@@ -221,20 +249,36 @@ async fn run_with_connector<C, S>(
                 let session = pump(stream, &mut outbound, &inbound, &mut shutdown)
                     .instrument(tracing::info_span!("link", server = %url, attempt));
                 tokio::pin!(session);
+                let connected_at = tokio::time::Instant::now();
+                // What this connection still owes, not the whole window: the
+                // seconds earlier reconnects in this same outage already served
+                // count towards it (see `LINK_SETTLED`).
+                let owed = LINK_SETTLED.saturating_sub(connected_for);
                 // Two phases rather than a `select!` loop: the deadline matters
                 // exactly once per connection, and past it there is nothing left
                 // to race, so the second phase is a bare `await`. `biased` puts
                 // the session first, which decides the tie — a connection that
                 // ends in the same poll as the deadline reads as "did not hold",
-                // the conservative half of a distinction that only ever costs one
-                // extra backoff step.
+                // the conservative half of a distinction that costs one extra
+                // backoff step and hands the whole ten seconds to the next
+                // connection, which then settles as soon as it opens. That is
+                // the one case where an upgrade alone ends an outage, and it is
+                // still ten seconds of measured uptime that says so.
                 let ended_before_settling = tokio::select! {
                     biased;
                     outcome = &mut session => Some(outcome),
-                    () = tokio::time::sleep(LINK_SETTLED) => None,
+                    () = tokio::time::sleep(owed) => None,
                 };
                 let outcome = match ended_before_settling {
-                    Some(outcome) => outcome,
+                    Some(outcome) => {
+                        // Short of the window, but not nothing: what this
+                        // connection did serve is what the next one builds on.
+                        // Saturating because the alternative is a panic in a
+                        // debug build over an arithmetic case a `Duration` this
+                        // small cannot reach.
+                        connected_for = connected_for.saturating_add(connected_at.elapsed());
+                        outcome
+                    }
                     None => {
                         // One decision, two effects, deliberately inseparable:
                         // the connection that earned the delay back is the same
@@ -242,6 +286,9 @@ async fn run_with_connector<C, S>(
                         // this went wrong in the first place.
                         debug!(server = %url, attempt, "server link held — retry delay reset");
                         backoff.reset();
+                        // Spent, not banked: the next outage starts from zero,
+                        // however long this link goes on to live.
+                        connected_for = Duration::ZERO;
                         if std::mem::take(&mut outage_reported) {
                             let _ = inbound.send(UplinkEvent::LinkUp).await;
                         }
@@ -494,7 +541,7 @@ async fn forward(payload: &[u8], inbound: &mpsc::Sender<UplinkEvent>, reported_d
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::future::{pending, ready};
+    use std::future::{Future, pending, ready};
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
@@ -655,6 +702,60 @@ mod tests {
         }
         fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
             self.sink_state()
+        }
+    }
+
+    /// A peer that carries the connection for a while and *then* hangs up: the
+    /// middle ground between `StalledLink`, which never ends, and a
+    /// `ScriptedLink` that closes in the same poll as the upgrade. That middle
+    /// ground is the whole subject of `LINK_SETTLED`, and nothing else here
+    /// could express it — a link either lived forever or died instantly.
+    struct BriefLink {
+        alive: Duration,
+        closing: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl BriefLink {
+        fn new(alive: Duration) -> Self {
+            Self {
+                alive,
+                closing: None,
+            }
+        }
+    }
+
+    impl Stream for BriefLink {
+        type Item = Result<Message, WsError>;
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            // The timer starts at the first poll, not at construction: the
+            // connector builds the link, and `pump` is what puts it on the wire.
+            let this = self.get_mut();
+            let alive = this.alive;
+            let closing = this
+                .closing
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(alive)));
+            closing
+                .as_mut()
+                .poll(cx)
+                .map(|()| Some(Ok(Message::Close(None))))
+        }
+    }
+
+    impl Sink<Message> for BriefLink {
+        type Error = WsError;
+        // Frozen, like `StalledLink`'s: these tests hold their outbound channel
+        // open and empty, so the writer parks on `recv` and never gets here.
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Pending
+        }
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), WsError> {
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Pending
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Pending
         }
     }
 
@@ -1160,6 +1261,102 @@ mod tests {
             panic!("expected exactly one outage report for one outage, got {events:?}");
         };
         assert!(reason.contains("closed"), "reason was {reason:?}");
+    }
+
+    /// The state the settle window used to have no way out of. A link that
+    /// keeps coming back but never holds `LINK_SETTLED` in one stretch reported
+    /// one `LinkDown` and then nothing, forever — and `Controller::link_up` is
+    /// set by `LinkUp` and by nothing else, so `Controller::watchdog` returned
+    /// early on every tick from then on: no confirm re-click, no re-issue, no
+    /// honest `Unresponsive` halt. A hunt paused on a missed purchase echo just
+    /// stayed paused, over a wire that was carrying traffic six seconds out of
+    /// every six-and-a-tenth.
+    #[tokio::test(start_paused = true)]
+    async fn a_link_that_only_ever_holds_briefly_still_reports_its_recovery() {
+        // Held open: a closed outbound channel would end the loop on the first
+        // cycle, and the second cycle is what this test is about.
+        let (_raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        let (event_tx, mut event_rx) = mpsc::channel::<UplinkEvent>(32);
+        let (stop_tx, stop_rx) = no_shutdown();
+        let dials = Arc::new(Mutex::new(0_u32));
+        let counted = Arc::clone(&dials);
+
+        let task = tokio::spawn(run_with_connector(
+            test_url(),
+            raw_rx,
+            event_tx,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            stop_rx,
+            move |_url| {
+                *counted.lock().unwrap() += 1;
+                // Six seconds each time: long enough to carry a refresh and its
+                // snapshot, short enough that no single connection ever settles.
+                ready(Ok::<_, WsError>(BriefLink::new(Duration::from_secs(6))))
+            },
+        ));
+
+        let outage = next_event(&mut event_rx).await;
+        assert!(
+            matches!(&outage, Some(UplinkEvent::LinkDown(reason)) if reason.contains("closed")),
+            "expected the first drop to report the outage, got {outage:?}"
+        );
+
+        let recovery = next_event(&mut event_rx).await;
+        assert!(
+            matches!(recovery, Some(UplinkEvent::LinkUp)),
+            "a link that keeps coming back must end its outage, got {recovery:?}"
+        );
+        assert_eq!(
+            *dials.lock().unwrap(),
+            2,
+            "six seconds twice is the ten this link owes: the second dial ends it"
+        );
+
+        stop_tx.send(true).expect("the receiver is in the task");
+        task.await.unwrap();
+    }
+
+    /// The half of the trade that must survive the fix above: what accumulates
+    /// is connected *time*, never connect attempts. A peer that hangs up a
+    /// millisecond after the upgrade — an auth reject answered on the wire, a
+    /// draining load balancer, a dialect mismatch — earns no recovery however
+    /// many times it does it, which is the whole reason the handshake alone was
+    /// never allowed to be one.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_hangs_up_a_millisecond_in_never_earns_a_recovery() {
+        let (_raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        let (event_tx, mut event_rx) = mpsc::channel::<UplinkEvent>(32);
+        let (stop_tx, stop_rx) = no_shutdown();
+
+        let task = tokio::spawn(run_with_connector(
+            test_url(),
+            raw_rx,
+            event_tx,
+            Duration::from_millis(100),
+            // Pinned to the floor rather than a realistic 30 s cap: it is the
+            // fastest this loop can legally dial, so it is the most cycles this
+            // peer can possibly fit into the window below.
+            Duration::from_millis(100),
+            stop_rx,
+            move |_url| ready(Ok::<_, WsError>(BriefLink::new(Duration::from_millis(1)))),
+        ));
+
+        // Three times `LINK_SETTLED` of wall clock, ~290 cycles of it, ~290 ms
+        // of actual connectivity. The clock is slept through rather than walked
+        // in steps: every timer in flight belongs to the task, so paused time
+        // advances to each of them in turn.
+        tokio::time::sleep(LINK_SETTLED * 3).await;
+
+        stop_tx.send(true).expect("the receiver is in the task");
+        task.await.unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+        let [UplinkEvent::LinkDown(_)] = &events[..] else {
+            panic!("a peer that never stays cannot recover; got {events:?}");
+        };
     }
 
     /// The success path of the writer: the chunk's bytes reach the wire, and the

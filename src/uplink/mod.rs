@@ -19,13 +19,17 @@ pub enum UplinkEvent {
     /// player is asked to send us — so it must never carry the server URL, whose
     /// userinfo and query can hold a credential.
     LinkDown(String),
-    /// The link came back after a reported outage: a connection that was
-    /// accepted *and stayed up* long enough to count as one (`LINK_SETTLED` in
-    /// `websocket`). A completed handshake alone is deliberately not this event.
-    /// A peer that accepts the upgrade and immediately hangs up would otherwise
-    /// report a recovery per retry, which is the mirror image of the `LinkDown`
-    /// contract above — and worse than a noisy journal, because the controller
-    /// re-grants the watchdog's expectation deadline on every one of these, so a
-    /// recovery ladder measured in 10 s windows would never climb.
+    /// The link came back after a reported outage: it was accepted *and stayed
+    /// up* long enough to count as one (`LINK_SETTLED` in `websocket`, summed
+    /// over the outage's reconnects — one connection need not hold it alone). A
+    /// completed handshake is deliberately not this event. A peer that accepts
+    /// the upgrade and immediately hangs up would otherwise report a recovery
+    /// per retry, which is the mirror image of the `LinkDown` contract above —
+    /// and worse than a noisy journal, because the controller re-grants the
+    /// watchdog's expectation deadline on every one of these, so a recovery
+    /// ladder measured in 10 s windows would never climb. Summing rather than
+    /// demanding one unbroken stretch is what keeps that from having the
+    /// opposite failure: an outage with no end, and a watchdog suspended for the
+    /// rest of the session.
     LinkUp,
 }
