@@ -86,17 +86,25 @@ fn crash_entry(
 
 /// Candidate log paths, most-preferred first: per-user app-data dir, then temp dir as a guaranteed-writable fallback.
 fn crash_log_paths() -> Vec<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    crash_log_paths_from(local.as_deref(), &std::env::temp_dir())
+    let local = crate::absolute_env_dir("LOCALAPPDATA");
+    crash_log_paths_from(local.as_deref(), &std::env::temp_dir(), std::process::id())
 }
 
 /// Pure version of [`crash_log_paths`], so a test can hand over a literal.
-fn crash_log_paths_from(local_appdata: Option<&Path>, temp: &Path) -> Vec<PathBuf> {
+///
+/// `pid` names the temp fallback: a *fixed* name in a world-writable directory
+/// is an NTFS hard-link target an unprivileged process can plant in advance and
+/// point at any file it can read, turning this append into an elevated
+/// append-or-truncate of that file. A per-process name does not make that
+/// impossible — a new hard link can still appear after `pid` is read — but it
+/// removes the predictable name the attack needs ahead of time, and the pid is
+/// otherwise-unpredictable to a process that has not already seen this one run.
+fn crash_log_paths_from(local_appdata: Option<&Path>, temp: &Path, pid: u32) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(local) = local_appdata {
         paths.push(local.join(crate::APP_DIR).join("crash.log"));
     }
-    paths.push(temp.join("arkyve-crash.log"));
+    paths.push(temp.join(format!("arkyve-crash-{pid}.log")));
     paths
 }
 
@@ -109,6 +117,31 @@ fn write_first_writable<'a>(paths: &'a [PathBuf], entry: &str) -> Option<&'a Pat
 
 fn append(path: &Path, entry: &str) -> std::io::Result<()> {
     use std::io::Write;
+    // Only the app-data candidate is gated, not the temp fallback: the latter
+    // has no app-data root of its own to redirect (it is `temp_dir()` itself,
+    // not a subdirectory this app created), and it is the ladder's guaranteed-
+    // writable backstop — refusing it on top of the primary would leave a
+    // panic with nowhere to land. Refused before `create_dir_all` gets a
+    // chance to run: that call resolves reparse points same as everything
+    // else, so checking after it would only notice a redirected parent once
+    // the elevated write it exists to prevent had already gone through it.
+    // `write_first_writable` treats this `Err` like any other and walks to
+    // the next candidate.
+    #[cfg(windows)]
+    if let Some(parent) = path.parent()
+        && parent
+            .file_name()
+            .is_some_and(|name| name == crate::APP_DIR)
+        && !crate::dirhandle::is_plain_directory(parent)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a plain directory (a reparse point, or not created yet)",
+                parent.display()
+            ),
+        ));
+    }
     // Best-effort: create the app-data parent so the path works before
     // capture creates the folder; the open below reports real failures.
     if let Some(parent) = path.parent() {
@@ -184,17 +217,36 @@ mod tests {
         let paths = crash_log_paths_from(
             Some(Path::new("C:/Users/x/AppData/Local")),
             Path::new("C:/Temp"),
+            4242,
         );
         assert_eq!(paths.len(), 2);
         assert!(paths[0].ends_with("arkyve-refresh-shop/crash.log"));
-        assert!(paths[1].ends_with("arkyve-crash.log"));
+        assert!(paths[1].ends_with("arkyve-crash-4242.log"));
     }
 
     #[test]
     fn falls_back_to_temp_without_appdata() {
-        let paths = crash_log_paths_from(None, Path::new("/tmp"));
+        let paths = crash_log_paths_from(None, Path::new("/tmp"), 4242);
         assert_eq!(paths.len(), 1);
-        assert!(paths[0].ends_with("arkyve-crash.log"));
+        assert!(paths[0].ends_with("arkyve-crash-4242.log"));
+    }
+
+    #[test]
+    fn the_temp_fallback_name_carries_the_process_id() {
+        // A fixed name in a world-writable directory is a hard-link target
+        // planted in advance; a per-process name removes the predictable name
+        // that plant needs. `std::process::id()` and the literal here must
+        // agree, not just both be "some number".
+        let pid = std::process::id();
+        let paths = crash_log_paths_from(None, Path::new("/tmp"), pid);
+        assert!(
+            paths[0]
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == format!("arkyve-crash-{pid}.log")),
+            "expected the pid in the fallback file name: {:?}",
+            paths[0]
+        );
     }
 
     #[test]
@@ -247,5 +299,97 @@ mod tests {
         let body = std::fs::read_to_string(file.path()).unwrap();
         assert!(body.contains("fresh-entry"));
         assert!(body.contains("second-entry"));
+    }
+
+    /// RAII scratch directory: removed on drop including on an assertion
+    /// panic, and named by test and pid so parallel tests cannot collide.
+    #[cfg(windows)]
+    struct TempDir(PathBuf);
+
+    #[cfg(windows)]
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "arkyve_crash_{tag}_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            // The junction goes first, with `remove_dir`, which unlinks a mount
+            // point without touching what is behind it — harmless (and ignored)
+            // when this instance never had one.
+            let _ = std::fs::remove_dir(self.0.join(crate::APP_DIR));
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A directory junction, which unlike a symlink an ordinary user can
+    /// create. `mklink` is a `cmd` builtin, so it cannot be spawned directly.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_app_data_root_that_is_a_reparse_point_is_refused() {
+        // The module header's attack, end to end: `home`'s app-data root is a
+        // junction onto `victim`, which stands in for whatever the attacker
+        // actually wants written or truncated.
+        let home = TempDir::new("junction_home");
+        let victim = TempDir::new("junction_victim");
+
+        let root = home.path().join(crate::APP_DIR);
+        if !junction(&root, victim.path()) {
+            // Group policy, or a filesystem without reparse points: asserting
+            // on a machine that cannot host the attack proves nothing.
+            eprintln!("skipped: mklink /J is unavailable here");
+            return;
+        }
+
+        let result = append(&root.join("crash.log"), "entry\n");
+
+        assert!(
+            result.is_err(),
+            "append through a junctioned app-data root must be refused, not followed"
+        );
+        assert!(
+            !victim.path().join("crash.log").exists(),
+            "the entry was written through the junction into the victim directory"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_app_data_root_that_is_a_real_directory_is_not_refused() {
+        // The other half of the pair: a check that refused everything would
+        // pass the junction test just as well.
+        let home = TempDir::new("real_home");
+        let root = home.path().join(crate::APP_DIR);
+        std::fs::create_dir_all(&root).unwrap();
+
+        append(&root.join("crash.log"), "entry\n").unwrap();
+
+        let body = std::fs::read_to_string(root.join("crash.log")).unwrap();
+        assert!(body.contains("entry"));
     }
 }

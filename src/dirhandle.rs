@@ -81,3 +81,17 @@ pub fn open_directory_itself(dir: &Path) -> std::io::Result<File> {
     }
     Ok(handle)
 }
+
+/// True when `dir` exists and is a plain directory this process may write into
+/// — never a junction, never a symlink, never a file.
+///
+/// The write paths (`crash`, `lib`'s log and config roots) need the *answer*,
+/// not the handle: they hand the path to `create_dir_all` and `OpenOptions`,
+/// which resolve reparse points themselves. This narrows the window between
+/// check and use to whatever those calls take; it does not close it. Closing it
+/// needs handle-relative opens that `std` does not expose, and the trade is
+/// deliberate — refusing a redirected root is worth far more than the residual
+/// race, and the alternative shipped today is no check at all.
+pub fn is_plain_directory(dir: &Path) -> bool {
+    open_directory_itself(dir).is_ok()
+}
