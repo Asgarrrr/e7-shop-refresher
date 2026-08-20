@@ -187,6 +187,15 @@ fn run_mode(
     // Read before setup consumes the config: these seed the window's timing
     // editor, which has no controller home.
     let seed_timings = config.actuator.timings;
+    // Same reason, one step stronger: nothing downstream of `setup` keeps these
+    // three at all — the port is baked into a kernel filter, the backend into a
+    // moved-in `Surface` — so this is the only moment the window can learn what
+    // a restart would currently do.
+    let seed_startup = ui::StartupSettings {
+        game_port: config.game_port,
+        dry_run: config.actuator.dry_run,
+        backend: config.actuator.backend,
+    };
     let (session, handles, shutdown) = app::setup(config);
     // The journal half of the no-log-file report: `LogSetup::report` sent it to a
     // stdout this build does not have, which is the whole problem. Earliest point
@@ -239,6 +248,7 @@ fn run_mode(
                 handles,
                 error,
                 seed_timings,
+                seed_startup,
                 config_path,
             )))
         }),

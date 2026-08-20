@@ -187,6 +187,10 @@ fn main() -> eframe::Result {
                 handles,
                 error,
                 Default::default(),
+                // The Startup drafts seed from `Config::default()`, which is
+                // what a preview should show: there is no launched session
+                // behind it whose real port could be reported.
+                Default::default(),
                 // scratch path: the design-mock preview must never overwrite the real config.toml on Apply
                 "ui_preview_scratch.toml".into(),
             )))

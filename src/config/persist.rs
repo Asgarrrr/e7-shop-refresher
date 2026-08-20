@@ -1,24 +1,41 @@
-//! Format-preserving persistence of the GUI-editable config sections back to
-//! config.toml. Only `[filter]`, `[limits]` and `[actuator.timings]` are
-//! rewritten; every other section is left as the player wrote it. Whole-section
-//! replacement drops a section's inner commented-out example lines on first
-//! save, but keeps the comments above each header.
+//! Format-preserving persistence of the GUI-editable parts of config.toml.
+//! `[filter]`, `[limits]` and `[actuator.timings]` are rewritten as whole
+//! sections; `game_port`, `actuator.dry_run` and `actuator.backend` are
+//! rewritten as single keys. Everything else is left as the player wrote it.
+//! Whole-section replacement drops a section's inner commented-out example
+//! lines on first save, but keeps the comments above each header; a single-key
+//! write keeps even those.
 //!
 //! [`strip_retired_keys`] is the one exception — see its docs.
 
 use std::io::Write as _;
+use std::num::NonZeroU16;
 use std::path::Path;
 
 use serde::Serialize;
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::actuator::plan::Timings;
+use crate::config::ActuatorBackend;
 use crate::domain::control::Limits;
 use crate::domain::filter::Filter;
 use crate::error::{Error, Result};
 
-/// One GUI-editable section to persist. Built per Apply from the commands
-/// that actually changed, so a limits-only edit never rewrites `[filter]`.
+/// One GUI-editable piece of config.toml to persist. Built per Apply from what
+/// actually changed, so a limits-only edit never rewrites `[filter]`.
+///
+/// # Why the last three are keys and not sections
+///
+/// The first three each own a whole TOML table, so a write can replace them
+/// wholesale. The last three do not own anything. `game_port` is a scalar at
+/// the document root — there is no section to replace. `dry_run` and `backend`
+/// are two keys of `[actuator]`, a table that also holds `timings`, which
+/// [`Section::Timings`] owns: replacing `[actuator]` wholesale would delete the
+/// player's tuned click timings on any Apply that touched the backend switch.
+///
+/// Splitting them into one variant per key rather than grouping them into a
+/// struct is the same rule the sentence above states, one level down — an Apply
+/// that moved only the port must not rewrite the backend line.
 ///
 /// `Debug` because [`save`] is best-effort and journals its failure by name.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +43,12 @@ pub enum Section {
     Filter(Filter),
     Limits(Limits),
     Timings(Timings),
+    /// `game_port`, a root key.
+    GamePort(NonZeroU16),
+    /// `actuator.dry_run`.
+    DryRun(bool),
+    /// `actuator.backend`.
+    Backend(ActuatorBackend),
 }
 
 /// Rewrite `path` so the managed sections reflect `edits`, preserving every
@@ -38,8 +61,9 @@ pub enum Section {
 /// - [`Error::ConfigReparse`] — the existing file is not valid TOML. Rewriting
 ///   is format-preserving, so it must parse what the player wrote first.
 /// - [`Error::ConfigSerialize`] — a section could not be rendered back to TOML.
-///   Unreachable for the three section types today, kept typed to stay
-///   distinguishable from the parse failure above.
+///   Unreachable for every [`Section`] today — the three table variants
+///   serialize infallibly and the three key variants do not serialize at all —
+///   kept typed to stay distinguishable from the parse failure above.
 /// - [`Error::ConfigWrite`] — the parent directory, the sibling temp file, or
 ///   the rename failed. The path is in the message: this is the read-only /
 ///   OneDrive-locked case, where Setup changes are otherwise lost in silence.
@@ -123,8 +147,9 @@ const RETIRED_KEYS: &[(&str, &[&str])] = &[
 /// Returns the keys it removed (`"capture.filter, forward.client_to_server"`),
 /// or `None` when the file held none and was therefore not written at all.
 ///
-/// [`save`] rewrites only `[filter]`, `[limits]` and `[actuator.timings]`, so
-/// without this the startup warning never stops firing. Both structs hold
+/// [`save`] never touches `[capture]` or `[forward]` — it writes only the six
+/// pieces [`Section`] names — so without this the startup warning never stops
+/// firing. Both structs hold
 /// *only* retired keys, so stripping always empties — and removes — the header
 /// too, but never a table this pass did not touch.
 ///
@@ -333,9 +358,64 @@ fn write_sections(text: &str, edits: &[Section]) -> Result<String> {
                 inline_ranges(&mut table);
                 set_nested_table(root, "actuator", "timings", table);
             }
+            // `NonZeroU16` is the loader's own domain, so there is nothing left
+            // to check here: a port this module can be handed is a port
+            // `Config::load` accepts.
+            Section::GamePort(port) => set_key(root, "game_port", i64::from(port.get()).into()),
+            Section::DryRun(dry_run) => set_actuator_key(root, "dry_run", (*dry_run).into()),
+            Section::Backend(backend) => {
+                set_actuator_key(root, "backend", backend_key(*backend).into());
+            }
         }
     }
     Ok(doc.to_string())
+}
+
+/// [`ActuatorBackend`] spelled the way the loader reads it.
+///
+/// An exhaustive match rather than a `Serialize` derive, on purpose: a variant
+/// added later fails to compile *here* instead of silently writing a key that
+/// the next launch refuses. `every_backend_writes_a_value_the_loader_accepts`
+/// pins the pair from the other side.
+fn backend_key(backend: ActuatorBackend) -> &'static str {
+    match backend {
+        ActuatorBackend::Input => "input",
+        ActuatorBackend::Message => "message",
+    }
+}
+
+/// Replace one key's value, keeping the key and every comment around it.
+///
+/// `Table::insert` replaces the whole `Item`, and an `Item`'s decor is the
+/// comments and blank lines attached to it — the same class of loss [`tidy`]
+/// exists to undo, one key down instead of one table. Assigning through the
+/// existing `Value` touches the value alone, so
+/// `game_port = 3333  # the port my client uses` keeps its trailing note and
+/// whatever the player wrote above it.
+///
+/// An absent key is a plain insert: there is no decor to save.
+fn set_key(table: &mut Table, key: &str, value: Value) {
+    if let Some(existing) = table.get_mut(key).and_then(Item::as_value_mut) {
+        let decor = existing.decor().clone();
+        *existing = value;
+        *existing.decor_mut() = decor;
+    } else {
+        table.insert(key, Item::Value(value));
+    }
+}
+
+/// Write one key into `[actuator]`, creating or promoting the table first.
+///
+/// `set_implicit(false)` because an implicit table prints no header, and a
+/// header-less `[actuator]` holding `dry_run` would render that key at the
+/// document root — where `deny_unknown_fields` refuses it on the next launch.
+/// Reached when the file has `[actuator.timings]` and no `[actuator]` of its
+/// own, which is exactly what [`set_nested_table`] creates.
+fn set_actuator_key(root: &mut Table, key: &str, value: Value) {
+    if let Some(actuator) = ensure_table(root, "actuator") {
+        actuator.set_implicit(false);
+        set_key(actuator, key, value);
+    }
 }
 
 /// Re-serialize a section value to a standalone table.
@@ -354,21 +434,32 @@ fn set_table(parent: &mut Table, key: &str, mut new: Table) {
 }
 
 /// Replace `parent[outer][inner]`, ensuring `outer` is a header table first.
-/// Absent → a fresh implicit table, so a new file grows only
-/// `[actuator.timings]` and no bare `[actuator]` header. Inline
-/// (`actuator = { .. }`) → promoted in place, so `dry_run`/`backend` survive the
-/// splice. Already a header table → left as is.
 fn set_nested_table(parent: &mut Table, outer: &str, inner: &str, new: Table) {
-    if let Some(inline) = parent.get(outer).and_then(Item::as_inline_table).cloned() {
-        parent.insert(outer, Item::Table(inline.into_table()));
-    } else if parent.get(outer).and_then(Item::as_table).is_none() {
-        let mut created = Table::new();
-        created.set_implicit(true);
-        parent.insert(outer, Item::Table(created));
-    }
-    if let Some(outer_table) = parent.get_mut(outer).and_then(Item::as_table_mut) {
+    if let Some(outer_table) = ensure_table(parent, outer) {
         set_table(outer_table, inner, new);
     }
+}
+
+/// `parent[key]` as a header table that can hold entries, whatever shape it was
+/// in — or `None` if it holds something that is not a table at all.
+///
+/// Absent → a fresh **implicit** table, so a new file grows only
+/// `[actuator.timings]` and no bare `[actuator]` header. Inline
+/// (`actuator = { .. }`) → promoted in place, so the keys already there survive
+/// the splice. Already a header table → left as is, decor and all.
+///
+/// Shared by [`set_nested_table`] and [`set_actuator_key`] so the promotion
+/// rules cannot drift apart: the second one exists precisely to write into a
+/// table the first one may have created.
+fn ensure_table<'a>(parent: &'a mut Table, key: &str) -> Option<&'a mut Table> {
+    if let Some(inline) = parent.get(key).and_then(Item::as_inline_table).cloned() {
+        parent.insert(key, Item::Table(inline.into_table()));
+    } else if parent.get(key).and_then(Item::as_table).is_none() {
+        let mut created = Table::new();
+        created.set_implicit(true);
+        parent.insert(key, Item::Table(created));
+    }
+    parent.get_mut(key).and_then(Item::as_table_mut)
 }
 
 /// Render each child table (a `DelayRange`) as an inline `{ min_ms = .. }`,
@@ -519,10 +610,7 @@ backend = \"input\"
         assert!(out.contains("[actuator.timings]"));
         let config: crate::config::Config = toml::from_str(&out).expect("reload");
         assert!(config.actuator.dry_run);
-        assert_eq!(
-            config.actuator.backend,
-            crate::config::ActuatorBackend::Input
-        );
+        assert_eq!(config.actuator.backend, ActuatorBackend::Input);
     }
 
     #[test]
@@ -881,6 +969,117 @@ names = [\"ticketrare_name\"]
             matches!(err, Error::ConfigReparse(_)),
             "expected a typed re-parse error, got {err:?}"
         );
+    }
+
+    /// A port is one line in the middle of a hand-written file. Replacing the
+    /// `Item` instead of the `Value` would take the note beside it with it.
+    #[test]
+    fn writing_the_game_port_keeps_the_comments_wrapped_around_it() {
+        let text = "\
+# the port my client talks to
+game_port = 3333 # checked against the client 2026-08
+server_url = \"wss://ingest.arkyve.dev/refresh-shop\"
+";
+        let port = NonZeroU16::new(4001).expect("4001 is not zero");
+        let out = write_sections(text, &[Section::GamePort(port)]).expect("write");
+        assert_eq!(
+            out,
+            "\
+# the port my client talks to
+game_port = 4001 # checked against the client 2026-08
+server_url = \"wss://ingest.arkyve.dev/refresh-shop\"
+"
+        );
+    }
+
+    /// The reason these three are keys and not a section: `[actuator]` is
+    /// shared with `Section::Timings`, so a backend switch must not be able to
+    /// delete a tuned range.
+    #[test]
+    fn the_actuator_keys_leave_the_timings_beside_them_alone() {
+        let text = "\
+[actuator]
+dry_run = false
+backend = \"message\"
+
+[actuator.timings]
+refreshed = { min_ms = 200, max_ms = 800 }
+";
+        let out = write_sections(text, &[Section::Backend(ActuatorBackend::Input)]).expect("write");
+        assert!(out.contains("backend = \"input\""), "{out}");
+        assert!(out.contains("dry_run = false"), "sibling key kept: {out}");
+        assert!(
+            out.contains("refreshed = { min_ms = 200, max_ms = 800 }"),
+            "the tuned range must survive a backend switch: {out}"
+        );
+        let config: crate::config::Config = toml::from_str(&out).expect("reload");
+        assert_eq!(config.actuator.backend, ActuatorBackend::Input);
+        assert!(!config.actuator.dry_run);
+    }
+
+    /// `[actuator.timings]` alone leaves `[actuator]` implicit — header-less.
+    /// Writing a key into it without making it explicit puts that key at the
+    /// document root, where `deny_unknown_fields` refuses it on next launch.
+    #[test]
+    fn a_key_written_into_an_implicit_actuator_table_gets_its_header() {
+        let text = "[actuator.timings]\nrefreshed = { min_ms = 200, max_ms = 800 }\n";
+        let out = write_sections(text, &[Section::DryRun(true)]).expect("write");
+        let config: crate::config::Config =
+            toml::from_str(&out).expect("the write must reload, not land at the root");
+        assert!(config.actuator.dry_run, "{out}");
+        assert_eq!(
+            config.actuator.timings.refreshed,
+            range(200, 800),
+            "the timings must survive: {out}"
+        );
+    }
+
+    /// An inline `[actuator]` is the same document to any parser, and the
+    /// promotion path is shared with `Section::Timings` — so it is worth
+    /// pinning from this side too.
+    #[test]
+    fn an_inline_actuator_table_survives_a_key_write() {
+        let text = "actuator = { dry_run = true, backend = \"input\" }\n";
+        let out =
+            write_sections(text, &[Section::Backend(ActuatorBackend::Message)]).expect("write");
+        let config: crate::config::Config = toml::from_str(&out).expect("reload");
+        assert_eq!(config.actuator.backend, ActuatorBackend::Message);
+        assert!(config.actuator.dry_run, "the sibling key kept its value");
+    }
+
+    /// The rule this plan establishes, from the writer's side: every value the
+    /// editor can produce must be one the loader accepts. `backend_key`'s match
+    /// is exhaustive, so a new variant cannot skip this test — it stops the
+    /// build first.
+    #[test]
+    fn every_backend_writes_a_value_the_loader_accepts() {
+        for backend in [ActuatorBackend::Input, ActuatorBackend::Message] {
+            let out = write_sections("", &[Section::Backend(backend)]).expect("write");
+            let config: crate::config::Config =
+                toml::from_str(&out).unwrap_or_else(|err| panic!("{backend:?} must reload: {err}"));
+            assert_eq!(config.actuator.backend, backend);
+        }
+    }
+
+    /// The whole document, written from nothing and read back: the three keys
+    /// land in the two tables that own them and nowhere else.
+    #[test]
+    fn the_three_startup_keys_round_trip_together() {
+        let port = NonZeroU16::new(65_535).expect("65535 is not zero");
+        let out = write_sections(
+            "",
+            &[
+                Section::GamePort(port),
+                Section::DryRun(true),
+                Section::Backend(ActuatorBackend::Input),
+            ],
+        )
+        .expect("write");
+        let config: crate::config::Config = toml::from_str(&out).expect("reload");
+        assert_eq!(config.game_port, port);
+        assert!(config.actuator.dry_run);
+        assert_eq!(config.actuator.backend, ActuatorBackend::Input);
+        config.validate().expect("what we write must also validate");
     }
 
     #[test]
