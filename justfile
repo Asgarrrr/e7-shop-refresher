@@ -150,10 +150,12 @@ coverage:
 # which is not a finding worth a reader's time.
 #
 # Default features on purpose, and this one is measured rather than assumed:
-# `--no-default-features` looks cheaper and is not, because `egui_kittest` is an
-# ungated dev-dependency and every `cargo test` lane therefore builds the whole
-# egui tree anyway. What the default lane buys for that same cost is a stronger
-# verdict — running the reduced lane reported
+# `--no-default-features` looks cheaper and is not free, because `egui_kittest`
+# is an ungated dev-dependency and every `cargo test` lane therefore still
+# builds the egui core anyway (the heavier wgpu/naga/ash stack behind it is now
+# gated behind the `render-png` feature and skipped here — see `Cargo.toml`'s
+# `[dev-dependencies]` note). What the default lane buys for that same cost is
+# a stronger verdict — running the reduced lane reported
 # `Controller::is_recovery_enabled -> false` as a survivor, and it is not one:
 # the test that kills it (`app::tests::setup_enables_recovery_only_when_live`)
 # has two `#[cfg]` bodies and only the `all(windows, feature = "actuator")` one

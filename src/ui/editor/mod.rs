@@ -726,6 +726,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "render-png")]
     #[ignore = "renders the Setup sections to a PNG for visual iteration; run with --ignored"]
     fn render_stop_section_png() {
         let limits = Limits {

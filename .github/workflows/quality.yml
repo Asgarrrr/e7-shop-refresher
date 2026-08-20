@@ -226,11 +226,13 @@ jobs:
       # mutant usually means "no pixel changed", which is not a finding.
       #
       # Default features on purpose. `--no-default-features` would look cheaper
-      # and is not: `egui_kittest` is an ungated dev-dependency, so `cargo test`
-      # builds the whole egui tree in every lane anyway (see `Cargo.toml`'s
-      # `[dev-dependencies]` note). What the default lane buys for that same cost
-      # is the strongest possible verdict — a mutant reported as surviving here
-      # survived *every* test the product build has.
+      # and is not free: `egui_kittest` is an ungated dev-dependency, so
+      # `cargo test` still builds the egui core in every lane (the wgpu/naga/ash
+      # stack behind it is now gated behind the `render-png` feature and skipped
+      # here — see `Cargo.toml`'s `[dev-dependencies]` note). What the default
+      # lane buys for that same cost is the strongest possible verdict — a
+      # mutant reported as surviving here survived *every* test the product
+      # build has.
       #
       # `--timeout 120`: the full suite runs in about 2 s once built, so 120 s is
       # sixty times the honest runtime. It is there for the mutants that turn a
