@@ -158,19 +158,21 @@ cargo build --release
 ```
 
 `rust-toolchain.toml` selects Rust 1.92.0 with Clippy and rustfmt for
-reproducible local checks. The canonical quality command on Windows, macOS and
-Linux is:
+reproducible local checks. The canonical quality command is:
 
 ```sh
 just verify
 ```
 
-It checks formatting plus the platform-independent Clippy and test lanes. On
-Windows, `just backends` adds the two Windows-only lanes: the capture backend on
-its own, and the shipped default features (`pcap-backend,gui,actuator`), each
-both linted and tested. CI repeats all of it on Rust 1.92.0 and current stable,
-then builds the default-feature Windows release on stable and checks that the
-`requireAdministrator` manifest is still embedded in it.
+It checks formatting plus the Clippy and test lanes that need no native
+capture backend and no elevation. On Windows, `just backends` adds the two
+Windows-only lanes: the capture backend on its own, and the shipped default
+features (`pcap-backend,gui,actuator`), each both linted and tested. CI
+repeats all of it on Rust 1.92.0 and current stable, then builds the
+default-feature Windows release on stable and checks that the
+`requireAdministrator` manifest is still embedded in it. CI runs only on
+Windows: nothing here checks that the crate still compiles on a non-Windows
+target.
 
 ### Capture backend
 
