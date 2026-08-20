@@ -1,19 +1,9 @@
 //! The `PostMessageW` backend (the default): synthetic mouse messages posted to
 //! the game window, so no focus is stolen and the player keeps the mouse.
 //!
-//! What it owns beyond [`MessageSurface`] itself is everything that follows from
-//! *posting* rather than injecting: the process-global [`shield`] each input
-//! re-asserts, the wParam/LPARAM encoders every posted message needs
-//! ([`pack_point`], [`wheel_wparam`]) and the verdict on a refused post
-//! ([`post_refusal`]). [`Target`]'s inherent methods live here too — the root
-//! defines the window both backends carry, but only this one converts it to
-//! client coordinates and re-verifies per event.
-//!
 //! [`post`], [`pack_point`] and [`post_refusal`] are `pub(super)` — visible in
 //! the `win` tree and nowhere else — solely because [`Hwnd`]'s doc comment is
-//! written *about* them: the whole reason the newtype exists is the transposition
-//! `post(lparam, …, target.hwnd)` used to compile. That rationale lives with the
-//! type, in the root, and rustdoc will not link into a module-private item.
+//! written *about* them, and rustdoc will not link into a module-private item.
 
 use std::time::Duration;
 
@@ -39,20 +29,11 @@ const SHIELD_DRAIN_MS: u64 = 50;
 /// Why a refused `PostMessageW` is fatal or merely recoverable.
 ///
 /// `ERROR_ACCESS_DENIED` here is UIPI. Do not classify it `Recoverable` under
-/// "window gone or queue full" — both causes are wrong for it, and the watchdog
-/// would re-issue clicks forever against a condition that cannot heal while the
-/// game keeps running. It is `Fatal`: acting again would be acting blind,
-/// exactly what that variant is for.
-///
-/// The preflight at acquire catches this first; this branch is the backstop
-/// for a window whose integrity level changed *mid-job*, after the probe
-/// passed — so it names the cause in one clause and leaves the full
-/// explanation and the fix to [`preflight_refusal`], rather than repeating a
-/// paragraph on every click.
-///
-/// Everything else keeps the old verdict, minus the invented certainty: a queue
-/// that is genuinely full, or a window that closed between the shield going up
-/// and the click going out, both self-heal on the next acquire.
+/// "window gone or queue full": both causes are wrong for it, and the watchdog
+/// would re-issue clicks forever against a condition that cannot heal. The
+/// preflight at acquire catches it first, so this backstop — for an integrity
+/// level that changed *mid-job* — names the cause in one clause and leaves the
+/// fix to [`preflight_refusal`].
 pub(super) fn post_refusal(error: &std::io::Error) -> SurfaceError {
     if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
         SurfaceError::Fatal(format!(
@@ -66,20 +47,14 @@ pub(super) fn post_refusal(error: &std::io::Error) -> SurfaceError {
     }
 }
 
-/// `PostMessageW` backend (the default): posts synthetic mouse messages to
-/// the game window — no focus stolen, the player keeps the mouse. The engine
-/// tracks its cursor through move messages, so every input re-asserts the
-/// [`shield`] over the game until [`release`](Surface::release).
+/// `PostMessageW` backend (the default). The engine tracks its cursor through
+/// move messages, so every input re-asserts the [`shield`] over the game until
+/// [`release`](Surface::release).
 ///
-/// Fieldless on purpose: the only thing this backend owns beyond one job is the
-/// process-global [`shield`], which its `Drop` lowers. The window travels as a
-/// [`Target`] parameter (see [`Surface`]'s "why the window is a parameter"),
-/// not a field this type keeps.
-///
-/// Braced-empty rather than a unit struct so that `MessageSurface::default()` —
-/// how `src/app/mod.rs` spawns it, and the shape every other backend in the crate
-/// is built with — does not become a `clippy::default_constructed_unit_structs`
-/// diagnostic in a file this type does not own.
+/// Braced-empty rather than a unit struct so `MessageSurface::default()` — how
+/// `src/app/mod.rs` spawns it — does not become a
+/// `clippy::default_constructed_unit_structs` diagnostic in a file this type
+/// does not own.
 #[derive(Default)]
 pub struct MessageSurface {}
 
@@ -90,8 +65,8 @@ impl Drop for MessageSurface {
 }
 
 impl Target {
-    /// Screen → client pixels. Pure: dropping the result means the input was
-    /// about to be posted at the wrong coordinates.
+    /// Screen → client pixels. Dropping the result means the input was about to
+    /// be posted at the wrong coordinates.
     #[must_use]
     fn to_client(self, at: (i32, i32)) -> (i32, i32) {
         (at.0 - self.rect.left, at.1 - self.rect.top)
@@ -123,9 +98,8 @@ impl Surface for MessageSurface {
     fn acquire(&mut self) -> Result<(Target, ClientRect), SurfaceError> {
         ensure_dpi_awareness()?;
         let hwnd = find_game_window()?;
-        // One probe per job, at the only moment a clear answer is still useful:
-        // the alternative is `shield::raise` failing on the first click of every
-        // job with a message that names the wrong cause.
+        // One probe per job: the alternative is `shield::raise` failing on the
+        // first click of every job with a message naming the wrong cause.
         probe_window_reachable(hwnd).map_err(|error| preflight_refusal(&error))?;
         let rect = client_rect(hwnd)?;
         let target = Target {
@@ -137,9 +111,8 @@ impl Surface for MessageSurface {
 
     /// Word for word `acquire`, and deliberately so: this backend posts to a
     /// window it never pulls forward, and the shield is raised per input by
-    /// `engage`, not here. There is nothing for a dry run to skip. Spelled out
-    /// rather than defaulted because the trait makes every backend answer the
-    /// question — the `input` backend's answer is not this one.
+    /// `engage`, so a dry run has nothing to skip. Spelled out rather than
+    /// defaulted because the `input` backend's answer is not this one.
     fn measure(&mut self) -> Result<(Target, ClientRect), SurfaceError> {
         self.acquire()
     }
@@ -157,10 +130,8 @@ impl Surface for MessageSurface {
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
         post(target.hwnd, WM_LBUTTONDOWN, MK_LBUTTON as usize, lparam)?;
         std::thread::sleep(Duration::from_millis(press_ms));
-        // Button is down: always post the release, retrying once on failure so a
-        // refused click never leaves the game seeing a held left button. This
-        // backend re-verifies per post rather than up front, so there is nothing
-        // to revalidate here — the decision itself is `release_twice`'s.
+        // This backend re-verifies per post rather than up front, so there is
+        // nothing to revalidate before the release.
         release_twice(
             || Ok(()),
             || post(target.hwnd, WM_LBUTTONUP, 0, lparam),
@@ -193,9 +164,8 @@ impl Surface for MessageSurface {
         Ok(())
     }
 
-    /// Lowers the shield the inputs raised. Idempotent — `shield::hide` tolerates
-    /// there being nothing up — because it runs both from the executor's guard and
-    /// from this type's `Drop`.
+    /// Lowers the shield the inputs raised. `shield::hide` tolerates there being
+    /// nothing up, which it must: this runs from the guard *and* from `Drop`.
     fn release(&mut self, _target: &Target) {
         shield::hide();
     }
@@ -203,13 +173,10 @@ impl Surface for MessageSurface {
 
 /// `WM_MOUSEWHEEL`'s wParam: the wheel delta in the high word, *signed 16-bit*.
 ///
-/// Validated exactly like the coordinate sibling below, and for the same reason.
-/// The old form was `((delta as u32) << 16)`, which discarded everything above
-/// bit 15 with no diagnostic — a shift never reports lost bits, not even in
-/// debug — so a large notch count would have scrolled a wrong distance in the
-/// *opposite* direction while `PostMessageW` reported success. `Recoverable`
-/// because nothing here can heal it but nothing is left half-done either: no
-/// message is posted at all.
+/// Range-checked rather than shifted: `((delta as u32) << 16)` discards
+/// everything above bit 15 with no diagnostic, so a large notch count would
+/// scroll a wrong distance in the *opposite* direction while `PostMessageW`
+/// reported success.
 fn wheel_wparam(notches: i32) -> Result<usize, SurfaceError> {
     let delta = i16::try_from(notches.saturating_mul(WHEEL_DELTA)).map_err(|_| {
         SurfaceError::Recoverable(format!(
@@ -221,18 +188,14 @@ fn wheel_wparam(notches: i32) -> Result<usize, SurfaceError> {
 
 /// `MAKELPARAM`: x in the low word, y in the high word, both signed 16-bit.
 ///
-/// A coordinate that does not fit is refused instead of being masked back
-/// inside the window: `& 0xFFFF` would fold it silently onto some other pixel
-/// and the click would still be posted, landing somewhere nobody planned.
-/// `Recoverable` because the only way to get here is an absurd client rect,
-/// and the next `acquire()` reads a fresh one — exactly the self-healing case
-/// [`SurfaceError::Recoverable`] describes.
+/// A coordinate that does not fit is refused rather than masked back inside the
+/// window: `& 0xFFFF` would fold it silently onto some other pixel and the click
+/// would still be posted. `Recoverable` because only an absurd client rect gets
+/// here, and the next `acquire()` reads a fresh one.
 ///
-/// The word assembly goes through `u32`, not `i32`: shifting a high word past
-/// bit 31 in a signed integer sets the sign bit, and the `as isize` widening
-/// would then sign-extend into the upper half of a 64-bit LPARAM. Windows
-/// only reads the low 32 bits, so the old form works by accident; this one
-/// builds the value the doc comment promises.
+/// The assembly goes through `u32`, not `i32`: shifting a high word past bit 31
+/// in a signed integer sets the sign bit, and the `as isize` widening would then
+/// sign-extend into the upper half of a 64-bit LPARAM.
 pub(super) fn pack_point((x, y): (i32, i32)) -> Result<isize, SurfaceError> {
     let x = i16::try_from(x)
         .map_err(|_| SurfaceError::Recoverable(format!("x {x} out of LPARAM range")))?;
@@ -246,14 +209,14 @@ pub(super) fn post(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> Result
     // SAFETY: `hwnd` may already be dead — `PostMessageW` reports that with
     // FALSE instead of faulting. Delivery is asynchronous, so nothing may be
     // borrowed by the queue: `wparam`/`lparam` carry packed coordinates and
-    // button flags only, never a pointer into this process.
+    // button flags, never a pointer into this process.
     let ok = unsafe { PostMessageW(hwnd.raw(), msg, wparam, lparam) } != 0;
     if ok {
         return Ok(());
     }
     // Read before any other Win32 call: `GetLastError` is per-thread and the
-    // very next call overwrites it. Here it is not colour for a bug report — it
-    // is what decides whether the loop stops or the watchdog retries.
+    // very next call overwrites it. Here it decides whether the loop stops or
+    // the watchdog retries.
     Err(post_refusal(&std::io::Error::last_os_error()))
 }
 
@@ -266,10 +229,8 @@ mod tests {
         GAME_HWND, OTHER_HWND, dead_handle, game_rect, uipi_refusal,
     };
 
-    /// `release` runs from the executor's guard *and* from this type's `Drop`, so
-    /// it can be reached two or three times over one job with no shield ever
-    /// raised (an `acquire` that succeeded and a first `engage` that did not).
-    /// `shield::hide` has to tolerate all of it.
+    /// `release` can be reached two or three times over one job with no shield
+    /// ever raised, and `shield::hide` has to tolerate all of it.
     #[test]
     fn message_surface_cleanup_is_idempotent_without_a_shield() {
         let mut surface = MessageSurface::default();
@@ -306,13 +267,11 @@ mod tests {
         assert!(!reason.contains("integrity"), "{reason}");
     }
 
-    // `message_surface_input_without_acquire_is_fatal_not_a_panic` stood here —
-    // see the note where its `WinSurface` twin was, in `send_input`'s test
-    // module. Same reason: the state it described cannot be constructed now that
-    // the window is a parameter.
+    // Do not re-add `message_surface_input_without_acquire_is_fatal_not_a_panic`:
+    // the window is a parameter now, so the state it described cannot be
+    // constructed. See the note where its `WinSurface` twin was, in
+    // `send_input`'s test module.
 
-    /// The low word is x, the high word is y, and the whole thing stays
-    /// inside the low 32 bits Win32 reads back.
     #[test]
     fn pack_point_lays_x_low_and_y_high() {
         let packed = pack_point((0x1234, 0x5678)).unwrap();
@@ -328,9 +287,8 @@ mod tests {
         assert_eq!(packed as u32, 0xFFFE_FFFF);
     }
 
-    /// What Win32 reads back is the low 32 bits split into two sign-extended
-    /// words: every accepted coordinate must survive that round trip, high
-    /// words past 0x8000 included.
+    /// Win32 reads back the low 32 bits as two sign-extended words, and every
+    /// accepted coordinate must survive that — high words past 0x8000 included.
     #[test]
     fn pack_point_round_trips_through_get_x_y_lparam() {
         for point in [
@@ -348,8 +306,7 @@ mod tests {
     }
 
     /// Not reachable from the crate's own `±10` notches — which is the point:
-    /// the trait boundary is what a future caller reaches, and (see
-    /// [`wheel_wparam`]'s doc) an unchecked shift would truncate silently.
+    /// the trait boundary is what a future caller reaches.
     #[test]
     fn a_wheel_delta_outside_the_signed_word_is_refused_instead_of_truncated() {
         // 300 notches × 120 = 36 000, past `i16::MAX`: the old form posted
@@ -364,8 +321,7 @@ mod tests {
         ));
     }
 
-    /// The notch counts the planner actually emits, and the sign convention
-    /// Win32 reads back out of the high word.
+    /// The notch counts the planner actually emits.
     #[test]
     fn wheel_wparam_carries_the_notches_as_a_signed_high_word() {
         assert_eq!(wheel_wparam(10).unwrap() >> 16, 1_200);
@@ -376,12 +332,9 @@ mod tests {
         assert_eq!(wheel_wparam(10).unwrap() & 0xFFFF, 0);
     }
 
-    /// The swap the newtype exists to stop, and the round trip the FFI boundary
-    /// depends on. The transposition itself cannot be written here — that is the
-    /// point, and a `#[test]` cannot assert a compile error — so what is pinned
-    /// is that a handle and a packed point are no longer the same type: the
-    /// packed point stays the `isize` LPARAM Win32 reads, while the handle only
-    /// becomes an `HWND` through `raw`.
+    /// The transposition the newtype exists to stop cannot be written here — a
+    /// `#[test]` cannot assert a compile error — so what is pinned instead is
+    /// that a handle and a packed point are no longer the same type.
     #[test]
     fn a_handle_survives_the_round_trip_to_the_abi_type_and_back() {
         let packed: isize = pack_point((0x1234, 0x5678)).unwrap();

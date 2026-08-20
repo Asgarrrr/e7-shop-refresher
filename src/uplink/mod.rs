@@ -7,12 +7,11 @@ pub mod protocol;
 
 pub use websocket::run;
 
-/// What the uplink task reports to the session: decoded server messages plus
-/// link-state transitions. The journal is the only surface a windowed-build
-/// player sees — tracing is inert there, so outages must travel this channel.
+/// What the uplink task reports to the session. The journal is the only surface
+/// a windowed-build player sees — tracing is inert there, so outages must travel
+/// this channel.
 #[derive(Debug)]
 pub enum UplinkEvent {
-    /// A decoded server message.
     Message(protocol::ServerMessage),
     /// The link failed or dropped; reported once per outage, not per retry. The
     /// reason becomes a journal line, which is mirrored into the log file the
@@ -21,15 +20,9 @@ pub enum UplinkEvent {
     LinkDown(String),
     /// The link came back after a reported outage: it was accepted *and stayed
     /// up* long enough to count as one (`LINK_SETTLED` in `websocket`, summed
-    /// over the outage's reconnects — one connection need not hold it alone). A
-    /// completed handshake is deliberately not this event. A peer that accepts
-    /// the upgrade and immediately hangs up would otherwise report a recovery
-    /// per retry, which is the mirror image of the `LinkDown` contract above —
-    /// and worse than a noisy journal, because the controller re-grants the
-    /// watchdog's expectation deadline on every one of these, so a recovery
-    /// ladder measured in 10 s windows would never climb. Summing rather than
-    /// demanding one unbroken stretch is what keeps that from having the
-    /// opposite failure: an outage with no end, and a watchdog suspended for the
-    /// rest of the session.
+    /// over the outage's reconnects). A completed handshake is deliberately not
+    /// this event — the controller re-grants the watchdog's expectation deadline
+    /// on every one of these, so a peer that accepts and hangs up would keep a
+    /// 10 s recovery ladder from ever climbing.
     LinkUp,
 }

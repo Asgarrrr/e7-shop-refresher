@@ -1,20 +1,9 @@
 //! Orchestration: capture -> reassembly -> gate -> uplink -> controller -> display.
 //!
-//! The root holds the *wiring*: the session state handed out before any fallible
-//! work runs, the channels that join the five concerns below, and the two entry
-//! points `main.rs` calls. Each submodule owns one of those concerns, reaching
-//! each other only through the channel ends and `Arc` handles created in
-//! [`Session::run`] — there is no shared `&mut` state between them.
-//!
-//! - [`pressure`] — the vocabulary the two pumps share (`CaptureEvent`, the
-//!   resync marker protocol).
-//! - [`ingest`] — the blocking capture loop.
-//! - [`reassembly`] — the post-resync anchor window and the forwarding ladder.
-//! - [`workers`] — who owns the threads and tasks, and teardown order.
-//! - [`console`] — stdin lines in, [`Command`]s out.
-//! - `session` — the session loop itself, predates this split and keeps its
-//!   own structure (the only place in the crate that nests two locks,
-//!   `controller` -> `timings`).
+//! The root holds the *wiring*. Submodules reach each other only through the
+//! channel ends and `Arc` handles created in [`Session::run`] — no shared
+//! `&mut` state. `session` predates that split, and is the only place in the
+//! crate that nests two locks (`controller` -> `timings`).
 
 mod console;
 #[cfg(test)]
@@ -50,28 +39,24 @@ use reassembly::reassemble_loop_with_pressure;
 use session::session_loop;
 use workers::{SessionWorkers, spawn_capture_with_budget};
 
-/// Reassembled chunks awaiting the uplink, and inbound server messages
-/// awaiting the session loop. Both stages are byte-capped by
-/// [`PipelineBudget`]; the slot count only bounds how far a producer runs
-/// ahead.
+/// Both stages are byte-capped by [`PipelineBudget`]; the slot count only
+/// bounds how far a producer runs ahead.
 const PIPELINE_QUEUE: usize = 256;
 
-/// Fatal-failure reports. Several producers, one consumer, first message
-/// wins — the depth exists so a racing second report can't block the task
-/// that's already unwinding.
+/// First message wins; the depth exists so a racing second report cannot block
+/// the task that is already unwinding.
 const FATAL_QUEUE: usize = 4;
 
-/// Player commands awaiting the session loop. Safety stops do not ride this
-/// queue (see [`Command`]), so saturation costs latency, never a missed stop.
+/// Safety stops do not ride this queue (see [`Command`]), so saturation costs
+/// latency, never a missed stop.
 const COMMAND_QUEUE: usize = 16;
 
-/// Click jobs awaiting the actuator. Deliberately shallow: a deep queue would
-/// let clicks planned against a dead shop pile up behind the epoch check.
+/// Deliberately shallow: a deep queue would let clicks planned against a dead
+/// shop pile up behind the epoch check.
 const JOB_QUEUE: usize = 8;
 
-/// A non-safety command into the session loop, decoupled from its source: the
-/// stdin task and the GUI push the same values through the same channel
-/// (stdin never produces the `Set*` variants).
+/// A non-safety command, decoupled from its source: the stdin task and the GUI
+/// push the same values through the same channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Start,
@@ -87,8 +72,7 @@ pub enum Command {
 }
 
 /// Cheap clones of the shared session state, for a view (the GUI) running
-/// beside the session loop: read `status()`/`progress()`/`last_snapshot()`/
-/// `checklist()` under short locks, send [`Command`]s, read the journal.
+/// beside the session loop: the controller is read under short locks.
 #[derive(Clone)]
 pub struct SessionHandles {
     pub controller: Arc<Mutex<Controller>>,
@@ -97,15 +81,10 @@ pub struct SessionHandles {
     pub journal: EventLog,
 }
 
-/// Cooperative stop for a session running on a detached task.
-///
-/// The GUI closes its window on the OS main thread while the pipeline lives on
-/// the runtime; without this the process would exit and skip teardown, leaving
-/// an orphaned live capture session in the driver. [`Command::Stop`] only
-/// disarms the hunt — it never leaves the session loop.
-///
-/// Cloneable (the sender is shared) so the window and the session can each
-/// hold one.
+/// Cooperative stop for a session running on a detached task. The GUI closes
+/// its window on the OS main thread while the pipeline lives on the runtime;
+/// without this the process exits skipping teardown, leaving an orphaned live
+/// capture session in the driver. [`Command::Stop`] only disarms the hunt.
 #[derive(Clone)]
 pub struct ShutdownSignal(Arc<watch::Sender<bool>>);
 
@@ -134,10 +113,8 @@ pub struct Session {
     shutdown: ShutdownSignal,
 }
 
-/// Builds the shared session state and hands out clones before any fallible
-/// work runs: a view keeps live handles even when [`Session::run`] fails
-/// later (bad filter, no capture backend). The third value is the cooperative
-/// stop — see [`ShutdownSignal`].
+/// Hands out clones before any fallible work runs, so a view keeps live handles
+/// even when [`Session::run`] fails later (bad filter, no capture backend).
 pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
     // Session starts Idle; the player arms it with `start`.
     let gate = WatchGate::new(false);
@@ -176,7 +153,6 @@ pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
     (session, handles, shutdown)
 }
 
-/// Live clicking unless the config asks for a dry run.
 #[cfg(all(windows, feature = "actuator"))]
 fn actuator_mode(config: &Config) -> Mode {
     if config.actuator.dry_run {
@@ -199,12 +175,10 @@ fn actuator_mode(_config: &Config) -> Mode {
 /// # Errors
 ///
 /// [`crate::Error::Config`] when `[filter]` names no criteria — the console has
-/// no editor, so an unrestricted filter can only be fixed in `config.toml` and
-/// failing fast beats booting a watch that can never arm. Otherwise whatever
-/// [`Session::run`] returns.
+/// no editor, so failing fast beats booting a watch that can never arm.
+/// Otherwise whatever [`Session::run`] returns.
 pub async fn run(config: Config) -> Result<()> {
-    // The GUI path (setup + `Session::run`) boots instead and refuses arming
-    // until a filter is set.
+    // The GUI path boots instead, and refuses arming until a filter is set.
     if config.filter.is_unrestricted() {
         return Err(crate::Error::Config(
             "no [filter] criteria in config.toml — define what to hunt (see config.example.toml)"
@@ -220,12 +194,10 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// [`crate::Error::Capture`] when no capture backend can be opened (see
-    /// `build_source`) or when the capture thread cannot be started, and
-    /// [`crate::Error::Fatal`] carrying the session's own fatal — the first
-    /// message the session loop froze off the fatal channel, already journaled
-    /// and already self-describing. A clean teardown, including a player stop,
-    /// is `Ok(())`.
+    /// [`crate::Error::Capture`] when no capture backend can be opened or the
+    /// capture thread cannot start, and [`crate::Error::Fatal`] carrying the
+    /// first message the loop froze off the fatal channel, already journaled
+    /// and self-describing. A clean teardown, player stop included, is `Ok(())`.
     pub async fn run(self) -> Result<()> {
         let Self {
             config,
@@ -246,16 +218,14 @@ impl Session {
         let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(CAPTURE_EVENT_QUEUE);
         let (raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(PIPELINE_QUEUE);
         let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(PIPELINE_QUEUE);
-        // One fatal-failure channel, several producers (see FATAL_QUEUE).
         let (fatal_tx, fatal_rx) = mpsc::channel::<String>(FATAL_QUEUE);
         // Every receiver is taken before the signal moves into the worker set;
         // a window close reaches the session loop and the workers alike.
         let shutdown_rx = shutdown.subscribe();
         let loop_shutdown_rx = shutdown.subscribe();
 
-        // Blocking capture receiver on a dedicated thread, wrapped in
-        // catch_unwind so a panic surfaces as a fatal message instead of a
-        // silently dropped sender (which reads as a clean "session ended").
+        // Wrapped in catch_unwind so a panic surfaces as a fatal message rather
+        // than a dropped sender, which reads as a clean "session ended".
         let source = build_source(&config)?;
         let capture = spawn_capture_with_budget(
             source,
@@ -268,34 +238,29 @@ impl Session {
         )?;
         let mut workers = SessionWorkers::new(shutdown, capture);
 
-        // Server link with automatic reconnection.
         workers.spawn(
             "uplink",
             &fatal_tx,
             crate::uplink::run(
-                // The whole `ServerUrl`, not the dial string: the redacted form
-                // travels with it, and the credential-bearing spelling is
-                // reachable only through `as_str()`, at the one line that dials.
+                // The whole `ServerUrl`, so the redacted form travels with it
+                // and the credential-bearing spelling stays behind `as_str()`.
                 config.server_url.clone(),
                 raw_rx,
                 message_tx,
                 config.reconnect_initial(),
                 config.reconnect_max(),
                 // Races against the handshake, the connected pump and the
-                // backoff (previously reached only by `abort` after the grace
-                // deadline).
+                // backoff — previously reached only by `abort`.
                 shutdown_rx.clone(),
             ),
         );
 
-        // Reassembly of the captured server-to-client stream.
         workers.spawn(
             "reassembly",
             &fatal_tx,
             reassemble_loop_with_pressure(segment_rx, raw_tx, pressure_resync),
         );
 
-        // Click jobs -> the game window, through the configured backend.
         #[cfg(all(windows, feature = "actuator"))]
         {
             use crate::actuator::run_executor;
@@ -333,7 +298,6 @@ impl Session {
         #[cfg(not(all(windows, feature = "actuator")))]
         drop(job_rx);
 
-        // Keyboard input, decoupled from the session loop through the channel.
         workers.spawn(
             "stdin",
             &fatal_tx,
@@ -385,11 +349,9 @@ impl Session {
 /// teardown, and capture must not keep streaming under a crash banner.
 /// Idempotent after a clean teardown.
 ///
-/// The task lives in a single-element [`tokio::task::JoinSet`], not a bare
-/// `JoinHandle`: dropping a handle detaches, so a cancelled `supervise` used
-/// to leave the session running unheld and `gate.set(false)` never reached —
-/// capture still forwarding, the actuator still clicking, under a session
-/// that is officially gone. `JoinSet` aborts on drop instead.
+/// A single-element [`tokio::task::JoinSet`], not a bare `JoinHandle`: dropping
+/// a handle detaches, so a cancelled `supervise` left the session running with
+/// `gate.set(false)` never reached. `JoinSet` aborts on drop.
 pub async fn supervise(
     session: impl Future<Output = Result<()>> + Send + 'static,
     gate: WatchGate,
@@ -405,9 +367,8 @@ pub async fn supervise(
         ),
         Some(Ok(Err(err))) => (format!("session error: {}", err.report()), true),
         Some(Err(panic)) => (format!("session crashed: {panic}"), true),
-        // Unreachable: the set holds exactly the task spawned above. Reported as
-        // a failure, not panicked on: this function's whole job is turning a
-        // dead session into a line the player can read.
+        // Unreachable, but reported rather than panicked on: this function's
+        // whole job is turning a dead session into a line the player can read.
         None => (
             "session crashed: the session task vanished".to_owned(),
             true,
@@ -415,11 +376,8 @@ pub async fn supervise(
     }
 }
 
-/// A line that names no command, carrying the trimmed input so the message can
-/// quote it.
-///
-/// Its `Display` carries the alias list, kept beside the table that
-/// produces it rather than spelled out again at the call site.
+/// Carries the trimmed input so the message can quote it. Its `Display` lists
+/// the aliases, kept beside the table that produces them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseCommandError(String);
 
@@ -435,10 +393,9 @@ impl std::fmt::Display for ParseCommandError {
 
 impl std::error::Error for ParseCommandError {}
 
-/// Parses the *typeable* subset of [`Command`]. The three `Set*` variants
-/// carry live retune payloads (a [`Filter`], [`Limits`], [`plan::Timings`])
-/// that no console line can express; the GUI constructs those directly, and
-/// the missing match arms below document that.
+/// Parses the *typeable* subset of [`Command`]. The three `Set*` variants carry
+/// payloads no console line can express, so the GUI constructs those directly —
+/// which is what the missing match arms below mean.
 impl std::str::FromStr for Command {
     type Err = ParseCommandError;
 
@@ -456,21 +413,17 @@ impl std::str::FromStr for Command {
 /// Opens the compiled capture backend. Two arms, so every feature combination
 /// builds and exactly one applies:
 ///
-/// - **Npcap**, when `pcap-backend` is on — the shipped default. It taps every
-///   adapter through `wpcap.dll` in this process: no driver of ours to load,
-///   no second process, no UAC prompt of its own. The process *is* elevated
-///   (manifested `requireAdministrator`), but for the actuator, not this —
-///   see `build.rs`.
+/// - **Npcap**, when `pcap-backend` is on — the shipped default, tapping every
+///   adapter through `wpcap.dll` in this process: no driver of ours, no second
+///   process, no UAC prompt of its own. The process *is* elevated, but for the
+///   actuator, not this — see `build.rs`.
 /// - **No backend** — an error the caller can show, never a panic; the
-///   `--no-default-features` build, where the rest of the pipeline still
-///   compiles and tests.
+///   `--no-default-features` build.
 ///
 /// Either way what arrives is an IP-layer copy: `PcapSource` strips each
-/// adapter's link framing before handing anything up, so it keeps working on
-/// a Wi-Fi adapter, where a raw NIC tap would deliver 802.11 frames this
-/// crate does not decode. Blocking, and quick: device enumeration plus one
-/// open and one filter compile per adapter, called from `Session::run` with
-/// nothing in it waiting on a human.
+/// adapter's link framing, so it keeps working on Wi-Fi, where a raw NIC tap
+/// would deliver 802.11 frames this crate does not decode. Blocking, but quick
+/// — nothing in it waits on a human.
 #[cfg(all(windows, feature = "pcap-backend"))]
 fn build_source(config: &Config) -> Result<CaptureSource> {
     use crate::capture::PcapSource;
@@ -557,9 +510,6 @@ mod tests {
         assert!(!failed);
         assert!(outcome.contains("session ended"));
     }
-
-    // Redaction now lives in `config::ServerUrl` with its own tests; the
-    // duplicate here is gone.
 
     #[test]
     fn parse_command_maps_aliases() {

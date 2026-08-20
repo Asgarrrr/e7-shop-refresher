@@ -1,11 +1,7 @@
 //! Worker supervision and teardown: who owns the capture thread and the four
 //! Tokio tasks, and in what order they are wound down.
 //!
-//! This module holds *handles*, never payloads — it never looks inside a
-//! [`CaptureEvent`]. The one direct call across the seam is
-//! [`spawn_capture_with_budget`] invoking `super::ingest::capture_loop_budgeted`
-//! on the thread it just created; everything else is a channel end, a
-//! `watch::Receiver` or a `JoinHandle`.
+//! Holds *handles*, never payloads — it never looks inside a [`CaptureEvent`].
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -39,8 +35,6 @@ impl CaptureWorker {
     /// Wakes and joins the OS thread synchronously. A timeout here would only
     /// detach an unabortable thread, so shutdown capability is the finite join.
     fn stop_and_join(&mut self) {
-        // No `if let Err(…)`: `CaptureStop::stop` is infallible — the branch
-        // that used to be here was unreachable in all three implementors.
         self.stop.stop();
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
@@ -72,10 +66,8 @@ impl SessionWorkers {
     }
 
     /// The panic catcher is the owned worker itself: no detached supervisor
-    /// holds a second child handle.
-    ///
-    /// The span is entered here, not inside each worker: four tasks interleave
-    /// into one log file, and `name` is the correlation field they all need.
+    /// holds a second child handle. The span is entered here because four
+    /// tasks interleave into one log file and all need `name` to correlate.
     pub(super) fn spawn(
         &mut self,
         name: &'static str,
@@ -105,10 +97,9 @@ impl SessionWorkers {
         self.shutdown.request();
         drop(actuator);
 
-        // `stop_and_join` parks its caller in `Thread::join`. On a runtime
-        // worker that would deny the scheduler the tasks whose exit is being
-        // waited on — a deadlock with a single worker. The blocking pool
-        // exists to be parked.
+        // `stop_and_join` parks its caller in `Thread::join`; on a runtime
+        // worker that denies the scheduler the very tasks it is waiting on —
+        // a deadlock at one worker thread.
         let mut capture = self.capture;
         if tokio::task::spawn_blocking(move || capture.stop_and_join())
             .await
@@ -131,8 +122,8 @@ impl SessionWorkers {
             }
         }
 
-        // The single deadline elapsed. Abort every unfinished task first, then
-        // await every handle (including cancelled ones) before returning.
+        // The single deadline elapsed: abort every unfinished task before
+        // awaiting any of them, so the aborts overlap.
         for worker in &mut self.tasks {
             if let Some(handle) = worker.handle.as_ref()
                 && !handle.is_finished()
@@ -141,22 +132,13 @@ impl SessionWorkers {
                 worker.aborted = true;
             }
         }
-        // A *second* deadline, not a bare await, and this is what makes
-        // `WORKER_SHUTDOWN_GRACE` an actual bound on `shutdown`. `abort()` only
-        // lands at an await point, and the actuator worker spends its time
-        // inside `crate::actuator::blocking`'s `block_in_place`, which has
-        // none: `actuator::win` records that a `SetWindowPos` aimed at a frozen
-        // Epic Seven "does not fail, it never returns". Awaiting that handle
-        // unconditionally parks teardown forever, which parks
-        // `runtime.block_on(app::run(…))` — and tokio's installed handler
-        // swallows the player's second Ctrl+C, so the console build could only
-        // be killed. Only the GUI lane was covered, by `main.rs`'s own
-        // `teardown_failed` timer.
-        //
-        // Dropping the handle detaches rather than kills, which is the honest
-        // outcome: a thread stuck in a Win32 call cannot be reclaimed from
-        // here, and the process is on its way out. Saying so in the log is the
-        // part that was missing.
+        // A *second* deadline, not a bare await: `abort()` only lands at an
+        // await point, the actuator worker sits in `block_in_place`, which has
+        // none, and a `SetWindowPos` aimed at a frozen Epic Seven never returns
+        // (`actuator::win`) — so an unbounded await parks teardown, and with it
+        // `runtime.block_on`, past a second Ctrl+C tokio already swallowed.
+        // Detaching on timeout is the honest outcome: a thread stuck in a Win32
+        // call cannot be reclaimed from here.
         let abandon_at = Instant::now() + WORKER_SHUTDOWN_GRACE;
         for worker in &mut self.tasks {
             if let Some(handle) = worker.handle.take() {
@@ -206,9 +188,7 @@ pub(super) fn spawn_capture_with_budget(
             }
         })
         // Not `?`: the blanket `From<io::Error>` would surface an exhausted
-        // thread limit as a bare "i/o: <os error>" with nothing saying what
-        // failed — the earliest thing that can break after config load, and
-        // the one failure the player can act on.
+        // thread limit as a bare "i/o: <os error>", naming nothing.
         .map_err(|source| {
             crate::Error::Capture(format!("starting the capture thread: {source}"))
         })?;
@@ -562,8 +542,8 @@ mod tests {
             fatal_tx.clone(),
         )
         .unwrap();
-        // Select and freeze the first cause before allowing the racing panic;
-        // this is deterministic and makes teardown unable to overwrite it.
+        // Freeze the first cause before allowing the racing panic, so teardown
+        // cannot overwrite it.
         let primary = fatal_rx.recv().await.unwrap();
         let mut workers = SessionWorkers::new(shutdown_tx, capture);
         workers.spawn("uplink", &fatal_tx, async { panic!("nearby panic") });

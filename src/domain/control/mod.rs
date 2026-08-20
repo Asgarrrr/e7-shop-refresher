@@ -11,10 +11,9 @@ mod dedup;
 mod tests;
 mod watchdog;
 
-// Re-exported for `app::session`'s test suite, which drives the same recovery
-// ladder from the outside and would otherwise re-spell its deadlines as
-// literals. `watchdog` itself stays private: only the derived deadline escapes,
-// never the two windows it is derived from.
+// For `app::session`'s tests, which drive the same ladder from outside and
+// would otherwise re-spell its deadlines as literals. Only the derived
+// deadline escapes, never the two windows behind it.
 #[cfg(test)]
 pub(crate) use watchdog::past_rung;
 
@@ -31,15 +30,13 @@ use watchdog::Expectation;
 /// A refresh always costs 3 crystals (game fact); a wire-sent cost overrides.
 const REFRESH_COST_CRYSTALS: Crystals = Crystals::new(3);
 
-/// A watchdog-issued retry. Deliberately distinct from bare
-/// `Refresh`/`Buy`: recovery reaches the caller from a tick, which carries
-/// no game-animation trigger — bare variants there would render as advice
-/// and submit nothing.
+/// A watchdog-issued retry. Distinct from bare `Refresh`/`Buy` because
+/// recovery reaches the caller from a tick, which carries no game-animation
+/// trigger — bare variants there would render as advice and submit nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recovery {
-    /// Blind confirm re-click after a missed refresh confirm — free and
-    /// safe: nothing clickable sits under the modal zone when it is closed
-    /// (player-confirmed game fact).
+    /// Blind confirm re-click after a missed refresh confirm. Free and safe:
+    /// nothing clickable sits under a closed modal zone (game fact).
     ConfirmRefresh,
     /// Blind confirm re-click after a missed buy confirm.
     ConfirmBuy,
@@ -54,24 +51,18 @@ pub enum Recovery {
 ///
 /// Deserialized from the config file's `[limits]` section; unknown keys are
 /// rejected because a misspelled limit is a limit that never triggers.
-/// `Copy` because it is four `Option`s of plain integers (40 bytes, no
-/// allocation): the GUI passes it around per frame and a `.clone()` there was
-/// only ever noise.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_refreshes: Option<u32>,
-    /// Crystal budget — a hard ceiling: a refresh that would cross it is
-    /// never issued.
-    ///
-    /// Typed as [`Crystals`], not a bare integer: the comparison against
-    /// [`Progress::spent`] (see `stop_reason`) is then unwritable in the wrong
-    /// currency. `Crystals` is `#[serde(transparent)]` in both directions, so
-    /// `config.toml` still spells this as a bare `max_spend = 300`.
+    /// Crystal budget — a hard ceiling: a refresh that would cross it is never
+    /// issued. Typed as [`Crystals`] so the comparison against
+    /// [`Progress::spent`] is unwritable in the wrong currency;
+    /// `#[serde(transparent)]`, so `config.toml` still says `max_spend = 300`.
     pub max_spend: Option<Crystals>,
-    /// Matched items, cumulative — not purchases. Reached by a match, the
-    /// halt waits for that match's pause to resolve: the found items are
-    /// bought, then the loop stops instead of resuming.
+    /// Matched items, cumulative — not purchases. Reached by a match, the halt
+    /// waits for that match's pause to resolve: the items are bought, then the
+    /// loop stops instead of resuming.
     pub max_matches: Option<u32>,
     pub max_duration_ms: Option<u64>,
 }
@@ -82,11 +73,10 @@ pub struct Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     PlayerStopped,
-    /// The relay pipeline ended (capture or uplink gone) while armed: the
-    /// player did not stop the hunt and must not be told they did.
+    /// The relay pipeline ended (capture or uplink gone) while armed — not the
+    /// player's stop, and they must not be told it was.
     SessionEnded,
-    /// The click executor could not act safely: a machine fault, not the
-    /// player's stop.
+    /// The click executor could not act safely: a machine fault.
     ActuatorFailed,
     /// The game answered nothing through the whole recovery ladder.
     Unresponsive,
@@ -112,8 +102,8 @@ pub enum Status {
 }
 
 /// Everything that can move the loop: player commands, decoded wire arrivals,
-/// link transitions, and the clock. The only input to [`Controller::handle`], and
-/// the only way time enters the state machine (`now_ms`, assumed monotonic).
+/// link transitions, and the clock. The only input to [`Controller::handle`],
+/// and the only way time enters the machine (`now_ms`, assumed monotonic).
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Arms the watch. The caller must deliver a snapshot *after* this:
@@ -121,10 +111,9 @@ pub enum Event {
     Start {
         now_ms: u64,
     },
-    /// The player asked to stop.
     Stop,
-    /// The relay is going away underneath the loop (uplink or capture gone):
-    /// same halt as `Stop`, honest label.
+    /// The relay is going away underneath the loop: same halt as `Stop`,
+    /// honest label.
     Shutdown,
     /// The click executor cannot act safely: same halt, honest label.
     ActuatorFailed,
@@ -135,15 +124,11 @@ pub enum Event {
     /// A server-confirmed buy: checks the item off the checklist; clearing
     /// the last entry auto-resumes the loop.
     Purchase {
-        /// The bought item's catalog id, `None` when the server omitted it. Was
-        /// a `u32` with `0` for absent, which is the sentinel `on_purchase`
-        /// re-derived (`if item != 0 && …`) despite `shop::catalog_id` being
-        /// documented as its only interpreter — see [`CatalogId`].
+        /// The bought item's catalog id, `None` when the server omitted it.
         item: Option<CatalogId>,
-        /// Gold balance after the buy — feeds the affordability planning of
-        /// the next matches. `None` is "the server did not say", which fails
-        /// open; `Some(Gold::new(0))` is an empty purse and vetoes every priced
-        /// match. The two are one `Option` apart and were one `u32` apart.
+        /// Gold balance after the buy, planning the next matches. `None` fails
+        /// open; `Some(Gold::new(0))` is an empty purse that vetoes every
+        /// priced match.
         gold: Option<Gold>,
         now_ms: u64,
     },
@@ -151,8 +136,7 @@ pub enum Event {
     /// The player retuned the stop limits mid-session (from the GUI).
     LimitsChanged(Limits),
     /// The uplink dropped: no proof can arrive, so the watchdog must not
-    /// escalate over a dead wire (the reconnect backoff alone outlasts the
-    /// whole ladder).
+    /// escalate — the reconnect backoff alone outlasts the whole ladder.
     LinkDown,
     /// The uplink is back; a pending expectation gets a fresh full deadline.
     LinkUp {
@@ -164,10 +148,10 @@ pub enum Event {
     },
 }
 
-/// One matched slot. `slot` is the sorted display position (1..=6 on a
-/// well-formed shop; row = slot − 1). `id` is `Some` exactly when the item is
-/// buyable AND a purchase echo can name it — i.e. exactly the checklist
-/// entries; an `id: None` target is display-only, never clicked.
+/// One matched slot. `slot` is the display position (1..=6 on a well-formed
+/// shop; row = slot − 1). `id` is `Some` exactly when the item is buyable AND
+/// an echo can name it — i.e. exactly the checklist entries; an `id: None`
+/// target is display-only, never clicked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuyTarget {
     pub slot: u8,
@@ -179,23 +163,21 @@ pub struct BuyTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Refresh,
-    /// The matched slots to buy.
     Buy {
         targets: Vec<BuyTarget>,
     },
     /// A watchdog retry to execute (recovery-enabled sessions only).
     Recover(Recovery),
     Halt(StopReason),
-    /// The event was rejected; nothing changed. Callers render the reason —
+    /// The event was rejected; nothing changed. Callers render the reason, so
     /// enforcement and messaging come from the same decision.
     Refused(RefusalReason),
 }
 
 impl Action {
-    /// Whether this action is the domain's explicit rejection verdict. Callers
-    /// deciding "was the event applied?" test for this, never the emptiness of
-    /// the action list — an accepted event that grows an action later must not
-    /// silently read as refused.
+    /// The domain's explicit rejection verdict. "Was the event applied?" tests
+    /// for this, never the emptiness of the action list — an accepted event
+    /// that grows an action later must not silently read as refused.
     pub fn is_refusal(&self) -> bool {
         matches!(self, Action::Refused(_))
     }
@@ -219,8 +201,7 @@ pub struct Progress {
 
 /// Confirmed purchases this run, tallied by the bought item's wire name so a
 /// view can group them into headline tokens (Covenant, Mystic, …) and a
-/// generic bucket. Buys that carry no name in their roll land in `untitled`.
-/// Reset on `Start`, like `Progress`.
+/// generic bucket. Nameless buys land in `untitled`. Reset on `Start`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Haul {
     named: BTreeMap<String, u32>,
@@ -257,11 +238,10 @@ impl Haul {
     }
 }
 
-/// Invariant: refreshes are reactive — one is only requested in reaction to
-/// a no-match snapshot or the purchase clearing the last checklist entry;
-/// duplicate snapshots and snapshots received while unarmed
-/// (`Idle`/`Stopped`) never trigger one (they are still stored for the
-/// view).
+/// Invariant: refreshes are reactive — one is requested only for a no-match
+/// snapshot or the purchase clearing the last checklist entry. Duplicates and
+/// snapshots arriving unarmed (`Idle`/`Stopped`) never trigger one, though
+/// they are still stored for the view.
 pub struct Controller {
     filter: Filter,
     limits: Limits,
@@ -270,37 +250,35 @@ pub struct Controller {
     progress: Progress,
     /// Confirmed buys this run, grouped by item name for the haul readout.
     haul: Haul,
-    /// Last balance/cost seen this session, locally debited per refresh so
-    /// the affordability estimate survives snapshots that omit meta; a
-    /// server-sent meta overwrites the estimate. Forgotten on `Start`.
+    /// Last balance/cost seen this session, locally debited per refresh so the
+    /// estimate survives snapshots that omit meta; a server-sent meta
+    /// overwrites it. Forgotten on `Start`.
     refresh_meta: Option<RefreshMeta>,
-    /// Last gold balance echoed by a purchase; the next matches' buys are
-    /// planned against it. `None` (nothing echoed yet) restricts nothing,
-    /// and `Start` forgets it — a stale balance must not veto buys.
+    /// Last gold balance echoed by a purchase; the next buys are planned
+    /// against it. `None` restricts nothing, and `Start` forgets it — a stale
+    /// balance must not veto buys.
     gold_balance: Option<Gold>,
     last_snapshot: Option<ShopSnapshot>,
     /// Matched-but-unbought catalog ids from the last evaluated snapshot.
     checklist: Vec<CatalogId>,
-    /// Identity of the last snapshot evaluated while armed
-    /// (`Watching | Paused`): an identical re-arrival is stored for the view
-    /// but never re-evaluated, so it cannot double-bill a refresh. Cleared
-    /// on `Start` only — surviving the post-buy auto-resume is what mutes a
-    /// re-open right after a buy.
+    /// Identity of the last snapshot evaluated while armed: an identical
+    /// re-arrival is stored for the view but never re-evaluated, so it cannot
+    /// double-bill a refresh. Cleared on `Start` only — surviving the post-buy
+    /// auto-resume is what mutes a re-open right after a buy.
     acted_fingerprint: Option<Fingerprint>,
-    /// Catalog ids bought in the current roll. The wire never says sold-out
-    /// and ids are stable per item type, so this is the only guard against
-    /// re-buying an already-bought slot. Both fields survive `Start`: a
-    /// restart clears `acted_fingerprint`, and keying the clear off that
-    /// alone would let a same-roll re-open wrongly forget the buys.
+    /// Catalog ids bought in the current roll. The wire never says sold-out and
+    /// ids are stable per item type, so this is the only guard against
+    /// re-buying a bought slot. Survives `Start`, which clears
+    /// `acted_fingerprint`: keying the clear off that alone would let a
+    /// same-roll re-open wrongly forget the buys.
     bought: Vec<CatalogId>,
-    /// The roll `bought` is scoped to; a snapshot with a different identity
-    /// is fresh stock and empties the set. Shares the `Arc` with
-    /// `acted_fingerprint` rather than deep-copying every slot's strings — the
-    /// two hold the same value whenever both are set.
+    /// The roll `bought` is scoped to; a different identity is fresh stock and
+    /// empties the set. Shares the `Arc` with `acted_fingerprint` rather than
+    /// deep-copying every slot's strings.
     bought_fingerprint: Option<Fingerprint>,
-    /// Watchdog armed. Only ever true for live actuation: Off is
-    /// player-paced advice and `DryRun` never yields wire feedback — deadlines
-    /// would self-halt both.
+    /// Watchdog armed. Only ever true for live actuation: Off is player-paced
+    /// advice and `DryRun` never yields wire feedback, so deadlines would
+    /// self-halt both.
     recovery: bool,
     /// The proof the watchdog currently waits on; `None` = quiet.
     expectation: Option<Expectation>,
@@ -330,10 +308,9 @@ impl Controller {
         }
     }
 
-    /// Arms the recovery watchdog: every issued refresh/buy gets an
-    /// expectation deadline, escalating nudge → re-issue → honest halt.
-    /// Called once at wiring time, only when the actuator really clicks
-    /// (`Mode::Live`).
+    /// Arms the recovery watchdog: every issued refresh/buy gets a deadline,
+    /// escalating nudge → re-issue → honest halt. Called once at wiring time,
+    /// only when the actuator really clicks (`Mode::Live`).
     pub fn enable_recovery(&mut self) {
         self.recovery = true;
     }
@@ -359,19 +336,16 @@ impl Controller {
         &self.haul
     }
 
-    /// The active stop limits.
     pub fn limits(&self) -> &Limits {
         &self.limits
     }
 
-    /// The active interest filter.
     pub fn filter(&self) -> &Filter {
         &self.filter
     }
 
-    /// The refresh meta the stop logic enforces: server-sent, locally debited
-    /// per advised refresh, discarded as stale on `Start`. This — not the raw
-    /// snapshot — is what a view must display.
+    /// The refresh meta the stop logic enforces: server-sent, locally debited,
+    /// discarded on `Start`. A view must display this, not the raw snapshot.
     pub fn refresh_meta(&self) -> Option<RefreshMeta> {
         self.refresh_meta
     }
@@ -382,16 +356,16 @@ impl Controller {
         &self.checklist
     }
 
-    /// Last gold balance echoed by a purchase this run, if any; `None` before
-    /// the first buy and again after `Start` clears it. What a view displays.
+    /// Last gold balance echoed by a purchase this run; `None` before the
+    /// first buy and again after `Start` clears it.
     pub fn gold_balance(&self) -> Option<Gold> {
         self.gold_balance
     }
 
     /// The returned actions **are** the decision; the state mutation alone is
-    /// not the output. `clippy::must_use_candidate` structurally cannot flag a
-    /// `&mut self` method, so this attribute is the only thing that will ever
-    /// catch a dropped refresh or a dropped buy.
+    /// not the output. `clippy::must_use_candidate` cannot flag a `&mut self`
+    /// method, so this attribute is the only thing that catches a dropped
+    /// refresh or buy.
     #[must_use = "these actions are the decision — dropping them loses the refresh or the buy"]
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
         match event {
@@ -402,10 +376,9 @@ impl Controller {
             Event::Snapshot { snapshot, now_ms } => self.on_snapshot(snapshot, now_ms),
             Event::Purchase { item, gold, now_ms } => self.on_purchase(item, gold, now_ms),
             Event::FilterChanged(filter) => {
-                // An unrestricted filter is never accepted — armed, it would
-                // match every slot of every shop. Accepted swaps apply from
-                // the next *new* snapshot: neither the stored snapshot nor a
-                // duplicate re-send is re-evaluated.
+                // An unrestricted filter would match every slot of every shop.
+                // Accepted swaps apply from the next *new* snapshot: neither
+                // the stored one nor a duplicate re-send is re-evaluated.
                 if filter.is_unrestricted() {
                     return vec![Action::Refused(RefusalReason::UnrestrictedFilter)];
                 }
@@ -428,9 +401,9 @@ impl Controller {
     }
 
     /// Never refreshes: opening the shop is free and yields the first
-    /// snapshot. Ignored mid-session so a stray `Start` cannot reset
-    /// counters, and refused while the filter is unrestricted — the loop
-    /// must never hunt without a target, whoever sent the event.
+    /// snapshot. Ignored mid-session so a stray `Start` cannot reset counters,
+    /// and refused while the filter is unrestricted — the loop must never hunt
+    /// without a target, whoever sent the event.
     fn on_start(&mut self, now_ms: u64) -> Vec<Action> {
         if !matches!(self.status, Status::Idle | Status::Stopped(_)) {
             return Vec::new();
@@ -453,10 +426,9 @@ impl Controller {
         Vec::new()
     }
 
-    /// Idempotent once stopped (the original reason is not relabelled), and a
-    /// no-op while Idle: a session that never ran did not stop — the
-    /// invariant lives here, not at the callers, so every Stop producer
-    /// (console, GUI button, teardown) gets it for free.
+    /// Idempotent once stopped (the original reason is not relabelled) and a
+    /// no-op while Idle: a session that never ran did not stop. The invariant
+    /// lives here so every Stop producer gets it for free.
     fn on_halt_request(&mut self, reason: StopReason) -> Vec<Action> {
         if !matches!(self.status, Status::Watching | Status::Paused) {
             return Vec::new();
@@ -468,8 +440,7 @@ impl Controller {
         if snapshot.refresh.is_some() {
             self.refresh_meta = snapshot.refresh;
         }
-        // Decide against a borrow, then store once: every snapshot is kept for
-        // the view whatever branch decided, so no per-path store can drift.
+        // Decide against a borrow, then store once: no per-path store to drift.
         let actions = self.evaluate_snapshot(&snapshot, now_ms);
         self.last_snapshot = Some(snapshot);
         actions
@@ -486,8 +457,7 @@ impl Controller {
         if snapshot.slots.is_empty() {
             return Vec::new();
         }
-        // Already acted on: a duplicate must never bill a second refresh
-        // or re-buy.
+        // A duplicate must never bill a second refresh or re-buy.
         let fingerprint = fingerprint(snapshot);
         if fingerprint.is_some() && fingerprint == self.acted_fingerprint {
             return Vec::new();
@@ -507,19 +477,19 @@ impl Controller {
                 self.bought_fingerprint = self.acted_fingerprint.clone();
             }
         }
-        // The awaited proof (or its superseder) arrived: disarm the watchdog.
-        // Duplicates and degraded arrivals returned above — a re-open is not
-        // a re-roll. Pause-entry and emit_refresh re-arm below.
+        // The awaited proof arrived: disarm. Duplicates and degraded arrivals
+        // returned above — a re-open is not a re-roll. Pause-entry and
+        // emit_refresh re-arm below.
         self.expectation = None;
 
         let (targets, buyable) = self.plan_targets(snapshot);
-        // Alignment by construction: the checklist is exactly the clickable
+        // Aligned by construction: the checklist is exactly the clickable
         // targets, so an actuator buying `id: Some` targets clears the pause.
         self.checklist = targets.iter().filter_map(|target| target.id).collect();
 
         if targets.is_empty() {
-            // A new no-match shop also unpauses (the hourly auto-refresh
-            // replaced the matches).
+            // A new no-match shop also unpauses (the hourly rotation replaced
+            // the matches).
             self.status = Status::Watching;
             return self.refresh_or_halt(now_ms);
         }
@@ -528,33 +498,31 @@ impl Controller {
             .matches_found
             .saturating_add(targets.len() as u32);
         if !buyable {
-            // Every match is dead stock — sold out or beyond the known gold:
-            // nobody can buy any of it, and pausing would park the loop until
-            // the hourly rotation. Show the match and keep hunting.
+            // Every match is dead stock (sold out or beyond the known gold);
+            // pausing would park the loop until the hourly rotation. Show the
+            // match and keep hunting.
             self.status = Status::Watching;
             let mut actions = vec![Action::Buy { targets }];
             actions.extend(self.refresh_or_halt(now_ms));
             return actions;
         }
-        // A match means a purchase to make: never refresh over it — and
-        // never halt over it either. The matched items are the hunt's very
-        // goal, so a reached `max_matches` does not fire here: the pause
-        // resolves first (the items get bought) and the limit lands at the
-        // next gate, which re-checks every stop reason.
+        // Never refresh over a match, and never halt over it: a reached
+        // `max_matches` does not fire here, because the matched items are the
+        // hunt's goal. The pause resolves first, then the limit lands at the
+        // next gate.
         self.status = Status::Paused;
         if self.recovery && !self.checklist.is_empty() {
-            // Only echo-clearable pauses get a deadline: an untrackable
-            // (empty-checklist) pause waits on the player, not the game.
+            // Only echo-clearable pauses get a deadline: an empty-checklist
+            // pause waits on the player, not the game.
             self.expectation = Some(Expectation::purchase(now_ms));
         }
         vec![Action::Buy { targets }]
     }
 
-    /// The matched slots, each clickable or display-only, planned against
-    /// the last echoed gold balance debited in click order (the second 184k
-    /// bookmark of a 200k purse is out of reach). An unknown balance or
-    /// price fails open. The flag says whether anything at all is in reach
-    /// of a buy — the tool's or the player's.
+    /// The matched slots, clickable or display-only, planned against the last
+    /// echoed gold balance debited in click order (the second 184k bookmark of
+    /// a 200k purse is out of reach). An unknown balance or price fails open.
+    /// The flag says whether anything at all is in reach of a buy.
     fn plan_targets(&self, snapshot: &ShopSnapshot) -> (Vec<BuyTarget>, bool) {
         let mut targets = Vec::new();
         let mut gold = self.gold_balance;
@@ -570,20 +538,16 @@ impl Controller {
             let already_bought = item.id.is_some_and(|id| self.bought.contains(&id));
             let in_reach = !item.is_sold_out() && affordable && !already_bought;
             if in_reach && let (Some(balance), Some(price)) = (gold, item.price) {
-                // `Gold::saturating_sub`, not `-`: both operands are
-                // wire-supplied, and `price <= balance` only holds here through
-                // `affordable` above — a non-local invariant an added `in_reach`
-                // term could break. At zero the next item simply reads
-                // unaffordable, which is intended. `Gold` has no `Sub` impl at
-                // all, so the panicking form is not spellable here.
+                // Saturating: `price <= balance` holds only through
+                // `affordable` above, which an added `in_reach` term could
+                // break. At zero the next item reads unaffordable, as intended.
                 gold = Some(balance.saturating_sub(price));
             }
             buyable |= in_reach;
             targets.push(BuyTarget {
                 slot: item.effective_slot(index),
-                // Only ids a buy can actually land on: a sold-out,
-                // unaffordable or already-bought slot may not hold the
-                // checklist open (nor be clicked).
+                // Only ids a buy can land on: a sold-out, unaffordable or
+                // already-bought slot may not hold the checklist open.
                 id: item.id.filter(|_| in_reach),
             });
         }
@@ -591,8 +555,8 @@ impl Controller {
     }
 
     /// A server-confirmed buy: records the echoed gold balance, then — only
-    /// meaningful while `Paused` — checks the item off the checklist; the
-    /// buy clearing the last entry resumes the hunt through the limits gate.
+    /// while `Paused` — checks the item off the checklist. The buy clearing
+    /// the last entry resumes the hunt through the limits gate.
     fn on_purchase(
         &mut self,
         item: Option<CatalogId>,
@@ -600,25 +564,20 @@ impl Controller {
         now_ms: u64,
     ) -> Vec<Action> {
         if gold.is_some() {
-            // The echoed balance is truth whatever the status: the next
-            // matches' buys are planned against it.
+            // Truth whatever the status: the next buys are planned against it.
             self.gold_balance = gold;
         }
-        // Like gold, a buy is truth whatever the status: the slot is spent
-        // for the rest of the roll. The `bought` guard also dedups a replayed
-        // echo, so a buy is counted at most once per roll (a genuine re-buy in
-        // a fresh roll clears `bought` and counts again — two items obtained).
+        // Also truth whatever the status — the slot is spent for the rest of
+        // the roll. The `bought` guard doubles as replay dedup, so a buy counts
+        // at most once per roll; a re-buy in a fresh roll counts again.
         if let Some(item) = item
             && !self.bought.contains(&item)
         {
             self.bought.push(item);
-            // `bought` takes every buy as roll truth (dedup, re-open guard);
-            // the haul is narrower — the *run's* take. Record only while a
-            // run is live (a manual buy after a stop is the player's, not the
-            // loop's) and only when the id still sits in the current roll: a
-            // stale echo whose roll rotated out before it landed resolves to
-            // no slot, and bucketing it would double-count the buy as a
-            // phantom Other.
+            // The haul is narrower than `bought`: the *run's* take. Hence only
+            // while a run is live (a post-stop buy is the player's own), and
+            // only when the id still sits in the roll — a stale echo whose roll
+            // rotated out would otherwise bucket as a phantom Other.
             if !matches!(self.status, Status::Stopped(_))
                 && let Some(slot) = self.last_snapshot.as_ref().and_then(|s| s.slot_by_id(item))
             {
@@ -637,8 +596,8 @@ impl Controller {
         self.checklist.swap_remove(position);
         if !self.checklist.is_empty() {
             if self.recovery {
-                // Proof of life: the game is delivering echoes, so the
-                // remaining buys restart the ladder with a full deadline.
+                // Proof of life: the remaining buys restart the ladder at rung
+                // zero with a full deadline.
                 self.expectation = Some(Expectation::purchase(now_ms));
             }
             return Vec::new();
@@ -650,14 +609,10 @@ impl Controller {
     /// A tick is a check-point: a limit tightened mid-session (or an elapsed
     /// timer) takes effect here, without waiting for the next snapshot.
     ///
-    /// While `Watching` quietly (no expectation pending), every stop reason
-    /// applies — an already-exceeded `max_refreshes`/`max_spend`/
-    /// `max_matches` must not linger with the gate on. While a refresh is in
-    /// flight the count/spend gates move into the ladder's own
-    /// `refresh_or_halt`: the awaited roll is already paid for and may hold
-    /// a match, so only time may halt over it — mirroring `Paused`, where
-    /// only the timeout applies lest a still-buyable pause be abandoned on,
-    /// say, an out-of-crystals estimate. Time first, watchdog second.
+    /// Quietly `Watching`, every stop reason applies. With a refresh in flight
+    /// the count/spend gates move into `refresh_or_halt` — the awaited roll is
+    /// paid for and may hold a match, so only time may halt over it, as in
+    /// `Paused`. Time first, watchdog second.
     fn on_tick(&mut self, now_ms: u64) -> Vec<Action> {
         match self.status {
             Status::Watching if self.expectation.is_none() => match self.stop_reason(now_ms) {
@@ -668,9 +623,9 @@ impl Controller {
                 self.halt(StopReason::Timeout)
             }
             Status::Watching | Status::Paused => self.watchdog(now_ms),
-            // Named, not `_`: the tick is the only time-driven check-point, so a
-            // new `Status` falling in here would get no limit enforcement and no
-            // watchdog for as long as it lasted. Make it a compile error.
+            // Named, not `_`: the tick is the only time-driven check-point, so
+            // a new `Status` landing here would silently get no limits and no
+            // watchdog. Keep it a compile error.
             Status::Idle | Status::Stopped(_) => Vec::new(),
         }
     }
@@ -684,16 +639,16 @@ impl Controller {
         }
     }
 
-    /// Single emission point: every refresh, including the auto-resume one,
-    /// is counted and debited before it goes out — and, with recovery on,
+    /// Single emission point: every refresh, the auto-resume one included, is
+    /// counted and debited before it goes out — and, with recovery on,
     /// expected to produce a snapshot in time.
     fn emit_refresh(&mut self, now_ms: u64) -> Action {
         self.progress.refreshes = self.progress.refreshes.saturating_add(1);
         let cost = self.refresh_cost();
         self.progress.spent = self.progress.spent.saturating_add(cost);
         if let Some(meta) = self.refresh_meta.as_mut() {
-            // Keeps the affordability estimate fresh across snapshots that
-            // omit meta; a server-sent meta overwrites it with truth.
+            // Keeps the estimate fresh across snapshots that omit meta; a
+            // server-sent meta overwrites it with truth.
             meta.crystal_balance = meta.crystal_balance.saturating_sub(cost);
         }
         if self.recovery {
@@ -702,24 +657,14 @@ impl Controller {
         Action::Refresh
     }
 
-    /// Spend tracking never waits for a snapshot that carries meta. Internal:
-    /// no view reads it since the top bar dropped the cost readout — re-expose
-    /// it when the Stats tab needs it again.
+    /// Spend tracking never waits for a snapshot that carries meta.
     ///
-    /// A wire-sent **zero** is refused and the constant used instead. Zero is
-    /// the one value that does not merely mis-state the price, it switches
-    /// both money gates off at once: `stop_reason`'s out-of-funds test becomes
+    /// A wire-sent **zero** is refused and the constant used instead: zero
+    /// switches both money gates off at once — out-of-funds becomes
     /// `balance < 0`, never true, and `spent` stops accumulating, so
-    /// `max_spend` is never reached either. A player whose only limit is
-    /// `max_spend` would get an unbounded loop spending crystals they really
-    /// paid for, against that field's own promise of a hard ceiling. Any other
-    /// cost is believed, as the constant's doc says.
-    ///
-    /// The floor is the constant and not `1`, because the question a zero
-    /// leaves open is "what does a refresh cost", and the answer this crate
-    /// has is 3. If free refreshes ever become a real mechanic, the cost of
-    /// this line is a spurious `MaxSpend` — it stops rather than spends, which
-    /// is the direction to be wrong in.
+    /// `max_spend` is unreachable too. Any other cost is believed. If free
+    /// refreshes ever become real, this costs a spurious `MaxSpend`: it stops
+    /// rather than spends, the direction to be wrong in.
     fn refresh_cost(&self) -> Crystals {
         match self.refresh_meta {
             Some(meta) if meta.cost > Crystals::new(0) => meta.cost,
@@ -729,10 +674,9 @@ impl Controller {
 
     fn halt(&mut self, reason: StopReason) -> Vec<Action> {
         self.status = Status::Stopped(reason);
-        // A stopped hunt has no pending purchases: snapshots stored while
-        // Stopped are never evaluated, and catalog ids are stable per item,
-        // so a surviving checklist would keep painting yesterday's matches
-        // as "wanted" in the view.
+        // Ids are stable per item and snapshots stored while Stopped are never
+        // evaluated, so a surviving checklist would keep painting yesterday's
+        // matches as "wanted" in the view.
         self.checklist.clear();
         // Every stop path (Unresponsive included) disarms the watchdog.
         self.expectation = None;
@@ -741,11 +685,9 @@ impl Controller {
 
     /// Checked before every refresh; the order below is the priority order.
     fn stop_reason(&self, now_ms: u64) -> Option<StopReason> {
-        // `refresh_cost()`, not `meta.cost`: the two must answer the same
-        // number or the floor above buys nothing. Debiting 3 per refresh in
-        // `emit_refresh` while comparing the balance against a wire-sent 0
-        // here would leave out-of-funds unreachable on exactly the message the
-        // floor exists for.
+        // `refresh_cost()`, not `meta.cost`: debiting 3 per refresh while
+        // weighing the balance against a wire-sent 0 here would leave
+        // out-of-funds unreachable on the very message the floor exists for.
         if let Some(meta) = self.refresh_meta
             && meta.crystal_balance < self.refresh_cost()
         {
@@ -757,10 +699,7 @@ impl Controller {
             return Some(StopReason::MaxRefreshes);
         }
         // Hard ceiling: also stop when the *next* refresh would cross it.
-        //
-        // `checked_add`, not `saturating_add`: the question is whether the
-        // *next* refresh crosses the ceiling, and a saturated `u32::MAX` would
-        // answer "over budget" for the right reason by accident.
+        // `checked_add` rather than `saturating_add` — see its doc.
         if let Some(max) = self.limits.max_spend
             && (self.progress.spent >= max
                 || self

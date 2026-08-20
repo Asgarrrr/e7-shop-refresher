@@ -1,44 +1,37 @@
 //! Pure projection of the controller for the window: everything one frame
-//! shows, copied under a single short lock.
-//!
-//! Two things are deliberately not copied per frame: the slot table's hover
-//! tooltip (see [`slot_detail`]) and the slot rows (see [`SlotRows`]). What
-//! remains in [`ViewState`] is `Copy` state and `&'static` labels, so
-//! building one allocates nothing.
+//! shows, copied under a single short lock. The hover tooltip
+//! ([`slot_detail`]) and the slot rows ([`SlotRows`]) are deliberately not
+//! copied per frame, so building a [`ViewState`] allocates nothing.
 
 use crate::domain::control::{Controller, Limits, Progress, Status};
 use crate::domain::shop::{CatalogId, Crystals, Gold, ShopItem};
 use crate::render::{HAUL_HEADLINERS, format_item, haul_tally, kind_label, status_summary};
 
-/// Plain per-frame copy of everything the window shows except the slot rows.
-/// Every field is `Copy` or `&'static`, so the copy is free.
+/// Every field is `Copy` or `&'static`, so the per-frame copy is free.
 pub(super) struct ViewState {
-    /// State word (idle/watching/…), carrying the severity color in the bar.
     pub status_word: &'static str,
-    /// Secondary clause beside the word: a hint, or the stop reason; `None`
-    /// while watching.
+    /// A hint, or the stop reason; `None` while watching.
     pub status_hint: Option<&'static str>,
-    /// The raw status, for the status color only — word/hint stay the source of the wording.
+    /// For the status color only — the two above own the wording.
     pub status_kind: Status,
     pub progress: Progress,
     pub limits: Limits,
-    /// From the controller's enforced meta (debited per refresh, cleared on
-    /// restart), not the raw snapshot — "skystones" in game, "crystals" in code.
+    /// From the controller's enforced meta, not the raw snapshot.
     pub crystal_balance: Option<Crystals>,
-    /// Last gold balance echoed by a purchase this run; `None` before the
-    /// first buy and again after `Start`.
+    /// Last gold balance echoed by a purchase; `None` before the first buy and
+    /// again after `Start`.
     pub gold_balance: Option<Gold>,
     /// A shop has been captured this session, even a degraded slotless one.
     /// Gates the welcome screen: empty rows alone must not resurrect it.
     pub has_snapshot: bool,
-    /// Confirmed buys this run, per headline token (label, count), shown even at zero once a run exists.
+    /// Confirmed buys this run, per headline token, shown even at zero once a
+    /// run exists.
     pub haul: [(&'static str, u32); HAUL_HEADLINERS.len()],
     /// Everything else bought this run, folded into one "+N other" bucket.
     pub haul_others: u32,
 }
 
-/// One shop slot as the table shows it. The full hover console line is not
-/// a field here — see [`slot_detail`].
+/// One shop slot as the table shows it.
 pub(super) struct SlotRow {
     pub slot: u8,
     pub kind: &'static str,
@@ -50,8 +43,8 @@ pub(super) struct SlotRow {
 }
 
 impl SlotRow {
-    /// Projects one slot. The cloned name is the only allocation a frame's
-    /// projection makes — why [`SlotRows`] gates it.
+    /// The cloned name is the only allocation a frame's projection makes —
+    /// which is why [`SlotRows`] gates it.
     fn project(item: &ShopItem, index: usize, checklist: &[CatalogId]) -> Self {
         Self {
             slot: item.effective_slot(index),
@@ -66,8 +59,8 @@ impl SlotRow {
     /// Whether this row still describes `item` at `index` — [`SlotRows`]'s
     /// gate, mirroring [`SlotRow::project`] with nothing allocated.
     ///
-    /// `self` is destructured rather than read field by field: a field added
-    /// above but left out here becomes an unused binding, which CI denies.
+    /// `self` is destructured rather than read field by field so that a field
+    /// added above but left out here becomes an unused binding, which CI denies.
     fn matches(&self, item: &ShopItem, index: usize, checklist: &[CatalogId]) -> bool {
         let Self {
             slot,
@@ -86,20 +79,14 @@ impl SlotRow {
     }
 }
 
-/// The slot table's rows, re-derived only when the shop or the checklist
-/// behind them moved — the same generation-gated shape `ShopApp::journal_cache`
-/// uses.
+/// The slot table's rows, re-derived only when the shop or the checklist behind
+/// them moved. This buys lock hold, not CPU: the projection runs inside the
+/// controller lock the session loop needs, and hover lifts the repaint rate
+/// above the 4 Hz idle poll.
 ///
-/// This buys lock hold, not CPU: the projection runs inside the controller
-/// lock the session loop uses to turn a captured shop into a click job, and
-/// hover lifts the repaint rate above the 4 Hz idle poll (250ms). Rebuilding
-/// only on change keeps the allocator out of that hold.
-///
-/// The gate compares fields rather than a generation counter or
-/// `Arc::ptr_eq`: [`Controller::last_snapshot`] hands out a snapshot stored
-/// inline, so a replacement lands at the same address — nothing cheaper is
-/// also correct. If the domain ever holds it behind an `Arc` (own-002's
-/// first step), this collapses to one pointer test.
+/// The gate compares fields rather than a generation counter or `Arc::ptr_eq`:
+/// [`Controller::last_snapshot`] stores the snapshot inline, so a replacement
+/// lands at the same address — nothing cheaper is also correct.
 #[derive(Default)]
 pub(super) struct SlotRows(Vec<SlotRow>);
 
@@ -145,19 +132,14 @@ impl SlotRows {
     }
 }
 
-/// The full console line for one slot — the shop table's hover tooltip —
-/// built on demand instead of projected into every [`SlotRow`].
+/// The shop table's hover tooltip, built on demand rather than projected into
+/// every [`SlotRow`]: as a field, `format_item` ran once per slot per frame
+/// inside the controller lock, at hover's display repaint rate, for a string
+/// only one row ever reads.
 ///
-/// It used to be a `SlotRow` field: `format_item` ran once per slot on every
-/// frame inside the controller lock, for a string only the hovered row ever
-/// reads, and hover repaints at display rate rather than the 250ms poll
-/// floor. `shop_table` now calls this from `on_hover_ui`, which egui invokes
-/// only for the hovered widget.
-///
-/// `index` is the row's position in the projected snapshot; a message
-/// landing between projection and hover describes the new roll instead — a
-/// sub-repaint skew resolved on the next poll. Empty when the snapshot no
-/// longer has that slot.
+/// `index` is the row's position in the projected snapshot, so a message
+/// landing between projection and hover describes the new roll — a sub-repaint
+/// skew resolved on the next poll. Empty when that slot is gone.
 pub(super) fn slot_detail(controller: &Controller, index: usize) -> String {
     controller
         .last_snapshot()
@@ -204,7 +186,6 @@ mod tests {
         }
     }
 
-    /// A freshly synced row cache, the way one frame builds it.
     fn rows(controller: &Controller) -> SlotRows {
         let mut rows = SlotRows::default();
         rows.sync(controller);
@@ -227,7 +208,8 @@ mod tests {
     #[test]
     fn slot_rows_use_effective_slot_fallback() {
         let mut ctrl = controller();
-        // First slot carries a wire slot, second falls back to its 1-based position.
+        // The second slot carries no wire slot and falls back to its 1-based
+        // position.
         let slots = vec![
             ShopItem {
                 slot: 5,
@@ -251,8 +233,8 @@ mod tests {
     fn slot_rows_flag_checklist_rows_as_wanted() {
         let mut ctrl = controller();
         let _ = ctrl.handle(Event::Start { now_ms: 0 });
-        // Default filter matches both; only the trackable id enters the
-        // checklist — the id-0 sentinel row must never read as wanted.
+        // The default filter matches both, but only a trackable id enters the
+        // checklist: the id-0 sentinel row must never read as wanted.
         let slots = vec![
             ShopItem {
                 id: CatalogId::new(42),
@@ -310,7 +292,6 @@ mod tests {
 
     #[test]
     fn view_state_balance_survives_meta_less_snapshot() {
-        // The controller keeps its enforced estimate across snapshots that omit meta.
         let mut ctrl = controller();
         let _ = ctrl.handle(Event::Snapshot {
             snapshot: ShopSnapshot {
@@ -332,7 +313,8 @@ mod tests {
 
     #[test]
     fn view_state_balance_cleared_on_restart() {
-        // `Start` discards a stale balance; it must not resurrect from the stored snapshot.
+        // `Start` discards a stale balance, and it must not resurrect from the
+        // stored snapshot.
         let mut ctrl = controller();
         let _ = ctrl.handle(Event::Snapshot {
             snapshot: ShopSnapshot {
@@ -369,7 +351,7 @@ mod tests {
         let view = view_state(&ctrl);
         assert_eq!(view.status_word, "Stopped");
         assert_eq!(view.status_kind, Status::Stopped(StopReason::PlayerStopped));
-        // The stop reason rides in the hint now, not a separate field.
+        // The stop reason rides in the hint, not a separate field.
         assert_eq!(view.status_hint, Some("player stopped"));
     }
 
@@ -393,8 +375,7 @@ mod tests {
 
     #[test]
     fn slot_detail_of_a_vanished_slot_is_empty() {
-        // The index may no longer exist by the time this is called: an
-        // absent slot or snapshot must read empty, not panic.
+        // The index may no longer exist by the time this is called.
         let mut ctrl = controller();
         assert_eq!(slot_detail(&ctrl, 0), "");
         let _ = ctrl.handle(Event::Snapshot {
@@ -404,14 +385,10 @@ mod tests {
         assert_eq!(slot_detail(&ctrl, 3), "");
     }
 
-    /// A second sync over an unchanged controller must not build a new
-    /// `Vec` — asserted through capacity, not identity.
-    ///
-    /// `sync` fills the cache by `collect`ing an iterator of known length, so
-    /// a rebuilt vector's capacity equals its length; growing the live one
-    /// first lets the two states tell themselves apart without allocator
-    /// addresses (a freed buffer can be handed back at the same address, so
-    /// `as_ptr` would prove nothing).
+    /// Asserted through capacity, not identity: `sync` `collect`s an iterator
+    /// of known length, so a rebuilt vector's capacity equals its length, and
+    /// growing the live one first tells the two apart. `as_ptr` would prove
+    /// nothing — a freed buffer can come back at the same address.
     #[test]
     fn slot_rows_are_not_re_derived_while_the_shop_and_the_checklist_hold() {
         let mut ctrl = controller();
@@ -429,7 +406,7 @@ mod tests {
         rows.0.reserve(64);
         let capacity = rows.0.capacity();
 
-        // Ten frames' worth of repaints with nothing new to show.
+        // Repaints with nothing new to show.
         for _ in 0..10 {
             rows.sync(&ctrl);
         }
@@ -458,8 +435,7 @@ mod tests {
         let mut rows = SlotRows::default();
         rows.sync(&ctrl);
 
-        // A new roll at the same slot lands at the same address (the
-        // snapshot is stored inline) — the gate must notice anyway.
+        // A new roll lands at the same address, and the gate must notice.
         let _ = ctrl.handle(Event::Snapshot {
             snapshot: roll("Mystic Medal"),
             now_ms: 1,
@@ -471,8 +447,8 @@ mod tests {
 
     #[test]
     fn slot_rows_are_re_derived_when_the_checklist_moves_under_them() {
-        // `wanted` is not in the snapshot: keying the cache on the shop
-        // alone would leave the row green after the purchase.
+        // `wanted` is not in the snapshot, so keying on the shop alone would
+        // leave the row green after the purchase.
         let mut ctrl = controller();
         let id = CatalogId::new(42);
         let _ = ctrl.handle(Event::Start { now_ms: 0 });

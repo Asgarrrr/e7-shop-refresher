@@ -1,11 +1,7 @@
 //! The reassembly pump: the post-resync anchor window, and the forwarding
 //! ladder that keeps a byte-pressure event from being reported as a closed
-//! pipeline.
-//!
-//! Runs as a Tokio task. Its whole input is the [`CaptureEvent`] channel and
-//! its whole output is the outbound `BudgetedChunk` channel; the only state
-//! shared with the capture pump is the [`PressureResync`] marker it
-//! acknowledges.
+//! pipeline. The only state shared with the capture pump is the
+//! [`PressureResync`] marker this task acknowledges.
 
 use std::time::Duration;
 
@@ -20,8 +16,7 @@ use crate::stream::{BudgetedChunk, BudgetedSegment, InitialBurst, Reassembler, R
 use super::pressure::{CaptureEvent, PressureResync};
 
 /// One-shot allowance for reordered predecessors right after capture resumes.
-/// Ten milliseconds is a documented hard cap on latency, chosen without
-/// server-side timing evidence.
+/// A hard cap on latency, chosen without server-side timing evidence.
 const INITIAL_ANCHOR_WINDOW: Duration = Duration::from_millis(10);
 
 enum AnchorState {
@@ -36,7 +31,6 @@ enum AnchorState {
     },
 }
 
-/// Consumes capture events, reassembles, forwards the ordered stream.
 #[cfg(test)]
 async fn reassemble_loop(
     events: mpsc::Receiver<CaptureEvent>,
@@ -99,11 +93,9 @@ pub(super) async fn reassemble_loop_with_pressure(
                 .expect("test segment fits capture quota"),
         };
 
-        // A SYN is never held behind the anchor deadline: it re-anchors the
-        // sequence space, so buffering it would make the burst's ordering
-        // meaningless. Commit any older burst first, then let `Reassembler`
-        // reset the connection incarnation immediately
-        // (`Reassembler::syn_starts_new_incarnation`).
+        // A SYN re-anchors the sequence space, so holding it behind the
+        // deadline would make the burst's ordering meaningless: commit any
+        // older burst first, then let `Reassembler` reset the incarnation.
         if segment.syn {
             if !flush_anchor(&mut anchor, &mut reassembler, &raw_tx).await {
                 break;
@@ -183,14 +175,10 @@ async fn flush_anchor(
         };
         match status {
             ForwardStatus::Open => {}
-            // Either form of pressure abandons the rest of the burst. For the
-            // flow that actually failed, its bytes belong to an origin that no
-            // longer exists; for the others under a shared-quota failure, they
-            // are dropped as conservatism rather than necessity — one anchor
-            // window is re-armed here and the surviving flows carry on through
-            // it. `ReassemblyOutcome` deliberately does not distinguish the two
-            // (`stream::reassembly` does, and sizes the eviction to the cause);
-            // the caller's response is the same either way.
+            // Either form of pressure abandons the rest of the burst: the
+            // failing flow's bytes belong to an origin that no longer exists,
+            // and dropping the others is conservatism — one anchor window is
+            // re-armed here and the survivors carry on through it.
             ForwardStatus::Pressure => {
                 *anchor = AnchorState::AwaitingFirst;
                 return true;
@@ -205,11 +193,7 @@ async fn flush_anchor(
 /// origin those bytes belonged to. `false` means the downstream closed and the
 /// caller must `break`.
 ///
-/// A plain function, not a macro: the four call sites are the crate's most
-/// correctness-critical transitions (a wrong `anchor` stalls reassembly
-/// forever), and `macro_rules!` would hide them from rust-analyzer, the
-/// debugger and error messages for no line-count savings. Only the
-/// *post*-forward transition lives here — two call sites set
+/// Only the *post*-forward transition lives here — two call sites set
 /// `AnchorState::Steady` immediately before calling; that ordering is theirs.
 async fn forward_or_rearm(
     reassembler: &mut Reassembler,
@@ -244,21 +228,17 @@ enum ForwardStatus {
     Closed,
 }
 
-/// Moves reassembled chunks into the outbound stage.
-///
-/// A chunk larger than the whole outbound quota can never be retagged, so it
-/// is dropped: a hole in the byte stream, not a closed pipeline. Reassembly
-/// state is cleared so the next segment re-anchors, exactly as under
-/// pending-byte pressure. This used to tear the session down and report it as
-/// a clean end.
+/// A chunk larger than the whole outbound quota can never be retagged, so it is
+/// dropped — a hole in the byte stream, not a closed pipeline — and reassembly
+/// is cleared so the next segment re-anchors. This used to tear the session
+/// down and report it as a clean end.
 async fn forward_chunks(
     chunks: Vec<BudgetedChunk>,
     reassembler: &mut Reassembler,
     raw_tx: &mpsc::Sender<BudgetedChunk>,
 ) -> ForwardStatus {
-    // WebSocket frame boundaries are deliberately non-semantic: reassembly
-    // has always produced different batches for in-order arrivals and gap
-    // fills. Only the concatenated byte order is the protocol contract.
+    // WebSocket frame boundaries are deliberately non-semantic: only the
+    // concatenated byte order is the protocol contract.
     for chunk in chunks {
         let retag = chunk.retag_outbound();
         tokio::pin!(retag);
@@ -333,8 +313,8 @@ mod tests {
             },
         );
         let (tx, mut rx) = mpsc::channel(1);
-        // The reassembler travels with the task: `forward_chunks` may have to
-        // clear it, and the test still needs it afterwards to release leases.
+        // Travels with the task: `forward_chunks` may clear it, and the test
+        // still needs it afterwards to release leases.
         let task = tokio::spawn(async move {
             let status = forward_chunks(chunks, &mut reassembler, &tx).await;
             (status, reassembler)
@@ -580,10 +560,8 @@ mod tests {
             .unwrap();
         tokio::task::yield_now().await;
 
-        // The paused clock advances whenever nothing is runnable, so
-        // `task.await` resolves with or without the `raw_tx.closed()` branch —
-        // the deadline arm reaches the same `break` 10 ms later. Elapsed time
-        // is the only way to tell the two apart.
+        // The paused clock advances whenever nothing is runnable, so both
+        // branches reach the same `break`; elapsed time is the only tell.
         let before = Instant::now();
         drop(raw_rx);
         task.await.unwrap();
@@ -642,9 +620,8 @@ mod tests {
         task.await.unwrap();
     }
 
-    /// Two game connections captured at once: the burst sorts each one on its
-    /// own sequence space, but replays them into the slots they were observed
-    /// in, so the alternation between the connections survives the reordering.
+    /// Two connections at once: the burst sorts each on its own sequence space
+    /// but replays into the observed slots, so the alternation survives.
     #[tokio::test(start_paused = true)]
     async fn initial_anchor_isolates_flows_while_preserving_slots() {
         let (event_tx, event_rx) = mpsc::channel(6);

@@ -9,12 +9,10 @@ use std::time::Instant;
 
 /// One journal entry: a console line stamped with the session clock.
 ///
-/// `text` is `Arc<str>`: written once by [`EventLog::push`], copied out
-/// wholesale up to four times a second by [`EventLog::to_entries`] for the
-/// GUI's repaint of text that never mutates. A `String` would cost up to
-/// [`JOURNAL_CAP`] allocations and memcpys per repaint; `Arc<str>` costs
-/// refcount bumps instead, `push` pays the one real allocation, and it skips
-/// `Arc<String>`'s second indirection to the bytes.
+/// `text` is `Arc<str>` because [`EventLog::to_entries`] copies the whole ring
+/// out four times a second for a repaint of text that never mutates: a `String`
+/// would cost up to [`JOURNAL_CAP`] allocations and memcpys per repaint, and
+/// `Arc<String>` adds a second indirection to the bytes.
 #[derive(Debug, Clone)]
 pub struct LogLine {
     pub at_ms: u64,
@@ -32,10 +30,9 @@ const JOURNAL_CAP: usize = 500;
 pub struct EventLog {
     epoch: Instant,
     /// Bumped on every push so readers can cache [`EventLog::entries`] and
-    /// re-clone only when something changed. Both sides use `Relaxed`: the
-    /// `Mutex` shared with `push` already gives the happens-before edge. A
-    /// stale read costs one frame of a 4 Hz repaint at worst — no worse than
-    /// `Acquire`, which gives no freshness guarantee either.
+    /// re-clone only when something changed. `Relaxed` on both sides: the
+    /// `Mutex` shared with `push` already gives the happens-before edge, and a
+    /// stale read costs one frame of a 4 Hz repaint at worst.
     generation: Arc<AtomicU64>,
     entries: Arc<Mutex<VecDeque<LogLine>>>,
 }
@@ -56,12 +53,11 @@ impl EventLog {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Single sink for player-facing lines: never print session lines around
-    /// it. Mirrors to `tracing` so lines survive the process (the ring dies
-    /// with it; the windowed build has no console) under `target: "journal"`
-    /// (`RUST_LOG=journal=info` isolates the player view). Records at `INFO`;
-    /// failures (actuator halt, aborted session, a refused config write)
-    /// belong at [`EventLog::emit_at`] instead, for level-based triage.
+    /// Single sink for player-facing lines: never print session lines around it.
+    /// Mirrors to `tracing` under `target: "journal"` so lines survive the
+    /// process the ring dies with (`RUST_LOG=journal=info` isolates the player
+    /// view). Records at `INFO`; failures belong at [`EventLog::emit_at`] for
+    /// level-based triage.
     pub fn emit(&self, lines: &[String]) {
         self.emit_at(tracing::Level::INFO, lines);
     }
@@ -89,32 +85,28 @@ impl EventLog {
         }
     }
 
-    /// Ring only — no `tracing` event, no log file, no record once the
-    /// process ends. Reserve for lines whose entire audience is the player
-    /// watching right now; anything worth later triage needs
-    /// [`EventLog::emit`] or [`EventLog::emit_at`] instead.
+    /// Ring only — no `tracing` event, no log file, no record once the process
+    /// ends. For lines whose entire audience is the player watching right now;
+    /// anything worth later triage needs [`EventLog::emit`] instead.
     pub fn push(&self, lines: &[String]) {
         if lines.is_empty() {
             return;
         }
         let at_ms = self.now_ms();
-        // Poison-tolerant like `to_entries`: `emit` runs on the session loop,
-        // the actuator executor and the watchdog, so panicking here would
+        // Poison-tolerant: `emit` runs on three threads, so panicking here would
         // cascade and freeze the GUI's history. `crate::sync`'s obligation is
         // discharged by the deque only ever being pushed to and read whole.
         let mut entries = crate::sync::lock_ignoring_poison(&self.entries);
         for text in lines {
             entries.push_back(LogLine {
                 at_ms,
-                // One allocation here, same as `text.clone()`; buys cheap
-                // copies later — see `LogLine`.
                 text: Arc::from(text.as_str()),
             });
         }
         while entries.len() > JOURNAL_CAP {
             entries.pop_front();
         }
-        // Bumped outside the lock to keep it short — see the `generation` field.
+        // Bumped outside the lock to keep it short.
         drop(entries);
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
@@ -123,13 +115,11 @@ impl EventLog {
         self.generation.load(Ordering::Relaxed)
     }
 
-    /// Copies the whole ring out — up to [`JOURNAL_CAP`] `LogLine`s. The `to_`
-    /// prefix is the warning: this is not a getter, and calling it per frame
-    /// is what made the GUI add [`EventLog::generation`] and a cache in front
-    /// of it. No longer a deep copy — [`LogLine::text`] is `Arc<str>`, so each
-    /// entry costs a refcount bump, not a fresh `String`; the lock, the `Vec`,
-    /// and 500 bumps are still real work 4 times a second, hence the cache.
-    /// Poison-tolerant, so the GUI can still show history after a panic.
+    /// Copies the whole ring out. The `to_` prefix is the warning: not a getter,
+    /// and calling it per frame is what made the GUI add
+    /// [`EventLog::generation`] and a cache in front of it — the lock, the `Vec`
+    /// and 500 refcount bumps are real work 4 times a second. Poison-tolerant,
+    /// so the GUI can still show history after a panic.
     pub fn to_entries(&self) -> Vec<LogLine> {
         crate::sync::lock_ignoring_poison(&self.entries)
             .iter()
@@ -181,8 +171,8 @@ mod tests {
 
     #[test]
     fn emit_at_records_every_level_in_the_ring() {
-        // The level only steers the `tracing` half; the ring must hold the
-        // line regardless, or a failure would show in the log but not the window.
+        // The level steers only the `tracing` half: a failure that skipped the
+        // ring would show in the log but not the window.
         let journal = EventLog::default();
         for level in [
             tracing::Level::ERROR,

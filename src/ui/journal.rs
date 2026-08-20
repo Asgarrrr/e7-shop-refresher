@@ -7,17 +7,13 @@ use crate::journal::LogLine;
 
 use super::theme;
 
-/// The journal's title bar: a caret (right = closed, down = open), the
-/// "JOURNAL" label, and — while collapsed — a muted peek of the most recent
-/// line. Returns true on click.
+/// The journal's title bar, with a peek of the most recent line while
+/// collapsed. Returns true on click.
 ///
-/// One interactive widget spans the whole bar: while collapsed the hit+hover
-/// area grows into the panel's inner `margin` so the entire bar toggles (the
-/// panel's content ui inherits the panel's outer clip rect, so this isn't
-/// clipped away). The hover fill is the full symmetric bar in both states, so
-/// the text stays centred; open, the click area drops the top margin only,
-/// leaving the panel's resize handle reachable. Painted, not nested widgets —
-/// a nested interactive label would steal hover over the text.
+/// One interactive widget spans the whole bar: collapsed, the hit area grows
+/// into the panel's `margin` so all of it toggles; open, it drops the top
+/// margin only, leaving the resize handle reachable. Painted, not nested
+/// widgets — a nested interactive label would steal hover over the text.
 pub(super) fn render_journal_header(
     ui: &mut egui::Ui,
     open: bool,
@@ -28,8 +24,8 @@ pub(super) fn render_journal_header(
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
     let ml = f32::from(margin.left);
     let mt = f32::from(margin.top);
-    // The caller reserves this same bottom margin below the header, so the
-    // open fill lands in real space, not over the log.
+    // The caller reserves this bottom margin, so the open fill lands in real
+    // space and not over the log.
     let highlight = content.expand2(egui::vec2(ml, mt));
     let hit = if open {
         egui::Rect::from_min_max(
@@ -41,9 +37,8 @@ pub(super) fn render_journal_header(
     };
     let response = ui.interact(hit, ui.id().with("journal_toggle"), egui::Sense::click());
 
-    // Built inside the closure: `widget_info` only calls it when AccessKit is
-    // live, a harness is reading, or the bar was just clicked. Outside, the
-    // `format!` would be paid every frame.
+    // Built inside the closure: outside, the `format!` would be paid every
+    // frame rather than only when something reads the widget info.
     let enabled = ui.is_enabled();
     response.widget_info(|| {
         let name = if !open && let Some(latest) = latest {
@@ -67,8 +62,8 @@ pub(super) fn render_journal_header(
     };
     let font = egui::TextStyle::Small.resolve(ui.style());
 
-    // Highlight the full header bar; keep the text clipped to the content row
-    // so the peek never spills into the right margin.
+    // The text stays clipped to the content row so the peek never spills into
+    // the right margin.
     if hovered {
         ui.painter().with_clip_rect(highlight).rect_filled(
             highlight,
@@ -93,18 +88,16 @@ pub(super) fn render_journal_header(
             font,
             theme::INK_FAINT,
         );
-        // A soft fade to the background at the right edge instead of a hard cut
-        // — egui has no cheap blur, but a transparent→bg gradient reads soft.
         paint_edge_fade(&painter, content, bg);
     }
     response.clicked()
 }
 
-/// The scrolling log body (no header): rendered only while the journal is open.
+/// The scrolling log body, rendered only while the journal is open.
 pub(super) fn render_journal_body(ui: &mut egui::Ui, journal: &[LogLine]) {
-    // show_rows lays out only the visible slice; its uniform-row math
-    // requires exactly one visual row per entry, so long lines extend into
-    // a horizontal scroll instead of wrapping.
+    // `show_rows` lays out only the visible slice, and its uniform-row math
+    // requires exactly one visual row per entry — so long lines extend into a
+    // horizontal scroll instead of wrapping.
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
     egui::ScrollArea::both()
         .id_salt("journal")
@@ -112,8 +105,7 @@ pub(super) fn render_journal_body(ui: &mut egui::Ui, journal: &[LogLine]) {
         .auto_shrink([false, false])
         .show_rows(ui, row_height, journal.len(), |ui, rows| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-            // One buffer for the whole visible slice: the stamp is written into
-            // it rather than returned as its own `String`, so a row costs the one
+            // One buffer for the whole visible slice, so a row costs the one
             // copy `RichText` makes and nothing else.
             let mut row = String::with_capacity(64);
             for line in &journal[rows] {
@@ -128,7 +120,7 @@ pub(super) fn render_journal_body(ui: &mut egui::Ui, journal: &[LogLine]) {
 
 /// A horizontal gradient (transparent → `bg`) over the right edge of `row`, so
 /// overflowing text dissolves into the background rather than being clipped
-/// hard. Cheap stand-in for a blur.
+/// hard. egui has no cheap blur; this reads soft enough.
 fn paint_edge_fade(painter: &egui::Painter, row: egui::Rect, bg: egui::Color32) {
     let fade = egui::Rect::from_min_max(
         egui::pos2(row.right() - 40.0, row.top()),
@@ -144,8 +136,8 @@ fn paint_edge_fade(painter: &egui::Painter, row: egui::Rect, bg: egui::Color32) 
     painter.add(mesh);
 }
 
-/// Session-relative `+m:ss` (hours appear once the session runs that long),
-/// appended to the caller's buffer so a visible row needs no `String` of its own.
+/// Session-relative `+m:ss`, appended to the caller's buffer so a visible row
+/// needs no `String` of its own.
 fn write_timestamp(out: &mut String, at_ms: u64) {
     use std::fmt::Write as _;
 
@@ -190,8 +182,6 @@ mod tests {
 
     #[test]
     fn journal_header_click_reports_a_toggle() {
-        // `Harness::new_ui` takes `impl FnMut`, so the flag is captured mutably;
-        // `drop(harness)` releases the borrow before the assert reads it.
         let mut toggled = false;
         let mut harness = Harness::new_ui(|ui| {
             if render_journal_header(ui, false, None, egui::Margin::symmetric(16, 10)) {

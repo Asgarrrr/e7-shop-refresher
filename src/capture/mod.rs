@@ -2,9 +2,8 @@
 
 mod ip;
 
-// The one capture backend: an Npcap tap over every adapter, in this process.
-// `pcap-backend` is either on, or the crate has no way to capture and says so
-// (see `app::build_source`).
+// The one capture backend. Without `pcap-backend` the crate has no way to
+// capture at all, and says so (see `app::build_source`).
 #[cfg(all(windows, feature = "pcap-backend"))]
 mod pcap;
 
@@ -17,9 +16,9 @@ pub use ip::parse_segment;
 #[cfg(all(windows, feature = "pcap-backend"))]
 pub use pcap::PcapSource;
 
-/// A blocking capture source paired with the capability that wakes it during
-/// session teardown, so the app cannot start a receive thread without
-/// retaining its stop handle.
+/// A blocking capture source paired with the capability that wakes it at
+/// teardown, so the app cannot start a receive thread without retaining its
+/// stop handle.
 pub(crate) struct CaptureSource {
     pub(crate) packets: Box<dyn PacketSource>,
     pub(crate) stop: Box<dyn CaptureStop>,
@@ -41,11 +40,10 @@ impl CaptureSource {
 /// One-shot, idempotent wake capability for a blocking [`PacketSource`].
 ///
 /// Implementations must not close a raw OS handle concurrently with receive.
-/// Calling `stop` more than once has the same effect as calling it once.
 ///
-/// Infallible: all three implementors returned `Ok(())` unconditionally,
-/// leaving `stop_and_join`'s error branch dead. Widen back to `Result` if a
-/// future implementor's wake can genuinely fail.
+/// Infallible because every implementor's wake is a flag store, which left
+/// `stop_and_join`'s error branch dead; widen back to `Result` if a future
+/// implementor's wake can genuinely fail.
 pub(crate) trait CaptureStop: Send {
     fn stop(&mut self);
 }
@@ -68,18 +66,16 @@ pub struct Segment {
     /// TCP sequence number of the first byte of `payload`.
     pub seq: u32,
     pub syn: bool,
-    /// The server-to-client bytes. In the capture path this is the captured
-    /// frame's own allocation trimmed down in place (see [`parse_segment`]),
-    /// so `payload.capacity()` stays the whole frame's, headers included, for
-    /// the segment's life. That's the memory actually retained, and what
+    /// The server-to-client bytes: the captured frame's own allocation trimmed
+    /// in place (see [`parse_segment`]), so `capacity()` stays the whole
+    /// frame's for the segment's life — the memory actually retained, and what
     /// `PipelineBudget::admit_capture` charges.
     pub payload: Vec<u8>,
 }
 
-// Size canaries: one of these exists per captured packet and the budgeted
-// form derived from it is queued by value, so a field added here is paid for
-// on every packet. `repr(Rust)` layout is unspecified, so a failure means
-// re-measure and update the number, not work around it.
+// Size canaries: one of these exists per captured packet and is queued by
+// value, so a field added here is paid for on every packet. `repr(Rust)`
+// layout is unspecified — a failure means re-measure, not work around.
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     // Two `SocketAddr` (32 each: the IPv6 variant is 28 bytes plus a tag).
@@ -99,8 +95,8 @@ pub trait PacketSource: Send {
     ///
     /// A passive tap never sees already-ACKed bytes again, so a hole from
     /// backend-side loss can never be filled by retransmission — the capture
-    /// loop turns this into a resync instead of waiting for a gap fill that
-    /// will not arrive. Backends that cannot lose packets keep the default.
+    /// loop resyncs instead of waiting for a gap fill that will not arrive.
+    /// Backends that cannot lose packets keep the default.
     fn take_capture_loss(&mut self) -> bool {
         false
     }

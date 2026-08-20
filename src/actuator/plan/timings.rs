@@ -1,29 +1,22 @@
 //! When each act lands: the tuned per-animation baselines, the player's
 //! extra-wait ranges on top of them, and the presets that dial those ranges.
 //!
-//! This is the genuinely public half of `plan`, and the reason the seam is here
-//! rather than only between geometry and jobs: `config`, `ui::editor` and
-//! `ui::editor::timing_meter` all speak [`Timings`], [`DelayRange`] and the
-//! `WAIT_*_MS` baselines, and `timing_meter` `const _: () = assert!`s against
-//! seven of the eight baselines. One file makes that cross-module contract a
-//! file boundary instead of a per-item annotation.
-//!
-//! Reads [`Jitter`] — a resolved wait is a baseline plus a draw — and nothing
-//! else in the module.
+//! The public half of `plan` — `config`, `ui::editor` and its `timing_meter`
+//! all speak [`Timings`], [`DelayRange`] and the `WAIT_*_MS` baselines, and
+//! `timing_meter` `const _: () = assert!`s against seven of the eight.
 
 use serde::{Deserialize, Serialize};
 
 use super::jitter::Jitter;
 
-// Block-animation waits (dispatch margin included): the game ignores input
-// while the matching animation runs, so every step waits before it acts.
-// Public because the Setup editor shows each as the baseline its extra-delay
-// range adds onto — one source of truth, no hand-copied hints.
+// Block-animation waits (dispatch margin included): the game ignores input while
+// the matching animation runs, so every step waits before it acts. Public
+// because the Setup editor shows each as the baseline its range adds onto.
 pub const WAIT_SHOP_OPENED_MS: u64 = 1_180;
 pub const WAIT_REFRESHED_MS: u64 = 780;
 pub const WAIT_PURCHASE_RESUMED_MS: u64 = 400;
 /// A watchdog retry fires into an idle game (the awaited animation never
-/// played): dispatch margin only.
+/// played), so this is dispatch margin only.
 pub const WAIT_RECOVERY_MS: u64 = 400;
 pub const WAIT_CONFIRM_REFRESH_MODAL_MS: u64 = 270;
 pub const WAIT_BUY_MODAL_MS: u64 = 150;
@@ -53,44 +46,28 @@ impl Trigger {
     }
 }
 
-/// The ceiling on a single extra wait: one minute.
-///
-/// The click baselines this adds onto are calibrated to the game's blocking
-/// animations and span 100 ms (`scroll_settle`) to 1180 ms (`shop_opened`), and
-/// the Setup tab's own meter tops out at 2500 ms total — so 60 000 ms is roughly
-/// fifty times the slowest baseline and twenty-four times anything the GUI can
-/// produce. Every legitimate "pause like a slow, distracted human" setting stays
-/// reachable, plus a wide margin for experimenting past what the UI offers.
-///
-/// What it makes unreachable is the two ways an unbounded value hurt: a `max_ms`
-/// in the tens of minutes silently freezes the refresh loop between two clicks
-/// with nothing to distinguish it from a hang, and a value near `u64::MAX`
-/// overflows the plain `baseline + extra` sums the timing editor does while
-/// painting a range (panic in debug, silent wrap in release).
-///
-/// It lives here, next to [`DelayRange`], rather than in `config` where it was
-/// first written: the type carries the bound now, so the constant belongs where
-/// the check is, and the loader is no longer the only place that could apply it.
+/// The ceiling on a single extra wait: one minute — fifty times the slowest
+/// baseline (1180 ms, `shop_opened`) and twenty-four times what the Setup tab's
+/// 2500 ms meter can produce, so every human-pace setting stays reachable. What
+/// it makes unreachable: a `max_ms` in the tens of minutes, which freezes the
+/// loop between two clicks indistinguishably from a hang, and a value near
+/// `u64::MAX`, which overflows the editor's plain `baseline + extra` sums.
 pub const MAX_TIMING_MS: u64 = 60_000;
 
 /// Why a `(min_ms, max_ms)` pair is not a [`DelayRange`].
 ///
-/// Both messages say what the value *would have done*, because this is the text
-/// a player reads in an error window over a file they are told not to hand-edit.
-/// Neither names the key: the pair reaches this type either from `config.toml`
-/// through `toml`, which prefixes the failing key's line and span, or from a
-/// struct literal, where the compiler names it.
+/// Both messages say what the value *would have done*: this is the text a player
+/// reads in an error window over a file they are told not to hand-edit. Neither
+/// names the key — `toml` prefixes the failing key's line and span, and a struct
+/// literal is named by the compiler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelayRangeError {
-    /// `min_ms > max_ms`. With the inline TOML form this table uses
+    /// `min_ms > max_ms`. In the inline TOML form this table uses
     /// (`{ min_ms = 800, max_ms = 200 }`) swapping the two is an ordinary typo,
-    /// and read leniently it becomes a fixed 800 ms delay — the player
-    /// configures variability and silently gets none, while the Setup tab shows
-    /// "Custom" with no clue why.
+    /// and read leniently it becomes a fixed 800 ms delay — variability
+    /// configured, none delivered, and the Setup tab showing "Custom".
     Reversed { min_ms: u64, max_ms: u64 },
-    /// `max_ms` past [`MAX_TIMING_MS`]. This is what freezes the loop for ten
-    /// minutes between two clicks, and what overflowed the editor's
-    /// `baseline + max` sums near `u64::MAX`.
+    /// `max_ms` past [`MAX_TIMING_MS`].
     AboveCeiling { max_ms: u64 },
 }
 
@@ -111,18 +88,14 @@ impl std::fmt::Display for DelayRangeError {
 
 impl std::error::Error for DelayRangeError {}
 
-/// The wire shape of a [`DelayRange`] — the two keys as `config.toml` spells
-/// them, carrying no invariant. It exists only as the `#[serde(try_from)]` hook:
-/// deriving `Deserialize` on the newtype itself would let serde fill the private
-/// fields directly and skip the check, which is the whole defect this pair fixes.
+/// The wire shape of a [`DelayRange`], and only that: deriving `Deserialize` on
+/// the newtype would let serde fill the private fields and skip the check.
 ///
-/// Both keys are `Option`, not bare `u64` under `#[serde(default)]`, because
-/// the two absences mean different things and the flat default conflated them.
-/// `refreshed = { min_ms = 200 }` is a legal, ordinary thing to write — one
-/// number, "always wait 200 ms extra" — and it used to fill `max_ms` with 0,
-/// fail `try_new` as [`DelayRangeError::Reversed`], and print advice for a
-/// mistake the player did not make ("swap them"). `config::parse`'s salvage
-/// then dropped the range to `0..=0`, so the line silently stopped applying.
+/// Both keys stay `Option` — do not put the flat `#[serde(default)]` back.
+/// `refreshed = { min_ms = 200 }` is legal and ordinary, and under the default it
+/// deserialized as `(200, 0)`, failed as [`DelayRangeError::Reversed`] advising a
+/// swap the player never wrote, after which `config::parse`'s salvage dropped the
+/// range to `0..=0` and the line silently stopped applying.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawDelayRange {
@@ -135,30 +108,25 @@ impl TryFrom<RawDelayRange> for DelayRange {
 
     fn try_from(raw: RawDelayRange) -> Result<Self, Self::Error> {
         let min_ms = raw.min_ms.unwrap_or(0);
-        // A floor with no ceiling is a fixed delay, which is what the range
-        // `min..=min` already spells. A ceiling with no floor keeps the `0`
-        // above, which is `DelayRange::ceiling`'s shape and the one both
-        // in-app producers make. Neither absence can reverse the range, so
-        // only a pair the player really did write backwards reaches the error.
+        // A floor with no ceiling is the fixed delay `min..=min`; a ceiling with
+        // no floor keeps the `0`, which is `DelayRange::ceiling`'s shape.
+        // Neither absence can reverse the range, so only a pair the player did
+        // write backwards reaches the error.
         let max_ms = raw.max_ms.unwrap_or(min_ms);
         DelayRange::try_new(min_ms, max_ms)
     }
 }
 
-/// An inclusive extra-wait range, in milliseconds. Each resolved wait draws a
-/// uniform value in `[min_ms, max_ms]` and adds it to a tuned baseline, so the
-/// loop's pauses vary like a human's instead of being byte-identical every
-/// time. The default (`0..=0`) reproduces the calibrated timing exactly; the
-/// baseline is the floor, so a range only ever slows the loop down.
+/// An inclusive extra-wait range, in milliseconds, drawn uniformly and added to
+/// a tuned baseline so the loop's pauses vary like a human's instead of being
+/// byte-identical. The baseline is the floor, so a range only slows the loop
+/// down; the default (`0..=0`) reproduces the calibrated timing exactly.
 ///
-/// `min_ms <= max_ms <= MAX_TIMING_MS` holds **by construction**: the fields are
-/// private and the three ways in ([`try_new`](Self::try_new),
-/// [`ceiling`](Self::ceiling), [`set_max_ms`](Self::set_max_ms)) each enforce it,
-/// with `Deserialize` routed through `RawDelayRange` so `config.toml` is no
-/// exception. Do not move the check back into a loop in `config::validate_timings`
-/// and let each producer (a preset, a GUI drag, `persist::save`) re-derive or
-/// bypass it — a GUI write one missing clamp away from invalid is a file the
-/// next launch refuses, recoverable only by hand-editing a file the app owns.
+/// `min_ms <= max_ms <= MAX_TIMING_MS` holds **by construction**. Do not move
+/// the check back into `config::validate_timings` and let each producer (a
+/// preset, a GUI drag, `persist::save`) re-derive or bypass it — a GUI write one
+/// missing clamp from invalid is a file the next launch refuses, recoverable
+/// only by hand-editing a file the app owns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(try_from = "RawDelayRange")]
 pub struct DelayRange {
@@ -167,15 +135,11 @@ pub struct DelayRange {
 }
 
 impl DelayRange {
-    /// The range `min_ms..=max_ms`, or why it is not one.
-    ///
     /// # Errors
     ///
-    /// [`DelayRangeError::Reversed`] when `min_ms > max_ms`, and
-    /// [`DelayRangeError::AboveCeiling`] when `max_ms` is past
-    /// [`MAX_TIMING_MS`]. The order matters for the message a player sees: a
-    /// reversed pair is reported as reversed even when it also breaks the
-    /// ceiling, because swapping it is the fix.
+    /// The check order matters for the message a player sees: a reversed pair is
+    /// [`DelayRangeError::Reversed`] even when it also breaks the
+    /// [`MAX_TIMING_MS`] ceiling, because swapping it is the fix.
     pub const fn try_new(min_ms: u64, max_ms: u64) -> Result<Self, DelayRangeError> {
         if min_ms > max_ms {
             return Err(DelayRangeError::Reversed { min_ms, max_ms });
@@ -188,10 +152,9 @@ impl DelayRange {
 
     /// A range with no floor — `0..=max_ms`, clamped to [`MAX_TIMING_MS`].
     ///
-    /// Infallible, and that is the point: this is the shape both producers
-    /// inside the app make (a preset dials the random ceiling, the Setup tab's
-    /// drag sets it), so neither needs a `Result` it could only `expect` on.
-    /// `min_ms = 0` cannot reverse the range, and the clamp answers the ceiling.
+    /// Infallible, and that is the point: this is the shape both in-app
+    /// producers make (a preset dials the ceiling, the Setup tab's drag sets
+    /// it), so neither needs a `Result` it could only `expect` on.
     #[must_use]
     pub const fn ceiling(max_ms: u64) -> Self {
         Self {
@@ -210,17 +173,15 @@ impl DelayRange {
         self.min_ms
     }
 
-    /// The ceiling of the draw, at most [`MAX_TIMING_MS`], never below
-    /// [`min_ms`](Self::min_ms).
+    /// At most [`MAX_TIMING_MS`], never below [`min_ms`](Self::min_ms).
     #[must_use]
     pub const fn max_ms(self) -> u64 {
         self.max_ms
     }
 
-    /// Move the ceiling to what the player just dragged to, keeping the
-    /// invariant: the value is clamped to [`MAX_TIMING_MS`], and a
-    /// config-seeded floor above it comes down with it (min never exceeds the
-    /// max the player just set).
+    /// Keeps the invariant across a drag: clamped to [`MAX_TIMING_MS`], and a
+    /// config-seeded floor above the new ceiling comes down with it rather than
+    /// leaving a reversed range.
     pub const fn set_max_ms(&mut self, max_ms: u64) {
         self.max_ms = if max_ms > MAX_TIMING_MS {
             MAX_TIMING_MS
@@ -232,21 +193,17 @@ impl DelayRange {
         }
     }
 
-    /// The inert default (`0..=0`): the calibrated baseline, no extra wait.
+    /// The inert default (`0..=0`): calibrated baseline, no extra wait.
     /// Persistence skips these so a first Apply does not fill
     /// `[actuator.timings]` with eight no-op ranges the player never set.
     pub fn is_inert(&self) -> bool {
         self.min_ms == 0 && self.max_ms == 0
     }
 
-    /// A uniform draw in `[min_ms, max_ms]`.
-    ///
-    /// Plain arithmetic, where the unvalidated version needed a `saturating_sub`
-    /// and a `checked_add`: the type's invariant makes every step provable. The
-    /// span cannot underflow (`min_ms <= max_ms`); the inclusive `span + 1`
-    /// modulus cannot overflow, which is what used to make `% 0` reachable from
-    /// a `max_ms = u64::MAX` config file; and the result is at most `max_ms`,
-    /// hence at most `MAX_TIMING_MS`.
+    /// A uniform draw in `[min_ms, max_ms]`. Plain arithmetic because the
+    /// invariant makes it provable: the span cannot underflow, and the inclusive
+    /// `span + 1` modulus cannot overflow — which used to make `% 0` reachable
+    /// from a `max_ms = u64::MAX` config file.
     fn draw(&self, jitter: &mut Jitter) -> u64 {
         let span = self.max_ms - self.min_ms;
         if span == 0 {
@@ -257,16 +214,13 @@ impl DelayRange {
 }
 
 /// Player-set extra-wait ranges, added on top of every tuned baseline above.
-/// All-default (`0..=0`) reproduces the calibrated timing exactly.
 ///
-/// Serialization skips every inert range: `config::persist` replaces the whole
-/// `[actuator.timings]` table on each Apply, and writing eight
-/// `{ min_ms = 0, max_ms = 0 }` lines the player never asked for would fight
-/// that module's whole purpose (preserving the shape of a hand-authored file).
-/// The container `#[serde(default)]` makes the omission round-trip exactly.
-/// Only whole ranges are skipped, never a single `min_ms = 0` inside a range
-/// that *is* written: there the zero is the draw's floor, and the readable
-/// `{ min_ms = .., max_ms = .. }` pair is the style the example documents.
+/// Serialization skips every inert range, because `config::persist` replaces the
+/// whole `[actuator.timings]` table on each Apply and eight
+/// `{ min_ms = 0, max_ms = 0 }` lines the player never asked for would fight that
+/// module's purpose (preserving the shape of a hand-authored file). Whole ranges
+/// only — never a lone `min_ms = 0` inside a range that *is* written, where the
+/// zero is the draw's floor and the pair is the style the example documents.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Timings {
@@ -296,22 +250,17 @@ pub struct Timings {
     pub scroll_settle: DelayRange,
 }
 
-/// Eight 16-byte ranges. `Copy` is kept deliberately above the usual 64-byte
-/// guidance — the type has no heap data, jobs are built a few times per refresh
-/// rather than per packet, and every alternative forces a `.clone()` that would
-/// signal a cost there is none of. The canary is here so a ninth action is a
-/// decision rather than a surprise, in the style of `capture`'s and `stream`'s.
+/// Eight 16-byte ranges, `Copy` deliberately above the usual 64-byte guidance:
+/// no heap data, built a few times per refresh rather than per packet, and the
+/// alternative forces a `.clone()` signalling a cost there is none of. The
+/// canary makes a ninth action a decision, not a surprise.
 const _: () = assert!(size_of::<Timings>() == 128);
 
 impl Timings {
-    /// Every range paired with its `[actuator.timings]` key, in declaration
-    /// order — what `Config::validate` walks to bound the player's values.
-    ///
-    /// The destructuring is exhaustive on purpose: a ninth action added above
-    /// stops compiling here until it is named, so validation can never
-    /// silently skip a knob that reaches the refresh loop. It destructures
-    /// *through the reference* — same exhaustiveness guarantee, without copying
-    /// all 128 bytes only to copy eight 16-byte ranges back out of them.
+    /// Every range paired with its `[actuator.timings]` key — what
+    /// `Config::validate` walks to bound the player's values. The destructuring
+    /// is exhaustive on purpose: a ninth action stops compiling here until it is
+    /// named, so validation cannot silently skip a knob that reaches the loop.
     pub fn named_ranges(&self) -> [(&'static str, DelayRange); 8] {
         let Timings {
             shop_opened,
@@ -335,12 +284,7 @@ impl Timings {
         ]
     }
 
-    // The five resolved waits below are `pub(super)` for the job builders in
-    // `jobs`, which are their only callers: a resolved wait is meaningless
-    // without the step it precedes.
-
-    /// The pre-wait for a trigger: its tuned baseline plus a fresh draw from
-    /// the matching range.
+    /// A trigger's tuned baseline plus a fresh draw from the matching range.
     pub(super) fn pre_wait_ms(&self, trigger: Trigger, jitter: &mut Jitter) -> u64 {
         let range = match trigger {
             Trigger::ShopOpened => self.shop_opened,
@@ -368,22 +312,16 @@ impl Timings {
     }
 }
 
-/// One-touch humanization level: a named set of per-action random ceilings the
-/// Setup UI offers before the per-action fine-tuning. A preset only dials the
-/// *random extra* every action can add on top of its tuned baseline (the
-/// `max_ms`); `min_ms` stays a config-only floor, so a preset never rewrites
-/// the calibrated minimum. Higher levels add more random slack so the loop
-/// clicks less like a metronome.
+/// One-touch humanization level: a named set of per-action random ceilings, so
+/// the loop clicks less like a metronome. A preset dials only the `max_ms`;
+/// `min_ms` stays a config-only floor, so it never rewrites the calibrated
+/// minimum.
 ///
-/// That sentence is a promise about what a *click* does, and until
-/// [`applied_to`](Self::applied_to) existed it was only true of the value
-/// [`timings`](Self::timings) returns, not of what the Setup tab wrote with it:
-/// the tab assigned that value wholesale, so a `refreshed = { min_ms = 200,
-/// .. }` seeded from `config.toml` was replaced by a range starting at 0 and
-/// `persist::save` then wrote the loss to disk — no warning, no undo, and no
-/// way back except retyping the floor into a file the app owns. Every producer
-/// of a `Timings` *from* a preset now goes through `applied_to`, which is the
-/// merge that keeps the promise.
+/// Every producer of a `Timings` *from* a preset must go through
+/// [`applied_to`](Self::applied_to), the merge that keeps that promise. The
+/// Setup tab used to assign [`timings`](Self::timings) wholesale, so a
+/// `config.toml` floor was replaced by a range starting at 0 and `persist::save`
+/// wrote the loss to disk — no warning, no undo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimingPreset {
     /// Tuned minimums only, no random extra — `Timings::default()`.
@@ -395,14 +333,13 @@ pub enum TimingPreset {
 }
 
 impl TimingPreset {
-    /// The three presets in display order (fastest to most cautious).
+    /// Display order: fastest to most cautious.
     pub const ALL: [TimingPreset; 3] = [
         TimingPreset::Instant,
         TimingPreset::Human,
         TimingPreset::Cautious,
     ];
 
-    /// The player-facing name of the level.
     pub fn label(self) -> &'static str {
         match self {
             TimingPreset::Instant => "Instant",
@@ -411,15 +348,9 @@ impl TimingPreset {
         }
     }
 
-    /// The `Timings` this level resolves to *on its own*: only `max_ms` is set
-    /// (the random ceiling); `min_ms` stays 0 so the floor remains a
-    /// config-only concern.
-    ///
-    /// This is the level's canonical value — the one `Instant.timings() ==
-    /// Timings::default()` pins, and the one the ceilings in
-    /// [`applied_to`](Self::applied_to) are read out of. It is *not* what a
-    /// player's click should produce: assigning it discards whatever floors
-    /// their `config.toml` set, which is what `applied_to` exists to stop.
+    /// The level *on its own*: only `max_ms` is set, `min_ms` stays 0, and
+    /// [`applied_to`](Self::applied_to) reads its ceilings out of this. Not what
+    /// a player's click should produce — assigning it discards their floors.
     pub fn timings(self) -> Timings {
         // Per-action random ceilings (ms) for Human; Cautious doubles them. The
         // watchdog stays tight at every level — recovery is not humanization.
@@ -442,31 +373,21 @@ impl TimingPreset {
     }
 
     /// This level's ceilings over `current`'s floors — what choosing the level
-    /// in the Setup tab produces.
+    /// in the Setup tab produces. Every `min_ms` is the player's, kept; the only
+    /// floor that moves is one the new ceiling dropped below, which
+    /// [`DelayRange::set_max_ms`] brings down rather than leave reversed (a
+    /// seeded `recovery` collapses to `0..=0`, since the watchdog has no random
+    /// extra at any level).
     ///
-    /// Every field's `max_ms` becomes the level's; every `min_ms` is the
-    /// player's, kept. The one floor that does move is one the new ceiling has
-    /// dropped below, and it moves because [`DelayRange::set_max_ms`] brings it
-    /// down rather than leave a reversed range — the same rule the Setup tab's
-    /// drag already obeys, and the only way this can lower a floor: a
-    /// `recovery = { min_ms = 100, max_ms = 200 }` meets a level whose recovery
-    /// ceiling is 0 at every level (the watchdog is not humanization), so both
-    /// ends collapse to 0. Choosing "no random extra here" and keeping a 100 ms
-    /// forced extra is not a state this type can hold, and the ceiling is what
-    /// the player just clicked.
-    ///
-    /// Written as a merge here rather than at the one UI call site because the
-    /// invariant belongs to the preset, not to the widget: a second caller
-    /// (a "reset timings" menu item, a future CLI flag) would otherwise have
-    /// to remember to merge, and forgetting is silent — it costs a setting on
-    /// disk, not a compile error.
+    /// A merge here rather than at the one UI call site because the invariant
+    /// belongs to the preset: a second caller forgetting to merge costs a
+    /// setting on disk, not a compile error.
     #[must_use]
     pub fn applied_to(self, current: &Timings) -> Timings {
         let ceilings = self.timings();
         let mut merged = *current;
-        // Exhaustive destructuring, for the reason `Timings::named_ranges`
-        // gives: a ninth action stops compiling here until it is named, so a
-        // new knob cannot quietly sit outside the preset control.
+        // Exhaustive, for the reason `Timings::named_ranges` gives: a new knob
+        // cannot quietly sit outside the preset control.
         let Timings {
             shop_opened,
             refreshed,
@@ -495,19 +416,14 @@ impl TimingPreset {
     /// The preset already in force in `timings`, or `None` when the player has
     /// fine-tuned away from every level ("Custom").
     ///
-    /// Spelled as "the level a click would not change" rather than
-    /// `preset.timings() == *timings`, and it has to be: with the merge above,
-    /// clicking a level on timings carrying a floor produces something the
-    /// old equality could never match, so the segment the player just pressed
-    /// would stay dark and the bars would spring open — the control would
-    /// report that it had failed while it had in fact done exactly what it
-    /// says. Comparing against the merge instead asks the question the label
-    /// answers: are these ceilings this level's? A floor is orthogonal, it is
-    /// not editable from this control, and the per-action bars are where it is
-    /// visible.
+    /// "The level a click would not change", not `preset.timings() == *timings`:
+    /// clicking a level on timings carrying a floor produces something equality
+    /// could never match, so the segment just pressed would stay dark while the
+    /// control had done exactly what it says. The merge asks what the label
+    /// answers — are these ceilings this level's? — and a floor is orthogonal.
     ///
-    /// [`applied_to`](Self::applied_to) is idempotent, so at most one level
-    /// can match: `Instant` zeroes every ceiling and the other two do not.
+    /// [`applied_to`](Self::applied_to) is idempotent, so at most one level can
+    /// match: `Instant` zeroes every ceiling and the other two do not.
     pub fn from_timings(timings: &Timings) -> Option<TimingPreset> {
         TimingPreset::ALL
             .into_iter()
@@ -541,8 +457,7 @@ mod tests {
 
     #[test]
     fn presets_only_dial_the_random_ceiling() {
-        // A preset must never write a floor: `min_ms` stays 0 on every action so
-        // the config-only minimum is left untouched.
+        // A preset must never write a floor: the minimum is config-only.
         for preset in TimingPreset::ALL {
             let t = preset.timings();
             for range in [
@@ -562,10 +477,8 @@ mod tests {
 
     #[test]
     fn choosing_a_level_keeps_a_config_set_floor_and_takes_its_ceiling() {
-        // The defect this merge exists for: a floor typed into config.toml
-        // (`refreshed = { min_ms = 200, max_ms = 800 }`, the shape
-        // config.example.toml documents) used to be wiped by one click on a
-        // preset, and `persist::save` then wrote the zero to disk.
+        // The defect this merge exists for: one click on a preset wiped a floor
+        // typed into config.toml, and `persist::save` wrote the zero to disk.
         let seeded = Timings {
             refreshed: range(200, 800),
             ..Timings::default()
@@ -577,13 +490,12 @@ mod tests {
             TimingPreset::Human.timings().refreshed.max_ms(),
             "and the level's ceiling replaced theirs"
         );
-        // Every other action was inert, so it is the level's range verbatim.
         assert_eq!(
             human.between_buys,
             TimingPreset::Human.timings().between_buys
         );
-        // And the control lights the level the player just chose, floor or not
-        // — the whole reason `from_timings` compares against the merge.
+        // The control lights the level the player just chose, floor or not —
+        // the whole reason `from_timings` compares against the merge.
         assert_eq!(
             TimingPreset::from_timings(&human),
             Some(TimingPreset::Human)
@@ -592,10 +504,9 @@ mod tests {
 
     #[test]
     fn a_floor_above_the_chosen_ceiling_comes_down_with_it() {
-        // The one case where a level *does* move a floor, and the reason is
-        // `set_max_ms`'s, not the preset's: `recovery` has no random extra at
-        // any level, and `min_ms = 100, max_ms = 0` is not a range this type
-        // can hold. Everything below that ceiling is still untouched.
+        // The one case where a level *does* move a floor, for `set_max_ms`'s
+        // reason and not the preset's: `recovery` has no random extra at any
+        // level, and `min_ms = 100, max_ms = 0` is not a range this type holds.
         let seeded = Timings {
             recovery: range(100, 200),
             buy_modal: range(40, 60),
@@ -616,8 +527,7 @@ mod tests {
     #[test]
     fn applying_a_level_twice_changes_nothing_the_second_time() {
         // What lets `from_timings` be "the level a click would not change":
-        // if the merge were not idempotent, the detected level would flicker
-        // between frames of a tab that renders it every one of them.
+        // without idempotence the detected level flickers frame to frame.
         let seeded = Timings {
             refreshed: range(200, 800),
             scroll_settle: range(10, 10),
@@ -640,10 +550,8 @@ mod tests {
 
     #[test]
     fn a_reversed_range_cannot_be_built_at_all() {
-        // A GUI edit, a future preset and `config.toml` all go through
-        // `try_new`, so there is no path left that could read a reversed pair
-        // leniently as a fixed delay. The message still says what the value
-        // would have been read as, because that tells the player it was a typo.
+        // The message says what the value would have been read as, because that
+        // is what tells the player it was a typo.
         let err = DelayRange::try_new(600, 100).expect_err("a reversed range is not a range");
         assert_eq!(
             err,
@@ -662,21 +570,17 @@ mod tests {
 
     #[test]
     fn one_bound_written_alone_is_a_range_and_not_a_reversed_pair() {
-        // `{ min_ms = 200 }` is an ordinary thing to write and used to be read
-        // as `(200, 0)` — `Reversed`, reported with advice ("swap them") for a
-        // mistake the player did not make, after which `config::parse`'s
-        // salvage dropped the whole range to `0..=0` and the line silently
-        // stopped applying.
+        // `{ min_ms = 200 }` is ordinary to write and used to read as `(200, 0)`
+        // — `Reversed`, advising a swap for a mistake the player did not make,
+        // after which the salvage dropped the range to `0..=0` and the line
+        // silently stopped applying.
         let floor_only: DelayRange =
             toml::from_str("min_ms = 200").expect("a floor alone is a fixed delay");
         assert_eq!(floor_only, DelayRange::try_new(200, 200).expect("legal"));
-        // The mirror case keeps the `0` floor, which is `DelayRange::ceiling`'s
-        // shape and what both in-app producers make.
+        // The mirror case keeps the `0` floor: `DelayRange::ceiling`'s shape.
         let ceiling_only: DelayRange =
             toml::from_str("max_ms = 400").expect("a ceiling alone is a 0..=max range");
         assert_eq!(ceiling_only, DelayRange::ceiling(400));
-        // An empty table is still the default, and a pair really written
-        // backwards is still refused.
         assert_eq!(
             toml::from_str::<DelayRange>("").expect("an absent table is the default"),
             DelayRange::default()
@@ -688,9 +592,7 @@ mod tests {
     fn a_range_past_the_ceiling_cannot_be_built_and_the_ceiling_itself_can() {
         // `u64::MAX` would overflow `draw`'s modulus and the editor's
         // `baseline + max` sums; 600_000 (ten minutes) would freeze the loop
-        // between two clicks. Both are unrepresentable, and the inclusive
-        // bound stays usable — the ceiling exists to stop a frozen loop, not
-        // to narrow the knob.
+        // between two clicks. The inclusive bound itself stays usable.
         assert_eq!(
             DelayRange::try_new(0, u64::MAX),
             Err(DelayRangeError::AboveCeiling { max_ms: u64::MAX })
@@ -700,17 +602,15 @@ mod tests {
             Err(DelayRangeError::AboveCeiling { max_ms: 600_000 })
         );
         assert_eq!(range(0, MAX_TIMING_MS).max_ms(), MAX_TIMING_MS);
-        // `ceiling` is the infallible door, so it clamps instead of failing.
         assert_eq!(DelayRange::ceiling(u64::MAX).max_ms(), MAX_TIMING_MS);
         assert_eq!(DelayRange::ceiling(0), DelayRange::default());
     }
 
     #[test]
     fn set_max_ms_keeps_the_invariant_it_could_break() {
-        // The Setup tab's drag is the one mutating producer. Dragging below a
-        // config-seeded floor must bring the floor down, not leave a reversed
-        // range behind — the check `timing_meter` used to make by hand, one line
-        // after writing `max_ms` and one line before anything could observe it.
+        // The Setup tab's drag is the one mutating producer, and dragging below
+        // a config-seeded floor must bring the floor down rather than leave a
+        // reversed range — the check `timing_meter` used to make by hand.
         let mut r = range(400, 900);
         r.set_max_ms(100);
         assert_eq!((r.min_ms(), r.max_ms()), (100, 100));
@@ -721,9 +621,8 @@ mod tests {
     #[test]
     fn only_the_all_zero_range_is_inert() {
         // Drives the `skip_serializing_if` on every `Timings` field: a range
-        // wrongly reported inert would be dropped from a saved config.toml,
-        // silently reverting the player's setting on the next launch. The old
-        // `(1, 0)` case is gone — the type no longer has that value.
+        // wrongly reported inert is dropped from a saved config.toml, reverting
+        // the player's setting on the next launch.
         assert!(DelayRange::default().is_inert());
         assert!(range(0, 0).is_inert());
         assert!(!range(0, 1).is_inert());
@@ -732,8 +631,7 @@ mod tests {
 
     #[test]
     fn named_ranges_covers_every_field_under_its_config_key() {
-        // Give each field a distinct value so a copy-paste in the pairing
-        // (two keys reading the same field) cannot pass.
+        // Distinct values so a copy-paste in the pairing cannot pass.
         let timings = Timings {
             shop_opened: range(0, 1),
             refreshed: range(0, 2),

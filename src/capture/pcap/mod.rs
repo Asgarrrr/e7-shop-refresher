@@ -1,42 +1,24 @@
 //! Npcap capture backend: an unelevated, adapter-agnostic tap.
 //!
-//! # Why this exists
-//!
 //! `WinDivert`, the backend this replaced, needed a kernel driver load and
-//! administrator rights — the deleted elevated broker, named pipe and UAC
-//! prompt (3 274 lines) existed only to contain that. Npcap can run
-//! driverless for ordinary users (`AdminOnly` off by default); a measured
-//! probe confirmed non-elevated capture (82/82 packets parsed, Wi-Fi,
-//! `DLT_EN10MB`), and that probe became this backend (see
-//! `docs/capture-backend-choice.md`). The exe still requires administrator,
-//! but for the actuator, not capture: it can't click a window at higher
-//! integrity, and Epic Seven inherits that from STOVE. See `build.rs`.
+//! administrator rights; Npcap runs driverless for ordinary users (`AdminOnly`
+//! off by default) — see `docs/capture-backend-choice.md`. The exe still
+//! requires administrator for the actuator, not capture: it cannot click a
+//! window at higher integrity, and Epic Seven inherits that from STOVE.
 //!
-//! # Why `wpcap.dll` is loaded by hand
+//! `wpcap.dll` is loaded by hand because static linking needs the Npcap SDK to
+//! build and kills the shipped exe in the Windows loader, before `main`, on any
+//! machine without Npcap; `libloading` turns that into an [`Error::Capture`]
+//! naming the download page.
 //!
-//! Static linking (`wpcap.lib`, as the `pcap` crate does) needs the Npcap
-//! SDK to build and kills the shipped exe in the Windows loader, before
-//! `main`, on any machine without Npcap. `libloading` keeps the binary
-//! startable everywhere and turns a missing Npcap into an ordinary
-//! [`Error::Capture`] naming the download page.
+//! [`PcapSource::open`] opens *every* adapter rather than selecting one. An
+//! idle one costs a parked thread and about a megabyte of kernel ring, nothing
+//! per packet, and selection would guess wrong: the dev machine's Ethernet held
+//! an APIPA address while Wi-Fi carried the traffic. [`crate::stream`] dedupes
+//! by TCP sequence number, so the duplicates cost nothing.
 //!
-//! # Why every adapter is opened, and none is selected
-//!
-//! [`PcapSource::open`] opens every device, one thread and BPF filter each.
-//! An idle adapter costs a parked thread and about a megabyte of kernel
-//! ring, nothing per packet. That buys away adapter-selection heuristics:
-//! the dev machine's Ethernet held an APIPA address while Wi-Fi carried the
-//! traffic, so "default route" or "real IP" would guess wrong, and it
-//! survives adapter switches with no extra code. Duplicate packets are
-//! already handled — [`crate::stream`] dedupes by TCP sequence number for
-//! ordinary retransmissions anyway.
-//!
-//! # How the three files divide it
-//!
-//! This root holds [`PacketSource`]: channel, funnel counters, lifecycle,
-//! diagnostics. [`link`] is the frame-to-IP-packet strip, the only layer
-//! with no FFI. [`sys`] is the `wpcap.dll` boundary, one file deliberately;
-//! its header says why.
+//! [`link`] is the frame-to-IP strip, the only layer with no FFI; [`sys`] is
+//! the `wpcap.dll` boundary, deliberately one file — its header says why.
 
 mod link;
 mod sys;
@@ -54,45 +36,34 @@ use super::{CaptureStop, PacketSource, Segment, parse_segment};
 use crate::error::{Error, Result};
 use sys::{INSTALL_HINT, READ_TIMEOUT_MS, SNAPLEN, Wpcap, capture_loop, enumerate, open_device};
 
-/// Packet frames between two funnel log lines. Every captured packet passes
-/// through the funnel, plus once on the very first packet, so a capture about
-/// to reject everything says so immediately, not after five hundred packets.
+/// Packet frames between two funnel log lines. Also logged on the very first
+/// packet, so a capture about to reject everything says so immediately rather
+/// than after five hundred packets.
 const FUNNEL_LOG_EVERY: u64 = 500;
 
 /// Stripped frames the funnel holds before a capture thread starts dropping
 /// them.
 ///
-/// This queue is the one place a captured frame sits *outside*
-/// [`crate::stream::PipelineBudget`]: nothing is charged until
-/// `admit_capture`, which runs after [`PacketSource::next_segment`] has
-/// already dequeued. So whatever it holds is added to the pipeline's stated
-/// 32 MiB ceiling rather than counted inside it, and the depth exists to keep
-/// that addition small and *stated*. An item is at most [`SNAPLEN`] = 262 144
-/// bytes, so sixteen of them are 4 MiB — 12.5 % on top of the ceiling, against
-/// the unbounded `channel()` this replaced, which had no ceiling at all and no
-/// counter to say how far past one it had gone. At the frame sizes actually
-/// measured here it is far less: the largest receive-coalesced packet the
-/// feasibility probe saw was 48 870 bytes (764 KiB for sixteen), and a
-/// full-MTU frame gives 24 KiB.
+/// The one place a captured frame sits *outside*
+/// [`crate::stream::PipelineBudget`]: nothing is charged until `admit_capture`,
+/// which runs only after [`PacketSource::next_segment`] has dequeued. What this
+/// holds is therefore added to the pipeline's stated 32 MiB ceiling rather than
+/// counted inside it, and the depth keeps that addition small and *stated*: at
+/// most [`SNAPLEN`] an item, so 4 MiB worst case, against an unbounded
+/// `channel()` whose worst case was the address space.
 ///
-/// Sixteen is a jitter buffer, not a queue. N capture threads each memcpy a
-/// frame while one consumer parses it, and the depth only has to cover the
-/// consumer being descheduled — the kernel filter admits one TCP port's
-/// server-to-client traffic, not a link's worth. It also bounds *teardown*,
-/// which the unbounded version did not: the receiver drains and parses every
-/// queued frame before it can see the disconnect.
+/// Sixteen is a jitter buffer, not a queue — it only covers the single consumer
+/// being descheduled — and it bounds *teardown*, since the receiver drains and
+/// parses every queued frame before it can see the disconnect.
 const FRAME_QUEUE_DEPTH: usize = 16;
-
-// --- Public source ---------------------------------------------------------
 
 /// Where packets that reach this process go to die.
 ///
-/// `delivered` counts frames pulled off every adapter, stripped of their
-/// link header; `admitted` and `unparsed` are the two ways those frames end.
-/// Only `parse_segment` refusing a frame — malformed, or not the game server
-/// talking — can drop a packet here, so it alone explains a healthy-looking
-/// session that yields nothing. `delivered` staying at zero means the
-/// adapters are open but the kernel filter matches no traffic.
+/// `delivered` counts frames pulled off every adapter, already stripped of
+/// their link header; `admitted` and `unparsed` are the two ways they end. Only
+/// `parse_segment` can drop one here, so `unparsed` alone explains a
+/// healthy-looking session that yields nothing, while `delivered` at zero means
+/// the adapters are open but the kernel filter matches no traffic.
 #[derive(Default)]
 struct Funnel {
     delivered: u64,
@@ -110,8 +81,7 @@ impl Funnel {
 }
 
 /// The rare half of [`Funnel::report`], kept out of line: `report` runs twice
-/// per delivered packet — the hottest path in this crate — so it should carry
-/// only the modulus test.
+/// per delivered packet, so it should carry only the modulus test.
 #[cold]
 #[inline(never)]
 fn log_funnel(funnel: &Funnel) {
@@ -125,59 +95,46 @@ fn log_funnel(funnel: &Funnel) {
 
 /// A capture thread's parting message, sent only when it stopped on an error.
 ///
-/// Out of band from the frames, and it has to be. The frame funnel is
-/// bounded, so a report pushed through it could be discarded by the very
-/// congestion it exists to survive; a *blocking* send of it would be worse
-/// still, because that funnel's receiver is a field of [`PcapSource`], dropped
-/// only after that struct's [`Drop`] has already tried to join this thread —
-/// a producer parked in `send` would be waiting on the thread that is waiting
-/// on it. This channel is therefore the unbounded `channel()`, which stays
-/// honest because it is bounded by construction: each capture thread sends at
-/// most one message, on one path, so the queue can never hold more messages
-/// than the machine has adapters.
+/// Out of band from the frames, and it has to be: that funnel is bounded, so a
+/// report pushed through it could be discarded by the very congestion it exists
+/// to survive, and a *blocking* send would deadlock against [`PcapSource`]'s
+/// [`Drop`], which joins this thread before dropping the receiver. The unbounded
+/// `channel()` stays honest because each thread sends at most one message.
 pub(super) struct AdapterFailure {
     pub(super) device: String,
     /// Frames this adapter pulled off the wire before it died.
     ///
-    /// Every one of them passed whichever rung of [`filter_candidates`] this
-    /// adapter accepted, and every rung is the game server's source port and
-    /// nothing else, so a non-zero count means this adapter was on the path
-    /// the game server's traffic actually takes — which is the whole reason
-    /// its death matters while an idle sibling's does not.
+    /// Every rung of [`filter_candidates`] admits the game server's source port
+    /// and nothing else, so a non-zero count means this adapter was on the path
+    /// the game's traffic takes — the reason its death matters and an idle
+    /// sibling's does not.
     pub(super) delivered: u64,
     pub(super) error: String,
 }
 
 /// The two timings [`PcapSource::next_segment`] runs on.
 ///
-/// Fields rather than constants only so a test can shrink both: the behaviour
-/// they pace — what this side of the channel does when a producer dies — is
-/// otherwise reachable only from a machine with Npcap and a cooperative
-/// driver failure. They travel together because neither means anything
-/// without the other.
+/// Fields rather than constants only so a test can shrink both: what this side
+/// of the channel does when a producer dies is otherwise reachable only from a
+/// machine with Npcap and a cooperative driver failure.
 #[derive(Clone, Copy)]
 struct Pacing {
     /// How long the receiver parks on the funnel before looking at anything
-    /// else. Matched to [`READ_TIMEOUT_MS`] because that is already the
-    /// cadence at which anything in this backend notices anything; a quiet
-    /// tap costs five wakeups a second on one thread.
+    /// else. Matched to [`READ_TIMEOUT_MS`], already the cadence at which this
+    /// backend notices anything; a quiet tap costs five wakeups a second.
     poll: Duration,
     /// How long the funnel may stay silent *after* the adapter that was
     /// carrying the game's traffic died, before the session is declared over.
     ///
-    /// Not a bare stall watchdog, and deliberately not one: silence alone is
-    /// indistinguishable from a player who is not in the shop, so a timer on
-    /// silence would end healthy sessions. This one is armed only by an
-    /// observed death, which makes it a question with a real answer — is
-    /// anyone *else* still carrying these packets? On a machine where two
-    /// adapters see the same frames (Hyper-V's vSwitch beside the physical
-    /// NIC; the module header's dedupe note assumes exactly that), the answer
-    /// is yes and the first packet to arrive disarms this. Five seconds is
-    /// not measured against the game's traffic cadence — nothing here has
-    /// measured that — it is chosen as far longer than a duplicate adapter
-    /// needs to prove itself, and its false-positive cost is an accurate
-    /// error and the relaunch the app already offers, against a session that
-    /// hangs forever.
+    /// Deliberately not a bare stall watchdog: silence is indistinguishable
+    /// from a player who is not in the shop, so a timer on it would end healthy
+    /// sessions. Armed only by an observed death, it asks a question with a
+    /// real answer — is anyone *else* still carrying these packets? Where two
+    /// adapters see the same frames (Hyper-V's vSwitch beside the physical NIC)
+    /// the first packet disarms it. Five seconds is unmeasured against the
+    /// game's cadence, just far longer than a duplicate adapter needs to prove
+    /// itself; a false positive costs an accurate error and a relaunch, against
+    /// a session that hangs forever.
     blind: Duration,
 }
 
@@ -194,28 +151,17 @@ impl Default for Pacing {
 pub struct PcapSource {
     /// Stripped IP packets, funnelled from every capture thread.
     ///
-    /// Bounded, at [`FRAME_QUEUE_DEPTH`]. This was an unbounded channel, and
-    /// the argument for that is worth keeping because half of it still
-    /// holds: a bounded channel *would* park a capture thread outside the
-    /// driver whenever the consumer lagged, overflowing the kernel ring
-    /// behind it and turning a transient stall into unrecoverable loss. True
-    /// of a **blocking** bounded send, which is why nothing here blocks — a
-    /// full funnel drops the newest frame, counts it, and raises the same
-    /// `capture_loss` flag the driver's own `ps_drop` raises, so the pipeline
-    /// re-anchors rather than stalls (see `sys::forward`). The other half of
-    /// that argument was wrong: the kernel filter rate-limits producers to
-    /// one TCP port's traffic, which bounds the *average* rate and says
-    /// nothing at all about depth, so the queue's worst case was the
-    /// process's address space — memory
-    /// [`crate::stream::PipelineBudget`] cannot see, for the reason
-    /// [`FRAME_QUEUE_DEPTH`] gives.
+    /// Bounded, at [`FRAME_QUEUE_DEPTH`], and never blocking: a blocking send
+    /// would park a capture thread outside the driver whenever the consumer
+    /// lagged, overflowing the kernel ring behind it. A full funnel instead
+    /// drops the newest frame and raises the same `capture_loss` flag the
+    /// driver's `ps_drop` raises, so the pipeline re-anchors (`sys::forward`).
     packets: Receiver<Vec<u8>>,
     /// One message per capture thread that died on an error. See
     /// [`AdapterFailure`] for why this is not the channel above.
     failures: Receiver<AdapterFailure>,
-    /// Every failure reaped so far, as `device: reason`, so that the
-    /// disconnect at the end of the session can say what happened instead of
-    /// reporting only that it happened.
+    /// Every failure reaped so far, as `device: reason`, so the disconnect at
+    /// the end of the session can say what happened and not only that it did.
     failed: Vec<String>,
     /// When the adapter carrying the traffic died and nothing has arrived
     /// since. Cleared by the next packet, whoever delivers it.
@@ -235,20 +181,15 @@ pub struct PcapSource {
 /// Remote wake for a [`PcapSource`] parked on its channel.
 ///
 /// A flag, not a handle operation: calling `pcap_close` from another thread
-/// while a receive is in flight is a use-after-free — [`CaptureStop`]'s
-/// contract in [`super`] forbids that, after it burned this codebase once.
-/// Teardown only stores `true`; each capture thread notices within one
-/// [`sys::READ_TIMEOUT_MS`] window, closes its own handle, and drops its
-/// sender. When the last sender goes, the receiver in
-/// [`PacketSource::next_segment`] wakes with a disconnect, which is the one
-/// thing that ends that call for good — it also wakes every [`Pacing::poll`],
-/// but only to look around and park again. Idempotent: storing `true` twice
-/// is storing `true`.
+/// while a receive is in flight is a use-after-free, which [`CaptureStop`]'s
+/// contract in [`super`] forbids after it burned this codebase once. Each
+/// capture thread notices within one [`sys::READ_TIMEOUT_MS`] window, closes
+/// its own handle and drops its sender; the last one going wakes
+/// [`PacketSource::next_segment`] with the disconnect that ends it for good.
 ///
 /// `Relaxed` throughout, on this flag and `capture_loss`: the boolean is the
-/// whole message, so there's no payload for `Acquire` to acquire — teardown
-/// never touches another thread's handle, and packets publish through the
-/// channel, which carries its own edge.
+/// whole message, so there is no payload for `Acquire` to acquire — packets
+/// publish through the channel, which carries its own edge.
 pub(crate) struct PcapStop {
     stop: Arc<AtomicBool>,
 }
@@ -262,37 +203,28 @@ impl CaptureStop for PcapStop {
 impl PcapSource {
     /// Opens every usable adapter and starts capturing.
     ///
-    /// Blocking, and quick: enumeration plus one `pcap_open_live` and one
-    /// filter compile per device — nothing waits on a human, unlike the
-    /// backend it replaced, which put a UAC prompt in the middle of this
-    /// call. A device that fails to open, or reports a link type
+    /// Blocking, and quick: nothing here waits on a human, unlike the backend
+    /// it replaced. A device that fails to open, or reports a link type
     /// [`link::LinkStrip`] can't see past, is logged and skipped so one
-    /// refusing adapter doesn't block a machine with a dozen virtual ones.
-    /// Only zero usable devices is fatal.
+    /// refusing adapter doesn't block a machine with a dozen virtual ones. Only
+    /// zero usable devices is fatal.
     ///
     /// # Errors
     ///
-    /// Always [`Error::Capture`], with a player-readable message, from one of
-    /// three causes:
+    /// Always [`Error::Capture`], with a player-readable message:
     ///
-    /// - `wpcap.dll` could not be loaded from either candidate path, or is
-    ///   missing one of the thirteen symbols this backend needs — Npcap is
-    ///   not installed, or too old. Message names the download page.
+    /// - `wpcap.dll` could not be loaded, or is missing a symbol — Npcap is not
+    ///   installed, or too old. The message names the download page.
     /// - no adapter survived [`sys::open_device`]; [`no_usable_device_error`]
     ///   distinguishes admin-restricted driver, no device at all, and every
     ///   device refused with its own reason.
-    /// - a capture thread failed to spawn — the one cause unrelated to the
-    ///   Npcap install. [`start_capture_threads`] stops and joins the ones
-    ///   that did start before this returns; [`Drop`] cannot do it, because
-    ///   the `Self` whose `Drop` it would be is never constructed on this
-    ///   path.
+    /// - a capture thread failed to spawn. [`start_capture_threads`] stops and
+    ///   joins the ones that did start, because the `Self` whose [`Drop`] would
+    ///   do it is never constructed on this path.
     pub(crate) fn open(game_port: NonZeroU16) -> Result<(Self, PcapStop)> {
         let (wpcap, loaded_from) = Wpcap::load()?;
-        // No `plain_name_resolved` field any more: there is no plain name to
-        // resolve, because resolving one is what let a `wpcap.dll` beside the
-        // exe run at high integrity. The path carries what that boolean did —
-        // ending in `System32\wpcap.dll` rather than `System32\Npcap\wpcap.dll`
-        // is the WinPcap-compatible install.
+        // The path names the install mode: `System32\wpcap.dll` rather than
+        // `System32\Npcap\wpcap.dll` is the WinPcap-compatible one.
         info!(
             path = %loaded_from.display(),
             version = %wpcap.version(),
@@ -326,8 +258,6 @@ impl PcapSource {
         let capture_loss = Arc::new(AtomicBool::new(false));
         let (sender, packets) = sync_channel(FRAME_QUEUE_DEPTH);
         let (failed_sender, failures) = channel();
-        // `handle.device` is borrowed only for `format!`, fully evaluated
-        // before any closure exists, so the thread name needs no clone.
         let named: Vec<(String, _)> = handles
             .into_iter()
             .map(|handle| {
@@ -355,10 +285,9 @@ impl PcapSource {
         info!(
             adapters = threads.len(),
             skipped = refused.len(),
-            // The filter this asked every adapter for. An adapter whose
-            // libpcap refused it is capturing on a later rung of
-            // [`filter_candidates`] and said so in its own warning; there is
-            // no single filter to name here any more.
+            // Only the filter every adapter was *asked* for: one that refused
+            // it is capturing on a later rung of `filter_candidates` and said
+            // so in its own warning.
             filter = %filters[0],
             snaplen = SNAPLEN,
             queue_depth = FRAME_QUEUE_DEPTH,
@@ -386,58 +315,31 @@ impl PcapSource {
 /// The kernel filters this backend offers one adapter, most capable first.
 ///
 /// A ladder, not a set: [`open_device`] installs the first rung that adapter's
-/// libpcap accepts and keeps capturing on it. Both rungs admit only the game
-/// server's own source port, so everything else is still discarded in the
-/// driver rather than copied to user space first.
+/// libpcap accepts. Both rungs admit only the game server's own source port, so
+/// everything else is still discarded in the driver.
 ///
-/// # What the single filter this replaces could not see
+/// The tagged arms exist because `tcp and src port {game_port}` compiles, on
+/// `DLT_EN10MB`, to an `EtherType` test at offset 12 — where a tagged frame
+/// holds `0x8100`, not `0x0800`. The driver discarded every tagged frame before
+/// this process woke, leaving `link`'s VLAN handling unreachable and a tagged
+/// player with nothing but `delivered == 0` to go on.
 ///
-/// `tcp and src port {game_port}` compiles, on `DLT_EN10MB`, to an `EtherType`
-/// test at offset 12. On an 802.1Q-tagged frame offset 12 holds the tag
-/// protocol identifier `0x8100`, not `0x0800`, so the test fails and the
-/// driver discards the frame before this process is woken. That made every
-/// line of `link::ethernet_payload_offset`'s VLAN handling unreachable: a
-/// tagged frame could not get to it, so the diagnostic tell its comment
-/// promises — `unparsed` climbing beside `delivered` — could not appear
-/// either. A player behind VLAN tags saw `delivered == 0`, which this backend
-/// reads as "the adapters are open but the filter matches no traffic", and got
-/// no diagnosis past that.
+/// Three facts about the shape, none of them re-derivable from the code:
 ///
-/// # Why the expression is shaped exactly like this
-///
-/// `vlan` in libpcap is not a predicate. It tests the current link type for a
-/// tag *and then shifts every subsequent decoding offset by four*, for the
-/// remainder of the expression as the parser reads it. Parentheses group the
-/// boolean; they do not scope that shift back. Two consequences, both
-/// load-bearing:
-///
-/// - The untagged arm has to be written **to the left** of the first `vlan`.
-///   To its right it would be compiled against the shifted offsets and would
-///   then match only tagged frames — the same blind spot, inverted, and
-///   invisible on a machine that has no tags to test with.
-/// - Each further `vlan` shifts four more, which is what makes the third arm a
-///   double-tag matcher (802.1ad outer plus 802.1Q inner) without saying so:
-///   it is read after the second arm's shift is already in effect, so its own
-///   `vlan` tests offset 16 and its `tcp` tests offset 20. `link`'s
-///   `MAX_VLAN_TAGS` strips exactly that depth, so filter and strip now admit
-///   the same frames.
-///
-/// The parentheses around every arm are not decoration. `pcap-filter(7)`:
-/// "Alternation and concatenation have equal precedence and associate left to
-/// right" — `and` does **not** bind tighter than `or` here, unlike almost every
-/// other language that has both. Unparenthesised, `A or vlan and A` parses as
-/// `(A or vlan) and A`: a different filter, which compiles.
-///
-/// # Why the first rung can only ever widen, and the second rung exists anyway
-///
-/// Every arm after the first is joined with `or` and read after it, so nothing
-/// added here can subtract a frame the old filter admitted; a wrong arm costs
-/// at most some frames `parse_segment` then rejects. The failure this change
-/// could still cause is an expression that does not *compile* — [`open_device`]
-/// treats a filter it cannot install as a refused adapter, so on a libpcap too
-/// old or too unusual to know `vlan` this would turn a partial outage into a
-/// total one. Hence the second rung, which is the previous filter, byte for
-/// byte.
+/// - `vlan` is not a predicate: it tests for a tag *and shifts every subsequent
+///   decoding offset by four*, for the rest of the expression as the parser
+///   reads it, and parentheses do not scope that back. The untagged arm must
+///   therefore sit **left** of the first `vlan`, and each further `vlan` shifts
+///   four more — which is what silently makes the third arm a double-tag
+///   matcher, at exactly the depth `link`'s `MAX_VLAN_TAGS` strips.
+/// - `pcap-filter(7)`: "Alternation and concatenation have equal precedence and
+///   associate left to right". `and` does **not** bind tighter than `or`, so
+///   every arm is parenthesised — unparenthesised, `A or vlan and A` parses as
+///   `(A or vlan) and A`, a different filter that compiles.
+/// - The ladder falls back per adapter because [`open_device`] treats a filter
+///   it cannot install as a refused adapter, so on a libpcap too old to know
+///   `vlan` one blind spot would become no capture at all. The second rung is
+///   the previous filter, byte for byte.
 fn filter_candidates(game_port: NonZeroU16) -> [String; 2] {
     let untagged = format!("tcp and src port {game_port}");
     let tagged = format!("({untagged}) or (vlan and {untagged}) or (vlan and vlan and {untagged})");
@@ -447,22 +349,15 @@ fn filter_candidates(game_port: NonZeroU16) -> [String; 2] {
 /// Starts one named thread per adapter, and — the reason this is a function at
 /// all — stops and joins everything it already started if any spawn fails.
 ///
-/// The loop this replaces returned through a bare `?`, before `PcapSource` was
-/// constructed, so no [`Drop`] existed to run: the flag was never set, the
-/// `Vec<JoinHandle>` was dropped (which detaches), and every thread already
-/// spawned kept its `pcap_t` and its `Arc<Wpcap>` alive for the life of the
-/// process. They could not even exit on their own. `capture_loop`'s only other
-/// way out is the receiver going away, which it learns about by *sending* — and
-/// [`PcapSource::open`] deliberately opens every device, so most of those
-/// threads are on adapters that will never match the filter and never send
-/// anything. They sat on 200 ms `pcap_next_ex` timeouts forever. The app
-/// reports a failed capture and offers a relaunch, so it compounded once per
-/// attempt.
+/// Returning through a bare `?` here leaks threads permanently: `PcapSource`
+/// does not exist yet, so no [`Drop`] sets the stop flag, and a spawned
+/// `capture_loop`'s only other exit is the receiver going away — which it
+/// learns by *sending*, and most adapters never match the filter and so never
+/// send. They sat on 200 ms `pcap_next_ex` timeouts forever, once per relaunch.
 ///
-/// Generic over the adapter only so that failure path is reachable from a test:
-/// `open` instantiates it at `sys::Handle`, which needs a live `pcap_t` and
-/// therefore a machine with Npcap, while the cleanup being asserted is pure
-/// thread lifecycle.
+/// Generic over the adapter only so that path is reachable from a test: `open`
+/// instantiates it at `sys::Handle`, which needs a machine with Npcap, while
+/// the cleanup being asserted is pure thread lifecycle.
 fn start_capture_threads<A>(
     stop: &AtomicBool,
     threads: &mut Vec<JoinHandle<()>>,
@@ -483,11 +378,8 @@ fn start_capture_threads<A>(
 
 /// Sets the stop flag and joins, the one way capture threads are ever ended.
 ///
-/// Shared by [`start_capture_threads`]'s abandoned-open path and
-/// [`PcapSource::drop`] because they are the same operation on the same
-/// invariant, not because the second happened to be convenient: a capture
-/// thread notices the flag within one [`READ_TIMEOUT_MS`] window, so the join
-/// costs about that much once, not once per thread.
+/// A capture thread notices the flag within one [`READ_TIMEOUT_MS`] window, so
+/// the join costs about that much once, not once per thread.
 fn stop_and_join(stop: &AtomicBool, threads: &mut Vec<JoinHandle<()>>) {
     stop.store(true, Ordering::Relaxed);
     for thread in threads.drain(..) {
@@ -500,10 +392,9 @@ fn stop_and_join(stop: &AtomicBool, threads: &mut Vec<JoinHandle<()>>) {
 impl Drop for PcapSource {
     /// Stops and joins the capture threads.
     ///
-    /// Teardown normally goes through [`PcapStop`] first, so this is usually
-    /// a no-op join of already-finished threads. It exists for the paths
-    /// that don't — otherwise a dropped source with its stop handle still
-    /// alive would leave threads capturing into a channel nobody reads.
+    /// Teardown normally goes through [`PcapStop`] first, so this is usually a
+    /// no-op join. It exists for the paths that don't, where a dropped source
+    /// would leave threads capturing into a channel nobody reads.
     fn drop(&mut self) {
         stop_and_join(&self.stop, &mut self.threads);
     }
@@ -514,24 +405,20 @@ impl PcapSource {
     /// deadline or a log line, depending on whether the dead adapter was
     /// carrying anything.
     ///
-    /// There was no such path at all before, and its absence was the whole
-    /// bug: a `pcap_next_ex` error warned and ended one thread, its siblings
-    /// kept the channel alive, and this side stayed parked in `recv` forever.
-    /// `app::ingest` blocks on `next_segment` with no timeout, so its
-    /// `fatal.blocking_send` never fired, nothing reached the journal, and the
-    /// window went on showing a running session that would never see another
-    /// packet. Five adapters open and the one carrying the game disabled, its
-    /// driver reset, or Npcap upgraded under it — that was the shape of it.
+    /// Without this path a `pcap_next_ex` error ended one thread while its
+    /// siblings kept the channel alive, parking this side in `recv` forever:
+    /// `app::ingest` blocks on `next_segment` with no timeout, so nothing
+    /// reached the journal and the window went on showing a running session
+    /// that would never see another packet.
     fn reap_failures(&mut self) {
         while let Ok(failure) = self.failures.try_recv() {
             let device = short_device_name(&failure.device);
             self.failed.push(format!("{device}: {}", failure.error));
             if failure.delivered == 0 {
                 // This backend opens every adapter precisely because it has no
-                // reason to believe in any of them, so an idle one dying costs
-                // nothing and must not cost the session either. It is still
-                // kept, for the disconnect message: "every capture thread
-                // exited" is otherwise unattributable.
+                // reason to believe in any, so an idle one dying must not cost
+                // the session. Still recorded: "every capture thread exited" is
+                // otherwise unattributable.
                 warn!(
                     device,
                     error = %failure.error,
@@ -549,10 +436,9 @@ impl PcapSource {
         }
     }
 
-    /// The fatal half of [`Self::reap_failures`], separated because it is a
-    /// question about *elapsed silence* rather than about a message: an
-    /// adapter that was delivering has died and nothing has replaced it. See
-    /// [`Pacing::blind`] for why this is armed by a death and not by a timer.
+    /// The fatal half of [`Self::reap_failures`]: an adapter that was
+    /// delivering has died and nothing has replaced it. See [`Pacing::blind`]
+    /// for why this is armed by a death and not by a timer.
     fn report_if_blind(&self) -> Result<()> {
         let Some(since) = self.blind_since else {
             return Ok(());
@@ -589,15 +475,14 @@ impl PacketSource for PcapSource {
         loop {
             let packet = match self.packets.recv_timeout(self.pacing.poll) {
                 Ok(packet) => {
-                    // Whoever sent this, the tap is not blind: a frame that
-                    // got here passed the kernel filter, so some adapter is
-                    // still on the game server's path.
+                    // Whoever sent it, the tap is not blind: it passed the
+                    // kernel filter, so some adapter is still on the server's
+                    // path.
                     self.blind_since = None;
                     packet
                 }
-                // The funnel went quiet for one poll — the only moment this
-                // side of the channel gets to look at anything but a packet,
-                // and the only moment at which looking is worth anything.
+                // A quiet poll is the only moment this side gets to look at
+                // anything but a packet.
                 Err(RecvTimeoutError::Timeout) => {
                     self.reap_failures();
                     self.report_if_blind()?;
@@ -610,12 +495,9 @@ impl PacketSource for PcapSource {
             };
 
             self.funnel.delivered += 1;
-            // The link header is already gone: each capture thread strips its
-            // own adapter's framing, since the strip length depends on the
-            // adapter and nothing down here knows which one a packet came
-            // from. What arrives is a raw IP packet, the only shape
-            // `parse_segment` accepts, handed over by value so this buffer
-            // becomes the segment's payload rather than being copied.
+            // The link header is already gone: its length depends on the
+            // adapter, and nothing down here knows which one a packet came
+            // from. By value, so the buffer becomes the payload uncopied.
             let Some(segment) = parse_segment(packet, self.game_port) else {
                 self.funnel.unparsed += 1;
                 self.funnel.report();
@@ -624,14 +506,11 @@ impl PacketSource for PcapSource {
 
             self.funnel.admitted += 1;
             if self.funnel.admitted == 1 {
-                // Anything admitted was sent by the game server —
-                // `parse_segment` accepts nothing else — so this line proves
-                // the filter, port, adapter choice, and link-layer strip all
-                // agree. Its absence in a session log means capture is open
-                // but sees nothing from the game server. Logs the client's
-                // port, not its address: on IPv6 that address is the
-                // player's globally routable one, in a file they're asked to
-                // email.
+                // `parse_segment` admits nothing but the game server, so this
+                // proves filter, port, adapter choice and strip all agree; its
+                // absence means capture is open but sees nothing. The client's
+                // port, not its address: on IPv6 that is the player's globally
+                // routable one, in a file they're asked to email.
                 info!(
                     payload = segment.payload.len(),
                     syn = segment.syn,
@@ -647,14 +526,11 @@ impl PacketSource for PcapSource {
 
     fn take_capture_loss(&mut self) -> bool {
         // `swap`, not load-then-store: the read-and-clear must be atomic
-        // against a capture thread setting it again. `Relaxed` because an RMW
-        // on one location is ordered against every other RMW on it
-        // regardless, and there's no payload behind the flag (see [`PcapStop`]).
+        // against a capture thread setting it again. `Relaxed` for the reason
+        // given at `PcapStop` — there is no payload behind the flag.
         self.capture_loss.swap(false, Ordering::Relaxed)
     }
 }
-
-// --- No usable device: saying which of the three things happened -----------
 
 /// Why one adapter didn't make the capture set, collected for the
 /// zero-usable-device error.
@@ -665,19 +541,15 @@ struct Refusal {
 
 /// Turns "no adapter survived" into a message that names a cause.
 ///
-/// Two failures are indistinguishable from return codes alone: Npcap
-/// restricted to administrators hands back an empty device list (or
-/// access-denied opens) from an unelevated process, identical to a machine
-/// with no adapters at all. The registry's `AdminOnly` value settles it — 0
-/// on the machine this backend was measured on.
+/// Two failures are indistinguishable from return codes alone: Npcap restricted
+/// to administrators hands an unelevated process an empty device list, just as
+/// a machine with no adapters does. The registry's `AdminOnly` settles it.
 fn no_usable_device_error(devices: &[String], refused: &[Refusal]) -> Error {
     if npcap_admin_only().is_some_and(|value| value != 0) {
         return Error::Capture(
-            // No "or run this app elevated": the shipped exe carries a
-            // `requireAdministrator` manifest, so a player reading this has
-            // already approved a UAC prompt and has nothing left to raise.
-            // That half of the advice dates from the unelevated-capture probe
-            // and pointed at a non-fix. Reinstalling is the only lever.
+            // No "or run this app elevated": the exe is manifested
+            // `requireAdministrator`, so a player reading this has already
+            // approved a UAC prompt. Reinstalling is the only lever.
             "Npcap is installed but its driver is restricted to administrators \
              (HKLM\\SYSTEM\\CurrentControlSet\\Services\\npcap\\Parameters\\AdminOnly is set): \
              reinstall Npcap with \"Restrict Npcap driver's access to Administrators\" unchecked"
@@ -713,13 +585,11 @@ fn npcap_admin_only() -> Option<u32> {
     let value = wide("AdminOnly");
     let mut data: u32 = 0;
     let mut size = size_of::<u32>() as u32;
-    // SAFETY: `subkey` and `value` are NUL-terminated UTF-16 buffers owned by
-    // this frame and alive across the call. `data` and `size` are stack slots;
-    // `size` is initialized to exactly `data`'s size and `RRF_RT_REG_DWORD`
-    // restricts the call to writing a `DWORD` into it, so no over-write is
-    // possible. `HKEY_LOCAL_MACHINE` is a predefined key that needs no close.
-    // Failure mode: a `WIN32_ERROR` return, with `data` untouched — hence the
-    // status check before it is read.
+    // SAFETY: `subkey` and `value` are NUL-terminated UTF-16 buffers alive
+    // across the call. `size` is exactly `data`'s size and `RRF_RT_REG_DWORD`
+    // restricts the write to a `DWORD`, so no over-write is possible.
+    // `HKEY_LOCAL_MACHINE` needs no close. On failure `data` is untouched,
+    // hence the status check before it is read.
     let status = unsafe {
         RegGetValueW(
             HKEY_LOCAL_MACHINE,
@@ -735,9 +605,6 @@ fn npcap_admin_only() -> Option<u32> {
 }
 
 /// NUL-terminated UTF-16, as every `...W` entry point wants it.
-///
-/// `actuator::win` had a byte-identical copy of this, down to the sizing
-/// argument; both now read [`crate::wide`], which carries that argument once.
 use crate::wide::wide;
 
 /// `\Device\NPF_{GUID}` is unreadable in a log line; the GUID alone is enough to
@@ -750,12 +617,10 @@ fn short_device_name(device: &str) -> &str {
 impl PcapSource {
     /// A source with no adapters behind it, for the tests below.
     ///
-    /// The two channels are handed in so a test can play the part of the
-    /// capture threads. [`PcapSource::open`] is unrunnable anywhere without
-    /// Npcap and a real adapter (which is why the smoke test below is
-    /// `#[ignore]`d), and what needs pinning here — what this side does when
-    /// one producer dies while its siblings hold the channel open — lives
-    /// entirely on this side of them.
+    /// The channels are handed in so a test can play the capture threads:
+    /// [`PcapSource::open`] is unrunnable without Npcap, while what needs
+    /// pinning — what this side does when one producer dies with its siblings
+    /// still holding the channel open — lives entirely on this side of them.
     fn from_channels(
         packets: Receiver<Vec<u8>>,
         failures: Receiver<AdapterFailure>,
@@ -790,7 +655,7 @@ mod tests {
 
     /// The production pacing with both delays collapsed: these tests assert
     /// *what* happens when an adapter dies, not how long the backend waits
-    /// first, and the wait is a field precisely so they need not pay it.
+    /// first.
     fn immediate() -> Pacing {
         Pacing {
             poll: Duration::from_millis(5),
@@ -798,19 +663,17 @@ mod tests {
         }
     }
 
-    /// How long a test waits for a call that must not park forever. Generous:
-    /// its only job is to turn "blocks for the life of the process" into a
-    /// named failure instead of a suite that hangs.
+    /// How long a test waits for a call that must not park forever: generous,
+    /// because its only job is to turn "blocks for the life of the process"
+    /// into a named failure rather than a hung suite.
     const NEVER_PARKS: Duration = Duration::from_secs(5);
 
     #[test]
     fn a_dead_adapter_ends_the_session_even_while_its_siblings_hold_the_funnel_open() {
         let (frames, packets) = sync_channel(FRAME_QUEUE_DEPTH);
         let (report, failures) = channel();
-        // The siblings: still capturing, still holding a sender, and with
-        // nothing to say because the kernel filter matches nothing on their
-        // adapters. That alone used to be enough to park `next_segment` in
-        // `recv` for the rest of the process's life — the receiver's only
+        // Siblings still holding a sender, with nothing to say because the
+        // kernel filter matches nothing on their adapters. The receiver's only
         // `Err` is the all-senders-gone disconnect, and these two never go.
         let siblings = (frames.clone(), frames);
         let mut source = PcapSource::from_channels(packets, failures, game_port(), immediate());
@@ -849,8 +712,8 @@ mod tests {
         let (report, failures) = channel();
         let sibling = frames.clone();
         let mut source = PcapSource::from_channels(packets, failures, game_port(), immediate());
-        // Delivered nothing, so it was never on the game's path: this backend
-        // opens every device it can, and most of them are idle by design.
+        // Delivered nothing, so it was never on the game's path: most of the
+        // devices this backend opens are idle by design.
         report
             .send(AdapterFailure {
                 device: r"\Device\NPF_{IDLE}".to_owned(),
@@ -859,9 +722,8 @@ mod tests {
             })
             .expect("the source is alive");
         drop(report);
-        // Every capture thread is now gone, which is the only thing that may
-        // end this source — and the reason it ended is carried into the
-        // message rather than left in a log line nobody correlates.
+        // Every capture thread gone is the only thing that may end this source,
+        // and the reason must reach the message, not a log line nobody reads.
         drop(sibling);
         drop(frames);
 
@@ -875,12 +737,10 @@ mod tests {
 
     #[test]
     fn a_failed_spawn_stops_and_joins_the_capture_threads_that_did_start() {
-        // The shape of `open`'s spawn loop when the third `Builder::spawn`
-        // fails with two threads already running. Before, the `?` on that line
-        // returned before `PcapSource` existed, so nothing set the flag and
-        // nothing joined: two threads spinning on a stop flag that would never
-        // be set, each holding an open `pcap_t` and pinning `wpcap.dll`, for
-        // the life of the process — and again on the next relaunch.
+        // `open`'s spawn loop when the third `Builder::spawn` fails with two
+        // threads already running. A bare `?` returns before `PcapSource`
+        // exists, so nothing sets the flag and nothing joins: two threads
+        // spinning forever, each pinning an open `pcap_t` and `wpcap.dll`.
         let stop = Arc::new(AtomicBool::new(false));
         let exited = Arc::new(AtomicUsize::new(0));
         let attempts = AtomicUsize::new(0);
@@ -898,9 +758,9 @@ mod tests {
             let stop = Arc::clone(&stop);
             let exited = Arc::clone(&exited);
             std::thread::Builder::new().name(name).spawn(move || {
-                // `capture_loop`'s shape: the flag is the only exit these ever
-                // get, since an adapter matching nothing never sends and so
-                // never learns that the receiver is gone.
+                // `capture_loop`'s shape: an adapter matching nothing never
+                // sends, so it never learns the receiver is gone and the flag
+                // is its only exit.
                 while !stop.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -925,9 +785,9 @@ mod tests {
         assert!(threads.is_empty(), "nothing is handed back to leak");
     }
 
-    /// Live smoke check, never run by CI (`#[ignore]`; CI has neither an
-    /// adapter nor Npcap). Run by hand on a machine with Npcap to confirm the
-    /// dynamic load, enumeration, and per-adapter open still work:
+    /// Live smoke check, never run by CI, which has neither an adapter nor
+    /// Npcap. Run by hand to confirm the dynamic load, enumeration and
+    /// per-adapter open still work:
     ///
     /// ```text
     /// cargo test --no-default-features --features pcap-backend -- --ignored --nocapture
@@ -942,7 +802,7 @@ mod tests {
         stop.stop();
     }
 
-    /// Splits a filter on its top-level `or`s. Crude on purpose — it only has
+    /// Splits a filter on its top-level `or`s. Crude on purpose: it only has
     /// to handle the one shape [`filter_candidates`] builds, and a parser that
     /// could handle more would be a second thing to get wrong.
     fn top_level_arms(filter: &str) -> Vec<&str> {
@@ -970,11 +830,9 @@ mod tests {
         let arms = top_level_arms(&tagged);
         assert_eq!(arms.len(), 3, "untagged, one tag, two tags: {tagged}");
 
-        // The whole bug this filter fixes, and the whole way a fix could go
-        // wrong, is which side of `vlan` a term is read on: `vlan` shifts every
-        // decoding offset after it by four, so an untagged arm written to its
-        // right would match tagged frames only — the same outage, inverted, and
-        // unobservable on a machine with no tags to test against.
+        // `vlan` shifts every decoding offset after it by four, so an untagged
+        // arm written to its right would match tagged frames only — the same
+        // outage inverted, unobservable on a machine with no tags.
         let first_vlan = tagged.find("vlan").expect("a vlan arm");
         let untagged_arm = tagged.find("tcp and src port").expect("an untagged arm");
         assert!(
@@ -1001,10 +859,9 @@ mod tests {
 
     #[test]
     fn the_fallback_rung_is_the_filter_this_backend_shipped_before_vlan_was_handled() {
-        // Not a restatement of the code: this rung is what a machine whose
-        // libpcap refuses `vlan` gets, and its whole value is that it is the
-        // *previous* behaviour rather than an approximation of it. A drift here
-        // would mean the fail-safe path is itself a change nobody measured.
+        // This rung's whole value is being the *previous* behaviour rather than
+        // an approximation: drift makes the fail-safe path itself a change
+        // nobody measured.
         let [tagged, untagged] = filter_candidates(game_port());
         assert_eq!(untagged, "tcp and src port 3333");
         assert!(!untagged.contains("vlan"));

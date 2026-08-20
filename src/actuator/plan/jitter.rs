@@ -1,27 +1,16 @@
 //! The one deterministic randomness source in `plan`, and the salt that keeps
-//! its two consumers independent of each other.
-//!
-//! Its own module because both halves above it draw from it and neither owns it:
-//! [`timings`](super::timings) draws waits out of a `Jitter`, the
-//! [`jobs`](super::jobs) builders draw click positions and press holds out of a
-//! second one, and the salt below is the reason those two streams cannot
-//! interfere. Reads [`geometry`](super::geometry) — a jittered point is still a
-//! design-space point — and nothing else.
+//! its two consumers — [`timings`](super::timings)'s waits and the
+//! [`jobs`](super::jobs) builders' positions — on independent streams.
 
 use super::geometry::{DesignPoint, Zone};
 
-/// Separates the wait-jitter stream from the click-position stream: both seed
-/// from the same `now_ms`, but a shared sequence would make click coordinates
-/// depend on the timing config. `XOR`ing the seed keeps positions byte-stable
-/// whatever the ranges.
-///
-/// `pub(super)` for the three job builders, which are the only things that open
-/// the second stream.
+/// Both streams seed from the same `now_ms`, and one shared sequence would make
+/// click coordinates depend on the timing config; `XOR`ing keeps positions
+/// byte-stable whatever the ranges.
 pub(super) const DELAY_SEED_SALT: u64 = 0xD31A_7000_D31A_7000;
 
-/// Deterministic per-seed click randomizer (xorshift64*): points land in the
-/// central 75% of a zone and press holds vary, so no two clicks look alike
-/// while tests stay reproducible.
+/// Deterministic per-seed click randomizer (xorshift64*): no two clicks look
+/// alike, while tests stay reproducible.
 pub struct Jitter(u64);
 
 impl Jitter {
@@ -34,8 +23,8 @@ impl Jitter {
         })
     }
 
-    /// The raw draw. `pub(super)` for `DelayRange::draw`, the wait side of the
-    /// stream; every other caller wants one of the shaped draws below.
+    /// The raw draw, for `DelayRange::draw`; every other caller wants a shaped
+    /// one below.
     pub(super) fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;

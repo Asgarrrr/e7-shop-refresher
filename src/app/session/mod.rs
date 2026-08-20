@@ -19,31 +19,27 @@ use crate::watch::{HaltSource, WatchGate};
 use super::Command;
 
 /// The session tick period; the domain's time limits are read against this
-/// wall clock. [`HEARTBEAT_EVERY_TICKS`] counts these ticks.
+/// wall clock.
 const TICK_PERIOD: Duration = Duration::from_secs(1);
 
 /// One heartbeat every 30 ticks (30 s). A healthy pipeline at rest and a dead
 /// one are otherwise indistinguishable in the logs: both are silent.
 const HEARTBEAT_EVERY_TICKS: u64 = 30;
 
-/// How long the loop waits, after the uplink channel closed with no fatal
-/// captured, for a racing supervisor report. A panicking worker drops its
-/// sender one scheduling hop before its supervisor sends the fatal, so
-/// without this window a crash reads as a clean "session ended".
+/// A panicking worker drops its sender one scheduling hop before its supervisor
+/// sends the fatal, so without this window a crash reads as a clean
+/// "session ended".
 const FATAL_REPORT_GRACE: Duration = Duration::from_millis(150);
 
-/// The controller's poison-tolerant lock: a panic elsewhere must not turn every
-/// later dispatch into a second panic. `.expect("controller mutex poisoned")`
-/// was rejected here for a measured reason — it turned a recoverable frame fault
-/// into `supervise` reporting "session crashed" and stopping the relay.
-///
-/// [`crate::sync`]'s obligation is discharged by `Controller::handle` being pure
-/// and saturating, so a guard released by an unwinding thread never leaves state
-/// half-written. The GUI reads this same mutex through the same function.
+/// Poison-tolerant: `.expect("controller mutex poisoned")` turned a recoverable
+/// frame fault into `supervise` reporting "session crashed" and stopping the
+/// relay. [`crate::sync`]'s obligation is discharged by `Controller::handle`
+/// being pure and saturating, so an unwinding thread leaves no half-written
+/// state behind its guard.
 use crate::sync::lock_ignoring_poison as lock;
 
-/// Why the loop stopped. Exactly one holds when the loop breaks, and the
-/// teardown event and fatal-report grace window are both read off it.
+/// Why the loop stopped. The teardown event and the fatal-report grace window
+/// are both read off it.
 enum Exit {
     /// Ctrl+C or the window closing — the player's own stop.
     PlayerStopped,
@@ -53,17 +49,10 @@ enum Exit {
     Fatal(String),
 }
 
-/// Owns the controller for the session: multiplexes player commands, server
-/// messages, a 1 s tick (time limits), capture failures, the cooperative
-/// shutdown signal, and Ctrl+C.
-///
-/// The mutex guard is only ever held across synchronous calls, never an
-/// `.await`. The wall clock is read here so the domain stays pure. The guard
-/// is taken through [`lock`], which stays usable after a panic elsewhere.
-///
-/// Returns the fatal failure, if one ended the session: the caller turns it
-/// into an error outcome (banner + exit code). The message is self-describing
-/// (`network capture: …`, `uplink task panicked`).
+/// Owns the controller for the session. The mutex guard is only ever held
+/// across synchronous calls, never an `.await`; the wall clock is read here so
+/// the domain stays pure. Returns the fatal failure, if one ended the session,
+/// for the caller to turn into a banner and an exit code.
 #[expect(
     clippy::too_many_arguments,
     reason = "four borrowed session handles plus the four channels this loop multiplexes; \
@@ -80,20 +69,12 @@ pub(super) async fn session_loop(
     mut shutdown: watch::Receiver<bool>,
 ) -> Option<String> {
     let now_ms = || journal.now_ms();
-    // The tick deadline is owned here rather than by `tokio::time::interval`,
-    // because the tick is not serviced from the `select!` at all — see the note
-    // above it. Starting at `Instant::now()` reproduces `interval`'s immediate
-    // first tick: the loop takes a check-point as it starts.
-    //
-    // Re-arming from *now* rather than from the missed deadline is
-    // `MissedTickBehavior::Delay`, kept for the reason it was chosen: Burst
-    // would replay every tick missed during a CPU stall back to back, all
-    // carrying near-identical `now_ms` — pointless repeated dispatches, each
-    // taking and releasing the controller mutex, right after a hiccup.
+    // Not `tokio::time::interval`, because the tick is serviced outside the
+    // `select!` — see the note above it. Re-arming from *now* is
+    // `MissedTickBehavior::Delay`; Burst would replay a CPU stall's worth of
+    // ticks back to back, all carrying near-identical `now_ms`.
     let mut next_tick = tokio::time::Instant::now();
-    // Only ever *wakes* the loop at the deadline. Whether a tick is due is
-    // decided by `next_tick`, never by this future having been polled, which
-    // is the whole point: a future that is never polled cannot answer.
+    // Only *wakes* the loop; whether a tick is due is decided by `next_tick`.
     let tick_wakeup = tokio::time::sleep_until(next_tick);
     tokio::pin!(tick_wakeup);
     let ctrl_c = tokio::signal::ctrl_c();
@@ -105,41 +86,23 @@ pub(super) async fn session_loop(
     let mut shutdown_open = true;
     let mut ticks: u64 = 0;
     let mut last_shop_ms: Option<u64> = None;
-    // An unknown server tag presents like a mute server; this count lets the
-    // heartbeat tell the two apart (see `heartbeat`).
+    // An unknown server tag presents like a mute server; `heartbeat` tells the
+    // two apart by this count.
     let mut unknown_messages: u64 = 0;
     let exit = loop {
         // Read here, not just in the branch: a window closed during startup
         // sets the signal before the loop starts, when `changed()` never fires.
         if *shutdown.borrow() {
             journal.emit(&[">> shutting down".to_owned()]);
-            // The player's own stop, like Ctrl+C.
             break Exit::PlayerStopped;
         }
-        // `Event::Tick` is the only check-point that enforces `Limits` and
-        // steps the watchdog's rungs, and it is the one thing here that has to
-        // happen on a schedule rather than on an arrival. That is exactly what
-        // the `biased` select below cannot promise it: its branch list is a
-        // priority order, `messages` is ready on every poll while a server
-        // sends faster than `on_message` runs, and a tick under it is not
-        // "late" — it is never. Tokio's cooperative budget does not rescue it
-        // either: when the budget runs out *every* branch returns pending
-        // together, the task yields, and the next poll restarts at the top of
-        // the same list. Measured, not asserted: fed a run of
-        // `ServerMessage::Unknown` — the cheapest message there is — the loop
-        // ran five seconds past a 500 ms `max_duration_ms` without dispatching
-        // one tick, and stopped only when the test cut the flood off.
-        //
-        // So the tick is not a branch. It is serviced here, against a deadline
-        // this loop owns, before the select is entered: a flood can make a
-        // tick late by one `on_message` call and by nothing more.
-        //
-        // This does not walk back the ordering below (`08d62ba`). The exits
-        // still sit above the branch a remote party keeps ready — and what now
-        // sits above *them* is not a branch a remote party can hold open, it
-        // is a bounded synchronous dispatch that runs at most once per
-        // `TICK_PERIOD`. The fatal arm's "break immediately" pays one tick for
-        // this, where the tick used to pay everything.
+        // The tick is a deadline this loop owns, not a `select!` branch: as a
+        // branch under `messages` it was never serviced at all under a flood
+        // (measured: five seconds past a 500 ms `max_duration_ms`, no tick),
+        // and `Event::Tick` is the only thing that enforces `Limits` and steps
+        // the watchdog's rungs. Tokio's budget does not break the tie — it
+        // returns *every* branch pending at once and re-polls from the top.
+        // Above the exits, but bounded: one dispatch per `TICK_PERIOD`.
         let due = tokio::time::Instant::now();
         if due >= next_tick {
             next_tick = due + TICK_PERIOD;
@@ -158,27 +121,12 @@ pub(super) async fn session_loop(
                 heartbeat(controller, gate, now, last_shop_ms, unknown_messages);
             }
         }
-        // `biased` polls in source order and takes the first ready branch, so
-        // this list is a priority order and a branch that is *always* ready
-        // starves everything below it. `messages` is the one branch that can be:
-        // it is fed by the uplink over 256 slots, and a server sending faster
-        // than `on_message` runs keeps it perpetually ready.
-        //
-        // So the four branches that end the session come first, together. Three
-        // of them used to sit below `messages` — including `fatal_errors`, whose
-        // own comment says "break immediately: the channel cascade can take tens
-        // of seconds, during which the window would keep claiming a healthy
-        // watch", which the ordering then contradicted. `ctrl_c` sat last of
-        // all, two branches below the `shutdown` signal that is the same
-        // player intent in the windowed build.
-        //
-        // The safety halt stays first of the four; that much was already argued
-        // (`docs/tech-debt/06-async.md`, `async-cancel-safety`). Nothing below
-        // the exits can starve anything: `commands` is human-paced, and
-        // `tick_wakeup` is last because a wakeup is the cheapest thing to be
-        // late for — the deadline it wakes for is absolute, so a wakeup that
-        // never comes loses no tick; the check above still fires on the next
-        // trip round the loop.
+        // `biased` makes this a priority list, and an always-ready branch
+        // starves everything under it. `messages` is the one a remote party can
+        // hold that way, so the four session-ending branches sit above it
+        // (`08d62ba`) — safety halt first. Nothing below them can starve:
+        // `commands` is human-paced, and `tick_wakeup`'s deadline is absolute,
+        // so a wakeup that never comes loses no tick.
         tokio::select! {
             biased;
             source = gate.next_halt() => {
@@ -204,11 +152,10 @@ pub(super) async fn session_loop(
             }
             error = fatal_errors.recv(), if fatal_open => match error {
                 Some(error) => {
-                    // Break immediately: the channel cascade can take tens
-                    // of seconds, during which the window would keep
-                    // claiming a healthy watch. `error`, not `info`:
-                    // README's troubleshooting tells the player to look for
-                    // this line, and a narrowed `RUST_LOG` would delete it.
+                    // Break immediately: the channel cascade can take tens of
+                    // seconds, during which the window would keep claiming a
+                    // healthy watch. `error`, not `info`, because README's
+                    // troubleshooting sends the player looking for this line.
                     journal.emit_at(
                         tracing::Level::ERROR,
                         &[format!(">> session aborted — {error}")],
@@ -235,11 +182,10 @@ pub(super) async fn session_loop(
                     on_message(controller, gate, journal, actuator, message, now);
                 }
                 // An armed watch with a dead link looks exactly like a closed
-                // shop, so this is journaled; the controller is told too so
-                // the watchdog does not escalate over a dead wire.
+                // shop: journaled at `warn` so the reason survives a narrowed
+                // log, and told to the controller so the watchdog does not
+                // escalate over a dead wire.
                 Some(UplinkEvent::LinkDown(reason)) => {
-                    // `warn`, not `info`: a log narrowed to info would hide
-                    // the reason no shop can arrive.
                     journal.emit_at(
                         tracing::Level::WARN,
                         &[format!(">> server link down: {reason} — retrying, no shop can arrive")],
@@ -253,13 +199,11 @@ pub(super) async fn session_loop(
                 }
                 None => break Exit::UplinkClosed,
             },
-            // Parks the loop until the next tick is due and nothing more: the
-            // tick is dispatched at the top, where no branch can outrank it.
+            // Parks until the next tick is due; the tick itself runs at the top.
             _ = &mut tick_wakeup => {}
         }
     };
-    // See [`FATAL_REPORT_GRACE`]: if the loop ended on a closed uplink with
-    // no fatal captured yet, wait briefly for a racing supervisor report.
+    // See [`FATAL_REPORT_GRACE`].
     let mut raced_failure = None;
     if matches!(exit, Exit::UplinkClosed)
         && fatal_open
@@ -271,10 +215,8 @@ pub(super) async fn session_loop(
         );
         raced_failure = Some(error);
     }
-    // The window (GUI build) outlives the loop: leave an honest state behind
-    // — controller stopped, gate (and thus capture) off, a journal line
-    // saying why. The domain ignores both teardown events for a never-armed
-    // controller.
+    // The window (GUI build) outlives the loop, so leave honest state behind:
+    // controller stopped, gate off, a journal line saying why.
     let teardown = match exit {
         Exit::PlayerStopped => Event::Stop,
         Exit::UplinkClosed | Exit::Fatal(_) => Event::Shutdown,
@@ -286,14 +228,9 @@ pub(super) async fn session_loop(
     }
 }
 
-/// One periodic line saying the loop is alive and what it is waiting on.
-///
-/// Capture blind, server mute, actuator stuck, and an unparsed server
-/// dialect are otherwise indistinguishable in a silent log. `since_last_shop_s`
-/// is `None` until the first shop; `unknown_messages` separates "server
-/// mute" from "server talking, client not understanding" — both present as
-/// no shop arriving. Nothing is awaited here, so the controller guard never
-/// crosses an await.
+/// Capture blind, server mute, actuator stuck and an unparsed server dialect
+/// are indistinguishable in a silent log; `unknown_messages` is what separates
+/// the last two. Nothing is awaited, so the guard never crosses an await.
 fn heartbeat(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
@@ -316,8 +253,7 @@ fn heartbeat(
     );
 }
 
-/// Translates a player command into a controller event and echoes an outcome:
-/// a command is never silent, even when the controller ignores it.
+/// A command is never silent, even when the controller ignores it.
 fn on_command(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
@@ -330,8 +266,8 @@ fn on_command(
     journal.emit(&lines);
 }
 
-/// The command logic behind [`on_command`], returning the lines to print
-/// (`Toggle` resolves against the current status).
+/// The command logic behind [`on_command`]; `Toggle` resolves against the
+/// current status.
 fn handle_command(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
@@ -347,11 +283,10 @@ fn handle_command(
             Status::Watching | Status::Paused => Event::Stop,
             Status::Idle | Status::Stopped(_) => Event::Start { now_ms },
         },
-        // Retunes echo their own confirmation: the transition logic below
-        // only reads status changes, which these never cause. Acceptance is
-        // read from the domain's verdict (absence of `Action::Refused`), not
-        // list emptiness, so the confirmation survives a retune that also
-        // emits an action.
+        // Retunes echo their own confirmation: the transition logic below only
+        // reads status changes, which these never cause. Acceptance comes from
+        // the domain's verdict, not list emptiness, so it survives a retune
+        // that also emits an action.
         Command::SetFilter(filter) => {
             let paused = ctrl.status() == Status::Paused;
             let actions = ctrl.handle(Event::FilterChanged(filter));
@@ -379,8 +314,7 @@ fn handle_command(
             }
             return lines;
         }
-        // Timings are not domain state: swap the actuator's shared waits and
-        // acknowledge. The next queued job bakes them in.
+        // Timings are not domain state; the next queued job bakes them in.
         Command::SetTimings(timings) => {
             actuator.set_timings(timings);
             return vec![">> click timings updated — applies to the next queued clicks".to_owned()];
@@ -408,8 +342,7 @@ fn handle_command(
     lines
 }
 
-/// Renders a shop or a purchase and feeds it to the controller; acks and
-/// unknown messages are silent.
+/// Acks and unknown messages produce no player-facing line.
 fn on_message(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
@@ -419,12 +352,11 @@ fn on_message(
     now_ms: u64,
 ) {
     match message {
-        // Neither is silent overall — see `heartbeat`'s unknown-message
-        // handling — just nothing player-facing to print here.
+        // Counted by `heartbeat`; just nothing player-facing to print here.
         ServerMessage::Ack | ServerMessage::Unknown => {}
         ServerMessage::Shop(snapshot) => {
-            // The full item dump stays console-only: the GUI table shows the
-            // same snapshot; the journal only carries the decisions.
+            // Console-only: the GUI table shows the same snapshot, and the
+            // journal carries only the decisions.
             render_shop(&snapshot);
             // Every shop message bumps, duplicates included: a re-send means
             // the player touched the game, so in-flight clicks are aborted.
@@ -476,9 +408,8 @@ fn handle_purchase(
     lines
 }
 
-/// An omitted-id notice never resolves a name: an echo with no id is `None`,
-/// and `None == item.id` would also match an item that has no id — hence the
-/// explicit `is_some()` guard.
+/// The `is_some()` guard is load-bearing: `None == item.id` would let an
+/// echo with no id resolve to the name of an item that also has none.
 fn purchase_line(controller: &Controller, notice: &PurchaseNotice) -> String {
     let name = controller.last_snapshot().and_then(|snapshot| {
         snapshot
@@ -500,9 +431,9 @@ fn purchase_line(controller: &Controller, notice: &PurchaseNotice) -> String {
     }
 }
 
-/// Locks, handles, applies; printing happens after the guard is released.
-/// No trigger reaches the actuator from here: callers (ticks, teardown,
-/// test setup) are never shop or purchase arrivals.
+/// Printing happens after the guard is released. No trigger reaches the
+/// actuator from here: callers (ticks, teardown, test setup) are never shop or
+/// purchase arrivals.
 fn dispatch(
     controller: &Mutex<Controller>,
     gate: &WatchGate,
@@ -518,18 +449,12 @@ fn dispatch(
     journal.emit(&lines);
 }
 
-/// Applies the controller's decisions: drives the capture gate, translates
-/// refresh/buy decisions into click jobs when the actuator is on, and
-/// renders everything into lines. Callers print after the guard is dropped
-/// — console I/O can block or panic on closed stdout and must not stall or
-/// poison the controller the GUI shares.
+/// Callers print after the guard is dropped: console I/O can block or panic on
+/// closed stdout and must not stall or poison the controller the GUI shares.
 ///
-/// `trigger` names the animation the game plays when the actions land.
-/// Paths that cannot advise a refresh or buy today (commands, ticks,
-/// teardown) pass `None`; if one ever does, the advice line still renders
-/// and no job is queued. The gate follows the status: capture flows only
-/// while the session is live, and off -> on retriggers the capture
-/// thread's existing resync.
+/// `trigger` names the animation the game plays when the actions land; paths
+/// that cannot advise a refresh or buy pass `None`. The gate follows the
+/// status, and off -> on retriggers the capture thread's existing resync.
 fn apply(
     actions: &[Action],
     controller: &Controller,
@@ -573,9 +498,8 @@ fn active_trigger(actuator: &ActuatorHandle, trigger: Option<Trigger>) -> Option
     }
 }
 
-/// A refresh decision: a click job when the actuator is on (the job's
-/// pre-wait covers the animation `trigger` names), the advice line
-/// otherwise.
+/// A refresh decision: a click job when the actuator is on (the job's pre-wait
+/// covers the animation `trigger` names), the advice line otherwise.
 fn submit_refresh(
     lines: &mut Vec<String>,
     actuator: &ActuatorHandle,
@@ -594,9 +518,8 @@ fn submit_refresh(
     queue_refresh(lines, actuator, trigger, now_ms);
 }
 
-/// The refresh-job submission core shared by the normal path and the
-/// watchdog re-issue: plan at the current epoch, journal a full queue.
-/// Callers narrate the attempt themselves.
+/// The refresh-job submission core shared by the normal path and the watchdog
+/// re-issue. Callers narrate the attempt themselves.
 fn queue_refresh(
     lines: &mut Vec<String>,
     actuator: &ActuatorHandle,
@@ -613,10 +536,9 @@ fn queue_refresh(
 }
 
 /// Submits a job, journaling the drop — a lost click must never be silent.
-/// `dropped` names what was lost, e.g. "refresh dropped". A full queue is
-/// back-pressure that clears itself; a closed channel means the executor
-/// task is gone — no retry, re-arm, or patience brings it back, only
-/// relaunching the app — so the two causes get different lines.
+/// A full queue is back-pressure that clears itself; a closed channel means the
+/// executor task is gone and only relaunching the app brings it back, so the
+/// two causes get different lines.
 fn submit_or_report(
     lines: &mut Vec<String>,
     actuator: &ActuatorHandle,
@@ -634,9 +556,8 @@ fn submit_or_report(
     }
 }
 
-/// A watchdog retry: journal the rung, then queue its click job. Recovery
-/// only ever fires on recovery-enabled (live) sessions, but the mode gate
-/// stays — a job must never be queued without an input backend.
+/// Recovery only ever fires on recovery-enabled (live) sessions, but the mode
+/// gate stays — a job must never be queued without an input backend.
 fn submit_recovery(
     lines: &mut Vec<String>,
     controller: &Controller,
@@ -705,16 +626,11 @@ fn submit_buys(
     let Some(trigger) = active_trigger(actuator, trigger) else {
         return;
     };
-    // The crossing between the shop's 1-based display slot and the
-    // actuator's 0-based click row is enforced by the type system: `Row`
-    // exists only via `Slot::row`, so `&rows` cannot be a list of raw slot
-    // numbers. That used to compile and clicked the wrong item's Buy button
-    // with the player's gold behind it.
-    //
-    // The loop (not `filter_map`) is what lets an out-of-range slot be
-    // refused and named individually — `filter_map` would silently drop it,
-    // same as the old `row <= MAX_ROW` filter inside `buy_job`. One good
-    // slot beside one out-of-range slot must not lose the latter.
+    // 1-based display slot to 0-based click row, enforced by the type system:
+    // `Row` exists only via `Slot::row`. The version taking raw slot numbers
+    // compiled, and clicked the wrong item's Buy button with the player's gold
+    // behind it. A loop, not `filter_map`, so an out-of-range slot is named
+    // rather than silently dropped.
     let mut rows: Vec<plan::Row> = Vec::with_capacity(targets.len());
     for target in targets.iter().filter(|target| target.id.is_some()) {
         let slot = target.slot;
@@ -726,17 +642,14 @@ fn submit_buys(
         }
     }
     if rows.is_empty() {
-        // Normal buys go quiet here (untrackable matches are advice-only),
-        // but a watchdog re-issue just announced itself and must not end
-        // in silence.
+        // Normal buys go quiet here, but a watchdog re-issue just announced
+        // itself and must not end in silence.
         if trigger == Trigger::Recovery {
             lines.push(">> watchdog: no clickable slot for the outstanding buys".to_owned());
         }
         return;
     }
     for row in &rows {
-        // `Row::slot` reverses the conversion above; this is the one place
-        // that owns it.
         let slot = row.slot().get();
         lines.push(if actuator.mode == Mode::Live {
             format!(">> → buying slot {slot}")
@@ -773,8 +686,8 @@ fn render_match(lines: &mut Vec<String>, targets: &[BuyTarget], controller: &Con
     } else {
         ": buy in game — resumes automatically"
     };
-    // Written straight into the line: a `Vec<String>` of slot numbers only to
-    // `join(", ")` allocated once per target and once more for the join.
+    // Written straight into the line; a `Vec<String>` to `join(", ")` allocated
+    // once per target and once more for the join.
     let mut line = String::from(">> MATCH — slot(s) ");
     for (position, target) in targets.iter().enumerate() {
         if position > 0 {

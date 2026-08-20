@@ -1,7 +1,4 @@
-//! The timed input sequences themselves: what to click, in what order, and how
-//! long to wait before each act.
-//!
-//! The top layer — the only module here that reads all three of the others. Each
+//! What to click, in what order, and how long to wait before each act: every
 //! builder pairs a [`geometry`](super::geometry) zone with a
 //! [`timings`](super::timings) wait through two [`Jitter`] streams salted apart,
 //! and hands back a [`Job`] the executor replays step by step.
@@ -33,8 +30,8 @@ impl Input {
     }
 }
 
-/// One input, preceded by the wait that makes it land outside any
-/// input-blocking animation.
+/// One input, preceded by the wait that lands it outside any input-blocking
+/// animation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimedStep {
     pub wait_ms: u64,
@@ -44,19 +41,16 @@ pub struct TimedStep {
 /// The shop-generation number a plan was built against, read from
 /// [`SnapshotEpoch::current`](crate::actuator::SnapshotEpoch::current).
 ///
-/// A newtype because every job builder below takes it *immediately before* a
-/// `seed: u64` drawn from `now_ms`: two adjacent bare `u64`s would let a
-/// transposition compile. That would not produce a wrong click, which is
-/// worse: the executor's first act on every job is `job.epoch !=
-/// epoch.current()`, so a swapped pair drops *every* click forever while the
-/// journal blames the shop for changing. Only ever compared for equality —
-/// nothing here does arithmetic on a generation number.
+/// A newtype because every builder takes it *immediately before* a `seed: u64`,
+/// and two adjacent bare `u64`s let a transposition compile. The result is not
+/// a wrong click but something worse: the executor's first act on every job is
+/// `job.epoch != epoch.current()`, so a swapped pair drops *every* click
+/// forever while the journal blames the shop for changing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Epoch(pub u64);
 
-/// A full input sequence, valid for one shop state: `epoch` is the snapshot
-/// generation the plan was built against — the executor drops the job once a
-/// newer shop has arrived.
+/// A full input sequence, valid for one shop state: the executor drops the job
+/// once a shop newer than `epoch` has arrived.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Job {
     pub epoch: Epoch,
@@ -77,10 +71,9 @@ fn scroll(jitter: &mut Jitter, notches: i32) -> Input {
     }
 }
 
-/// One jittered click in the given confirm zone: the watchdog's free nudge
-/// after a confirm click that missed its modal. Safe on the shop screen —
-/// nothing clickable sits under either confirm zone when no modal is open
-/// (player-confirmed game fact).
+/// The watchdog's free nudge after a confirm click that missed its modal. Safe
+/// on the shop screen: nothing clickable sits under either confirm zone when no
+/// modal is open (player-confirmed game fact).
 #[must_use = "a planned job that is never submitted is a lost click"]
 pub fn confirm_retry_job(zone: Zone, timings: Timings, epoch: Epoch, seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
@@ -112,13 +105,13 @@ pub fn refresh_job(trigger: Trigger, timings: Timings, epoch: Epoch, seed: u64) 
     Job { epoch, steps }
 }
 
-/// Buy every row in `rows`. A [`Row`] is in range by construction, so there is
-/// nothing to drop here any more — a slot outside the six rows was already
-/// refused by [`Slot::row`](super::Slot::row), where the caller still had a slot
-/// number to put in the journal. Stateless about the list: always scroll to the
-/// top first (the clamp makes it a no-op when already there), buy the top-group
-/// rows, one scroll to the bottom, buy the bottom-group rows. Each buy is click +
-/// confirm.
+/// Buy every row in `rows`, each as click + confirm. Stateless about the list:
+/// always scroll to the top first (the clamp makes it a no-op when already
+/// there), buy the top-group rows, one scroll to the bottom, buy the rest.
+///
+/// Nothing is filtered here — a slot outside the six rows was already refused by
+/// [`Slot::row`](super::Slot::row), where the caller still had a slot number for
+/// the journal.
 #[must_use = "a planned job that is never submitted is a lost click"]
 pub fn buy_job(trigger: Trigger, timings: Timings, epoch: Epoch, rows: &[Row], seed: u64) -> Job {
     let mut jitter = Jitter::new(seed);
@@ -136,8 +129,7 @@ pub fn buy_job(trigger: Trigger, timings: Timings, epoch: Epoch, rows: &[Row], s
         wait_ms: timings.pre_wait_ms(trigger, &mut delay),
         input: scroll(&mut jitter, SCROLL_TO_EXTREME_NOTCHES),
     }];
-    // Each buy draws its own settle/between-buys wait, so the pacing varies
-    // step to step; the pre-scroll before the bottom group draws afresh too.
+    // Each buy draws its own wait, so the pacing varies step to step.
     let mut wait_ms = timings.scroll_settle_ms(&mut delay);
     let mut at_bottom = false;
     for row in rows {
@@ -175,12 +167,10 @@ mod tests {
         }
     }
 
-    /// The three builders once their fixed arguments are bound.
     type Build = fn(Timings, u64) -> Job;
 
-    /// Both properties below belong to the `Jitter::new(seed ^
-    /// DELAY_SEED_SALT)` line all three builders share, so they are stated once
-    /// over this table instead of three times over.
+    /// Two properties below belong to the `Jitter::new(seed ^ DELAY_SEED_SALT)`
+    /// line all three builders share, so they are stated once over the table.
     fn builders() -> [(&'static str, Build); 3] {
         [
             ("confirm_retry_job", |timings, seed| {
@@ -202,7 +192,7 @@ mod tests {
     }
 
     /// Every range wide: a point range returns `min_ms` without touching the
-    /// jitter, which would leave the delay seed unobservable.
+    /// jitter, leaving the delay seed unobservable.
     fn wide_ranges() -> Timings {
         let wide = range(0, MAX_TIMING_MS);
         Timings {
@@ -246,8 +236,7 @@ mod tests {
 
     #[test]
     fn buy_job_orders_top_group_then_one_scroll_then_bottom_group() {
-        // Unsorted, with a duplicate. An out-of-range row cannot be spelled
-        // here at all — see `a_slot_outside_the_six_rows_never_becomes_a_click`.
+        // Unsorted, with a duplicate.
         let job = buy_job(
             Trigger::ShopOpened,
             Timings::default(),
@@ -299,11 +288,8 @@ mod tests {
 
     #[test]
     fn a_slot_outside_the_six_rows_never_becomes_a_click() {
-        // Do not let `buy_job` filter out-of-range rows itself again — a caller
-        // passing *slot* numbers would silently lose row 6 instead of being
-        // refused. The refusal happens one step earlier and exactly once: slot 7
-        // and a clamped `effective_slot` fallback (`u8::MAX`) have no row at
-        // all, and the resulting empty plan clicks nothing.
+        // Do not let `buy_job` filter out-of-range rows again: a caller passing
+        // *slot* numbers would silently lose row 6 instead of being refused.
         assert_eq!(Slot::new(7).row(), None);
         assert_eq!(Slot::new(u8::MAX).row(), None);
         let rows: Vec<Row> = [7, u8::MAX]
@@ -317,9 +303,8 @@ mod tests {
 
     #[test]
     fn extra_ranges_add_a_bounded_draw_on_top_of_the_baselines() {
-        // Every draw lands on the step it names, within [baseline+min,
-        // baseline+max], and no click position moves (the delay stream is
-        // salted apart from the position stream).
+        // Every draw lands on the step it names, and no click position moves
+        // (the delay stream is salted apart from the position stream).
         let timings = Timings {
             refreshed: range(200, 800),
             confirm_refresh_modal: range(50, 150),
@@ -353,8 +338,7 @@ mod tests {
         let a = refresh_job(Trigger::Refreshed, timings, Epoch(3), 42);
         let b = refresh_job(Trigger::Refreshed, timings, Epoch(3), 42);
         assert_eq!(a.steps[0].wait_ms, b.steps[0].wait_ms); // same seed
-        // A different seed almost surely lands on a different draw over a wide
-        // range; scan a few so the test never flakes on one unlucky collision.
+        // Scan a few seeds so the test never flakes on one unlucky collision.
         let differs = (100..110).any(|seed| {
             refresh_job(Trigger::Refreshed, timings, Epoch(3), seed).steps[0].wait_ms
                 != a.steps[0].wait_ms
@@ -371,8 +355,7 @@ mod tests {
             between_buys: range(400, 400),
             ..Timings::default()
         };
-        // Point ranges keep the assertions exact while still exercising the
-        // draw path on every buy step.
+        // Point ranges keep the assertions exact while still drawing.
         let job = buy_job(
             Trigger::ShopOpened,
             timings,
@@ -399,13 +382,11 @@ mod tests {
 
     #[test]
     fn every_builder_maps_distinct_seeds_to_distinct_delay_streams() {
-        // What the salt buys is a bijection: two sessions never share a click
-        // rhythm. The probe seeds are picked so both ways of losing it show. The
-        // salt has no bit below bit 12, so a masking salt sends *every* seed
-        // under 4096 to one stream — 42 against 43 catches that. A setting salt
-        // cannot see a bit it already sets, and bit 12 is one of them — 42
-        // against 42 | 0x1000 catches that. Small seeds alone miss the second,
-        // large ones alone miss the first.
+        // The salt buys a bijection: two sessions never share a click rhythm.
+        // Both ways of losing it need a different probe — a masking salt sends
+        // every seed under 4096 (no salt bit below bit 12) to one stream, which
+        // 42 against 43 catches; a setting salt cannot see a bit it already
+        // sets, which 42 against 42 | 0x1000 catches.
         let seeds = [42_u64, 43, 42 | 0x1000];
         let timings = wide_ranges();
         for (name, build) in builders() {
@@ -423,11 +404,8 @@ mod tests {
 
     #[test]
     fn no_builder_lets_the_timings_move_an_input() {
-        // The other half of the contract: the waits are drawn from a stream of
-        // their own, so widening every range leaves positions and press holds
-        // byte-identical. `extra_ranges_add_a_bounded_draw_on_top_of_the_baselines`
-        // says this of `refresh_job`; the two builders that spend money had no
-        // such test.
+        // The other half of the contract: widening every range leaves positions
+        // and press holds byte-identical.
         for (name, build) in builders() {
             let salted = build(wide_ranges(), 42);
             let baseline = build(Timings::default(), 42);
@@ -440,10 +418,9 @@ mod tests {
 
     #[test]
     fn the_widest_legal_range_draws_inside_itself() {
-        // `draw` is plain arithmetic now that `try_new` bounds the range, so the
-        // widest thing it can ever see is the one worth pinning: the inclusive
-        // `span + 1` modulus must not overflow (that is what `% 0` used to come
-        // from) and the draw must land in the range it was asked for.
+        // The widest range `draw` can ever see: the inclusive `span + 1` modulus
+        // must not overflow (that is where `% 0` used to come from) and the draw
+        // must land in the range it was asked for.
         let timings = Timings {
             refreshed: range(0, MAX_TIMING_MS),
             ..Timings::default()

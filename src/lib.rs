@@ -13,16 +13,11 @@
 //! ```
 //!
 //! The startup policy at the bottom of this file lives here rather than in
-//! `main.rs` so tests can reach it: *where* the app's files live, *whether
-//! logging works at all* and *what a player is told about retired config keys*
-//! are decisions every single run takes first, and a binary crate cannot be
-//! imported. `main.rs` keeps only the dispatch and the two `run_mode` arms.
+//! `main.rs` so tests can reach it: a binary crate cannot be imported.
+//! `main.rs` keeps only the dispatch and the two `run_mode` arms.
 
-// Shipped code has none of these today (measured: 0 sites in --lib --bins).
-// `not(test)` keeps the ratchet off the test harness, where `unwrap` in a
-// fixture is correct — 257 sites and rising. The rest of the lint policy
-// lives in Cargo.toml's `[lints]`; these two cannot, since a `[lints]` table
-// applies to every target including tests.
+// Not in Cargo.toml's `[lints]`: a `[lints]` table applies to every target,
+// and the test harness uses `unwrap` in fixtures on purpose.
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::panic))]
 
 pub mod actuator;
@@ -30,10 +25,10 @@ pub mod app;
 pub mod capture;
 pub mod config;
 pub mod crash;
-// Windows-only and ungated for the same reason `wide` and `system32` are:
-// `migrate` (always compiled) and `install` (gui) both rewrite a DACL while
-// holding an elevated token, neither can reach the other, and the gate that
-// keeps a junction from redirecting that rewrite must not exist in two copies.
+// Windows-only and ungated, like `wide` and `system32`: `migrate` (always
+// compiled) and `install` (gui) both rewrite a DACL under an elevated token,
+// neither can reach the other, and the gate that stops a junction redirecting
+// that rewrite must not exist in two copies.
 #[cfg(windows)]
 pub mod dirhandle;
 pub mod domain;
@@ -43,18 +38,15 @@ pub mod journal;
 #[cfg(feature = "gui")]
 pub mod install;
 pub mod migrate;
-// Ungated on purpose: `install` (gui) and `capture::pcap` (windows +
-// pcap-backend) both name the pinned Npcap build and neither can reach the
-// other, so the facts live where both can see them.
+// Ungated: `install` (gui) and `capture::pcap` (windows + pcap-backend) both
+// name the pinned Npcap build and neither can reach the other.
 pub mod npcap;
 mod render;
 pub mod stream;
-// The poison policy five modules used to each restate. See its header.
 pub mod sync;
-// Windows-only and ungated for the same reason `wide` is: `install` (gui) and
-// `capture::pcap` (windows + pcap-backend) both have to resolve a path under
-// System32 and neither can reach the other. See its header for why the copy had
-// to go.
+// Windows-only and ungated, like `wide`: `install` (gui) and `capture::pcap`
+// (windows + pcap-backend) both resolve a path under System32 and neither can
+// reach the other.
 #[cfg(windows)]
 pub mod system32;
 #[cfg(feature = "gui")]
@@ -78,24 +70,19 @@ pub const APP_NAME: &str = "Arkyve Refresh Shop";
 /// `%LOCALAPPDATA%` (local). One constant so the two never diverge.
 pub const APP_DIR: &str = "arkyve-refresh-shop";
 
-// --- startup policy: paths, logging, retired keys, exit codes ---------------
-
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 /// Location of the config file. The app owns this file (the GUI's Setup/Apply
-/// writes it); the player isn't expected to hand-edit it, so it lives out of
-/// the way in per-user roaming app-data on Windows —
-/// `%APPDATA%\arkyve-refresh-shop\config.toml` — rather than beside the exe.
-/// If `APPDATA` is somehow unset, or on non-Windows dev machines (mac), it
-/// falls back to a `config.toml` in the working directory.
+/// writes it) and the player isn't expected to hand-edit it, so it lives out of
+/// the way in per-user roaming app-data rather than beside the exe.
 #[must_use]
 pub fn config_path() -> PathBuf {
     #[cfg(windows)]
     let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-    // Not a Windows path layout at all on a dev machine: `%APPDATA%` has no
-    // meaning there, so the working directory is the whole policy.
+    // `%APPDATA%` has no meaning on a dev machine (mac), so the working
+    // directory is the whole policy there.
     #[cfg(not(windows))]
     let appdata: Option<PathBuf> = None;
     config_path_from(appdata.as_deref())
@@ -112,17 +99,13 @@ pub fn config_path_from(appdata: Option<&Path>) -> PathBuf {
     }
 }
 
-/// On first run no config file exists yet. Write the bundled example (compiled
-/// into the exe) to the resolved path so the player finds a real, commented
-/// file at the standard location — and a valid one: the example carries the
+/// On first run, writes the bundled example to the resolved path: it carries the
 /// default hunt `[filter]`, which the relay requires to start.
 ///
-/// Best-effort: a failure never stops startup, but is never silent, since
-/// the outcome differs — `Config::default`'s filter is unrestricted and the
-/// relay refuses to hunt on one, so a failed seed makes the console build
-/// exit naming a `config.toml` that was never written, and the GUI build
-/// boot into "Idle — define a filter first". Logging is already installed
-/// by the time `main` calls this, so say so.
+/// Best-effort but never silent, because `Config::default`'s filter is
+/// unrestricted and the relay refuses to hunt on one — a failed seed leaves the
+/// console build naming a `config.toml` that was never written and the GUI build
+/// on "Idle — define a filter first".
 pub fn seed_config_if_missing(path: &Path) {
     if path.exists() {
         return;
@@ -148,12 +131,10 @@ pub fn seed_config_if_missing(path: &Path) {
 /// in per-user *local* app-data (logs are machine-local, they must not roam),
 /// then the same leaf under the temp dir.
 ///
-/// The second candidate is the whole point. `%LOCALAPPDATA%\<app>` being
-/// *set but unwritable* is a measured failure mode — exactly the admins-only
-/// protected DACL [`migrate`] exists to repair, plus the ordinary `OneDrive`
-/// / antivirus / quota cases — and the old single-candidate version degraded
-/// straight to an inert stdout there. A log in `%TEMP%` is worth far more
-/// than no log. Same ladder as [`crash`]'s.
+/// The second candidate is the whole point: `%LOCALAPPDATA%\<app>` *set but
+/// unwritable* is a measured failure mode (the DACL [`migrate`] repairs, plus
+/// `OneDrive` / antivirus / quota), and one candidate alone degrades to an inert
+/// stdout there. Same ladder as [`crash`]'s.
 #[must_use]
 pub fn log_dirs() -> Vec<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
@@ -174,20 +155,16 @@ pub fn log_dirs_from(local_appdata: Option<&Path>, temp: &Path) -> Vec<PathBuf> 
 /// What [`install_logging`] had to do to get a writer, so `main` can log it
 /// *through the subscriber that call just installed*.
 ///
-/// Deferred for the same reason [`migrate::Leftovers`] is: everything worth
-/// saying here happens before there is anything to say it to. Without this the
-/// one self-concealing failure in the crate stays self-concealing — the windowed
-/// build has no console, so "fell back to stdout" means "produced no output at
-/// all", and a player whose log directory is unwritable gets an app with no log
-/// file *and* no explanation, while `README.md`'s first triage bullet then gives
-/// the wrong diagnosis ("`starting` missing → the app never got to run").
+/// Deferred like [`migrate::Leftovers`]: everything worth saying happens before
+/// there is anything to say it to. In the windowed build "fell back to stdout"
+/// means "produced no output at all", so without this the failure conceals
+/// itself.
 pub struct LogSetup {
-    /// Where the log actually went. `None` when every candidate refused, i.e.
-    /// when there is no log file at all.
+    /// Where the log went. `None` when there is no log file at all.
     destination: Option<PathBuf>,
-    /// Candidates that refused, most-preferred first, with the reason. The
-    /// `InitError` wraps an `io::Error`, so its `Debug` is what separates
-    /// "antivirus has it open" from "the DACL is wrong" from "the disk is full".
+    /// Candidates that refused, most-preferred first. The `InitError` wraps an
+    /// `io::Error`, so its `Debug` is what separates "antivirus has it open"
+    /// from "the DACL is wrong" from "the disk is full".
     refusals: Vec<(PathBuf, tracing_appender::rolling::InitError)>,
 }
 
@@ -208,10 +185,9 @@ impl LogSetup {
                 dir = %dir.display(),
                 "the preferred log directory was unusable; this run's log file is in the fallback directory"
             ),
-            // Emitted anyway: real in the console lane, and in the windowed
-            // one the honest record of why the file the player was asked for
-            // does not exist. `crash.log` is unaffected — it has its own
-            // two-candidate ladder and does not go through the subscriber.
+            // Emitted anyway: the only record of why the file the player was
+            // asked for does not exist. `crash.log` has its own ladder and does
+            // not go through the subscriber.
             None => tracing::error!(
                 "no log file: every candidate directory refused, so this session leaves no diagnostic trail beyond crash.log"
             ),
@@ -225,20 +201,17 @@ impl LogSetup {
     }
 }
 
-/// Installs the tracing subscriber over a daily-rotated file.
+/// Installs the tracing subscriber over a daily-rotated file, because the
+/// windowed build's stdout and stderr are inert sinks.
 ///
-/// The windowed build has no console — stdout and stderr are inert sinks —
-/// so a stdout subscriber loses every event once the app ships. The
-/// returned guard flushes the non-blocking writer on drop: it MUST live
-/// until the end of `main`, or the last (most interesting) lines never hit
-/// disk.
+/// The returned guard flushes the non-blocking writer on drop: it MUST live
+/// until the end of `main`, or the last (most interesting) lines never hit disk.
+/// The [`LogSetup`] beside it must be `report`ed once this call returns; nothing
+/// it has to say can be logged from inside.
 ///
-/// The [`LogSetup`] beside it must be `report`ed once this call returns;
-/// nothing it has to say can be logged from inside.
-///
-/// Not covered by a unit test on purpose: it installs a *process-global*
-/// subscriber, so a second call — what a second test would be — panics.
-/// [`log_dirs_from`] carries the part worth testing.
+/// Untested on purpose: the subscriber is *process-global*, so a second call —
+/// what a second test would be — panics. [`log_dirs_from`] carries the part
+/// worth testing.
 #[must_use = "the worker guard flushes the log on drop; keep it alive, and `report` the setup"]
 pub fn install_logging() -> (
     Option<tracing_appender::non_blocking::WorkerGuard>,
@@ -275,12 +248,8 @@ pub fn install_logging() -> (
 
     let writer = match file_writer {
         Some(writer) => {
-            // The console-only lane is the one with a real terminal —
-            // `windows_subsystem = "windows"` is gated on `gui` — and
-            // someone is actually watching, so tee: otherwise
-            // `RUST_LOG=arkyve_refresh_shop=trace` in a terminal produces
-            // zero output and the developer has to go find a file under
-            // `%LOCALAPPDATA%` (or `/var/folders/…/T` on a mac).
+            // Tee, because this lane has a real terminal: otherwise
+            // `RUST_LOG=…=trace` produces zero output on screen.
             #[cfg(not(feature = "gui"))]
             let writer = {
                 use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -288,9 +257,8 @@ pub fn install_logging() -> (
             };
             BoxMakeWriter::new(writer)
         }
-        // Every candidate refused: stdout rather than no subscriber at all —
-        // inert in the windowed build, real in the console one.
-        // `setup.report()` makes this state visible when it is not.
+        // Every candidate refused: stdout rather than no subscriber at all,
+        // inert in the windowed build, where `setup.report()` makes it visible.
         None => BoxMakeWriter::new(std::io::stdout),
     };
 
@@ -298,8 +266,7 @@ pub fn install_logging() -> (
         .with_env_filter(
             // `try_from_default_env`, not `from_default_env`: a malformed
             // RUST_LOG must not kill the app. `journal=info` keeps the
-            // player-facing lines (on that target) in the file — the
-            // crate-level directive does not cover them.
+            // player-facing lines in the file; the crate directive misses them.
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("arkyve_refresh_shop=debug,journal=info,warn")),
         )
@@ -313,13 +280,9 @@ pub fn install_logging() -> (
 
 /// Config keys that still parse but no longer do anything, in report order.
 ///
-/// The capture filter is a BPF expression built from `game_port` inside the
-/// Npcap backend, the receive buffer is the snaplen that backend picks, and
-/// the forward directions stopped being a choice when the pipeline dropped
-/// the client -> server half it never decoded. They are still *accepted*
-/// because deleting the fields would make `Config::load` fail on every
-/// config file written by an earlier release — which is every config file
-/// that exists.
+/// Still *accepted* because deleting the fields would make `Config::load` fail
+/// on every config file written by an earlier release — which is every config
+/// file that exists.
 #[must_use]
 pub fn retired_keys(config: &Config) -> Vec<String> {
     [config.capture.retired_keys(), config.forward.retired_keys()]
@@ -330,24 +293,19 @@ pub fn retired_keys(config: &Config) -> Vec<String> {
 
 /// Which of the three things happened when the retired keys were stripped.
 ///
-/// A value rather than three `warn!` calls in place, so the decision table
-/// is testable: a player must read the right one of the three, and the
-/// difference is past tense, present tense, or "somebody else got there
-/// first".
+/// A value rather than three `warn!` calls in place, so the decision table is
+/// testable: past tense, present tense, or "somebody else got there first".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetiredKeys {
-    /// Nothing retired in the loaded config: say nothing. Every install from
-    /// here on, and it costs no second read and no log line.
+    /// Nothing retired: say nothing, and skip the second read entirely.
     Absent,
     /// The keys were on disk and have now been deleted.
     Removed(String),
-    /// The rewrite failed: the keys really are still on disk, so this stays a
-    /// "you may want to act" warning rather than a past-tense one — it will
-    /// repeat on the next launch.
+    /// The rewrite failed, so the keys are still on disk: a "you may want to
+    /// act" warning, and it will repeat next launch.
     NotRewritten { keys: String, error: String },
-    /// Loaded from the file, absent from the file: something rewrote it
-    /// underneath us between the two reads. Nothing to do, and worth a line,
-    /// because the warning will come back next launch.
+    /// Something rewrote the file between the two reads. Nothing to do, but the
+    /// warning comes back next launch, so say so.
     AlreadyGone(String),
 }
 
@@ -373,8 +331,7 @@ impl RetiredKeys {
         }
     }
 
-    /// Says it out loud, once, at the one moment the player might correlate it
-    /// with something.
+    /// Says it out loud, once.
     pub fn report(&self) {
         match self {
             Self::Absent => {}
@@ -398,14 +355,9 @@ impl RetiredKeys {
 /// Strips the retired keys from `path` and reports which of the three things
 /// happened.
 ///
-/// Called after `Config::load` on purpose: we only ever rewrite a file the
-/// app has just parsed *and* validated — a run about to die on an invalid
-/// config touches nothing — and the loaded `Config` tells us whether there
-/// is anything to strip.
-///
-/// "Once" used to be a lie: nothing removed the keys, and `persist::save`
-/// rewrites only the GUI-editable sections, so the warning came back every
-/// launch with no cure but hand-editing a file the app owns.
+/// Called after `Config::load` on purpose: we only rewrite a file the app has
+/// just parsed *and* validated, so a run about to die on an invalid config
+/// touches nothing.
 pub fn strip_and_report_retired_keys(config: &Config, path: &Path) {
     let keys = retired_keys(config);
     if keys.is_empty() {
@@ -415,13 +367,10 @@ pub fn strip_and_report_retired_keys(config: &Config, path: &Path) {
 }
 
 /// Every fatal error before the main window opens lands here: the log file
-/// always (stderr is inert in the windowed build, and the likeliest of these —
-/// invalid config, runtime that won't build — are exactly the ones a player
-/// hits), stderr, then an error window in the windowed build.
-///
-/// The caller logs the *structured* cause before calling this; `message` is the
-/// player-facing prose, multi-line on purpose, which is why it is not logged
-/// again here — a `\n` in a field breaks one-event-per-line in the file.
+/// always (stderr is inert in the windowed build), stderr, then an error window
+/// in the windowed build. The caller logs the *structured* cause first;
+/// `message` is player-facing prose, multi-line on purpose, and not logged again
+/// here because a `\n` in a field breaks one-event-per-line in the file.
 #[must_use = "this is the process exit code"]
 pub fn fatal(message: String) -> ExitCode {
     tracing::error!("startup failed");
@@ -436,26 +385,15 @@ pub fn fatal(message: String) -> ExitCode {
 
 /// Waits out a session task the closing window has already asked to stop, and
 /// answers the half of [`exit_code`]'s contract the window cannot see: did the
-/// session actually finish, or did the process have to walk away from it.
-///
-/// Both failures it reports are sessions that did not end on their own terms,
-/// and neither can reach the `session_failed` flag `app::supervise` sets —
-/// that flag is written *by* the task, and in both of these the task is what
-/// broke. A teardown past `grace` is aborted mid-unwind, so a live capture
-/// session can briefly outlive the process; a task that panicked where
-/// `app::supervise` could not catch it (its wrapper, not the session inside)
-/// never wrote an outcome anywhere, which is the residual risk the wrapper's own
-/// comment in `main` names. Reported here rather than at the call site because
-/// the call site had a `warn!` and no return value, so a run that had to be
-/// killed on the way out still exited `SUCCESS` — the exact case the contract
-/// below says is a failure.
+/// session finish, or did the process walk away from it. Neither failure below
+/// can reach `app::supervise`'s `session_failed` flag, because that flag is
+/// written *by* the task and here the task is what broke.
 ///
 /// `&mut task`, not `task`: `timeout` takes its future by value, so handing over
 /// the `JoinHandle` would *detach* the task on the timeout arm rather than
-/// cancel it, and the caller's `shutdown_background` would then leak blocking
-/// threads — exactly the outcome the warning describes. `JoinHandle` is
-/// `Unpin + Future`, so a borrow is a valid branch; aborting turns that accident
-/// into the intended path.
+/// cancel it, and `shutdown_background` would then leak blocking threads. The
+/// borrow is valid (`JoinHandle` is `Unpin + Future`) and the explicit abort is
+/// what makes that arm mean what it says.
 pub async fn teardown_failed(mut task: tokio::task::JoinHandle<()>, grace: Duration) -> bool {
     match tokio::time::timeout(grace, &mut task).await {
         Ok(Ok(())) => false,
@@ -481,10 +419,8 @@ pub async fn teardown_failed(mut task: tokio::task::JoinHandle<()>, grace: Durat
 }
 
 /// The exit-code contract, in one place because scripts and smoke checks read
-/// it: success needs *both* a window that closed cleanly and a session that did
-/// not die. A dead session is a failure even when the window closed cleanly —
-/// including one that had to be aborted, which is what [`teardown_failed`]
-/// folds into `session_failed`.
+/// it: success needs *both* a cleanly closed window and a session that did not
+/// die, an aborted one included ([`teardown_failed`] folds that in).
 #[must_use]
 pub fn exit_code(window_closed_cleanly: bool, session_failed: bool) -> ExitCode {
     if window_closed_cleanly && !session_failed {
@@ -547,9 +483,6 @@ mod tests {
 
     #[test]
     fn the_seeded_example_is_what_config_load_then_reads() {
-        // The pairing `config.rs` test had to hand-reimplement this before
-        // the function moved out of the binary: the real writer, then the
-        // real loader.
         let dir = TempDir::new("roundtrip");
         let path = dir.join("config.toml");
         seed_config_if_missing(&path);
@@ -622,8 +555,8 @@ mod tests {
 
     #[test]
     fn a_config_with_no_retired_key_reports_nothing_and_rewrites_nothing() {
-        // The steady state, and the reason the strip costs nothing on a healthy
-        // install: no keys means the file is never even re-read.
+        // No keys means the file is never even re-read: the strip costs nothing
+        // on a healthy install.
         let dir = TempDir::new("noretired");
         let path = dir.join("config.toml");
         strip_and_report_retired_keys(&Config::default(), &path);
@@ -648,10 +581,7 @@ mod tests {
     }
 
     /// The three teardowns the closing window can meet, and which of them the
-    /// exit code has to call a failure. The middle two are why this function
-    /// returns anything at all: both used to be a `warn!` the caller dropped on
-    /// the floor, so a session the process gave up on exited `SUCCESS` and
-    /// contradicted the contract tested above.
+    /// exit code has to call a failure.
     #[tokio::test(start_paused = true)]
     async fn a_session_the_process_had_to_abandon_is_not_a_success() {
         let grace = Duration::from_secs(3);

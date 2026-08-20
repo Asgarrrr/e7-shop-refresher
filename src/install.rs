@@ -1,77 +1,33 @@
 //! Fetching the Npcap installer for a player who has none.
 //!
-//! The window's error banner offers a `Download` button; this is what it drives.
-//! It fetches one pinned file, checks it byte for byte, and launches it. It does
-//! not install anything itself and it cannot: Npcap's silent installer is the
-//! paid OEM product (`docs/npcap-provisioning.md` quotes the licence), so the
-//! player still meets Npcap's own setup window and its own licence. What this
-//! removes is the trip to a browser, a download folder and back.
-//!
-//! Which build, from where, and against which hash are not decided here — they
-//! are [`crate::npcap`], because `capture::pcap` names the same build in the
-//! message a player without Npcap reads and cannot see this module. That file
-//! also carries the argument for pinning a hash rather than checking a
-//! signature. What is decided here is everything about *how* the file is
-//! obtained and handed to Windows.
-//!
-//! # Why the verified file is held open
+//! One pinned file, checked byte for byte, then launched. It cannot install
+//! anything itself — Npcap's silent installer is the paid OEM product
+//! (`docs/npcap-provisioning.md` quotes the licence). Build, URL and hash live
+//! in [`crate::npcap`].
 //!
 //! A pin only binds if the bytes hashed and the bytes executed are the same
-//! bytes. They were not: the check and the launch used to be two separate opens
-//! of one predictable `%TEMP%` path, which any medium-integrity process of the
-//! same user can write. Swap the file between them and the administrator token
-//! starts the attacker's binary instead — repeatably, since the success path
-//! leaves the file behind and re-verifies it on every later click, and
-//! observably, since [`Progress`] narrates each step.
-//!
-//! So [`Fetcher::fetch_and_check`] returns the open [`File`] it hashed, opened
+//! bytes, and any medium-integrity process of the same user can write `%TEMP%`.
+//! So [`Fetcher::fetch_and_check`] returns the [`File`] it hashed, opened
 //! through [`open_locked`] with neither `FILE_SHARE_WRITE` nor
-//! `FILE_SHARE_DELETE`, and [`Fetcher::run`] holds it across the spawn. While
-//! that handle lives the path cannot be written, replaced, renamed or deleted
-//! by anyone, so `CreateProcess` maps the file that was hashed and no other.
+//! `FILE_SHARE_DELETE`, and [`Fetcher::run`] holds it across the spawn.
 //! `FILE_SHARE_READ` has to stay: the image `CreateProcess` maps is a read.
 //!
-//! The download is written by this module rather than by `curl --output`, for
-//! the neighbouring reason: `create_new` refuses to follow a symlink or to
-//! reuse anything already sitting at the path, so an elevated write cannot be
-//! aimed out of `%TEMP%` by something planted there first.
+//! That handle binds the installer's bytes, not its neighbours, and
+//! `CreateProcess` puts the image's own directory **first** in the child's DLL
+//! search order, behind only `KnownDLLs` — measured: 37 entries, holding none of
+//! `version`, `uxtheme`, `dwmapi`, `riched20`, `msimg32` or `winmm`, most of
+//! what an NSIS setup stub imports. Measured too, `icacls %TEMP%` grants the
+//! interactive user `(I)(OI)(CI)(F)`. A planted `%TEMP%\version.dll` therefore
+//! loads into the **elevated** installer without touching the file the pin
+//! covers, so the download stages into a per-run directory clamped to
+//! [`STAGING_DACL`].
 //!
-//! # Why it is not held open *in* `%TEMP%`
-//!
-//! That handle binds the installer's bytes. It binds nothing about the
-//! directory they sit in, and `CreateProcess` puts the image's own directory
-//! **first** in the child's DLL search order — ahead of System32, behind only
-//! the `KnownDLLs` section. Measured on the dev machine: that section holds 37
-//! entries and not one of `version`, `uxtheme`, `dwmapi`, `riched20`, `msimg32`
-//! or `winmm` is among them, which is most of what an NSIS setup stub imports.
-//! So a `%TEMP%\version.dll` written by exactly the medium-integrity same-user
-//! process the section above assumes — `icacls %TEMP%` grants the interactive
-//! user `(I)(OI)(CI)(F)` — is loaded into the **elevated** installer without
-//! ever touching the file the pin covers. The hash cannot see it: it verifies
-//! the exe, and the attack arrives as a sibling.
-//!
-//! So the download lands in a per-run directory this process creates inside
-//! `%TEMP%` and immediately clamps to Administrators and SYSTEM with a
-//! protected DACL ([`STAGING_DACL`]) — the same Win32 the `WinDivert` cleanup
-//! in [`crate::migrate`] exists to *undo*, used here where it belongs: on a
-//! directory whose only content is an executable an administrator token is
-//! about to run, and never on the one holding the player's logs.
-//!
-//! The other half of that finding does not survive contact and is written down
-//! so it is not tried again: a parent cannot switch the image directory off for
-//! its child. `CreateProcess` takes no search-order flag,
-//! `SetDefaultDllDirectories` only ever changes the process that calls it, and
-//! `CWDIllegalInDllSearch` is a machine-wide setting rather than something a
-//! launcher hands over. The one lever that is real is the child's *current*
-//! directory, which is inherited and otherwise points at wherever the player
-//! started this app from; [`Fetcher::run`] aims it at the clamped directory too.
-//! That covers the current-directory slot in the search order and nothing else.
-//! Staging out of `%TEMP%` is what covers the image-directory slot, and there is
-//! no substitute for it.
-//!
-//! What none of this reaches is what the installer does once it is running:
-//! Npcap's NSIS stub extracts its own plugins into its own `%TEMP%\ns*.tmp` and
-//! loads them from there, and no choice available to this module changes that.
+//! Do not try to close that from the parent instead — it cannot be done.
+//! `CreateProcess` takes no search-order flag, `SetDefaultDllDirectories`
+//! changes only its own process, `CWDIllegalInDllSearch` is machine-wide. The
+//! child's *current* directory is the one settable slot; the image-directory
+//! slot has no substitute for staging. Out of reach either way: Npcap's NSIS
+//! stub loads its own plugins from its own `%TEMP%\ns*.tmp`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -83,30 +39,20 @@ use tracing::{info, warn};
 
 use crate::npcap::{INSTALLER_BYTES, INSTALLER_SHA256, INSTALLER_URL, TEMP_INSTALLER_NAME};
 
-/// Ceiling on the download, in seconds, handed to `curl`. Generous: the measured
-/// time is under a second, and a player on hotel Wi-Fi is not a failure.
+/// Ceiling handed to `curl`, generous against hotel Wi-Fi: the measured download
+/// is under a second.
 const FETCH_TIMEOUT_SECS: u32 = 120;
 
-/// Name prefix of the directory the verified installer is staged in.
-///
-/// Deliberately not [`crate::APP_DIR`]: `%TEMP%\arkyve-refresh-shop\logs` is
-/// this crate's fallback log directory (`crate::log_dirs_from`), and
-/// [`STAGING_DACL`] applied there would take the log away from every unelevated
-/// run — which is the exact failure [`crate::migrate`] ships to undo on machines
-/// that already suffered it. The staging directory has to be somewhere nothing
-/// else of ours lives, and this prefix is what [`sweep_old_staging`] recognises.
+/// Prefix of the staging directory's name, and what [`sweep_old_staging`]
+/// recognises. Never [`crate::APP_DIR`]: [`STAGING_DACL`] on
+/// `%TEMP%\arkyve-refresh-shop\logs` would take the fallback log away from every
+/// unelevated run, the failure [`crate::migrate`] ships to undo.
 const STAGING_PREFIX: &str = "arkyve-npcap-staging-";
 
-/// The DACL the staging directory is clamped to, in SDDL.
-///
-/// `D:P` — **protected**, so none of `%TEMP%`'s own ACEs are inherited into it.
-/// That is the whole point: measured with `icacls %TEMP%`, the interactive user
-/// is granted `(I)(OI)(CI)(F)`, and the interactive user is who the module
-/// header's attacker is. `(A;OICI;FA;;;BA)` and `(A;OICI;FA;;;SY)` grant full
-/// access to `BUILTIN\Administrators` and `LocalSystem`, inherited by whatever
-/// is created inside, and to nobody else. This process holds an administrator
-/// token (`build.rs` manifests it) so it is on the inside of that list, and so
-/// is the installer it launches; the attacker is not.
+/// The DACL the staging directory is clamped to. `D:P` is **protected**, which
+/// is what stops `%TEMP%`'s inherited ACEs (module header) reaching it; the two
+/// ACEs admit `BUILTIN\Administrators` and `LocalSystem` and nobody else, and
+/// this process's administrator token (`build.rs` manifests it) is inside that.
 const STAGING_DACL: &str = "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)";
 
 /// What the banner shows while this runs.
@@ -115,25 +61,14 @@ pub enum Progress {
     /// Nothing started, or the last attempt was abandoned.
     #[default]
     Idle,
-    /// `curl` is running.
     Fetching,
-    /// Downloaded; hashing before anything is executed.
     Checking,
-    /// Handed to the shell. Npcap's own installer owns the screen now.
     Launched,
-    /// Launched, and then the one-click restart the banner offers did not
-    /// happen. The string is player-facing and says why.
-    ///
-    /// Not [`Progress::Failed`], because the two want opposite remedies. The
-    /// download succeeded here; the file is still on disk and still verifies,
-    /// so `Failed`'s remedy — start the fetch again — takes
-    /// [`Fetcher::fetch_and_check`]'s reuse fast path and puts a *second* Npcap
-    /// setup window on screen, while the restart that actually failed is
-    /// overwritten by `Launched` and never reported. What this state owes the
-    /// player is the restart, again.
+    /// The one-click restart did not happen. Distinct from [`Progress::Failed`]
+    /// because `Failed`'s remedy — fetch again — takes the reuse fast path and
+    /// puts a *second* Npcap setup window on screen. String is player-facing.
     RestartFailed(String),
-    /// Gave up before anything was launched. The string is player-facing and
-    /// names the step that failed.
+    /// Gave up before anything was launched. String is player-facing.
     Failed(String),
 }
 
@@ -149,23 +84,15 @@ impl Fetcher {
         Self::default()
     }
 
-    /// Current step, for the button's label.
-    ///
-    /// Poison-tolerant like the rest of this crate's shared state ([`crate::sync`]):
-    /// a panicked worker must not take the window's error banner down with it.
-    /// The cell holds one `Progress`, replaced whole, so there is no half-written
-    /// state for a reader to catch.
+    /// Poison-tolerant like the rest of this crate's shared state: a panicked
+    /// worker must not take the error banner down with it.
     #[must_use]
     pub fn progress(&self) -> Progress {
         crate::sync::lock_ignoring_poison(&self.progress).clone()
     }
 
-    /// Records a failed relaunch — the one failure raised by the window rather
-    /// than by the worker, and one that has nowhere else to be seen.
-    ///
-    /// Lands in [`Progress::RestartFailed`], not `Failed`: see that variant for
-    /// why a restart that did not happen must not be offered a download's
-    /// remedy.
+    /// The one failure raised by the window rather than the worker. See
+    /// [`Progress::RestartFailed`] for why not `Failed`.
     pub fn restart_failed(&self, reason: String) {
         warn!(reason = %reason, "the relaunch failed at the window");
         self.set(Progress::RestartFailed(reason));
@@ -175,36 +102,20 @@ impl Fetcher {
         *crate::sync::lock_ignoring_poison(&self.progress) = next;
     }
 
-    /// Starts fetch → check → launch on a worker thread, unless one is already
-    /// in flight or an installer has already been launched.
+    /// Off the UI thread because the window repaints at 4 Hz; refused once
+    /// launched, since the reuse fast path would put a second elevated Npcap
+    /// setup on screen.
     ///
-    /// Off the UI thread on purpose: the window repaints at 4 Hz and a blocking
-    /// download would freeze it for as long as the network takes, which on the
-    /// failure path this feature exists for is exactly when it would hurt.
-    ///
-    /// Refused after a launch, because this whole call ends in a `spawn` and
-    /// [`fetch_and_check`](Self::fetch_and_check)'s reuse fast path makes
-    /// reaching it cheap: Npcap's setup is already on the player's screen and a
-    /// second copy of it is not a remedy for anything. The banner offers no such
-    /// control, and the refusal here is what keeps that from being the only
-    /// thing standing between a click and a second elevated installer.
-    ///
-    /// The test and the claim share one lock acquisition, which is the whole
-    /// reason this is not `if !accepts_a_start(&self.progress())`. That spelling
-    /// read the cell, dropped the lock, and left `Idle` in it until the worker
-    /// thread got as far as its own first write — inside `fetch_and_check`, one
-    /// thread spawn and a `remove_file` later. The window repaints at 4 Hz, so a
-    /// second click one frame after the first found `Idle` and spawned a second
-    /// worker, and on the reuse fast path that worker verifies and launches: two
-    /// elevated Npcap installers, from the guard written to prevent exactly one
-    /// of them.
+    /// Do not split the test and the claim back into
+    /// `if !accepts_a_start(&self.progress())`: that left `Idle` in the cell
+    /// until the worker's own first write, a spawn and a `remove_file` later,
+    /// and at 4 Hz the next frame's click took it.
     pub fn start(&self) {
         if !self.claim() {
             return;
         }
         let handle = self.clone();
-        // Detached: nothing joins it, and its whole output is the progress cell
-        // above. A failure to spawn is reported through the same cell.
+        // Detached; its whole output, a failure to spawn included, is the cell.
         if let Err(err) = std::thread::Builder::new()
             .name("npcap-fetch".to_owned())
             .spawn(move || handle.run())
@@ -215,32 +126,22 @@ impl Fetcher {
         }
     }
 
-    /// Takes the fetch if it is there to take, under one lock acquisition.
-    ///
-    /// A separate `fn` for the same reason [`accepts_a_start`] is one: `start`
-    /// ends in a `spawn`, so a test that exercised it would perform a real
-    /// download and a real elevated `CreateProcess`. This is the part with a
-    /// rule in it, and it can be called as often as a test likes.
-    ///
-    /// `true` means the caller now owns the fetch and nobody else can take it.
+    /// Takes the fetch under one lock acquisition. Separate from `start` for the
+    /// same reason [`accepts_a_start`] is: a test of `start` downloads and
+    /// elevates for real.
     fn claim(&self) -> bool {
         let mut progress = crate::sync::lock_ignoring_poison(&self.progress);
         if !accepts_a_start(&progress) {
             return false;
         }
-        // The claim, written before the lock is dropped. This is the whole
-        // change: reading the cell and then writing it in two acquisitions left
-        // `Idle` visible in between, and `fetch_and_check`'s own
-        // `set(Progress::Fetching)` — the first write there used to be — was a
-        // thread spawn and a `remove_file` away.
+        // Written before the lock is dropped; see `start`.
         *progress = Progress::Fetching;
         true
     }
 
     fn run(self) {
-        // Before the download, not after it: this is what decides *where* the
-        // bytes land, and a file written into `%TEMP%` and then moved would have
-        // spent the interval beside anything a same-user process cares to plant.
+        // Before the download: bytes written into `%TEMP%` and then moved would
+        // spend the interval beside anything a same-user process planted.
         if let Err(reason) = staging_ready() {
             warn!(reason = %reason, "the Npcap installer was not obtained");
             self.set(Progress::Failed(reason));
@@ -249,17 +150,12 @@ impl Fetcher {
         let target = installer_path();
         match self.fetch_and_check(&target) {
             Ok(verified) => {
-                // `current_dir`, not the inherited one: the child's current
-                // directory is a slot in its DLL search order, and this process
-                // inherited its own from whatever started the app — a Desktop, a
-                // download folder, the game's directory. The clamped staging
-                // directory is the one place on this path nothing can be planted
-                // in. It does not touch the *image* directory slot; see the
-                // module header for why nothing can.
+                // The child's current directory is a slot in its DLL search
+                // order and the inherited one is wherever the app was started
+                // from. Not the *image* slot; see the header.
                 let spawned = Command::new(&target).current_dir(staging_dir()).spawn();
-                // Only now: until `CreateProcess` has returned, this handle is
-                // the whole reason the path still holds the hashed bytes. See
-                // the module header.
+                // Only once `CreateProcess` has returned: until then this handle
+                // is why the path still holds the hashed bytes.
                 drop(verified);
                 match spawned {
                     Ok(_) => {
@@ -281,57 +177,41 @@ impl Fetcher {
         }
     }
 
-    /// Downloads unless a verified copy is already there, then verifies, and
-    /// returns the handle the verification was made through.
-    ///
-    /// Re-clicking after a failed launch therefore costs nothing, and a partial
-    /// file from an interrupted run is replaced rather than trusted. The reused
-    /// copy goes through the same locked handle as a fresh one, so the fast path
-    /// is not the weak path.
-    ///
-    /// "Already there" now means *within this run*: the staging directory is
-    /// created per process and an earlier run's is swept, so a restarted app
-    /// downloads again. That is a measured second against a directory whose
-    /// contents this process cannot vouch for — see [`staging_dir`].
+    /// Returns the handle the verification was made through. The reused copy
+    /// takes the same locked handle as a fresh one, so the fast path is not the
+    /// weak path; "already there" means within this run only, since the staging
+    /// directory is per process and a re-download measures one second.
     fn fetch_and_check(&self, target: &Path) -> Result<File, String> {
         if let Ok(existing) = open_locked(target) {
             if verify(&existing).is_ok() {
                 self.set(Progress::Checking);
                 return Ok(existing);
             }
-            // Explicitly, not by falling out of scope: this handle denies
-            // `FILE_SHARE_DELETE`, and the very next thing below is a delete of
-            // this path.
+            // Explicitly: this handle denies `FILE_SHARE_DELETE` and the next
+            // thing below is a delete of this path.
             drop(existing);
         }
 
-        // Before the download, not after it: whatever is at the path is not the
-        // installer — `verify` just refused it, or there was nothing to open —
-        // and a download that then fails must not leave it sitting in the temp
-        // directory for someone to run by hand. It is also what lets the write
-        // below use `create_new`.
+        // Whatever is there is not the installer; a later failure must not leave
+        // it to be run by hand, and `create_new` below needs the path free.
         let _ = std::fs::remove_file(target);
 
-        // No `set(Fetching)` here: `start` claimed the state before this thread
+        // No `set(Fetching)`: `start` claimed the state before this thread
         // existed, which is what makes the claim a claim.
         let bytes = download()?;
 
         self.set(Progress::Checking);
         write_new(target, &bytes)?;
 
-        // Re-read from disk rather than hashing `bytes`: the claim this
-        // function has to support is about the file the caller is going to
-        // execute, and the only way to make it is to hash through the handle
-        // that will still be open when it does.
+        // Not a hash of `bytes`: the claim is about the file the caller will
+        // execute, so it must be made through the handle held across the spawn.
         let file = open_locked(target)
             .map_err(|err| format!("the downloaded installer could not be re-opened: {err}"))?;
         match verify(&file) {
             Ok(()) => Ok(file),
             Err(reason) => {
-                // Before the delete, for the reason given on the fast path.
+                // Dropped before the delete, as on the fast path.
                 drop(file);
-                // A file that fails the check is deleted rather than left for
-                // someone to run by hand out of the temp directory.
                 let _ = std::fs::remove_file(target);
                 Err(reason)
             }
@@ -339,17 +219,14 @@ impl Fetcher {
     }
 }
 
-/// Whether [`Fetcher::start`] may run from this state.
-///
-/// A predicate rather than a `matches!` inside `start`, so the rule can be
-/// asserted without spawning the worker — a test that let a refusal through
-/// would run the real thing: a download and an elevated `CreateProcess`.
+/// A predicate rather than a `matches!` inside [`Fetcher::start`], so the rule
+/// can be asserted without spawning a worker that downloads and elevates.
 fn accepts_a_start(progress: &Progress) -> bool {
     match progress {
         Progress::Idle | Progress::Failed(_) => true,
         // In flight: a second worker would race the first over one path.
         Progress::Fetching | Progress::Checking => false,
-        // Already launched: see [`Fetcher::start`].
+        // Already launched: see `Fetcher::start`.
         Progress::Launched | Progress::RestartFailed(_) => false,
     }
 }
@@ -357,40 +234,23 @@ fn accepts_a_start(progress: &Progress) -> bool {
 /// Fetches the pinned URL into memory.
 ///
 /// `curl.exe` rather than an HTTP client: it ships with Windows 10 1803 and
-/// later, so this adds no dependency to a crate that has refused several, and it
-/// uses the machine's own proxy and TLS configuration — which a hand-rolled
-/// client would have to be taught.
+/// later and uses the machine's own proxy and TLS configuration. To stdout
+/// rather than `--output`, so the one process creating the file is this one;
+/// `--max-filesize` bounds the response body.
 ///
-/// To stdout rather than `--output`, so that the one process that creates the
-/// file is this one; `--max-filesize` keeps that from meaning an unbounded
-/// response body in a `Vec`.
-///
-/// The directory comes from [`crate::system32::directory`] and not from
-/// `%SystemRoot%`, which is the same correction the `wpcap.dll` candidates
-/// already carry and it belongs here more than there: this process holds an
-/// administrator token, and the value picks *the executable it runs*. An
-/// attacker who can set that variable for a launcher and plant a
-/// `System32\curl.exe` under the path it names gets arbitrary code run elevated
-/// — by exactly the medium-integrity same-user process the module header's
-/// swap-the-file attack assumes, and one step earlier than the hash pin looks.
-/// The pin cannot help: it hashes what curl *printed*, long after curl ran.
+/// The path comes from [`crate::system32::directory`], never `%SystemRoot%`:
+/// this process is elevated, so that variable would pick *the executable it
+/// runs* — one step earlier than the pin can see, since the pin hashes what curl
+/// printed.
 fn download() -> Result<Vec<u8>, String> {
     let curl = curl_path();
     if !curl.is_file() {
         return Err("this Windows has no curl.exe to download with".to_owned());
     }
     let out = Command::new(curl)
-        // `--disable` first, and it only works first: it tells curl not to read
-        // its default config file. On Windows that file is `%APPDATA%\_curlrc`
-        // — a path any medium-integrity process of the same user can create,
-        // and a config file may set *any* option, `--output` included. Without
-        // this flag the same swap-the-file attacker the paragraph above
-        // describes does not need to plant a `curl.exe` at all: they drop a
-        // `_curlrc` naming an output path and a source, the player clicks
-        // Download once, and this process's administrator token writes
-        // attacker-chosen bytes wherever they asked. The hash pin cannot see
-        // it for the same reason it cannot see a planted `curl.exe`: it hashes
-        // what curl printed, long after curl has already written the file.
+        // `--disable`, and it only works first: it stops curl reading
+        // `%APPDATA%\_curlrc`, which a same-user process can create and which may
+        // set *any* option, `--output` included. The pin cannot see that either.
         .arg("--disable")
         .args(["--fail", "--silent", "--show-error", "--location"])
         .args(["--max-time", &FETCH_TIMEOUT_SECS.to_string()])
@@ -399,10 +259,8 @@ fn download() -> Result<Vec<u8>, String> {
         .output()
         .map_err(|err| format!("the download could not be started: {err}"))?;
     if !out.status.success() {
-        // `--show-error`'s explanation used to reach the console this build does
-        // not have; now that stdout is the payload, stderr is captured, and the
-        // log is the one place it can be read. The banner keeps the short
-        // sentence — a TLS or proxy diagnostic is for whoever opens `logs\*.log`.
+        // stdout is the payload, so stderr is captured and the log is the only
+        // place a TLS or proxy diagnostic can be read.
         warn!(
             exit = out.status.code().unwrap_or(-1),
             detail = %String::from_utf8_lossy(&out.stderr).trim(),
@@ -417,13 +275,9 @@ fn download() -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
-/// Writes `bytes` to a file this call creates, or fails.
-///
-/// `create_new`: if anything is already at `path` — a leftover, a symlink aimed
-/// somewhere sensitive, a file an attacker re-planted in the moment between the
-/// delete above and this call — the open fails and nothing is written. An
-/// elevated `curl --output` had no such refusal, which is why the download no
-/// longer goes through one.
+/// `create_new` is the point: anything already at `path` — a leftover, a symlink
+/// aimed somewhere sensitive, a file re-planted since the delete above — refuses
+/// the open. An elevated `curl --output` had no such refusal.
 fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = create_new_locked(path).map_err(|err| {
         format!(
@@ -435,11 +289,9 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|err| format!("the installer could not be written: {err}"))
 }
 
-/// Read handle that denies every access another process would need to change
-/// what is at this path. See the module header for what rests on it.
-///
-/// `FILE_SHARE_READ` is the one flag kept: without it `CreateProcess` could not
-/// map the image, and with it nobody can do anything but read.
+/// Read handle denying every access another process would need to change what is
+/// at this path; the module header is what rests on it. `FILE_SHARE_READ` is the
+/// one flag kept — without it `CreateProcess` could not map the image.
 #[cfg(windows)]
 fn open_locked(path: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -465,9 +317,8 @@ fn create_new_locked(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-/// The fetcher is only reachable from the Windows capture path; these two exist
-/// so the module compiles on a dev machine. Neither carries the sharing
-/// guarantee, and neither needs to — nothing calls them.
+/// Dev-machine stubs; nothing off Windows reaches the fetcher, so neither
+/// carries the sharing guarantee.
 #[cfg(not(windows))]
 fn open_locked(path: &Path) -> std::io::Result<File> {
     File::open(path)
@@ -478,12 +329,8 @@ fn create_new_locked(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
-/// The `curl.exe` [`download`] will run, by absolute path.
-///
-/// Two arms for the same reason [`open_locked`] has two: the fetcher is only
-/// reachable from the Windows capture path, and this file has to compile on a
-/// dev machine. The non-Windows arm names a path that will not exist, which is
-/// the branch `download` already handles.
+/// The `curl.exe` [`download`] will run, by absolute path. The non-Windows arm
+/// names one that will not exist, a branch `download` already handles.
 #[cfg(windows)]
 fn curl_path() -> PathBuf {
     crate::system32::directory().join("curl.exe")
@@ -494,30 +341,21 @@ fn curl_path() -> PathBuf {
     PathBuf::from("curl.exe")
 }
 
-/// Where the download lands. The name is version-stamped and lives with the
-/// version — see [`TEMP_INSTALLER_NAME`]; the directory is this module's, and
-/// the module header is why.
+/// Where the download lands: a version-stamped name kept with the version
+/// ([`TEMP_INSTALLER_NAME`]) in a directory the module header explains.
 fn installer_path() -> PathBuf {
     staging_dir().join(TEMP_INSTALLER_NAME)
 }
 
-/// The directory the verified installer is staged in, chosen once per process.
+/// Chosen once per process. Under `%TEMP%` because this app cannot clean up
+/// after the installer it launches, never *at* `%TEMP%` per the module header.
 ///
-/// Still under `%TEMP%`: that is the right home for something this app launches
-/// and then cannot clean up after itself, and it is the only user-scoped
-/// location that is not also holding logs or config. Never *at* `%TEMP%`, for
-/// the reason in the module header.
-///
-/// The name carries the process id and the clock, and neither is load-bearing —
-/// nothing here trusts an attacker's ignorance of a path. It buys two things a
-/// fixed name does not. Two runs of the app cannot collide over one directory,
-/// which matters because [`prepare_staging`] insists on creating the directory
-/// rather than adopting one. And a name that could be worked out ahead of time
-/// could be *occupied* ahead of time, which would turn that same insistence into
-/// a Download button an attacker can hold shut for as long as they like.
-///
-/// Pure: it computes a path and touches no disk, so a test can assert what it
-/// chose without an elevated process creating anything.
+/// The pid and clock are not secrets — nothing trusts an attacker's ignorance of
+/// a path. They stop two runs colliding, which matters because
+/// [`prepare_staging`] insists on *creating* the directory, and stop a
+/// predictable name being occupied first, which would turn that insistence into
+/// a Download button an attacker can hold shut. Touches no disk, so a test can
+/// assert the choice without creating anything.
 fn staging_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -528,13 +366,9 @@ fn staging_dir() -> &'static Path {
     })
 }
 
-/// Creates and clamps the staging directory, once per process.
-///
-/// Once, and the answer — failure included — is kept: [`staging_dir`] names one
-/// path per process, so a second attempt would find the directory this one
-/// created and [`prepare_staging`]'s `create_dir` would refuse it. Caching the
-/// error is also what keeps a player clicking Download on a machine where the
-/// DACL cannot be written from re-running the whole dance each time.
+/// The answer is cached, failure included: [`staging_dir`] names one path per
+/// process, so a second attempt would hit [`prepare_staging`]'s `create_dir`
+/// refusing the directory this one created.
 fn staging_ready() -> Result<(), String> {
     static PREPARED: OnceLock<Result<(), String>> = OnceLock::new();
     PREPARED
@@ -544,39 +378,22 @@ fn staging_ready() -> Result<(), String> {
 
 /// Sweeps what earlier runs left, creates `dir`, clamps it, and proves it empty.
 ///
-/// `create_dir` and not `create_dir_all`: anything already at this path was put
-/// there by someone else — [`staging_dir`] picks a fresh name per run — and a
-/// refusal is the only safe reading of that. It is also why the sweep runs
-/// first and cannot be folded into the create.
+/// `create_dir`, not `create_dir_all`: [`staging_dir`] picks a fresh name per
+/// run, so anything already there was put there by someone else — which is also
+/// why the sweep runs first. The emptiness check is the second half of the
+/// clamp: the directory is born with `%TEMP%`'s inherited ACEs and loses them
+/// only when [`lock_down`] returns, leaving a microsecond window for a
+/// `version.dll`.
 ///
-/// The emptiness check is the second half of the clamp, not a formality. The
-/// directory is born with `%TEMP%`'s inherited ACEs on it and only loses them
-/// when [`lock_down`] returns, so there is a window — microseconds, and it
-/// requires a process already watching the tree — in which a `version.dll` could
-/// be dropped in. A file in a directory that was created empty a moment ago is
-/// that, and the run is abandoned.
-///
-/// **What this does not close, stated rather than glossed:** in the same window
-/// the directory could be removed and re-created by the attacker, who would then
-/// own it, and an owner can rewrite the DACL this function just applied. The
-/// emptiness check does not see that — the swapped directory is empty too. The
-/// fix is to create the directory with its DACL already on it, atomically, which
-/// means `CreateDirectoryW` with a `SECURITY_ATTRIBUTES`; there is no `std` API
-/// that passes one, and the `windows-sys` feature that exposes the call —
-/// `Win32_Storage_FileSystem` — is not enabled in `Cargo.toml`. Alternatively
-/// the swap is *detectable*: an elevated process's objects are owned by
-/// `BUILTIN\Administrators` (measured on the dev machine, and the same
-/// measurement `crate::migrate`'s header records), a filtered token cannot set
-/// that owner, so reading the owner back would tell the two apart.
-///
-/// What the window can **no longer** do is pass the clamp off as done. Replacing
-/// the path with a junction used to be the quiet version of this swap: the DACL
-/// landed on the reparse point, this function returned `Ok`, and the installer
-/// was then written and launched inside the attacker's directory with the whole
-/// staging story intact on paper. [`lock_down`] refuses a reparse point now, so
-/// that swap ends the download instead of hollowing it out. What is left is the
-/// loud version — the attacker owns a real directory and rewrites its DACL —
-/// which costs a download this app abandons.
+/// **What this does not close:** in that same window the attacker can remove and
+/// re-create the directory, owning it and free to rewrite the DACL just applied
+/// — and it is empty, so the check passes. Closing it needs the DACL applied
+/// atomically at creation, `CreateDirectoryW` with a `SECURITY_ATTRIBUTES`: no
+/// `std` API passes one and `windows-sys`'s `Win32_Storage_FileSystem` is not
+/// enabled. It is at least *detectable*: measured, an elevated process's objects
+/// are owned by `BUILTIN\Administrators` and a filtered token cannot set that
+/// owner. The quieter junction version is already closed — [`lock_down`] refuses
+/// a reparse point — so what remains costs the attacker an abandoned download.
 fn prepare_staging(dir: &Path) -> Result<(), String> {
     sweep_old_staging(dir);
 
@@ -615,28 +432,19 @@ fn prepare_staging(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Deletes the staging directories of runs that are over.
+/// Deletes the staging directories of runs that are over. Best-effort, and it
+/// has to exist: nothing else on the machine will ever remove them, so an
+/// elevated run would leave an undeletable megabyte in `%TEMP%` per download.
 ///
-/// Best-effort, and it has to exist: [`STAGING_DACL`] puts these out of reach of
-/// the unelevated player, so nothing else on the machine will ever remove them —
-/// not the player, not Disk Cleanup. An elevated run leaving an undeletable
-/// megabyte in `%TEMP%` on every download is the same kind of litter
-/// [`crate::migrate`] was written to clear up, and the cheapest place to not
-/// create it is here.
+/// "Undeletable" is measured, and the opposite of what was expected: `%TEMP%`
+/// grants the interactive user `FILE_DELETE_CHILD`, normally enough to delete a
+/// child whose own DACL grants nothing, yet `remove_dir` on an *empty* clamped
+/// directory the user owns still answers `ERROR_ACCESS_DENIED` — owning it buys
+/// `READ_CONTROL` and `WRITE_DAC`, neither of which is `DELETE`. So the sweep
+/// needs the administrator token.
 ///
-/// "Out of reach" is measured, not assumed, and it was the opposite of what was
-/// expected: `%TEMP%` grants the interactive user `FILE_DELETE_CHILD`, which is
-/// normally enough to delete a child whose own DACL grants nothing, and it is
-/// still not enough here — `a_staged_directory_stops_inheriting_the_users_full_control`
-/// gets `ERROR_ACCESS_DENIED` from `remove_dir` on an *empty* clamped directory
-/// it owns. Being the owner buys `READ_CONTROL` and `WRITE_DAC` and neither of
-/// those is `DELETE`. So the sweep genuinely needs the administrator token, and
-/// the test has to hand the rights back before it can tidy up.
-///
-/// A directory belonging to a run that is still going is protected by nothing
-/// here — `remove_dir_all` simply fails, because the installer inside is held by
-/// [`open_locked`] or mapped by the process it was launched into, and neither
-/// grants `FILE_SHARE_DELETE`.
+/// A live run's directory survives anyway: `remove_dir_all` fails on the
+/// installer held by [`open_locked`] or mapped into the launched process.
 fn sweep_old_staging(current: &Path) {
     let Some(parent) = current.parent() else {
         return;
@@ -656,55 +464,33 @@ fn sweep_old_staging(current: &Path) {
         if path == current {
             continue;
         }
-        // Both spellings, because the name may have been taken by a file rather
-        // than a directory — planted, or left by a crash — and either way this
-        // run wants it gone before `create_dir` looks.
+        // Both spellings: the name may have been taken by a file — planted, or
+        // left by a crash — and either way it must be gone before `create_dir`.
         if std::fs::remove_dir_all(&path).is_err() {
             let _ = std::fs::remove_file(&path);
         }
     }
 }
 
-/// Puts `sddl`'s DACL on `dir` as a *protected* one, so nothing is inherited
-/// from the parent. Called with [`STAGING_DACL`], which is what makes `%TEMP%`'s
-/// full-control-for-the-user ACE stop at the staging directory's door.
+/// A *protected* DACL, which is what makes `%TEMP%`'s full-control-for-the-user
+/// ACE stop at the staging directory's door. SDDL rather than `InitializeAcl`
+/// plus two `CreateWellKnownSid` plus two `AddAccessAllowedAceEx`: the same two
+/// ACEs in five times the `unsafe`. `PROTECTED_DACL_SECURITY_INFORMATION` is not
+/// redundant with the string's `P` — `SetSecurityInfo` takes an `ACL`, not a
+/// descriptor, so the control word the `P` set never reaches it.
 ///
-/// The descriptor is parsed from SDDL rather than assembled from `InitializeAcl`
-/// plus two `CreateWellKnownSid` calls plus two `AddAccessAllowedAceEx` calls:
-/// that is the same two ACEs in five times the `unsafe`, and the string is the
-/// readable form of the thing being claimed.
+/// Addressed through `crate::dirhandle::open_directory_itself`, which refuses a
+/// reparse point, because the directory can be swapped for a junction between
+/// [`prepare_staging`]'s `create_dir` and this call. Measured, against the
+/// obvious guess: `SetNamedSecurityInfoW` does *not* follow a junction, so the
+/// old name-based call clamped the reparse point and reported success while
+/// [`installer_path`] resolved *through* it. Act on the object you checked, not
+/// the name — the same gate `crate::migrate` uses.
 ///
-/// `PROTECTED_DACL_SECURITY_INFORMATION` is passed alongside
-/// `DACL_SECURITY_INFORMATION` rather than left to the `P` in the string, and it
-/// is not redundant: `SetSecurityInfo` takes an `ACL`, not a descriptor, so
-/// the control word the `P` set is never handed to it. The information argument
-/// is the only place the protect bit can come from.
-///
-/// Addressed through a handle from `crate::dirhandle::open_directory_itself`,
-/// which refuses a reparse point outright. `%TEMP%` is writable by any same-user
-/// medium-integrity process, so between [`prepare_staging`]'s `create_dir` and
-/// this call the directory can be removed and replaced by a junction.
-///
-/// What that used to cost is worth stating precisely, because the obvious guess
-/// is wrong and was measured to be wrong: `SetNamedSecurityInfoW` does *not*
-/// follow a junction, so the old name-based call did not put [`STAGING_DACL`] on
-/// the target — it put it on the reparse point itself and returned success. The
-/// damage was quieter than that and no less total: the protected DACL ends up on
-/// an object no file is ever written to, while [`installer_path`] resolves
-/// *through* the junction, so the installer is downloaded into, verified in and
-/// launched from a directory the attacker still controls. Every guarantee in
-/// this module's staging story would hold on paper and none of it on disk.
-///
-/// Refusing the open is what turns that into a failed download. The gate is
-/// shared with `crate::migrate` rather than copied because it is the same
-/// argument — act on the object you checked, not on the name you checked.
-///
-/// `sddl` is a parameter and not the constant inlined for one reason, recorded
-/// so it is not "simplified" away: a clamped directory cannot be deleted by an
-/// unelevated owner (see [`sweep_old_staging`]), so the test that proves the
-/// clamp took has no other way to clean up after itself than to call this again
-/// with a DACL that grants the rights back. There is one production caller and
-/// it passes [`STAGING_DACL`].
+/// `sddl` is a parameter, not the constant inlined — do not simplify that away.
+/// An unelevated owner cannot delete a clamped directory (see
+/// [`sweep_old_staging`]), so the test proving the clamp took can only tidy up
+/// by calling this again with a DACL granting the rights back.
 #[cfg(windows)]
 fn lock_down(dir: &Path, sddl: &str) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
@@ -720,22 +506,16 @@ fn lock_down(dir: &Path, sddl: &str) -> std::io::Result<()> {
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     };
 
-    // Before anything is parsed: if the name no longer refers to a plain
-    // directory, there is nothing here worth clamping and the error says which
-    // of the two it was.
-    // Before anything is parsed: if the name no longer refers to a plain
-    // directory, there is nothing here worth clamping and the error says which
-    // of the two it was.
+    // Before anything is parsed: a name that is no longer a plain directory has
+    // nothing here worth clamping.
     let handle = crate::dirhandle::open_directory_itself(dir)?;
 
     let sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
 
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: `sddl` is a valid null-terminated UTF-16 string owned by this frame
-    // and alive across the call. `descriptor` is a live stack slot, written only
-    // on success with a single `LocalAlloc` block that owns the ACL as well. The
-    // size out-parameter is documented as optional and is not wanted. Failure
-    // allocates nothing, which is why the early return below frees nothing.
+    // SAFETY: `sddl` is a valid null-terminated UTF-16 string alive across the
+    // call; `descriptor` is a live stack slot, written on success with one
+    // `LocalAlloc` block owning the ACL too; the size out-parameter is optional.
     let built = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl.as_ptr(),
@@ -751,37 +531,30 @@ fn lock_down(dir: &Path, sddl: &str) -> std::io::Result<()> {
     let mut dacl: *mut ACL = ptr::null_mut();
     let mut present = 0;
     let mut defaulted = 0;
-    // SAFETY: `descriptor` is the block the call above allocated and reported
-    // success for, and nothing has freed it. The three out-parameters are stack
-    // slots that outlive the call. `dacl` is written to point *into* that block,
-    // so every read of it below happens before the one `LocalFree`.
+    // SAFETY: `descriptor` is the block allocated above and not yet freed; the
+    // three out-parameters are stack slots outliving the call; `dacl` points
+    // *into* that block, so every read of it precedes the one `LocalFree`.
     let read =
         unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) };
-    // GetLastError is per-thread and the very next Win32 call clobbers it: read
-    // it here, not after the `SetSecurityInfo` below.
+    // `GetLastError` is clobbered by the very next Win32 call: read it here, not
+    // after the `SetSecurityInfo` below.
     let read_err = std::io::Error::last_os_error();
 
     let outcome = if read == 0 {
         Err(read_err)
     } else if present == 0 || dacl.is_null() {
-        // Never passed on. `SetSecurityInfo` reads a null `pDacl` as
-        // "install a *null* DACL", which grants full access to everyone — the
-        // same trap `migrate::reset_dacl_to_inherited`'s doc comment is written
-        // around, and here it would hand the attacker the very directory this
-        // call exists to take away from them. `STAGING_DACL` names two ACEs so
-        // this is unreachable; it is checked because the cost of being wrong is
-        // the whole fix, silently.
+        // Never passed on: `SetSecurityInfo` reads a null `pDacl` as "install a
+        // *null* DACL", granting everyone full access. `STAGING_DACL` names two
+        // ACEs so this is unreachable, but being wrong costs the whole fix,
+        // silently.
         Err(std::io::Error::other(
             "the staging descriptor parsed with no DACL in it",
         ))
     } else {
         // SAFETY: `handle` is an open directory handle carrying `WRITE_DAC`,
-        // kept alive across the call by the borrow, and validated as a plain
-        // directory rather than a reparse point. `dacl` is the non-null ACL
-        // inside the descriptor above, which the call copies rather than
-        // retains. The owner, group and SACL pointers are null, which is "do not
-        // change" for the information bits not requested. Failure mode: a
-        // `WIN32_ERROR` return, handled below.
+        // alive across the call; `dacl` is the non-null ACL inside the
+        // descriptor above and is copied, not retained; the owner, group and
+        // SACL pointers are null, "do not change".
         let status = unsafe {
             SetSecurityInfo(
                 handle.as_raw_handle(),
@@ -800,17 +573,13 @@ fn lock_down(dir: &Path, sddl: &str) -> std::io::Result<()> {
         }
     };
 
-    // SAFETY: the only `LocalFree` in this function, on the only path that
-    // reaches it, freeing the block the parse allocated exactly once. `dacl`
-    // pointed into it and is not read again.
+    // SAFETY: the only `LocalFree`, freeing the parse's block exactly once;
+    // `dacl` pointed into it and is not read again.
     unsafe { LocalFree(descriptor.cast()) };
     outcome
 }
 
-/// The fetcher is only reachable from the Windows capture path; this exists so
-/// the module compiles on a dev machine. It carries no guarantee, and needs
-/// none — nothing calls it, in the same way [`open_locked`]'s non-Windows arm
-/// carries no sharing guarantee.
+/// Dev-machine stub; nothing off Windows reaches the fetcher.
 #[cfg(not(windows))]
 fn lock_down(_dir: &Path, _sddl: &str) -> std::io::Result<()> {
     Ok(())
@@ -819,53 +588,39 @@ fn lock_down(_dir: &Path, _sddl: &str) -> std::io::Result<()> {
 /// Starts a second copy of this executable, for the caller to follow with a
 /// window close.
 ///
-/// # Why a relaunch and not a re-probe
-///
-/// Nothing technical forces it. Measured: Windows does **not** cache a failed
-/// `LoadLibrary` — a path that answered `ERROR_MOD_NOT_FOUND` (126) loads
-/// successfully in the same process once the file appears — so re-opening the
-/// tap in place would work.
-///
-/// What forces it is where the failure lands. `build_source` runs inside
-/// `Session::run`, and its `?` ends the session; the window survives holding
+/// Nothing technical forces it — measured, Windows does **not** cache a failed
+/// `LoadLibrary`, so a path that answered `ERROR_MOD_NOT_FOUND` (126) loads in
+/// the same process once the file appears. What forces it is where the failure
+/// lands: `build_source`'s `?` ends `Session::run`, leaving the window holding
 /// [`SessionHandles`](crate::app::SessionHandles) whose command receiver went
-/// with it. Reviving that means `Option<CaptureWorker>` inside `SessionWorkers`,
-/// six values kept alive for a second attempt, and a changed teardown path —
-/// the one whose comments record that an error there leaves an orphaned live
-/// capture session on every launch/close cycle. Against that, a relaunch costs
-/// the player one click and loses nothing: at this point the session is dead,
-/// the journal holds two lines, and nothing has been typed.
-///
-/// No second UAC prompt: the exe is manifested `requireAdministrator` and this
-/// process already holds the token, so the child inherits it.
+/// with it. Reviving that costs an `Option<CaptureWorker>`, six values kept
+/// alive for a retry and a changed teardown path; a relaunch costs one click.
+/// No second UAC prompt — the exe is manifested `requireAdministrator`.
 ///
 /// # Errors
 ///
-/// If the running executable's path cannot be read, or the child cannot be
-/// spawned. The window keeps its banner in either case — a failed relaunch must
-/// not look like a successful one.
+/// If the executable's path cannot be read or the child cannot be spawned. The
+/// window keeps its banner either way: a failed relaunch must not look like a
+/// successful one.
 pub fn relaunch() -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
-    // The child is deliberately not held: it outlives this process by design,
-    // and waiting on it here would deadlock the window that is about to close.
+    // Not held: it outlives this process by design, and waiting would deadlock
+    // the window that is about to close.
     Command::new(&exe).spawn()?;
     info!(path = %exe.display(), "relaunching after the Npcap install");
     Ok(())
 }
 
-/// `Ok(())` only for the exact pinned build.
-///
-/// Takes the open handle, not the path: re-opening by name here is precisely
-/// the gap this module's header is about. `mut file: &File` because `&File`
-/// is itself a `Read`, so the caller keeps ownership of the handle it will hold
-/// across the spawn.
+/// Takes the open handle, not the path: re-opening by name is the gap the module
+/// header is about. `mut file: &File` because `&File` is itself a `Read`, so the
+/// caller keeps the handle it holds across the spawn.
 fn verify(mut file: &File) -> Result<(), String> {
     let size = file
         .metadata()
         .map_err(|err| format!("the downloaded file could not be read: {err}"))?
         .len();
-    // Checked before reading: a captive portal or an error page redirected into
-    // this file should not be loaded into memory just to be hashed.
+    // Before reading: a captive portal's error page should not be loaded into
+    // memory just to be hashed.
     if size != INSTALLER_BYTES {
         return Err(format!(
             "the download is {size} bytes, not the expected {INSTALLER_BYTES} — it is not the installer"
@@ -881,20 +636,17 @@ fn verify(mut file: &File) -> Result<(), String> {
     }
 }
 
-/// SHA-256 through CNG's one-shot entry point.
-///
-/// `BCryptHash` with the `BCRYPT_SHA256_ALG_HANDLE` pseudo-handle needs no
-/// provider to open and none to close, so the whole digest is a single call and
-/// a single `unsafe` block — which is why it is used here rather than the
-/// open/create/hash/finish/destroy sequence the same header offers.
+/// SHA-256 through CNG's one-shot entry point: the `BCRYPT_SHA256_ALG_HANDLE`
+/// pseudo-handle needs no provider opened or closed, so the digest is one call
+/// and one `unsafe` block rather than open/create/hash/finish/destroy.
 #[cfg(windows)]
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
 
     let mut out = [0_u8; 32];
     // SAFETY: the algorithm handle is the documented pseudo-handle constant, the
-    // secret is empty (this is a plain hash, not an HMAC), and both the input and
-    // output pointers come from slices whose lengths are passed alongside them.
+    // secret is empty (a plain hash, not an HMAC), and both pointers come from
+    // slices whose lengths are passed alongside them.
     let status = unsafe {
         BCryptHash(
             BCRYPT_SHA256_ALG_HANDLE,
@@ -907,18 +659,17 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
         )
     };
     if status != 0 {
-        // Leaves `out` zeroed, which cannot equal the pin, so the caller rejects
-        // the file. A hash that failed must never read as a hash that matched.
+        // `out` stays zeroed, which cannot equal the pin: a hash that failed must
+        // never read as a hash that matched.
         warn!(status, "BCryptHash failed; treating the file as unverified");
         return [0_u8; 32];
     }
     out
 }
 
+/// Dev-machine stub; nothing on a non-Windows target reaches the fetcher.
 #[cfg(not(windows))]
 fn sha256(_bytes: &[u8]) -> [u8; 32] {
-    // The fetcher is only reachable from the Windows capture path; this exists so
-    // the module compiles on a dev machine.
     [0_u8; 32]
 }
 
@@ -931,16 +682,8 @@ mod tests {
         assert_eq!(Fetcher::new().progress(), Progress::Idle);
     }
 
-    // The pin's own shape is asserted where the pin now lives, in `crate::npcap`
-    // — it guards `sha256`'s zeroed failure return, which is this module's, but
-    // the constant it guards is not.
-
-    /// The two-clicks case, which is what the banner actually produces: the
-    /// window repaints at 4 Hz, and the second frame's click used to find `Idle`
-    /// because the only writer of `Fetching` was the worker thread, inside
-    /// `fetch_and_check`. Both workers then race one path, and on the reuse fast
-    /// path the second one verifies and launches — a second elevated Npcap
-    /// installer, out of the guard written to prevent it.
+    /// At 4 Hz the second frame's click used to find `Idle`, and the reuse fast
+    /// path launched a second elevated Npcap installer.
     #[test]
     fn a_second_click_cannot_take_a_fetch_that_is_already_claimed() {
         let fetcher = Fetcher::new();
@@ -953,11 +696,9 @@ mod tests {
         assert!(!fetcher.claim(), "the second click must find it taken");
     }
 
-    /// The same rule under real contention rather than in sequence. Not because
-    /// the UI can produce it — `start` is only ever called from the one egui
-    /// thread — but because `Fetcher` is `Clone` and its whole purpose is to be
-    /// held by two threads at once, so "exactly one winner" is a property of the
-    /// type and not of its current caller.
+    /// The UI cannot produce this — `start` runs on one egui thread — but
+    /// `Fetcher` is `Clone`, so "exactly one winner" belongs to the type rather
+    /// than to its current caller.
     #[test]
     fn exactly_one_of_many_racing_claims_wins() {
         let fetcher = Fetcher::new();
@@ -980,12 +721,9 @@ mod tests {
         assert_eq!(won, 1, "one download, not eight");
     }
 
-    /// The one thing about this path that matters: it is absolute, it is under
-    /// the directory Win32 named, and it is the real `curl.exe`. The property
-    /// this replaced — that no `%SystemRoot%` read chooses it — cannot be
-    /// asserted from inside the process without setting that variable, which
-    /// this crate never does; see [`crate::system32`]'s test for the same note.
-    /// What holds it is that the environment read is gone.
+    /// The property this replaced — that no `%SystemRoot%` read chooses the path
+    /// — cannot be asserted without setting that variable. What holds it is that
+    /// the environment read is gone.
     #[cfg(windows)]
     #[test]
     fn the_downloader_runs_the_system_curl_by_absolute_path() {
@@ -995,16 +733,16 @@ mod tests {
             curl.starts_with(crate::system32::directory()),
             "{curl:?} — an elevated process must not run a curl.exe chosen by its launcher"
         );
-        // Not `is_file`: a Windows old enough to lack it is a supported machine
-        // and `download` reports it. What must hold is where we looked.
+        // Not `is_file`: a Windows old enough to lack curl is supported and
+        // `download` reports it. What must hold is where we looked.
         assert_eq!(curl.file_name(), Some(std::ffi::OsStr::new("curl.exe")));
     }
 
     #[cfg(windows)]
     #[test]
     fn sha256_matches_the_published_vectors() {
-        // NIST's two standard test vectors, so a wrong `BCryptHash` call is
-        // caught here rather than by a mysteriously rejected download.
+        // NIST's two standard vectors, so a wrong `BCryptHash` call is caught
+        // here and not as a mysteriously rejected download.
         let abc = sha256(b"abc");
         assert_eq!(
             abc[..4],
@@ -1033,10 +771,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_verified_file_cannot_be_swapped_while_its_handle_is_held() {
-        // The whole pin rests on this: between `verify` and `CreateProcess`
-        // nobody may write, delete or replace the file. Asserted against the OS
-        // rather than trusted, because a share mode is invisible at the call
-        // site that depends on it.
+        // Against the OS, because a share mode is invisible at the call site
+        // that depends on it.
         let path = std::env::temp_dir().join("arkyve-npcap-test-locked.bin");
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, b"the verified bytes").expect("write the fixture");
@@ -1055,15 +791,14 @@ mod tests {
             "a held installer handle must refuse a second writer"
         );
 
-        // And the denial is only for as long as the handle lives.
         drop(held);
         std::fs::remove_file(&path).expect("the path is free again once dropped");
     }
 
     #[test]
     fn the_installer_is_never_written_over_something_already_there() {
-        // `create_new` is what stands between an elevated write and a symlink
-        // planted at the predictable temp path.
+        // `create_new` stands between an elevated write and a symlink planted at
+        // the predictable temp path.
         let path = std::env::temp_dir().join("arkyve-npcap-test-planted.bin");
         std::fs::write(&path, b"planted").expect("write the fixture");
         let err = write_new(&path, b"the installer").expect_err("must refuse an occupied path");
@@ -1076,12 +811,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The finding the staging directory exists for. `open_locked` pins the
-    /// installer's bytes and nothing pins its neighbours, while the image's own
-    /// directory is first in the child's DLL search order — so an installer run
-    /// straight out of `%TEMP%` loads whatever `version.dll` a same-user process
-    /// left lying there, into an administrator token, without disturbing the
-    /// hash at all.
+    /// The finding the staging directory exists for: nothing pins the pinned
+    /// installer's *neighbours*, so a run out of `%TEMP%` loads a planted
+    /// `version.dll` elevated without disturbing the hash.
     #[test]
     fn the_installer_is_never_staged_in_the_shared_temp_root() {
         let temp = std::env::temp_dir();
@@ -1114,12 +846,9 @@ mod tests {
         );
     }
 
-    /// Asserted against the OS rather than against the SDDL string, for the same
-    /// reason the share-mode test above is: a DACL is invisible at the call site
-    /// that depends on it. Elevation-independent — the owner of a directory
-    /// always keeps `READ_CONTROL`, so the read-back works whether `cargo test`
-    /// runs filtered (a dev machine) or elevated (the CI runner, see the
-    /// `[[bin]]` note in `Cargo.toml`).
+    /// Against the OS, not the SDDL string: a DACL is invisible at the call site
+    /// that depends on it. Works filtered or elevated, since a directory's owner
+    /// always keeps `READ_CONTROL`.
     #[cfg(windows)]
     #[test]
     fn a_staged_directory_stops_inheriting_the_users_full_control() {
@@ -1153,42 +882,23 @@ mod tests {
             "exactly the two ACEs `STAGING_DACL` names — Administrators and SYSTEM"
         );
 
-        // The clamp is real enough that this test cannot tidy up after itself
-        // without undoing it: measured, `remove_dir` on the empty directory it
-        // just created answers `ERROR_ACCESS_DENIED`, because `%TEMP%`'s
-        // `FILE_DELETE_CHILD` does not stand in for a `DELETE` the new DACL does
-        // not grant.
-        //
-        // Undone by name rather than through `lock_down`, and the reason is
-        // worth recording because it is surprising: measured with a bare
-        // `CreateFileW` on a clamped directory, an unelevated owner is refused
-        // `READ_CONTROL`, `WRITE_DAC` and both together alike — the implicit
-        // owner rights do not survive `STAGING_DACL`. So `lock_down`'s handle
-        // gate cannot re-open what it has just clamped, while the name-based
-        // API still can. That costs production nothing — `prepare_staging`
-        // clamps a directory it created moments earlier and never re-clamps —
-        // and it is only this fixture that needs the other spelling.
+        // Measured: `remove_dir` on the empty directory it just created answers
+        // `ERROR_ACCESS_DENIED`, so the test cannot tidy up without un-clamping.
+        // Undone by name because — measured with a bare `CreateFileW` — an
+        // unelevated owner of a clamped directory is refused `READ_CONTROL`,
+        // `WRITE_DAC` and both together, so `lock_down`'s handle gate cannot
+        // re-open what it just clamped. Production never re-clamps.
         hand_back_full_control(&dir).expect("hand the fixture back");
         std::fs::remove_dir(&dir).expect("the fixture is deletable once un-clamped");
     }
 
-    /// The staging directory lives in `%TEMP%`, which any same-user
-    /// medium-integrity process can write. If it is removed and re-created as a
-    /// junction between [`prepare_staging`]'s `create_dir` and its clamp, the
-    /// old name-based DACL write clamped the *reparse point* and reported
-    /// success — measured, not assumed: `SetNamedSecurityInfoW` does not follow
-    /// a junction, so the target keeps its own DACL. That is the dangerous
-    /// outcome rather than the harmless one, because files resolve the other
-    /// way: [`installer_path`] goes *through* the junction, so the protection
-    /// sits on an object nothing is written to while the installer lands in the
-    /// attacker's directory.
-    ///
-    /// Hence the assertion below is about the link, not its target. A test
-    /// asserting the target was untouched would pass against the unfixed code
-    /// too, and prove nothing.
-    ///
-    /// Deliberately not named with `STAGING_PREFIX`: [`sweep_old_staging`] would
-    /// be entitled to delete it out from under a concurrently running test.
+    /// Measured: `SetNamedSecurityInfoW` does not follow a junction, so a
+    /// junction swapped in before the clamp took the DACL on the *reparse point*
+    /// and reported success while [`installer_path`] resolved *through* it.
+    /// Hence the assertion is about the link, not the target — asserting the
+    /// target was untouched would pass against the unfixed code. Deliberately
+    /// not named with `STAGING_PREFIX`, which [`sweep_old_staging`] would be
+    /// entitled to delete under a concurrent test.
     #[test]
     #[cfg(windows)]
     fn a_junction_in_place_of_the_staging_directory_is_refused_not_followed() {
@@ -1203,9 +913,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&victim).expect("the victim directory");
 
-        // A directory junction needs no privilege at all, unlike a symlink —
-        // which is exactly why this is reachable by the attacker in the first
-        // place, and why this test can build it on an unelevated machine.
+        // A junction needs no privilege, unlike a symlink — which is why the
+        // attacker can reach this and why the test can build it unelevated.
         let made = Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(&link)
@@ -1220,11 +929,8 @@ mod tests {
 
         let refused = lock_down(&link, STAGING_DACL);
 
-        // Checked before the error, so that a regression reports the thing that
-        // matters rather than its symptom. Against the unfixed code this reads
-        // `SE_DACL_PROTECTED`: the clamp landed on the junction and `lock_down`
-        // answered `Ok` — a staging directory that reports itself secured while
-        // every file written to it goes somewhere else.
+        // Checked before the error, so a regression reports the cause and not
+        // the symptom. Against the unfixed code this reads `SE_DACL_PROTECTED`.
         let (link_dacl, _) = dacl_of(&link);
         assert_eq!(
             link_dacl & SE_DACL_PROTECTED,
@@ -1243,17 +949,13 @@ mod tests {
         );
 
         // `remove_dir` unlinks the junction; `remove_dir_all` on the root would
-        // otherwise have to decide what to do about it.
+        // have to decide what to do about it.
         std::fs::remove_dir(&link).expect("unlink the junction");
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Puts an everyone-full-control DACL back on `dir`, by name.
-    ///
-    /// Fixture cleanup only, and it is the one thing in this module that is
-    /// *deliberately* name-based: see the comment at its call site for why the
-    /// handle gate cannot be used here, and note that nothing it does is a
-    /// security operation — it hands rights away rather than taking them.
+    /// Fixture cleanup only, and *deliberately* name-based — see the call site.
+    /// Not a security operation: it hands rights away.
     #[cfg(windows)]
     fn hand_back_full_control(dir: &Path) -> std::io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
@@ -1280,8 +982,8 @@ mod tests {
 
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
         // SAFETY: `sddl` is a valid null-terminated UTF-16 string alive across
-        // the call; `descriptor` is a live stack slot written only on success
-        // with one `LocalAlloc` block. The size out-parameter is optional.
+        // the call; `descriptor` is a live stack slot written on success with
+        // one `LocalAlloc` block; the size out-parameter is optional.
         let built = unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
@@ -1296,7 +998,7 @@ mod tests {
         let mut present = 0;
         let mut defaulted = 0;
         // SAFETY: `descriptor` is the block allocated above and not yet freed;
-        // the three out-parameters are stack slots outliving the call.
+        // the out-parameters are stack slots outliving the call.
         let read = unsafe {
             GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
         };
@@ -1307,9 +1009,8 @@ mod tests {
         );
 
         // SAFETY: `wide` is a valid null-terminated UTF-16 path alive for the
-        // call, `dacl` points into the descriptor above and is copied rather
-        // than retained, and the owner/group/SACL pointers are null meaning
-        // "do not change".
+        // call; `dacl` points into the descriptor above and is copied rather
+        // than retained; the owner/group/SACL pointers are null, "do not change".
         let status = unsafe {
             SetNamedSecurityInfoW(
                 wide.as_ptr(),
@@ -1332,7 +1033,6 @@ mod tests {
         }
     }
 
-    /// Reads back `(control word, ACE count)` for a path's DACL.
     #[cfg(windows)]
     fn dacl_of(dir: &Path) -> (u16, u16) {
         use std::os::windows::ffi::OsStrExt;
@@ -1353,10 +1053,9 @@ mod tests {
         let mut dacl: *mut ACL = ptr::null_mut();
 
         // SAFETY: `wide` is a valid null-terminated UTF-16 path alive across the
-        // call. `dacl` and `descriptor` are live stack slots; on success the call
-        // allocates one `LocalAlloc` block for the descriptor, with `dacl`
-        // pointing into it. The owner, group and SACL out-parameters are optional
-        // and passed null.
+        // call; `dacl` and `descriptor` are live stack slots, and on success one
+        // `LocalAlloc` block holds the descriptor with `dacl` pointing into it;
+        // the owner, group and SACL out-parameters are optional, passed null.
         let status = unsafe {
             GetNamedSecurityInfoW(
                 wide.as_ptr(),
@@ -1377,8 +1076,8 @@ mod tests {
 
         let mut control: u16 = 0;
         let mut revision: u32 = 0;
-        // SAFETY: `descriptor` is the block the call above allocated and reported
-        // success for; `control` and `revision` are stack slots outliving the call.
+        // SAFETY: `descriptor` is the block allocated above; `control` and
+        // `revision` are stack slots outliving the call.
         let ok = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
         assert_ne!(ok, 0, "reading the control word of {dir:?}");
         // SAFETY: `dacl` is the non-null ACL header inside that same live block.
@@ -1390,11 +1089,9 @@ mod tests {
         (control, aces)
     }
 
-    /// The other half of the staging directory: it is per-run, and a run cannot
-    /// delete its own on the way out — the installer it launched is still mapped.
-    /// Without this sweep an elevated app would leave an undeletable megabyte in
-    /// `%TEMP%` on every download, which is the litter `crate::migrate` exists to
-    /// clear up, freshly re-created.
+    /// A run cannot delete its own staging directory on the way out — the
+    /// installer it launched is still mapped — so without the sweep that is an
+    /// undeletable megabyte in `%TEMP%` per download.
     #[test]
     fn an_earlier_runs_staging_directory_is_swept_and_its_neighbours_are_not() {
         let parent = std::env::temp_dir().join(format!("arkyve-sweep-test-{}", std::process::id()));
@@ -1403,8 +1100,8 @@ mod tests {
 
         let stale = parent.join(format!("{STAGING_PREFIX}older-run"));
         let mine = parent.join(format!("{STAGING_PREFIX}this-run"));
-        // The name the sweep must never touch: `%TEMP%\arkyve-refresh-shop\logs`
-        // is where this crate's logs go when `%LOCALAPPDATA%` is unavailable.
+        // The name the sweep must never touch: the fallback log root, used when
+        // `%LOCALAPPDATA%` is unavailable.
         let logs = parent.join(crate::APP_DIR);
         std::fs::create_dir(&stale).expect("the stale sibling");
         std::fs::create_dir(&mine).expect("this run's directory");
@@ -1428,8 +1125,8 @@ mod tests {
 
     #[test]
     fn a_window_side_failure_lands_in_the_same_cell() {
-        // The relaunch is the one failure the worker cannot report; it must not
-        // be able to leave the banner claiming success.
+        // The one failure the worker cannot report; it must not leave the banner
+        // claiming success.
         let fetcher = Fetcher::new();
         fetcher.set(Progress::Launched);
         fetcher.restart_failed("could not restart: access denied".to_owned());
@@ -1439,8 +1136,7 @@ mod tests {
 
     #[test]
     fn a_failed_restart_is_not_a_failed_download() {
-        // The two are told apart here so the banner can offer each its own
-        // remedy. Collapsed into one state they shared `Failed`'s, which is a
+        // Collapsed into one state they share `Failed`'s remedy, which is a
         // second Npcap installer.
         let fetcher = Fetcher::new();
         fetcher.set(Progress::Launched);
@@ -1461,10 +1157,8 @@ mod tests {
 
     #[test]
     fn nothing_starts_a_second_installer_once_one_is_running() {
-        // Both post-launch states, because `fetch_and_check`'s reuse fast path
-        // means a start from either would reach the `spawn` with the file
-        // already on disk and already verified — an installer window the player
-        // did not ask for a second time.
+        // Both post-launch states: `fetch_and_check`'s reuse fast path means a
+        // start from either reaches the `spawn` with the file already verified.
         for state in [
             Progress::Launched,
             Progress::RestartFailed("could not restart: access denied".to_owned()),
@@ -1474,7 +1168,6 @@ mod tests {
                 "a start from {state:?} must be refused"
             );
         }
-        // And the states that mean "nothing is running" still may.
         assert!(accepts_a_start(&Progress::Idle));
         assert!(accepts_a_start(&Progress::Failed("no network".to_owned())));
     }

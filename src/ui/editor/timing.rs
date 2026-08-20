@@ -1,12 +1,7 @@
-//! Click timing: the section's summary, the copy and the per-pass reading
-//! under the mode control, the inline per-action bar block, and the routine
-//! baseline the estimate is built from. Works on a `Timings` value handed in
-//! by the caller, needing no `EditorState`. `timing_body` and `preset_row`
-//! stay in the shell because they also drive the Custom disclosure flag — see
-//! `_HANDOFF.md` for the draft-grouping prerequisite that would let them move.
-//!
-//! [`super::timing_meter`] is this group's painting, lifted out before this
-//! split; it keeps its eight compile-time ruler tripwires.
+//! Click timing: the section's summary, the copy and per-pass reading under the
+//! mode control, the inline bar block, and the routine baseline the estimate is
+//! built from. `timing_body` and `preset_row` stay in the shell because they
+//! also drive the Custom disclosure flag; [`super::timing_meter`] paints.
 
 use eframe::egui;
 
@@ -14,8 +9,8 @@ use super::super::theme;
 use super::timing_meter::{secs_range, timing_group, timing_legend};
 use crate::actuator::plan::{self, TimingPreset, Timings};
 
-/// The Click timing bar is always folded on arrival, so its peek names the
-/// humanization level in force, or "Custom" once fine-tuned away from a preset.
+/// The folded Click timing bar's peek: the humanization level in force, or
+/// "Custom" once fine-tuned away from a preset.
 pub(super) fn timing_summary(timings: &Timings) -> &'static str {
     match TimingPreset::from_timings(timings) {
         Some(preset) => preset.label(),
@@ -40,10 +35,8 @@ pub(super) fn mode_hint(active: Option<TimingPreset>) -> &'static str {
     }
 }
 
-/// The steady find-and-buy pass as one reading — summed baseline to
-/// baseline-plus-slack, in seconds — so the player sees per-pass cost without
-/// decoding eight bars. Folded into `timing_body`'s hint sentence rather than
-/// shown as its own stat row.
+/// The steady find-and-buy pass as one reading, so the player sees per-pass
+/// cost without decoding eight bars.
 pub(super) fn pass_estimate(t: &Timings) -> String {
     let slack = [
         t.refreshed,
@@ -51,27 +44,20 @@ pub(super) fn pass_estimate(t: &Timings) -> String {
         t.buy_modal,
         t.purchase_resumed,
     ];
-    // Both ends carry the slack, and the low one has to: `min_ms` is *forced*
-    // extra, added to every single draw, so a pass with four floors set is
-    // never as quick as the bare baselines. Reading the low end as
-    // `ROUTINE_TOTAL_MS` alone put two contradicting numbers on one screen —
-    // `timing_meter::resolved_band`, in the value column of each of these four
-    // bars, has always shown `baseline + min_ms` — and the contradiction grew
-    // with the setting, so the player who had most reason to trust the
-    // estimate got the worst one.
+    // The low end carries the slack too: `min_ms` is *forced* extra on every
+    // draw, so quoting the bare baseline contradicted the value column of these
+    // same four bars, which shows `baseline + min_ms`.
     //
-    // Plain sums, not `saturating_add`s: `DelayRange` carries
-    // `min_ms <= max_ms <= MAX_TIMING_MS` by construction, so four of either
-    // end plus the routine total cannot approach `u64::MAX`, and `lo <= hi`
-    // holds term by term — `secs_range` would print a backwards band if it
-    // did not.
+    // Plain sums, not `saturating_add`s: `DelayRange` is ordered and capped by
+    // construction, so neither can approach `u64::MAX` and `lo <= hi` holds
+    // term by term — `secs_range` would print a backwards band otherwise.
     let lo_total: u64 = ROUTINE_TOTAL_MS + slack.iter().map(|r| r.min_ms()).sum::<u64>();
     let hi_total: u64 = ROUTINE_TOTAL_MS + slack.iter().map(|r| r.max_ms()).sum::<u64>();
     secs_range(lo_total, hi_total)
 }
 
 /// The per-action bars, revealed inline when the Custom mode segment is
-/// active. The legend sits here, not up top, next to the bars it explains.
+/// active.
 pub(super) fn fine_tune_body(ui: &mut egui::Ui, t: &mut Timings) {
     timing_legend(ui);
     ui.add_space(theme::SP_SM);
@@ -117,11 +103,8 @@ pub(super) fn fine_tune_body(ui: &mut egui::Ui, t: &mut Timings) {
     );
 }
 
-/// The tuned baselines a single steady find-and-buy pass strings together, in
-/// click order: paid refresh, its confirm, the buy, and the resume. Shop-open
-/// (once), scroll/between-buys (multi-item), and the watchdog (only on a miss)
-/// sit outside this steady loop. `pass_estimate` adds each action's slack on
-/// top for the high end.
+/// The tuned baselines a steady find-and-buy pass strings together. Shop-open,
+/// scroll/between-buys, and the watchdog sit outside that loop.
 const ROUTINE: [u64; 4] = [
     plan::WAIT_REFRESHED_MS,
     plan::WAIT_CONFIRM_REFRESH_MODAL_MS,
@@ -130,9 +113,8 @@ const ROUTINE: [u64; 4] = [
 ];
 
 /// The steady pass's baseline total. A `const` rather than
-/// `ROUTINE.iter().sum()` inside [`pass_estimate`] (which re-summed on every
-/// frame the Setup tab painted), and gives the test a fixed target to assert
-/// against.
+/// `ROUTINE.iter().sum()` inside [`pass_estimate`], which re-summed on every
+/// frame the Setup tab painted.
 const ROUTINE_TOTAL_MS: u64 = {
     let mut total = 0;
     let mut index = 0;
@@ -150,16 +132,14 @@ mod tests {
 
     #[test]
     fn pass_estimate_tops_out_at_the_widest_range_the_type_allows() {
-        // The widest legal pair `DelayRange` can hold is the ceiling on both,
-        // so the label arithmetic is pinned against that: the sum must be
-        // exact (not saturated), and it must be the *four* slack steps only.
+        // At the widest legal pair, the sum must still be exact rather than
+        // saturated, over the four slack steps only.
         let full = DelayRange::ceiling(plan::MAX_TIMING_MS);
         let timings = Timings {
             refreshed: full,
             buy_modal: full,
             ..Timings::default()
         };
-        // Asserted against the shared const, not a re-sum of `ROUTINE`.
         assert_eq!(
             pass_estimate(&timings),
             secs_range(ROUTINE_TOTAL_MS, ROUTINE_TOTAL_MS + 2 * plan::MAX_TIMING_MS)
@@ -168,11 +148,8 @@ mod tests {
 
     #[test]
     fn the_per_pass_low_end_agrees_with_the_bars_above_it() {
-        // One screen, two readings of the same four waits: this sentence and
-        // the value column of each bar. A floor of 200 ms on the paid refresh
-        // means every pass really does take 200 ms longer, and
-        // `timing_meter::resolved_band` says so on that row — so the estimate
-        // must not keep quoting the bare baseline as its floor.
+        // Two readings of the same four waits on one screen: a 200 ms floor
+        // means every pass really does take 200 ms longer.
         let timings = Timings {
             refreshed: DelayRange::try_new(200, 800).expect("a valid fixture range"),
             buy_modal: DelayRange::try_new(50, 50).expect("a valid fixture range"),
@@ -186,7 +163,6 @@ mod tests {
 
     #[test]
     fn mode_hint_varies_with_the_active_mode() {
-        // Custom wins over the detected preset so the hint tracks the lit segment.
         assert!(mode_hint(Some(TimingPreset::Instant)).starts_with("Instant"));
         assert!(mode_hint(Some(TimingPreset::Human)).starts_with("Human"));
         assert!(mode_hint(Some(TimingPreset::Cautious)).starts_with("Cautious"));

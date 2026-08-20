@@ -1,26 +1,18 @@
 //! TCP reassembly.
 //!
 //! Capture observes traffic below TCP, so segments may arrive out of order,
-//! duplicated (retransmissions), or overlapping. This layer reconstructs,
-//! per connection, the ordered byte stream the TCP stack would deliver.
-//! Only the server-to-client half is ever captured, so "the stream of a
-//! flow" is unambiguous and `FlowKey` is the whole reassembly identity.
+//! duplicated, or overlapping; this layer reconstructs, per connection, the
+//! ordered byte stream the TCP stack would deliver. Only the server-to-client
+//! half is ever captured, so `FlowKey` is the whole reassembly identity.
 //!
-//! Work is done in relative offsets from the stream origin (the first
-//! observed segment). TCP sequence numbers are `u32` and wrap; a segment's
-//! offset is derived from its distance to the currently expected byte, not
-//! the fixed origin, so the signed `i32` sequence window tracks the stream
-//! as it advances. Anchoring to the origin instead would break once a
-//! half-stream delivered 2 GiB: the distance would exceed `i32` range and
-//! every later segment would look like an already-delivered retransmission.
+//! Offsets are relative and measured from the currently expected byte, not
+//! from the fixed origin: anchoring to the origin breaks once a half-stream
+//! has delivered 2 GiB, where the distance exceeds `i32` range and every
+//! later segment reads as an already-delivered retransmission.
 //!
-//! Two submodules, one seam. [`budget`] owns byte accounting — the shared
-//! `Mutex<Usage>` pool, per-stage quotas, and the move-only
-//! `BudgetedChunk`/`PayloadLease` pair that makes a double release
-//! unrepresentable; nothing in it knows what TCP is. [`reassembly`] owns
-//! everything above and treats a budgeted payload as an opaque carrier. This
-//! file keeps the quota numbers and their compile-time relation, being the
-//! only module that sees both halves.
+//! [`budget`] owns byte accounting and knows nothing of TCP; [`reassembly`]
+//! treats a budgeted payload as an opaque carrier. The quota numbers and their
+//! compile-time relation live here, the only module that sees both halves.
 
 mod budget;
 mod reassembly;
@@ -38,19 +30,16 @@ pub(crate) const CAPTURE_STAGE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const REASSEMBLY_STAGE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const OUTBOUND_STAGE_BYTES: usize = 8 * 1024 * 1024;
 
-/// One post-resync burst is deliberately small: it only gives reordered
+/// Deliberately small: one post-resync burst only gives reordered
 /// predecessors a chance to establish the initial sequence anchor.
 pub(crate) const INITIAL_ANCHOR_MAX_BYTES: usize = 256 * 1024;
 pub(crate) const INITIAL_ANCHOR_MAX_SEGMENTS: usize = 128;
 
-/// Per-stage byte quotas. `pub(crate)` only so the test-only
-/// `PipelineBudget::with_test_limits` can be named by the two sibling test
-/// suites that override the production constants; nothing outside this
-/// module can build a budget from it on a production path.
-///
-/// Declared here, not in [`budget`]: it's named from outside `stream` only
-/// under `cfg(test)`, so a `pub(crate) use` re-export would be an unused
-/// import in a shipped build — a broken build under `-D warnings`.
+/// Per-stage byte quotas, `pub(crate)` only for the test-only
+/// `PipelineBudget::with_test_limits`. Declared here rather than in [`budget`]
+/// because it is named from outside `stream` only under `cfg(test)`, so a
+/// re-export would be an unused import in a shipped build — fatal under
+/// `-D warnings`.
 #[derive(Clone, Copy)]
 pub(crate) struct BudgetLimits {
     pub(crate) global: usize,
@@ -59,31 +48,22 @@ pub(crate) struct BudgetLimits {
     pub(crate) outbound: usize,
 }
 
-// These four numbers are the pipeline's defence against unbounded memory on a
-// capture path that runs for hours, and what a later tuning pass edits by
-// hand. They are not the *whole* defence, and the gap is worth naming here
-// rather than leaving a reader to trust this list: a captured frame is charged
-// only at `admit_capture`, so the queue between the capture threads and
-// `PcapSource::next_segment` holds memory nothing below can see.
-// `capture::pcap::FRAME_QUEUE_DEPTH` bounds that queue separately and argues
-// its number there. Their relation is pure arithmetic over constants, checked
-// here rather than on the player's machine — `with_limits` still keeps runtime
-// asserts because `with_test_limits` passes arbitrary values.
+// The pipeline's memory bound, and what a tuning pass edits by hand. Not the
+// whole bound: a frame is charged only at `admit_capture`, so the queue between
+// the capture threads and `PcapSource::next_segment` is bounded separately by
+// `capture::pcap::FRAME_QUEUE_DEPTH`. `with_limits` still asserts at runtime
+// because `with_test_limits` passes arbitrary values.
 const _: () = {
     assert!(CAPTURE_STAGE_BYTES <= PIPELINE_GLOBAL_BYTES);
     assert!(REASSEMBLY_STAGE_BYTES <= PIPELINE_GLOBAL_BYTES);
     assert!(OUTBOUND_STAGE_BYTES <= PIPELINE_GLOBAL_BYTES);
-    // The per-stream pending cap must fit the global reassembly quota, or it is
-    // dead code: the stage limit trips first, every time.
+    // Or the per-stream cap is dead code: the stage limit would trip first.
     assert!(MAX_PENDING_BYTES <= REASSEMBLY_STAGE_BYTES);
-    // A burst is held in the capture stage while it buffers, so a burst cap
-    // above that quota could never fill.
+    // A burst buffers inside the capture stage, so a larger cap could never fill.
     assert!(INITIAL_ANCHOR_MAX_BYTES <= CAPTURE_STAGE_BYTES);
 };
 
-// Fixtures shared by both submodules' test suites, not duplicated: a flow
-// key and a capacity-vs-length segment are the vocabulary of both halves —
-// `budget` charges the capacity, `reassembly` orders by sequence number.
+// Fixtures kept here rather than duplicated across both submodules' suites.
 #[cfg(test)]
 use std::net::{Ipv4Addr, SocketAddr};
 

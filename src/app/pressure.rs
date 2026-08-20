@@ -1,13 +1,8 @@
 //! The vocabulary the two pumps share, and nothing else.
 //!
 //! [`CaptureEvent`] crosses the metadata channel from the capture thread to
-//! reassembly; [`PressureResync`] is the marker protocol keeping that crossing
-//! lossless when the queue or byte budget says no. They are the only two items
-//! `super::ingest` and `super::reassembly` both need, so they live here rather
-//! than in the root.
-//!
-//! The two pumps run on different threads and share exactly these two types —
-//! one via `mpsc`, one via `Arc<AtomicU8>` — with no shared `&mut` state.
+//! reassembly; [`PressureResync`] keeps that crossing lossless when the queue
+//! or byte budget says no. They are the only state the two pumps share.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -19,10 +14,8 @@ use tracing::error;
 use crate::capture::Segment;
 use crate::stream::{BudgetedSegment, PipelineBudget};
 
-/// Metadata queue depth between the capture thread and reassembly. `stream.rs`
-/// reasons about "a 512-slot channel" when it justifies its size canaries, so
-/// this number and those canaries move together — see the `CaptureEvent` assert
-/// below.
+/// `stream.rs` reasons about "a 512-slot channel" when it justifies its size
+/// canaries, so this number and those canaries move together.
 pub(super) const CAPTURE_EVENT_QUEUE: usize = 512;
 
 /// Event flowing from the capture thread to reassembly.
@@ -40,25 +33,19 @@ pub(super) enum CaptureEvent {
     PressureResync,
 }
 
-/// `CaptureEvent` is stored **by value** in a [`CAPTURE_EVENT_QUEUE`]-slot
-/// channel, so its size is that queue's footprint: one extra field on the
-/// largest variant silently inflates tens of KiB of always-resident memory.
-/// `stream.rs`'s canaries pin the *fields* (`BudgetedSegment`, `Segment`); this
-/// one pins the enum that is actually queued.
-///
-/// If this fires, re-measure and update the number deliberately — never work
-/// around it by boxing a variant without saying why here.
+/// Stored **by value** in a [`CAPTURE_EVENT_QUEUE`]-slot channel, so one extra
+/// field on the largest variant silently inflates tens of KiB of resident
+/// memory. `stream.rs`'s canaries pin the *fields*; this pins the queued enum.
+/// If it fires, re-measure — do not box a variant without saying why here.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     size_of::<CaptureEvent>() == 120,
     "CaptureEvent grew: it is queued by value, so this is per-slot queue memory"
 );
 
-/// The three states of the pressure-marker protocol, in the order they cycle:
-/// `Ack -> Pending -> Enqueued -> Ack`. Stored in an `AtomicU8` with explicit
-/// discriminants, the way [`crate::watch::HaltSource`] already does it — the two
-/// named atomics sit in the same pipeline and both deserve a `match` rather than
-/// a chain of `!=`.
+/// The pressure-marker protocol, in the order it cycles. Explicit discriminants
+/// in an `AtomicU8`, as [`crate::watch::HaltSource`] does it, so readers get a
+/// `match` rather than a chain of `!=`.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Resync {
@@ -71,18 +58,12 @@ enum Resync {
 }
 
 impl Resync {
-    /// Decodes a value this type itself wrote. [`PressureResync`] is the only
-    /// writer and every store goes through `Self as u8`, so the fallback branch
-    /// cannot be reached today — but this runs once per captured packet on the
-    /// capture thread, wrapped in `catch_unwind` by `spawn_capture_with_budget`,
-    /// so a panic here would cost a player the whole session. It follows the
-    /// same policy `stream.rs` uses for `pending_after_release`: a conservative
-    /// value plus a named report, with the fail-fast kept in `debug_assert!` so
-    /// an abort costs a stack trace, not a session.
-    ///
-    /// `Pending`, not `Ack`, is the conservative choice: it keeps segments
-    /// blocked and a marker owed, where `Ack` would drop the resync marker and
-    /// leave reassembly anchored on bytes that never arrived.
+    /// The fallback cannot be reached today, but this runs once per captured
+    /// packet and a panic there costs a player the session — so, as with
+    /// `stream.rs`'s `pending_after_release`, a conservative value plus a report
+    /// with the fail-fast left in `debug_assert!`. `Pending` is the conservative
+    /// one: `Ack` would drop the marker and leave reassembly anchored on bytes
+    /// that never arrived.
     fn from_u8(value: u8) -> Self {
         match value {
             0 => Self::Ack,
@@ -96,8 +77,7 @@ impl Resync {
     }
 }
 
-/// The impossible branch of [`Resync::from_u8`], kept out of a body that runs
-/// once per captured packet.
+/// Kept out of [`Resync::from_u8`], which runs once per captured packet.
 #[cold]
 #[inline(never)]
 fn report_unknown_resync(value: u8) {
@@ -108,16 +88,14 @@ fn report_unknown_resync(value: u8) {
     debug_assert!(false, "PressureResync holds only its own discriminants");
 }
 
-/// Lossless single-producer pressure marker protocol. A full metadata queue
-/// leaves the request Pending; capture retries before admitting later bytes.
+/// Lossless single-producer pressure marker. A full metadata queue leaves the
+/// request Pending; capture retries before admitting later bytes.
 ///
 /// `Relaxed` throughout, deliberately: this atomic is a state machine, not a
-/// publication channel. The only thing that crosses the thread boundary is the
-/// [`CaptureEvent::PressureResync`] marker, and it rides the `mpsc` channel,
-/// which supplies the happens-before edge. What must hold here — the marker is
-/// never enqueued twice, and never lost when `try_send` reports `Full` — rests
-/// on RMW atomicity and on the modification order over a single location, both
-/// of which `Relaxed` already gives. Do not "strengthen" these back.
+/// publication channel — the marker itself rides the `mpsc`, which supplies the
+/// happens-before edge. What must hold (never enqueued twice, never lost on a
+/// `Full`) rests on RMW atomicity and single-location modification order, both
+/// of which `Relaxed` gives. Do not "strengthen" these back.
 #[derive(Clone, Default)]
 pub(super) struct PressureResync(Arc<AtomicU8>);
 

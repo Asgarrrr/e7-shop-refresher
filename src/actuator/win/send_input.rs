@@ -2,15 +2,13 @@
 //! the real foreground window.
 //!
 //! Everything that reaches process-global input state sits behind the
-//! [`InputDriver`] trait declared here, which is what lets the event-order tests
-//! prove that validation happens before injection without moving the player's
-//! mouse or stealing anyone's focus. The window itself, and the checks that
-//! decide whether it may be driven at all, come from the module root.
+//! [`InputDriver`] trait, which is what lets the event-order tests prove that
+//! validation happens before injection without moving the player's mouse or
+//! stealing anyone's focus.
 //!
-//! [`sendinput_result`] is `pub(super)` — visible in the `win` tree and nowhere
-//! else — because it is the *evidence* the DPI preflight cites for why the
-//! awareness has to be read back rather than inferred: this backend cannot report
-//! a mis-scaled click at all. [`dpi`](super::dpi) links to it for that reason.
+//! [`sendinput_result`] is `pub(super)` only so [`dpi`](super::dpi) can link to
+//! it: this backend cannot report a mis-scaled click at all, which is why the
+//! DPI awareness has to be read back rather than inferred.
 
 use std::time::Duration;
 
@@ -34,15 +32,14 @@ use super::{
 
 /// The foreground switch is asynchronous: give it a beat before verifying.
 ///
-/// It is only ever paid *before* a press. 100 ms is longer than the whole hold
-/// a click plans (40–90 ms, `Jitter::press_ms`), so a beat spent between the
-/// `LEFTDOWN` and the `LEFTUP` would more than double the press the game
-/// measures — see [`WinSurface::release_after_down`], which is the one place
-/// that could have reached it from there and deliberately does not.
+/// The timing budget, stated once for the whole tree: a planned hold is 40–90 ms
+/// (`Jitter::press_ms`) and this settle is 100 ms, so anything that blocks
+/// between the `LEFTDOWN` and the `LEFTUP` more than doubles the press the game
+/// measures. Nothing may — see [`WinSurface::release_after_down`], the one place
+/// that could have reached this from there and deliberately does not.
 const FOCUS_SETTLE_MS: u64 = 100;
 
-/// Full range of a `MOUSEEVENTF_ABSOLUTE` coordinate — a Win32 protocol
-/// constant, like `WHEEL_DELTA` in the module root.
+/// Full range of a `MOUSEEVENTF_ABSOLUTE` coordinate.
 const ABSOLUTE_COORD_MAX: i64 = 65_535;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,13 +54,9 @@ enum InputEvent {
 /// for why this trait exists).
 trait InputDriver: Send {
     fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError>;
-    /// The preflight probe of [`probe_window_reachable`], raw.
-    ///
-    /// Hands back the thread's last-error untouched instead of a
-    /// [`SurfaceError`] so that the *classification* — which message the player
-    /// reads, and whether the loop stops — stays in one pure function
-    /// ([`preflight_refusal`]) that the tests can drive with a synthetic
-    /// `ERROR_ACCESS_DENIED` and no Win32 anywhere.
+    /// [`probe_window_reachable`], handing back the thread's last-error
+    /// untouched so the classification stays in the pure [`preflight_refusal`],
+    /// which tests drive with a synthetic `ERROR_ACCESS_DENIED`.
     fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()>;
     fn foreground_window(&mut self) -> Hwnd;
     fn request_foreground(&mut self, hwnd: Hwnd);
@@ -91,11 +84,9 @@ impl InputDriver for SystemInputDriver {
     }
 
     fn request_foreground(&mut self, hwnd: Hwnd) {
-        // The refusal is dropped on purpose: `SetForegroundWindow` reports
-        // FALSE both when the switch is denied and when it merely has not
-        // happened yet, so its verdict is worthless. `ensure_foreground`
-        // sleeps and then re-reads the actual foreground window — that read
-        // is the authority, and it is the one that produces the error.
+        // The refusal is dropped on purpose: `SetForegroundWindow` reports FALSE
+        // both when the switch is denied and when it merely has not happened
+        // yet. `ensure_foreground`'s re-read after the settle is the authority.
         // SAFETY: `hwnd` is the handle `acquire` found; the call validates it
         // itself and answers FALSE for a window that died in between.
         let _ = unsafe { SetForegroundWindow(hwnd.raw()) };
@@ -124,13 +115,10 @@ impl InputDriver for SystemInputDriver {
 /// `SendInput` backend: real cursor, real foreground.
 ///
 /// The driver stays erased behind `Box<dyn InputDriver>` even though production
-/// only ever holds the one ZST. `trait-002` proposed
-/// `WinSurface<D: InputDriver = SystemInputDriver>` instead, and it does not
-/// stand alone: `InputDriver`/`SystemInputDriver` are private to this module, so
-/// a type parameter over them makes `WinSurface` leak a private type
-/// (`private_bounds`, `private_interfaces` — red under `-D warnings`) and
-/// `run_executor(WinSurface::default(), …)` in `src/app/mod.rs` becomes a hard
-/// error. Measured, not assumed. The allocation is one per session.
+/// only ever holds the one ZST: `InputDriver`/`SystemInputDriver` are private to
+/// this module, so `trait-002`'s `WinSurface<D: InputDriver = SystemInputDriver>`
+/// would leak a private type (`private_bounds`, `private_interfaces` — red under
+/// `-D warnings`). Measured, not assumed; the allocation is one per session.
 pub struct WinSurface {
     driver: Box<dyn InputDriver>,
 }
@@ -151,15 +139,12 @@ impl WinSurface {
         }
     }
 
-    /// The part of acquiring that both doors owe: find the window by title, then
-    /// refuse one this process may not drive.
-    ///
-    /// The probe comes before the foreground is stolen and before any coordinate
-    /// is planned — a window this process may not drive is not worth pulling
-    /// forward, and `SendInput` will not report the refusal later, see
-    /// [`probe_window_reachable`]. A dry run keeps
-    /// it: it provably changes nothing, and "the real run would be refused" is
-    /// the most useful sentence a rehearsal can print.
+    /// The part of acquiring that both doors owe. The probe comes before the
+    /// foreground is stolen and before any coordinate is planned — an
+    /// unreachable window is not worth pulling forward, and `SendInput` will not
+    /// report the refusal later (see [`probe_window_reachable`]). A dry run
+    /// keeps it: it provably changes nothing, and "the real run would be
+    /// refused" is the most useful sentence a rehearsal can print.
     fn locate(&mut self) -> Result<Hwnd, SurfaceError> {
         let hwnd = self.driver.find_game_window()?;
         self.driver
@@ -183,22 +168,12 @@ impl WinSurface {
     }
 
     /// Everything [`validate_target`](Self::validate_target) checks that is a
-    /// pure *read*: the acquired title still names this exact HWND, and its
-    /// planned screen rectangle is unchanged and usable. The ordering is part of
-    /// the safety contract.
-    ///
-    /// Split out from `validate_target` rather than inlined twice because
+    /// pure *read*, split out because
     /// [`release_after_down`](Self::release_after_down) needs exactly this half
-    /// and must not have the other: `FindWindowW`, `GetClientRect` and
-    /// `ClientToScreen` are answered out of window-manager state without ever
-    /// entering Epic Seven's message loop — contrast `SetWindowPos` in
-    /// [`probe_window_reachable`], which does, and is why that call needed a hang
-    /// check — so these three cost their syscalls and cannot wait on anything.
-    ///
-    /// `target` arrives from the caller — the executor's guard, holding what
-    /// `acquire` produced — rather than out of a field this type kept: everything
-    /// checked below is about the *world* having moved, which is the only failure
-    /// left once "was there an acquire at all" is carried by the type.
+    /// and must not have the other. `FindWindowW`, `GetClientRect` and
+    /// `ClientToScreen` are answered out of window-manager state and cannot wait
+    /// on anything; `SetWindowPos` does enter Epic Seven's message loop, which is
+    /// why [`probe_window_reachable`] needed a hang check and this does not.
     fn verify_placement(&mut self, target: Target) -> Result<(), SurfaceError> {
         let titled = self.driver.find_game_window()?;
         if titled != target.hwnd {
@@ -223,27 +198,18 @@ impl WinSurface {
         self.ensure_foreground(target.hwnd)
     }
 
-    /// [`validate_target`](Self::validate_target) with the acting taken out: the
-    /// same placement reads, and a bare look at who owns the foreground in place
-    /// of a demand to own it.
-    ///
-    /// This is what a check is allowed to be while the left button is down. It
-    /// can still answer the only question that matters there — did this click
-    /// land where the job aimed it — but it cannot call `SetForegroundWindow`,
-    /// cannot sleep [`FOCUS_SETTLE_MS`], and so cannot stretch the press.
+    /// [`validate_target`](Self::validate_target) with the acting taken out: a
+    /// bare look at who owns the foreground in place of a demand to own it. This
+    /// is what a check is allowed to be while the left button is down — no
+    /// `SetForegroundWindow`, no [`FOCUS_SETTLE_MS`] sleep, so it cannot stretch
+    /// the press.
     ///
     /// `Recoverable`, where [`ensure_foreground`](Self::ensure_foreground)'s
-    /// refusal is `Fatal`, and the difference is what was actually learned. There
-    /// the app *asked* for the foreground and Windows still refused it after a
-    /// full settle, which is a condition that does not heal while both processes
-    /// keep running. Here nothing was asked: someone else simply owns the
-    /// foreground this instant — an alt-tab, a notification, the player replying
-    /// to a message — and the next job's `acquire` pulls the game back in front
-    /// as a matter of course. That is `Recoverable`'s own definition, the world
-    /// moving under a job, and halting the watch on it would end a session on a
-    /// keystroke the player is entitled to make. If the foreground really has
-    /// become unobtainable, the retry's `acquire` is where that is discovered —
-    /// by the code that tries for it, which is the only code entitled to say so.
+    /// refusal is `Fatal`: there the app *asked* for the foreground and Windows
+    /// refused after a full settle, which does not heal while both processes
+    /// keep running, whereas here nothing was asked and the next job's `acquire`
+    /// takes the foreground back — producing the `Fatal` itself if it genuinely
+    /// cannot.
     fn observe_target(&mut self, target: Target) -> Result<(), SurfaceError> {
         self.verify_placement(target)?;
         if self.driver.foreground_window() != target.hwnd {
@@ -263,34 +229,21 @@ impl WinSurface {
 
     /// This backend's half of [`release_twice`]: *look*, then `LEFTUP`.
     ///
-    /// Look, not validate, and the word is the whole decision. Once the button is
-    /// down the only obligation left is to get it up on schedule, so nothing here
-    /// may block, sleep, or try to put anything right. This used to call the full
-    /// [`validate_target`](Self::validate_target), which does all three: on a
-    /// foreground lost mid-hold it calls `SetForegroundWindow` and then sleeps
-    /// [`FOCUS_SETTLE_MS`], so a planned 40–90 ms press (`Jitter::press_ms`)
-    /// became a 140–190 ms one — and 190 ms is not a slow click, it is a
-    /// different gesture, which is exactly what a game reading a long-press
-    /// would make of it. Activating windows while the button is held is the
-    /// second half of the same mistake: whatever the recovery lands on receives
-    /// a button that went down somewhere else.
+    /// Look, not validate, and the word is the whole decision. Nothing here may
+    /// block, sleep, or put anything right: this used to call the full
+    /// [`validate_target`](Self::validate_target), whose `SetForegroundWindow`
+    /// plus [`FOCUS_SETTLE_MS`] sleep turned the planned press into a 140–190 ms
+    /// one, a long-press rather than a click — and activated a window that would
+    /// then receive a button pressed somewhere else. Recovery belongs before the
+    /// press, where `send_guarded` refuses the `LEFTDOWN` if it cannot pull the
+    /// window forward, and after the release, in the next job's `acquire`.
     ///
-    /// Recovery has two legitimate homes and this is neither. Before the press,
-    /// where `send_guarded` already pulls the window forward and refuses the
-    /// `LEFTDOWN` if it cannot — `focus_loss_during_move_settle_blocks_left_down`
-    /// pins that, and it is why the case reaching here is only ever a loss during
-    /// the hold itself. And after the release, in the next job's `acquire`.
+    /// What is *not* dropped is the finding: a click released over a window that
+    /// no longer owned the foreground did not land where the job aimed it, so
+    /// releasing promptly must not become releasing quietly. That verdict goes in
+    /// `release_twice`'s first slot, returned once the button is provably up.
     ///
-    /// What is *not* dropped is the finding. A click released over a window that
-    /// no longer owned the foreground did not land where the job aimed it, and the
-    /// caller has to hear that even though the release itself succeeded —
-    /// releasing promptly must not become releasing quietly. `release_twice`'s
-    /// first slot is where that verdict goes: its `Err` is returned once the
-    /// button is provably up, and the button goes up on every path through it.
-    ///
-    /// The borrow has to be split by hand because both closures want
-    /// `&mut self` — hence the raw pointer-free dance of looking first into a
-    /// `Result` and handing `release_twice` a closure that only needs the driver.
+    /// The `observed` binding exists because both closures want `&mut self`.
     fn release_after_down(&mut self, target: Target) -> Result<(), SurfaceError> {
         let observed = self.observe_target(target);
         let driver = &mut self.driver;
@@ -312,12 +265,11 @@ impl Surface for WinSurface {
     /// step: `SendInput` aims at whatever owns the foreground, so a live job
     /// cannot skip the steal and a dry run must not perform it.
     ///
-    /// The order in `acquire` is left alone rather than reused here, which is why
-    /// the rect read is spelled twice. `ensure_foreground` restores a minimized
-    /// window, so measuring after it is what makes a live job's rect the
-    /// restored one; a dry run reads whatever is there and reports a minimized
-    /// window as the recoverable abort it would be. Swapping the two lines to
-    /// share them would quietly move a live job onto the second behaviour.
+    /// The rect read is spelled twice rather than shared: `ensure_foreground`
+    /// restores a minimized window, so measuring after it is what makes a live
+    /// job's rect the restored one, while a dry run reads whatever is there.
+    /// Sharing the two lines would quietly move a live job onto the second
+    /// behaviour.
     fn measure(&mut self) -> Result<(Target, ClientRect), SurfaceError> {
         let hwnd = self.locate()?;
         let rect = self.driver.client_rect(hwnd)?;
@@ -351,16 +303,14 @@ impl Surface for WinSurface {
     }
 
     // No `release`: this backend engaged nothing outside the events it already
-    // sent, and the `Option<Target>` its `release` used to clear does not exist
-    // any more — the window is the executor guard's, and it drops with the job.
+    // sent, and the window is the executor guard's, dropping with the job.
 }
 
-/// One `SM_*` metric. Win32 has no error channel here: an unknown index (or
-/// a metric the session cannot answer) simply reads back 0.
+/// One `SM_*` metric. Win32 has no error channel here: an unknown index (or a
+/// metric the session cannot answer) simply reads back 0.
 fn system_metric(index: i32) -> i32 {
-    // SAFETY: the call reads a process-global integer and takes no pointer or
-    // handle; every index reaching it is a documented `SM_*` constant, and any
-    // other value would return 0 rather than fault.
+    // SAFETY: the call takes no pointer or handle, and any index it does not
+    // recognize returns 0 rather than faulting.
     unsafe { GetSystemMetrics(index) }
 }
 
@@ -379,17 +329,11 @@ fn move_cursor(at: (i32, i32)) -> Result<(), SurfaceError> {
     send_input(MOUSEINPUT {
         // Clamped, not truncated: a failed `GetSystemMetrics` reads 0, the
         // `.max(1)` above turns that into a width of 1, and the ratio then
-        // leaves i32 entirely. Landing on the desktop edge is wrong but
-        // bounded; a wrapped `as i32` would aim anywhere.
-        //
-        // Which is a panic guard on an unreachable path, not a misclick on a
-        // reachable one — worth stating, because `.max(1)` reads as a live case.
-        // Getting here means `acquire` already found the game window, proved it
-        // reachable, pulled it to the foreground and measured a client rect
-        // `Viewport::of` accepted as at least 16:9. A session whose virtual
-        // screen has no extent has none of those. `docs/tech-debt/09-num.md`'s
-        // `num-008` rules the same way and files the `NonZeroI32` spelling that
-        // would make the guard unremovable as a nit for whoever next opens this.
+        // leaves i32 entirely — a wrapped `as i32` would aim anywhere, while the
+        // desktop edge is at least bounded. An unreachable path, not a live one:
+        // getting here means `acquire` already measured a client rect
+        // `Viewport::of` accepted, which a session with no virtual screen cannot
+        // have.
         dx: dx.clamp(0, ABSOLUTE_COORD_MAX) as i32,
         dy: dy.clamp(0, ABSOLUTE_COORD_MAX) as i32,
         mouseData: 0,
@@ -403,10 +347,8 @@ fn send_mouse(data: i32, flags: u32) -> Result<(), SurfaceError> {
     send_input(MOUSEINPUT {
         dx: 0,
         dy: 0,
-        // `mouseData` is a `u32` holding a signed wheel delta in its low word:
-        // spelled out rather than left to `as _`, so the reinterpretation is
-        // visible instead of inferred from the field's declaration in another
-        // crate.
+        // `mouseData` is a `u32` holding a signed wheel delta in its low word;
+        // spelled out so the reinterpretation is visible rather than inferred.
         mouseData: data.cast_unsigned(),
         dwFlags: flags,
         time: 0,
@@ -420,11 +362,9 @@ fn send_input(mi: MOUSEINPUT) -> Result<(), SurfaceError> {
         Anonymous: INPUT_0 { mi },
     };
     // SAFETY: `input` is one fully initialized `INPUT` living for the whole
-    // call. The count is 1, matching the single-element pointer, and the
-    // third argument is `size_of::<INPUT>()` — the stride of *one* structure,
-    // not the byte length of the array. Passing the total size there is the
-    // classic mistake that makes `SendInput` reject everything; this is the
-    // correct form.
+    // call, the count of 1 matches the single-element pointer, and the third
+    // argument is the stride of *one* structure — passing the array's total size
+    // there is the classic mistake that makes `SendInput` reject everything.
     let inserted = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
     sendinput_result(inserted)
 }
@@ -433,12 +373,10 @@ fn send_input(mi: MOUSEINPUT) -> Result<(), SurfaceError> {
 /// anything else means the input was blocked (foreground lock, full queue).
 /// Recoverable: the watchdog re-issues against a fresh acquire.
 ///
-/// Note what is *not* in that list: UIPI. The documentation is explicit —
-/// "neither `GetLastError` nor the return value will indicate the failure was
-/// caused by UIPI blocking" — so a window out of this process's reach makes this
-/// function answer `Ok(())` while nothing moves in the game. That blind spot is
-/// covered at acquire time by [`probe_window_reachable`], and it cannot be
-/// covered here.
+/// Note what is *not* in that list: UIPI. "Neither `GetLastError` nor the return
+/// value will indicate the failure was caused by UIPI blocking", so an
+/// out-of-reach window makes this answer `Ok(())` while nothing moves in the
+/// game — a blind spot only [`probe_window_reachable`] can cover.
 pub(super) fn sendinput_result(inserted: u32) -> Result<(), SurfaceError> {
     if inserted == 1 {
         Ok(())
@@ -475,9 +413,9 @@ mod tests {
         foreground: Hwnd,
         rect: ClientRect,
         find_results: VecDeque<Result<Hwnd, SurfaceError>>,
-        /// Scripted preflight outcomes, raw: an `Err` here is the thread's
-        /// last-error as Win32 would have left it, so the tests exercise the
-        /// real classification instead of a pre-classified verdict.
+        /// Raw: an `Err` here is the thread's last-error as Win32 would have
+        /// left it, so the tests exercise the real classification rather than a
+        /// pre-classified verdict.
         probe_results: VecDeque<std::io::Result<()>>,
         foreground_results: VecDeque<Hwnd>,
         rect_results: VecDeque<Result<ClientRect, SurfaceError>>,
@@ -587,9 +525,8 @@ mod tests {
         (surface, state)
     }
 
-    /// Acquires, checks the rect, and hands back the window every later call in
-    /// the test has to present — which is the whole shape of `api-004`: the test
-    /// cannot reach an input without holding the proof of an acquire either.
+    /// Hands back the window every later call has to present: under `api-004` a
+    /// test cannot reach an input without the proof of an acquire either.
     fn acquire_and_clear(surface: &mut WinSurface, state: &Arc<Mutex<FakeState>>) -> Target {
         let (target, rect) = surface.acquire().expect("the fake acquires");
         assert_eq!(rect, game_rect());
@@ -611,9 +548,9 @@ mod tests {
             .collect()
     }
 
-    /// Where a call landed in the recorded sequence. Panics rather than returning
-    /// an `Option`: every caller is asserting *about* the call, so its absence is
-    /// the test failing, not a case to handle.
+    /// Where a call landed in the recorded sequence. Panics rather than
+    /// returning an `Option`: every caller asserts *about* the call, so its
+    /// absence is the test failing, not a case to handle.
     fn index_of(calls: &[DriverCall], wanted: &DriverCall) -> usize {
         calls
             .iter()
@@ -638,9 +575,8 @@ mod tests {
             .foreground_results
             .extend([OTHER_HWND, GAME_HWND]);
 
-        // The target is *returned* rather than stashed in the surface: the rect
-        // the executor plans against and the window the inputs are aimed at come
-        // out of the same call, so they cannot disagree.
+        // The rect the executor plans against and the window the inputs are
+        // aimed at come out of the same call, so they cannot disagree.
         let (target, rect) = surface.acquire().expect("the fake acquires");
         assert_eq!(rect, game_rect());
         assert_eq!(target.hwnd, GAME_HWND);
@@ -649,9 +585,8 @@ mod tests {
             calls(&state),
             vec![
                 DriverCall::FindWindow,
-                // The preflight comes before the foreground steal: a window this
-                // process may not drive is not worth pulling in front of the
-                // player's own.
+                // Before the foreground steal: an unreachable window is not
+                // worth pulling in front of the player's own.
                 DriverCall::Probe(GAME_HWND),
                 DriverCall::Foreground,
                 DriverCall::RequestForeground(GAME_HWND),
@@ -662,20 +597,16 @@ mod tests {
         );
     }
 
-    /// The dry-run door, against the same fake as its live twin above. `Mode`
-    /// promises to send nothing, and on this backend `acquire` broke that promise
-    /// before a coordinate was even planned: `RequestForeground` is a real
-    /// `SetForegroundWindow`, so rehearsing the plan yanked Epic Seven in front
-    /// of whatever the player was doing, every tick, for no input at all.
-    ///
-    /// The call list is the assertion, not a count: `FindWindow` and `Probe` must
-    /// stay (a dry run that cannot name a UIPI refusal has stopped rehearsing)
-    /// and `ClientRect` must stay (it is what resolves the screen coordinates the
-    /// journal prints). Only the three foreground calls and the focus settle go.
+    /// `RequestForeground` is a real `SetForegroundWindow`, so a dry run through
+    /// `acquire` yanked Epic Seven in front of the player every tick, for no
+    /// input at all. The call list is the assertion, not a count: `FindWindow`
+    /// and `Probe` must stay (a dry run that cannot name a UIPI refusal has
+    /// stopped rehearsing) and so must `ClientRect` (it resolves the screen
+    /// coordinates the journal prints).
     #[test]
     fn measure_reads_the_window_without_pulling_it_forward() {
         let (mut surface, state) = fake_surface();
-        // The foreground belongs to someone else — the case where `acquire` would
+        // The foreground belongs to someone else: the case where `acquire` would
         // take it away.
         state
             .lock()
@@ -875,12 +806,11 @@ mod tests {
         assert_eq!(sent_events(&state), vec![InputEvent::Move((30, 40))]);
     }
 
-    // Do not re-add a test for "input after release, or with no acquire at
-    // all, is Fatal not a panic" (it used to live here and in `post_message`'s
-    // test module): since `api-004` there is no `Option<Target>` to be `None`,
-    // so the call cannot be written without a `Target` to present — the state
-    // is unrepresentable, not merely untested. What it guarded is now pinned in
-    // `actuator::mod`'s `every_input_and_the_release_see_the_window_that_job_acquired`.
+    // Do not re-add a test for "input after release, or with no acquire at all,
+    // is Fatal not a panic": since `api-004` the call cannot be written without
+    // a `Target` to present, so the state is unrepresentable rather than
+    // untested. What it guarded is pinned in `actuator::mod`'s
+    // `every_input_and_the_release_see_the_window_that_job_acquired`.
 
     #[test]
     fn send_refusal_before_left_down_never_synthesizes_left_up() {
@@ -902,32 +832,26 @@ mod tests {
         );
     }
 
-    /// The hold the game measures is the hold the job planned, even when the
-    /// foreground goes elsewhere while the button is down.
-    ///
-    /// This replaces `focus_is_restored_before_guarded_left_up`, which asserted
-    /// the opposite — that `RequestForeground` came before the `LEFTUP` — and was
-    /// pinning the defect. Restoring focus there meant `SetForegroundWindow` plus
-    /// a `FOCUS_SETTLE_MS` sleep *inside* the press: 90 + 100 ms held, which the
-    /// game reads as a long-press rather than a click. Do not re-add it; the
-    /// foreground is restored before the `LEFTDOWN`
-    /// (`focus_loss_during_move_settle_blocks_left_down`) and again at the next
-    /// `acquire`, which are the two moments recovery costs nothing.
+    /// Do not re-add `focus_is_restored_before_guarded_left_up`, which this
+    /// replaces: it asserted that `RequestForeground` came before the `LEFTUP`,
+    /// which is the defect — `SetForegroundWindow` plus a `FOCUS_SETTLE_MS`
+    /// sleep *inside* the press makes 90 + 100 ms, a long-press rather than a
+    /// click. Recovery belongs before the `LEFTDOWN`
+    /// (`focus_loss_during_move_settle_blocks_left_down`) and at the next
+    /// `acquire`.
     #[test]
     fn a_foreground_lost_mid_press_does_not_stretch_the_hold() {
         let (mut surface, state) = fake_surface();
         let target = acquire_and_clear(&mut surface, &state);
         // Focus survives the move and the press, then goes elsewhere while the
-        // button is held — the one window in which a click can be turned into a
-        // gesture nobody planned.
+        // button is held.
         state
             .lock()
             .unwrap()
             .foreground_results
             .extend([GAME_HWND, GAME_HWND, OTHER_HWND]);
 
-        // 90 ms is the top of `Jitter::press_ms`'s 40..=90 band: the longest hold
-        // the planner can actually emit, so this is the worst case.
+        // 90 ms is the top of `Jitter::press_ms`'s band: the worst case.
         let verdict = surface.click(&target, (30, 40), 90);
 
         let actual = calls(&state);
@@ -966,8 +890,7 @@ mod tests {
 
         // Recoverable, not Fatal: nothing refused this app the foreground, it
         // merely observed someone else holding it, and the next `acquire` takes
-        // it back. Halting the watch would make an alt-tab mid-click a stop the
-        // player has to undo by hand.
+        // it back.
         assert!(matches!(
             surface.click(&target, (30, 40), 5),
             Err(SurfaceError::Recoverable(reason)) if reason.contains("lost the foreground")
@@ -1031,8 +954,7 @@ mod tests {
         }
 
         // The retry got the button up, so the fault worth reporting is the one
-        // that says the click missed — not the transient refusal of the first
-        // `LEFTUP`, which the second one answered.
+        // that says the click missed, not the first `LEFTUP`'s refusal.
         assert!(matches!(
             surface.click(&target, (30, 40), 5),
             Err(SurfaceError::Recoverable(reason)) if reason.contains("lost the foreground")
@@ -1120,10 +1042,8 @@ mod tests {
             surface.acquire(),
             Err(SurfaceError::Fatal(reason)) if reason.contains("higher integrity level")
         ));
-        // Nothing was focused and nothing was measured, so the job never becomes
-        // clickable — and now for a stronger reason than an unset field: the `Err`
-        // carries no `Target`, so there is no window for a later input to be
-        // aimed at.
+        // Nothing was focused and nothing was measured: the `Err` carries no
+        // `Target`, so there is no window for a later input to be aimed at.
         assert_eq!(
             calls(&state),
             vec![DriverCall::FindWindow, DriverCall::Probe(GAME_HWND)]

@@ -13,9 +13,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub struct ShopSnapshot {
     #[serde(default)]
     pub merchant: Option<String>,
-    /// The slots on offer. Tolerant per element — see [`lenient_slots`], which
-    /// carries the argument for dropping a bad slot rather than failing the
-    /// snapshot the way this field used to.
+    /// The slots on offer. Tolerant per element — see [`lenient_slots`] for
+    /// why a bad slot is dropped rather than failing the snapshot.
     #[serde(default, deserialize_with = "lenient_slots")]
     pub slots: Vec<ShopItem>,
     /// Refresh-session facts (balance, cost), grouped apart since they are
@@ -28,21 +27,9 @@ pub struct ShopSnapshot {
 /// A global catalog id — the identity the purchase echo uses to name the item
 /// the player asked for.
 ///
-/// Two things at once, both of which used to be `u32`:
-///
-/// 1. **The `0` sentinel is gone.** `NonZeroU32` inside, so "the server omitted
-///    the id" is `None` and nothing else. It used to be `id: u32` with `0` for
-///    absent, interpreted by a free `shop::catalog_id(id)` documented as the
-///    only place to do so — a contract broken while it was written:
-///    `Controller::on_purchase` re-derived it as `if item != 0 && …`. A
-///    sentinel's cost is that every reader has to remember it; the fix is
-///    making it unspellable. Both old interpreters are gone with it; the
-///    conversion now happens once, in [`optional_catalog_id`], where a raw
-///    wire number arrives.
-/// 2. **It is not a counter.** The id space used to be assignable from any
-///    `u32` in the crate: a gold balance, a price, a crystal cost, a refresh
-///    count. `checklist`, `bought`, `BuyTarget::id` and `PurchaseNotice::item`
-///    all speak this type now, so an id and an amount cannot be swapped.
+/// `NonZeroU32`, because the server spells "no id" as `0`: absence is `None`
+/// and nothing else, interpreted only in [`optional_catalog_id`]. A distinct
+/// type so an id and an amount cannot be swapped.
 ///
 /// `#[serde(transparent)]`, so the wire shape is a bare number, unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
@@ -51,7 +38,7 @@ pub struct CatalogId(NonZeroU32);
 
 impl CatalogId {
     /// The id `raw` names, or `None` for the `0` the server sends when it has
-    /// none. The single interpreter of that number — see the type.
+    /// none.
     #[must_use]
     pub const fn new(raw: u32) -> Option<Self> {
         match NonZeroU32::new(raw) {
@@ -60,7 +47,6 @@ impl CatalogId {
         }
     }
 
-    /// The number, for a wire field or a log line.
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0.get()
@@ -74,108 +60,58 @@ impl std::fmt::Display for CatalogId {
 }
 
 /// Gold — what a shop item costs, and what a purchase echo reports left in the
-/// purse. One of the two money ledgers this crate runs; [`Crystals`] is the
-/// other, and keeping them apart is the whole reason both exist.
+/// purse. One of two money ledgers; [`Crystals`] is the other, and they are
+/// distinct types so a gold price can never be weighed against a crystal
+/// budget.
 ///
-/// Both were bare `u32` until this pass: `Controller` debits a *gold* price
-/// from a *gold* balance in `plan_targets` while comparing a *crystal* spend
-/// against a *crystal* budget in `stop_reason`, and nothing but field names
-/// separated them. `progress.spent >= item.price` — a crystal budget weighed
-/// against a gold price — compiled, passed every lint, and would have
-/// silently vetoed or authorised every buy of the run. That line is
-/// `expected Crystals, found Gold` now; the rest of this type is what it
-/// took to make that true without loosening anything else.
+/// **No `Add`/`Sub`/`AddAssign`/`SubAssign`, deliberately.** `Cargo.toml` sets
+/// `overflow-checks = true` on the release profile, so `balance - price` would
+/// panic on underflow in the shipped binary. Every arithmetic site names its
+/// overflow policy instead — [`Gold::saturating_sub`] here,
+/// [`Crystals::saturating_add`] / [`Crystals::checked_add`] on the other.
 ///
-/// # No arithmetic operators, deliberately
+/// **`Option<Gold>`, not a `0` sentinel.** Unlike [`CatalogId`], zero is a
+/// legitimate value: an empty purse is a *known* balance that must veto a
+/// priced buy, while an unknown balance fails open and vetoes nothing. So
+/// there is deliberately no `deserialize_with` here — `"gold": 0` decodes to
+/// `Some(Gold(0))`.
 ///
-/// `Add`, `Sub`, `AddAssign` and `SubAssign` are not implemented; their
-/// absence is the design, not an oversight. `Cargo.toml` sets
-/// `overflow-checks = true` on the release profile (a wrapped counter used
-/// to be a silent wrong number in a shipped build), so `balance - price`
-/// panics on underflow in the shipped binary, and both operands come off
-/// the wire where nothing guarantees the order. `plan_targets` holds
-/// `price <= balance` only through a separate `affordable` term computed
-/// three lines earlier — a non-local invariant `in_reach` could break
-/// without touching the subtraction. So the operator is not spellable, and
-/// every arithmetic site names its overflow policy —
-/// [`Gold::saturating_sub`] here, [`Crystals::saturating_add`] /
-/// [`Crystals::checked_add`] on the other ledger.
-///
-/// # `Option<Gold>`, not a `0` sentinel
-///
-/// [`CatalogId`] folds absent / `null` / `0` to `None` because `0` is the
-/// server's own spelling of "no id" — the value space has no legitimate zero.
-/// Money does. An empty purse is a *known* balance of zero and must veto a
-/// priced buy; an unknown balance must fail open and veto nothing. Folding `0`
-/// to `None` here would turn "the player is broke" into "we have no idea", i.e.
-/// authorise exactly the buys that cannot happen. So `Gold` wraps a plain `u32`,
-/// absence rides in the `Option` around it, and there is deliberately **no**
-/// `deserialize_with` on the wire fields: `"gold": 0` decodes to
-/// `Some(Gold(0))`. That is the same sentinel policy as `CatalogId`, not a
-/// second one — fold the sentinel where the value space has no zero, keep the
-/// zero where it means something.
-///
-/// `#[serde(transparent)]`, so the wire shape is a bare number, unchanged —
-/// and `Serialize` too, since `Filter::max_price` is a `Gold` that
-/// `config::persist` writes back to `config.toml` as a bare
-/// `max_price = 300000`, which `config/persist.rs`'s strip test pins by
-/// string.
+/// `#[serde(transparent)]` in both directions — `Serialize` too, since
+/// `Filter::max_price` is a `Gold` that `config::persist` writes back to
+/// `config.toml` as a bare `max_price = 300000`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct Gold(u32);
 
 impl Gold {
-    /// The amount `raw` names.
-    ///
-    /// Total, unlike [`CatalogId::new`]: every `u32` is a gold amount, so there
-    /// is no `Option` to unwrap and no sentinel to interpret.
-    ///
-    /// `Filter::max_price` and `Limits::max_spend` — the player's two raw
-    /// ceilings — are `Option<Gold>` and `Option<Crystals>` themselves now, so
-    /// both comparisons are in-ledger from the parse onward. What remains for
-    /// this constructor is fixtures and the `deserialize_with`-free wire path.
+    /// The amount `raw` names. Total, unlike [`CatalogId::new`]: every `u32` is
+    /// a gold amount, so there is no sentinel to interpret.
     #[must_use]
     pub const fn new(raw: u32) -> Self {
         Self(raw)
     }
 
-    /// The number, for a wire field or a comparison against something that is
-    /// not yet a currency.
-    ///
-    /// Has no caller in the crate today — the intended steady state, not an
-    /// oversight: every comparison is in-ledger, every print goes through
-    /// [`Display`](std::fmt::Display), and the two raw ceilings that do cross
-    /// come in through [`Gold::new`] instead of dragging an amount out. It
-    /// exists so a caller who genuinely needs the number has a documented way
-    /// to ask, rather than widening the tuple field to `pub`. **Do not use it
-    /// for arithmetic** — that re-opens the hole this type closed; the ledger
-    /// has named methods for that.
+    /// The number, for a wire field or a non-currency comparison. Callerless
+    /// on purpose. **Do not use it for arithmetic** — that re-opens the hole
+    /// this type closed.
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0
     }
 
-    /// `self - rhs`, floored at zero.
-    ///
-    /// The only subtraction on this ledger, saturating because its one caller
-    /// (`Controller::plan_targets`, debiting each planned buy from the running
-    /// balance) holds `rhs <= self` only through a separate affordability
-    /// test. At zero the next item simply reads unaffordable — see the type's
-    /// note on why `Sub` is absent.
+    /// `self - rhs`, floored at zero. Its one caller
+    /// (`Controller::plan_targets`) holds `rhs <= self` only through a separate
+    /// affordability test; at zero the next item reads unaffordable.
     #[must_use]
     pub const fn saturating_sub(self, rhs: Self) -> Self {
         Self(self.0.saturating_sub(rhs.0))
     }
 }
 
-/// Crystals — "skystones" in game. What a shop refresh costs and the
-/// player's refresh budget is denominated in. The other half of the pair
-/// [`Gold`] documents.
-///
-/// This ledger *accumulates*: `Progress::spent` adds a refresh cost per
-/// issued refresh and `RefreshMeta::crystal_balance` is debited by the same
-/// amount, so it carries an add where [`Gold`] carries only a subtract. Both
-/// directions are explicit about overflow for the reason [`Gold`] gives.
+/// Crystals — "skystones" in game. What a shop refresh costs and the player's
+/// refresh budget is denominated in; the other half of the pair [`Gold`]
+/// documents. This ledger accumulates, so it carries an add where [`Gold`]
+/// carries only a subtract.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct Crystals(u32);
@@ -183,41 +119,28 @@ pub struct Crystals(u32);
 impl Crystals {
     /// The amount `raw` names. Total, like [`Gold::new`], and for the same
     /// reason: zero crystals is a real balance.
-    ///
-    /// `Controller::stop_reason` used to lift `[limits] max_spend` here so the
-    /// budget comparison `type-004` was filed against had two crystal operands.
-    /// The field is a `Crystals` now, so that call is gone — see [`Gold::new`].
     #[must_use]
     pub const fn new(raw: u32) -> Self {
         Self(raw)
     }
 
-    /// The number. Callerless and deliberately so — see [`Gold::get`], which
-    /// carries the argument for both.
+    /// The number. Callerless and deliberately so — see [`Gold::get`].
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0
     }
 
-    /// `self + rhs`, capped at `u32::MAX`.
-    ///
-    /// Spend accumulation: a run long enough to overflow a `u32` of crystals
-    /// has already tripped every budget the player could set, so pinning at the
-    /// ceiling keeps `stop_reason` halting rather than panicking on the
-    /// overflow-checked release profile.
+    /// `self + rhs`, capped at `u32::MAX`: pinning keeps `stop_reason` halting
+    /// rather than panicking on the overflow-checked release profile.
     #[must_use]
     pub const fn saturating_add(self, rhs: Self) -> Self {
         Self(self.0.saturating_add(rhs.0))
     }
 
-    /// `self + rhs`, or `None` on overflow.
-    ///
-    /// Not interchangeable with [`Crystals::saturating_add`]: `stop_reason`
-    /// asks whether the *next* refresh would cross the budget, and a
-    /// saturating answer there reads as "`u32::MAX`, over budget" —
-    /// accidentally right, for the wrong reason. `None` says "this cannot be
-    /// computed, so the ceiling is certainly crossed", which is what the
-    /// caller means.
+    /// `self + rhs`, or `None` on overflow. Not interchangeable with
+    /// [`Crystals::saturating_add`]: `stop_reason` asks whether the *next*
+    /// refresh crosses the budget, and a saturated `u32::MAX` would answer
+    /// "over budget" for the wrong reason.
     #[must_use]
     pub const fn checked_add(self, rhs: Self) -> Option<Self> {
         match self.0.checked_add(rhs.0) {
@@ -227,50 +150,35 @@ impl Crystals {
     }
 
     /// `self - rhs`, floored at zero. Debits the locally-tracked balance per
-    /// advised refresh; a balance already at zero stays there and
-    /// `stop_reason`'s out-of-funds test fires on the next gate.
+    /// advised refresh; at zero `stop_reason` fires out-of-funds on the next
+    /// gate.
     #[must_use]
     pub const fn saturating_sub(self, rhs: Self) -> Self {
         Self(self.0.saturating_sub(rhs.0))
     }
 }
 
-/// A gold amount renders as a thousands-grouped decimal, and only that way.
-///
-/// `Display` rather than leaving every site to call `render::grouped` itself:
-/// the four places that print an amount — the status-bar balance tiles, the
-/// slot table's price column, the console/tooltip item line, and the
-/// journal's "bought" line — each decided grouping on their own, and the last
-/// one did not group at all: `{gold} gold left` printed `250000` in the
-/// journal while the table beside it showed `250,000`. Now there is one
-/// rendering per currency, living on the currency.
-///
-/// The call goes `domain` → `render`, the one edge in that direction. Two
-/// alternatives: writing this impl inside `render.rs` (legal, but then a
-/// reader of `shop.rs` cannot see the type has a `Display` at all), or moving
-/// `grouped` down here (it also formats refresh counts, which are not money,
-/// so it would be a number formatter homed in the shop model). `grouped` is a
-/// pure `u32` → `String` with no I/O and no state.
+/// Thousands-grouped, and only that way: one rendering per currency, so no
+/// call site can decide grouping on its own (one of the four once did not
+/// group at all). The `domain` → `render` call is the one edge in that
+/// direction and is deliberate; `grouped` is a pure `u32` → `String`.
 impl std::fmt::Display for Gold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&crate::render::grouped(self.0))
     }
 }
 
-/// Grouped like [`Gold`] — see that impl for why the rendering lives on the
-/// currency and not at the four call sites.
+/// Grouped like [`Gold`], for the reason that impl gives.
 impl std::fmt::Display for Crystals {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&crate::render::grouped(self.0))
     }
 }
 
-/// Reads a wire catalog id: absent, `null` and `0` all mean "no id".
-///
-/// The one place a raw id number is interpreted — see [`CatalogId`]. `0` is
-/// the server's own spelling of absent, so it is accepted and folded here
-/// rather than refused: the message is still good, it just cannot be tied
-/// back to a slot.
+/// Reads a wire catalog id: absent, `null` and `0` all mean "no id". The one
+/// place a raw id number is interpreted — see [`CatalogId`]. A `0` is folded
+/// rather than refused: the message is still good, it just cannot be tied back
+/// to a slot.
 pub(crate) fn optional_catalog_id<'de, D>(de: D) -> Result<Option<CatalogId>, D::Error>
 where
     D: Deserializer<'de>,
@@ -300,11 +208,9 @@ pub struct RefreshMeta {
 /// snapshot. The value is consumed wholesale first — a bare `?` on the typed
 /// parse would abort the surrounding message mid-stream.
 ///
-/// Logged, because both fields change app behavior, not just what it shows:
-/// a dropped `limit` makes a sold-out slot read buyable (the actuator clicks
-/// Buy, no echo arrives, and the watchdog halts `Unresponsive` blaming the
-/// game), and a dropped `refresh` silently disables out-of-funds detection.
-/// `debug!` not `warn!`: the default filter keeps it in the log file.
+/// Logged because both fields change behaviour, not just display: a dropped
+/// `limit` makes a sold-out slot read buyable (ending in a `Unresponsive` halt
+/// that blames the game), a dropped `refresh` disables out-of-funds detection.
 fn object_or_none<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -326,10 +232,8 @@ where
 
 /// Tolerant wire collection (`substats`): an undecodable element is dropped,
 /// a non-array value degrades to empty — the containing message survives.
-///
-/// Logged for the same reason as [`object_or_none`]: a silently shortened
-/// substat list quietly fails `min_substats` and every `required_substats`
-/// threshold, so the loop refreshes past an item the player wanted.
+/// Logged, because a silently shortened substat list fails `min_substats` and
+/// every `required_substats` threshold, refreshing past a wanted item.
 fn lenient_elements<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -361,73 +265,28 @@ where
 /// Tolerant slot list: an undecodable slot is dropped, a non-array value
 /// degrades to empty — the snapshot survives either way.
 ///
-/// Its own function rather than [`lenient_elements`], which its body nearly
-/// repeats, because the argument for dropping a *slot* is not the argument for
-/// dropping a substat, and because the loss worth logging here is the arity,
-/// which needs counting rather than listing.
+/// A missed match beats the alternative: a bare `Vec<ShopItem>` propagates the
+/// element's error up through the internally-tagged `ServerMessage`, where
+/// `#[serde(other)] Unknown` cannot catch it (that arm rescues an unknown
+/// *tag*, not an undecodable payload), so the whole message is dropped and the
+/// armed `Expectation` climbs to `StopReason::Unresponsive`.
 ///
-/// # Why dropping beats the failure it replaces
+/// **Hazard, judged remote but real:** [`ShopItem::effective_slot`] falls back
+/// to the 1-based position, so a shop that *both* omits `slot` numbers and
+/// ships an undecodable slot renumbers past the hole and the actuator clicks
+/// one row off — a wrong buy with real gold. Keeping the arity with a default
+/// [`ShopItem`] is worse: `dedup::fingerprint` yields `None` when any slot has
+/// no id, so one bad scalar would disable duplicate suppression for that roll
+/// and every re-delivery would bill another refresh.
 ///
-/// Dropping a slot is a real loss, and a worse one than [`lenient_elements`]
-/// takes: the filter then sees five slots and calls that the shop, so a match
-/// in the sixth is missed and the loop refreshes past the item the player was
-/// hunting, with nothing on screen saying a slot went missing. What makes it
-/// the better branch is what the alternative actually was. A bare
-/// `Vec<ShopItem>` propagates an element's error up through the
-/// internally-tagged `ServerMessage`, where `#[serde(other)] Unknown` cannot
-/// catch it — that arm rescues an unknown *tag*, not a payload that failed to
-/// decode — so `websocket::forward` dropped the whole message at `debug!`. No
-/// snapshot reached the view, `last_shop_ms` never advanced, and the
-/// `Expectation` armed by the last refresh climbed the ladder to
-/// `StopReason::Unresponsive`.
+/// `warn!` once per snapshot naming the arity (the per-slot serde errors stay
+/// at `debug!`): the only on-screen trace is a gap in the slot column.
 ///
-/// So the choice was never one missed match against none. It was one missed
-/// match against six missed matches *and* a stopped run *and* a halt reason
-/// that sends the player to look at Epic Seven — check the window, restart the
-/// client — when what happened is that the analysis server put a `300` in a
-/// `u8`. Failing loudly is only worth something when it points at the right
-/// thing.
-///
-/// # What it costs, named rather than waved past
-///
-/// [`ShopItem::effective_slot`] falls back to the 1-based *position* when the
-/// server omits `slot`, so a shop that both omits slot numbers and ships one
-/// undecodable slot renumbers everything after the hole and the actuator
-/// clicks one row off — a wrong buy with real gold, not a missed one. That
-/// needs two independent server faults at once and `slot` is pinned by the
-/// wire fixture in `uplink::protocol`, so it is judged remote; it is written
-/// down because it is the only branch here that spends money rather than
-/// losing an opportunity.
-///
-/// Substituting a default [`ShopItem`] for the bad one — keeping the arity, so
-/// nothing renumbers — is the obvious answer to that and is worse:
-/// `dedup::fingerprint` yields `None` when any slot has no id, and a
-/// placeholder has none, so one bad scalar would switch duplicate suppression
-/// off for that roll and every re-delivery of the same shop would bill another
-/// refresh in crystals. A certain recurring spend to buy off a remote wrong
-/// click is the wrong trade.
-///
-/// # What the log and the player see
-///
-/// One `warn!` per snapshot naming the arity, not one per dropped slot: what a
-/// reader of the log file the README asks players to send needs is that the
-/// shop was six slots and five arrived, and a server stuck on a bad scalar
-/// re-sends one on every roll. `warn!` rather than the `debug!` both siblings
-/// use because this is `websocket::forward`'s dialect line's class of event —
-/// client and server disagree about the wire and the symptom is silence —
-/// while the per-slot serde errors stay at `debug!`, which the default filter
-/// still files. On screen the only trace is a gap in the slot column, and only
-/// when the survivors carry wire `slot` numbers of their own: weak evidence,
-/// but it is what a player who counts to six in the game window would have to
-/// go on.
-///
-/// A wholly non-array `slots` degrades to empty, and be clear about what that
-/// buys: `Controller::evaluate_snapshot` treats a slotless snapshot as a
-/// degraded message and returns before it disarms the expectation, so the
-/// watchdog still climbs to `Unresponsive`. The gain is diagnosis, not the
-/// session — `last_shop_ms` advances, so the heartbeat can read "server
-/// talking, payload unusable" instead of "server mute", which are exactly the
-/// two cases that line exists to separate.
+/// A non-array `slots` degrades to empty, which does not save the session —
+/// `Controller::evaluate_snapshot` returns on a slotless snapshot before
+/// disarming the expectation, so the watchdog still climbs to `Unresponsive`.
+/// The gain is diagnosis: `last_shop_ms` advances, so the heartbeat can say
+/// "server talking, payload unusable" rather than "server mute".
 fn lenient_slots<'de, D>(de: D) -> Result<Vec<ShopItem>, D::Error>
 where
     D: Deserializer<'de>,
@@ -459,9 +318,8 @@ where
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ShopItem {
-    /// The item's catalog id, `None` when the server omits it — ties a
-    /// purchase confirmation back to the slot the player wanted. See
-    /// [`CatalogId`] for the sentinel policy.
+    /// Ties a purchase confirmation back to the slot the player wanted.
+    /// `None` when the server omits it — see [`CatalogId`].
     #[serde(default, deserialize_with = "optional_catalog_id")]
     pub id: Option<CatalogId>,
     /// Shop slot (1..=6); `0` if the server omits it.
@@ -472,10 +330,9 @@ pub struct ShopItem {
     pub kind: ItemKind,
     #[serde(default)]
     pub name: Option<String>,
-    /// Price in gold. `None` when the server omits it, which fails *open*
-    /// everywhere it is read — an unknown price can never be proven
-    /// unaffordable. A wire `0` is a real price of zero, not an omission —
-    /// see [`Gold`].
+    /// Price in gold. `None` fails *open* everywhere it is read — an unknown
+    /// price can never be proven unaffordable. A wire `0` is a real price of
+    /// zero, not an omission ([`Gold`]).
     #[serde(default)]
     pub price: Option<Gold>,
     /// Gear grade (2, 3, or 4).
@@ -485,8 +342,7 @@ pub struct ShopItem {
     #[serde(default)]
     pub set: Option<String>,
     /// Substats and their values, keyed by internal stat name. A nameless or
-    /// mistyped entry is dropped, not fatal: it could never match a name-keyed
-    /// criterion anyway.
+    /// mistyped entry is dropped: it could never match a name-keyed criterion.
     #[serde(default, deserialize_with = "lenient_elements")]
     pub substats: Vec<Substat>,
     /// Fail-open like an absent field: a partial or mistyped limit degrades
@@ -503,11 +359,9 @@ impl ShopItem {
 
     /// Player-facing slot number: the wire slot, or the 1-based position when
     /// the server omitted it (`slot == 0`), clamped so an oversized shop
-    /// cannot wrap back into the `0` sentinel.
-    ///
-    /// Not injective on malformed shops: a fallback number can collide with
-    /// another item's wire slot, so callers matching items by this number may
-    /// over-select there.
+    /// cannot wrap back into the `0` sentinel. Not injective on malformed
+    /// shops — a fallback number can collide with another item's wire slot, so
+    /// callers matching by it may over-select.
     ///
     /// # Examples
     ///
@@ -559,13 +413,9 @@ pub struct Substat {
     pub value: Option<f64>,
 }
 
-/// Purchase limit, e.g. "0/1" (sold out) or "1/1" (available).
-///
-/// Both fields stay `u32`, deliberately: these are *counts of purchases*,
-/// not money, so they belong to neither ledger, and the only thing ever
-/// asked of them is `remaining == 0` ([`ShopItem::is_sold_out`]) — not a
-/// cross-space comparison. A third newtype would need its own arithmetic
-/// policy and wire fold, filed against a hazard nobody has shown.
+/// Purchase limit, e.g. "0/1" (sold out) or "1/1" (available). Both fields
+/// stay `u32` deliberately: counts of purchases belong to neither money
+/// ledger, and the only question asked of them is `remaining == 0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct PurchaseLimit {
     pub remaining: u32,
@@ -580,9 +430,7 @@ mod tests {
         serde_json::from_str(json).expect("snapshot should parse")
     }
 
-    /// Fixture amounts, so a test reads `xtl(95)` rather than
-    /// `Crystals::new(95)` six times a line — the same shorthand the control
-    /// and session suites give [`CatalogId`] with `cid`.
+    /// Fixture amounts, so a test reads `xtl(95)`, not `Crystals::new(95)`.
     const fn xtl(raw: u32) -> Crystals {
         Crystals::new(raw)
     }
@@ -603,9 +451,8 @@ mod tests {
         );
     }
 
-    /// The wire shape of both currencies is a bare number
-    /// (`#[serde(transparent)]`), and — unlike [`CatalogId`] — a `0` stays a
-    /// `0`. See [`Gold`] for why.
+    /// Both currencies are bare numbers on the wire and — unlike
+    /// [`CatalogId`] — a `0` stays a `0`. See [`Gold`].
     #[test]
     fn a_zero_amount_is_a_real_amount_and_only_absence_is_unknown() {
         let priced = parse(r#"{"slots":[{"price":0}],"refresh":{"crystal_balance":0,"cost":3}}"#);
@@ -619,18 +466,15 @@ mod tests {
             assert_eq!(parse(json).slots[0].price, None, "{json}");
         }
 
-        // Transparent on the way in: no wrapper object, and a large amount is
-        // not truncated on its way into the newtype.
+        // Transparent on the way in: no wrapper object, no truncation.
         assert_eq!(
             parse(r#"{"slots":[{"price":4294967295}]}"#).slots[0].price,
             Some(gold(u32::MAX))
         );
     }
 
-    /// The arithmetic each ledger is allowed, and the floors/ceilings it
-    /// pins. `Add`/`Sub` are deliberately absent (see [`Gold`]): a regression
-    /// that added an operator would still pass this, but one that changed a
-    /// saturating method into a wrapping one would not.
+    /// The floors and ceilings each ledger pins. Catches a saturating method
+    /// turned wrapping; does not catch an added `Add`/`Sub` (see [`Gold`]).
     #[test]
     fn currency_arithmetic_saturates_at_both_ends() {
         assert_eq!(gold(200_000).saturating_sub(gold(184_000)), gold(16_000));
@@ -640,14 +484,10 @@ mod tests {
         assert_eq!(xtl(u32::MAX).saturating_add(xtl(1)), xtl(u32::MAX));
         assert_eq!(xtl(6).saturating_sub(xtl(9)), xtl(0));
 
-        // See Crystals::checked_add: None, not a pinned u32::MAX that happens
-        // to compare over budget.
         assert_eq!(xtl(3).checked_add(xtl(3)), Some(xtl(6)));
         assert_eq!(xtl(u32::MAX).checked_add(xtl(1)), None);
     }
 
-    /// Both currencies render grouped, and only grouped — see the `Display`
-    /// impl for why.
     #[test]
     fn both_currencies_display_thousands_grouped() {
         assert_eq!(gold(1_234_567).to_string(), "1,234,567");
@@ -657,7 +497,6 @@ mod tests {
 
     #[test]
     fn refresh_partial_object_degrades_to_none() {
-        // A half-shipped `refresh` must not fail the whole snapshot.
         let snapshot = parse(r#"{"refresh":{"crystal_balance":95},"slots":[{}]}"#);
         assert_eq!(snapshot.refresh, None);
         assert_eq!(snapshot.slots.len(), 1);
@@ -671,7 +510,6 @@ mod tests {
 
     #[test]
     fn refresh_mistyped_degrades_to_none() {
-        // The degrade contract covers wrong types, not just partial objects.
         assert_eq!(parse(r#"{"refresh":5,"slots":[{}]}"#).refresh, None);
         assert_eq!(parse(r#"{"refresh":"n/a"}"#).refresh, None);
         assert_eq!(parse(r#"{"refresh":[]}"#).refresh, None);
@@ -679,8 +517,7 @@ mod tests {
 
     #[test]
     fn partial_limit_degrades_to_buyable() {
-        // Fail-open like an absent limit: the item stays buyable and the
-        // snapshot survives.
+        // Fail-open: a dropped limit must never read as sold out.
         let snapshot = parse(r#"{"slots":[{"id":5,"limit":{"remaining":0}}]}"#);
         assert_eq!(snapshot.slots[0].limit, None);
         assert!(!snapshot.slots[0].is_sold_out());
@@ -703,8 +540,7 @@ mod tests {
 
     #[test]
     fn slot_by_id_finds_the_slot_and_the_zero_sentinel_becomes_no_id() {
-        // The haul-recording lookup. `0` must never resolve to a slot — and
-        // cannot, since `CatalogId::new(0)` is `None`.
+        // The haul-recording lookup: `0` must never resolve to a slot.
         let snapshot = parse(r#"{"slots":[{"id":0,"slot":1},{"id":102,"slot":2}]}"#);
         assert_eq!(snapshot.slots[0].id, None, "the 0 folds to absent at parse");
         let hit = snapshot
@@ -719,12 +555,9 @@ mod tests {
         );
     }
 
-    /// The failure this file's last intolerant collection used to cause. Both
-    /// payloads are shapes the server can actually emit — a slot number past
-    /// `u8::MAX` and a stringified price — and each used to abort the whole
-    /// `ShopSnapshot`, hence the whole `ServerMessage`, hence the run. See
-    /// [`lenient_slots`] for why the surviving slots are worth more than the
-    /// halt.
+    /// Both payloads are shapes the server can emit — a slot past `u8::MAX`, a
+    /// stringified price — and each would abort the whole `ServerMessage`,
+    /// hence the run. See [`lenient_slots`].
     #[test]
     fn a_bad_scalar_drops_its_slot_and_not_the_snapshot() {
         for json in [
@@ -742,11 +575,9 @@ mod tests {
         }
     }
 
-    /// The whole-collection half of the degrade, like
-    /// [`mistyped_substats_degrade_to_empty`] one level down. This one does
-    /// *not* save the session — `evaluate_snapshot` refuses a slotless
-    /// snapshot — so what it pins is that the snapshot still arrives, which is
-    /// what lets the heartbeat tell a talking server from a mute one.
+    /// Does *not* save the session (`evaluate_snapshot` refuses a slotless
+    /// snapshot); it pins that the snapshot still arrives, which is what lets
+    /// the heartbeat tell a talking server from a mute one.
     #[test]
     fn mistyped_slots_degrade_to_empty() {
         for json in [

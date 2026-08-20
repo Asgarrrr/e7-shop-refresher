@@ -1,14 +1,7 @@
 //! The `server_url` key's type, and the cleartext rule it carries.
 //!
-//! [`ServerUrl`]'s two fields are private *to this file*, so "the dial
-//! string is reachable through exactly one `as_str()`, and `Debug`/`Display`
-//! print the redacted form only" is a claim a reader can check by reading
-//! one file rather than the whole schema module. Nothing in the config
-//! schema touches these fields directly; it only calls [`ServerUrl::parse`].
-//!
-//! The authority-splitting helpers below live here rather than in the schema
-//! because `parse` is their only caller, and the userinfo subtlety they
-//! encode is the reason the type exists.
+//! [`ServerUrl`]'s two fields are private *to this file*, so its promises are
+//! checkable by reading one file rather than the whole schema module.
 
 use std::fmt;
 
@@ -19,14 +12,11 @@ use crate::error::Result;
 /// The authority of `rest` (everything after a `scheme://`), with any
 /// `user:pass@` userinfo dropped: `host` or `host:port`, IPv6 in brackets.
 ///
-/// The real host is what follows the *last* `@` — what `http::Uri`, and thus the
-/// WebSocket client, actually connects to — so `127.0.0.1@evil.com` is correctly
-/// seen as `evil.com`. That one line does double duty, which is why it lives in
-/// exactly one place now: it is what stops a userinfo-embedded loopback from
-/// leaking traffic in cleartext to a remote host, *and* what keeps a credential
-/// out of the redacted form written to the log.
+/// The real host follows the *last* `@` — what `http::Uri`, and so the
+/// WebSocket client, connects to — making `127.0.0.1@evil.com` correctly
+/// `evil.com`. That does double duty: it stops a userinfo-embedded loopback
+/// leaking cleartext to a remote host, and keeps credentials out of the log.
 fn authority_of(rest: &str) -> &str {
-    // The authority ends at the first path/query/fragment separator.
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     authority
         .rsplit_once('@')
@@ -36,11 +26,10 @@ fn authority_of(rest: &str) -> &str {
 /// `scheme://host[:port]` — userinfo, path, query and fragment all gone. The
 /// only form of a server URL that may be written to a log or a journal line.
 ///
-/// Deliberately lenient rather than fallible: it runs *after* the scheme check
-/// inside [`ServerUrl::parse`] and only has to split an authority off text the
-/// caller already accepted, so refusing would mean two ways to fail one parse.
-/// Garbage reduces rather than errors (`"garbage"` becomes `"://garbage"`, which
-/// is unmistakably not a URL and still carries no secret).
+/// Lenient rather than fallible: it runs *after* [`ServerUrl::parse`]'s scheme
+/// check, so refusing would mean two ways to fail one parse. Garbage reduces
+/// (`"garbage"` becomes `"://garbage"`) rather than errors, and still carries
+/// no secret.
 fn redacted_authority(url: &str) -> String {
     let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
     format!("{scheme}://{}", authority_of(rest))
@@ -70,27 +59,16 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// A `server_url` that has been proven safe to dial, carrying the proof.
 ///
-/// The rule is a security property, not a spelling convention: `server_url`
-/// receives the reassembled game stream, which can carry session tokens, so it
-/// must be `wss://` — or `ws://` to a loopback host, where cleartext never
-/// leaves the machine. [`ServerUrl::parse`] is the single place that rule and
-/// the authority split it needs are written, and a `ServerUrl` that exists is
-/// the evidence that they passed.
+/// A security property, not a spelling convention: `server_url` receives the
+/// reassembled game stream, which can carry session tokens, so it must be
+/// `wss://` — or `ws://` to loopback, where cleartext never leaves the machine.
 ///
-/// It also carries the redacted `scheme://host[:port]` form: the same split
-/// that defeats `ws://127.0.0.1@evil.com` is what keeps a `user:pass@`
-/// credential out of the log the player is asked to send us. (This used to
-/// be written twice — here and in the now-deleted
-/// `app::redacted_server_url` — with only one copy carrying the userinfo
-/// tests.)
-///
-/// `Debug` and `Display` print the redacted form **only**, so no `?url`, `%url`
-/// or `#[instrument]` argument list can put a credential in the log. The dial
-/// string — what the WebSocket client is actually given — comes out through
-/// [`ServerUrl::as_str`] and nowhere else.
-///
-/// `Deserialize` goes through [`ServerUrl::parse`] via `#[serde(try_from =
-/// "String")]`, so a `config.toml` cannot produce one that has not been checked.
+/// `Debug` and `Display` print the redacted `scheme://host[:port]` **only**, so
+/// no `?url`, `%url` or `#[instrument]` can put a `user:pass@` credential in
+/// the log the player is asked to send us; the dial string comes out through
+/// [`ServerUrl::as_str`] and nowhere else. `Deserialize` goes through
+/// [`ServerUrl::parse`] via `#[serde(try_from = "String")]`, so a `config.toml`
+/// cannot produce an unchecked one.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct ServerUrl {
@@ -175,9 +153,8 @@ impl fmt::Display for ServerUrl {
     }
 }
 
-/// The serde hook: `#[serde(try_from = "String")]` on a `ServerUrl` field parses
-/// through [`ServerUrl::parse`], so the cleartext rule stops depending on
-/// `Config::load` being the only constructor.
+/// The `#[serde(try_from = "String")]` hook, so the cleartext rule does not
+/// depend on `Config::load` being the only constructor.
 impl TryFrom<String> for ServerUrl {
     type Error = crate::Error;
 
@@ -189,11 +166,6 @@ impl TryFrom<String> for ServerUrl {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The cleartext-rule tests below used to build a whole `Config` with the
-    // URL overwritten and call `validate()`. They call `ServerUrl::parse`
-    // directly now, since that *is* the load path — `Config::validate` has
-    // no `server_url` clause left to reach.
 
     #[test]
     fn wss_is_accepted() {
@@ -223,7 +195,6 @@ mod tests {
 
     #[test]
     fn ws_example_com_rejected() {
-        // Done-criteria spot check: a non-loopback ws:// host is refused.
         let err = ServerUrl::parse("ws://example.com/x").unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
     }
@@ -242,8 +213,7 @@ mod tests {
 
     #[test]
     fn ws_userinfo_loopback_is_rejected() {
-        // The loopback text sits in the userinfo; the real host (evil.com) is
-        // remote, so this must be refused — not accepted as loopback.
+        // The loopback text sits in the userinfo; the real host is remote.
         let err = ServerUrl::parse("ws://127.0.0.1:3001@evil.com/refresh-shop").unwrap_err();
         assert!(matches!(err, crate::Error::Config(_)));
     }
@@ -257,8 +227,7 @@ mod tests {
 
     #[test]
     fn an_uppercase_wss_scheme_is_accepted() {
-        // URL schemes are case-insensitive; an uppercase scheme must not be
-        // rejected when the WebSocket client would accept it.
+        // URL schemes are case-insensitive, and the WebSocket client accepts it.
         assert!(ServerUrl::parse("WSS://ingest.arkyve.dev/refresh-shop").is_ok());
     }
 
@@ -275,8 +244,7 @@ mod tests {
 
     #[test]
     fn a_parsed_server_url_keeps_the_dial_string_and_redacts_the_credential() {
-        // The two halves the crate used to write twice: what gets dialed, and
-        // what is safe to log. One parse now produces both.
+        // What gets dialed and what is safe to log, from one parse.
         let url = ServerUrl::parse("wss://token:secret@ingest.arkyve.dev:8443/path?key=abc")
             .expect("wss is accepted whatever the authority carries");
         assert_eq!(
@@ -288,8 +256,8 @@ mod tests {
 
     #[test]
     fn a_server_urls_debug_and_display_cannot_leak_the_credential() {
-        // The reason `Debug` is hand-written: the log file is what the player is
-        // asked to email us, and `README.md` promises it carries no credential.
+        // The reason `Debug` is hand-written: `README.md` promises the log file
+        // the player emails us carries no credential.
         let url = ServerUrl::parse("wss://token:secret@ingest.arkyve.dev/x").expect("accepted");
         for rendered in [format!("{url:?}"), format!("{url}")] {
             assert!(!rendered.contains("secret"), "{rendered}");
@@ -299,16 +267,15 @@ mod tests {
 
     #[test]
     fn a_query_or_fragment_never_reaches_the_redacted_form() {
-        // A fragment used to be authority text to the loopback check and not to
-        // the log redactor; one parser now handles both.
+        // A fragment used to be authority text to the loopback check but not to
+        // the log redactor; `authority_of` serves both.
         let url = ServerUrl::parse("ws://127.0.0.1:9000/?key=abc#frag").expect("loopback");
         assert_eq!(url.redacted(), "ws://127.0.0.1:9000");
     }
 
     #[test]
     fn a_surrounding_whitespace_server_url_is_accepted_and_dials_trimmed() {
-        // A hand-edited `server_url = " wss://… "` names the same server; the
-        // trim has to happen before the scheme match *and* before the dial
+        // The trim has to happen before the scheme match *and* before the dial
         // string is kept, or the client gets a URL with a leading space.
         let url = ServerUrl::parse("  wss://ingest.arkyve.dev/x  ").expect("accepted");
         assert_eq!(url.as_str(), "wss://ingest.arkyve.dev/x");
@@ -316,9 +283,8 @@ mod tests {
 
     #[test]
     fn the_serde_hook_parses_through_the_same_rule() {
-        // `#[serde(try_from = "String")]` on a `ServerUrl` field is what makes
-        // the cleartext rule stop depending on `Config::load` being the only
-        // constructor; the conversion must be the same parse, not a second one.
+        // The `#[serde(try_from = "String")]` conversion must be the same
+        // parse, not a second one.
         assert!(ServerUrl::try_from("wss://ingest.arkyve.dev/x".to_owned()).is_ok());
         let error = ServerUrl::try_from("ws://evil.com/x".to_owned())
             .expect_err("a non-loopback ws:// must not become a ServerUrl");

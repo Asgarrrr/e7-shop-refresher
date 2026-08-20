@@ -19,18 +19,9 @@ const REPAINT_WHILE_FETCHING: std::time::Duration = std::time::Duration::from_mi
 
 /// Splits an error line around the first URL in it: `(before, url, after)`.
 ///
-/// The one error a player is most likely to meet — Npcap missing — ends in a
-/// download address, and an address in a `colored_label` has to be selected
-/// character by character out of a 270-character line before it can be pasted
-/// into a browser. Rendering it as a link instead costs nothing: `webbrowser`
-/// is already compiled (a non-optional dependency of `egui-winit`, which eframe
-/// pulls in) and `theme` already sets `hyperlink_color`, for a hyperlink the
-/// crate never drew.
-///
-/// A URL ends at the first whitespace, so a trailing `)` or `.` stays attached.
-/// Both are legal URL characters and no general rule can separate "end of
-/// sentence" from "end of path"; `INSTALL_HINT` is written so the address is
-/// followed by a space.
+/// A URL ends at the first whitespace, so a trailing `)` or `.` stays attached
+/// — both are legal URL characters, and `INSTALL_HINT` is written so the
+/// address is followed by a space.
 fn split_help_url(text: &str) -> Option<(&str, &str, &str)> {
     let start = text.find("https://")?;
     let rest = &text[start..];
@@ -38,14 +29,8 @@ fn split_help_url(text: &str) -> Option<(&str, &str, &str)> {
     Some((&text[..start], &rest[..len], &rest[len..]))
 }
 
-/// Strips the error-taxonomy prefixes a player has no use for.
-///
-/// The banner receives `session error: network capture: Npcap is missing…`:
-/// `app::supervise` adds the first, `Error::Capture`'s `Display` the second.
-/// Both are right in a log file and noise on screen — they name which layer
-/// failed to someone who cannot act on either. Degrades gracefully: if either
-/// string is ever reworded the prefix simply survives on screen, which is what
-/// the banner did before.
+/// Strips the error-taxonomy prefixes, which name which layer failed to someone
+/// who cannot act on either. If a string is reworded the prefix simply survives.
 fn without_error_prefixes(text: &str) -> &str {
     let mut rest = text;
     for prefix in ["session error: ", "network capture: "] {
@@ -56,17 +41,10 @@ fn without_error_prefixes(text: &str) -> &str {
 
 /// The error banner: one sentence, then an action row under it.
 ///
-/// Stacked rather than inline. A URL could be spliced into a flowing sentence
-/// because a link reads as a word; a stateful button cannot, and doing it
-/// anyway produced a banner where `Restart now` sat mid-clause with the rest of
-/// the sentence continuing past it — still instructing the player to restart
-/// the app the button was offering to restart.
-///
-/// So [`split_help_url`]'s three parts become a headline, an action row and a
-/// faint trailing hint. Nothing frames them and the button is the stock one:
-/// this module's header states that hierarchy comes from size and colour alone,
-/// with a single saturated element per screen, and that element is already the
-/// Start button one row below.
+/// Stacked, not inline: a link reads as a word in a flowing sentence but a
+/// stateful button does not, and inlining it left `Restart now` mid-clause with
+/// the sentence still telling the player to restart the app. The button is the
+/// stock one — the saturated element is already Start, one row below.
 fn error_banner(ui: &mut egui::Ui, text: &str, fetcher: &Fetcher) {
     let text = without_error_prefixes(text);
     let color = ui.visuals().error_fg_color;
@@ -74,10 +52,9 @@ fn error_banner(ui: &mut egui::Ui, text: &str, fetcher: &Fetcher) {
         ui.colored_label(color, text);
         return;
     };
-    // Only an installer earns the stacked layout and the action row. Any other
-    // address stays a link inside the sentence, because for a page the address
-    // *is* the information — and because a documentation URL must never end up
-    // under a button offering to download and run it.
+    // Only an installer earns the stacked layout and the action row: a
+    // documentation URL must never end up under a button offering to download
+    // and run it.
     if !url.to_ascii_lowercase().ends_with(".exe") {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -94,14 +71,9 @@ fn error_banner(ui: &mut egui::Ui, text: &str, fetcher: &Fetcher) {
     });
 }
 
-/// The action row: one button, and beside it whatever the player needs to know
-/// next.
-///
-/// The label carries the state instead of a separate spinner: the row is small
-/// and a second moving element in it would be noise. A fetch in flight disables
-/// the button, so a second click cannot start a second worker —
-/// [`Fetcher::start`] refuses that anyway, and this makes the refusal visible
-/// rather than silent.
+/// The action row: one button, and beside it whatever the player needs next.
+/// A fetch in flight disables it, making [`Fetcher::start`]'s refusal of a
+/// second worker visible rather than silent.
 fn install_row(ui: &mut egui::Ui, url: &str, hint: &str, fetcher: &Fetcher) {
     ui.horizontal_wrapped(|ui| match fetcher.progress() {
         Progress::Fetching => {
@@ -111,13 +83,10 @@ fn install_row(ui: &mut egui::Ui, url: &str, hint: &str, fetcher: &Fetcher) {
             ui.add_enabled(false, egui::Button::new("Checking…"));
         }
         Progress::Launched => restart_row(ui, fetcher, None),
-        // Same button, because the same thing still has to happen. What changes
-        // is only what is said beside it.
         Progress::RestartFailed(reason) => restart_row(ui, fetcher, Some(&reason)),
         Progress::Failed(reason) => {
             // The retry stays available: the common failures here are transient
-            // (a proxy, a captive portal, a dropped connection), and a dead end
-            // is what this whole feature exists to remove.
+            // (a proxy, a captive portal, a dropped connection).
             if ui.button("Retry download").clicked() {
                 fetcher.start();
             }
@@ -145,23 +114,14 @@ fn install_row(ui: &mut egui::Ui, url: &str, hint: &str, fetcher: &Fetcher) {
     }
 }
 
-/// The restart control, before and after a restart that did not work.
+/// The restart control, before and after a restart that did not work. The tap
+/// is opened once, inside the session that already died, so only a fresh
+/// process picks Npcap up (see `install::relaunch`).
 ///
-/// The relaunch is one click rather than "close this and open it again": the tap
-/// is opened once, inside the session that already died, so a fresh process is
-/// what picks Npcap up. See `install::relaunch` for why that is not a re-probe.
-///
-/// One function for both states because both want the same button. A failed
-/// restart used to fall through to [`Progress::Failed`], whose only control is
-/// `Retry download` — which on this path finds the verified installer still on
-/// disk, launches a *second* Npcap setup, and overwrites the restart error with
-/// `Launched` on the way. The remedy has to be the restart, so the state that
-/// carries the error keeps the restart's control and adds two things a second
-/// download would not have given: what went wrong, and the way out by hand for
-/// a failure that will not fix itself (`current_exe` failing is not weather).
-///
-/// The row stays one button plus text either way, which is all a status bar has
-/// room for.
+/// One function for both states: a failed restart must not fall through to
+/// [`Progress::Failed`], whose `Retry download` would find the verified
+/// installer on disk, launch a *second* Npcap setup, and overwrite the restart
+/// error with `Launched`.
 fn restart_row(ui: &mut egui::Ui, fetcher: &Fetcher, failure: Option<&str>) {
     if ui
         .button("Restart now")
@@ -170,8 +130,8 @@ fn restart_row(ui: &mut egui::Ui, fetcher: &Fetcher, failure: Option<&str>) {
     {
         match crate::install::relaunch() {
             Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
-            // Reported through the same cell as every other failure, so a
-            // relaunch that did not happen cannot read as one that did.
+            // Same cell as every other failure, so a relaunch that did not
+            // happen cannot read as one that did.
             Err(err) => fetcher.restart_failed(format!("could not restart: {err}")),
         }
     }
@@ -193,8 +153,7 @@ fn restart_row(ui: &mut egui::Ui, fetcher: &Fetcher, failure: Option<&str>) {
 
 /// Top chrome: the error banner, then two rows — status (dot + word + clause)
 /// with the one contextual button on the right, and under it a row of stat
-/// tiles (balances | refreshes + the per-token haul). Returns the clicked
-/// command.
+/// tiles.
 #[must_use]
 pub(super) fn render_status_bar(
     ui: &mut egui::Ui,
@@ -212,14 +171,12 @@ pub(super) fn render_status_bar(
     ui.add_space(theme::SP_XS);
     let color = theme::status_color(view.status_kind);
     let armed = matches!(view.status_kind, Status::Watching | Status::Paused);
-    // Row 1: button width first (right-aligned), then status fills the rest,
-    // so the clause has room and does not truncate.
+    // Button width first (right-aligned), then status fills the rest, so the
+    // clause has room and does not truncate.
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Sends the explicit command, never Toggle: the 4 Hz poll can show
-            // a label up to 250 ms stale, and a toggle raced by an auto-stop
-            // would re-arm the loop (the domain no-ops a redundant Stop and
-            // refuses a redundant Start).
+            // Explicit, never Toggle: the 4 Hz poll can show a label 250 ms
+            // stale, and a toggle raced by an auto-stop would re-arm the loop.
             let (label, command) = if armed {
                 ("Stop", Command::Stop)
             } else {
@@ -231,7 +188,6 @@ pub(super) fn render_status_bar(
                 }
             });
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                // The dot carries the color; the word stays ink.
                 status_dot(ui, color);
                 ui.add_space(theme::SP_SM);
                 ui.add(
@@ -245,14 +201,13 @@ pub(super) fn render_status_bar(
             });
         });
     });
-    // Row 2: balance tiles, then the run's readouts once a run exists (while
-    // Idle they'd be all zeros, noise).
+    // The run's readouts appear only once a run exists; while Idle they would
+    // be all zeros.
     ui.add_space(theme::SP_SM);
     row_separator(ui);
     ui.add_space(theme::SP_SM);
-    // Wrapped, not a flat row: a large Gold balance plus the haul tiles can
-    // exceed the panel's minimum width; wrapping folds the overflow to a
-    // second line instead of clipping tiles off-screen.
+    // Wrapped: a large Gold balance plus the haul tiles can exceed the panel's
+    // minimum width, and clipping would take tiles off-screen.
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = theme::SP_SM;
         skystone_tile(ui, view.crystal_balance);
@@ -261,8 +216,6 @@ pub(super) fn render_status_bar(
             // Size the divider to the tiles already laid.
             let tile_height = ui.min_size().y;
             group_divider(ui, tile_height);
-            // The haul replaces the old generic Spent/Matches counters with the
-            // per-token buy tally, bucketing the rest into Other.
             stat_tile(
                 ui,
                 "Refreshes",
@@ -280,16 +233,12 @@ pub(super) fn render_status_bar(
     clicked
 }
 
-/// The crystal balance tile. "Skystones" is the game's word; the code and the
-/// `RefreshMeta` that feeds it say crystals.
+/// The crystal balance tile. "Skystones" is the game's word; the code says
+/// crystals.
 ///
-/// A function per currency, not two `stat_tile(ui, "…", …)` calls: the old code
-/// called `stat_tile` for both balances directly, differing only by a string
-/// literal and which `view` field was passed, so swapping the two arguments
-/// compiled and mislabelled both balances. `Option<Crystals>` and `Option<Gold>`
-/// are not interchangeable, so each currency now has its own typed helper.
-/// The generic tiles below (Refreshes, haul tokens) stay plain counts with no
-/// ledger to bind to.
+/// A function per currency, not two `stat_tile` calls: those differed only by a
+/// string literal and a `view` field, so swapping the arguments compiled and
+/// mislabelled both balances. `Option<Crystals>` and `Option<Gold>` do not.
 fn skystone_tile(ui: &mut egui::Ui, balance: Option<Crystals>) {
     stat_tile(ui, "Skystones", amount_or_dash(balance));
 }
@@ -309,11 +258,9 @@ fn stat_tile(ui: &mut egui::Ui, label: &str, value: String) {
     });
 }
 
-/// A full-bleed hairline splitting the status/action row from the metrics row
-/// below it. Reserves a 1px strip for layout, then paints across the panel's
-/// clip rect (the full window width, past the side margin) so it reaches the
-/// edges like the tab and table rules. Dimmed below the plain hairline, since
-/// it divides two rows of the same chrome block rather than whole zones.
+/// A full-bleed hairline between the status row and the metrics row: painted
+/// across the panel's clip rect, past the side margin, so it reaches the edges
+/// like the tab and table rules. Dimmed, since it divides rows and not zones.
 fn row_separator(ui: &mut egui::Ui) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
@@ -324,8 +271,8 @@ fn row_separator(ui: &mut egui::Ui) {
     );
 }
 
-/// A hairline of the given height splitting the balance tiles from the counter
-/// tiles — a group divider, not a full-height rule.
+/// A group divider between the balance tiles and the counter tiles, sized to
+/// the tiles rather than the full row height.
 fn group_divider(ui: &mut egui::Ui, height: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, height), egui::Sense::hover());
     ui.painter().vline(
@@ -377,10 +324,9 @@ mod tests {
         assert_eq!(value_over_limit(3, None), "3/—");
     }
 
-    /// The shape of the message a player without Npcap actually gets, kept here
-    /// as a literal rather than imported: `INSTALL_HINT` lives behind
-    /// `cfg(all(windows, feature = "pcap-backend"))` and this test runs on every
-    /// lane. Only the structure is asserted, so the wording can move.
+    /// A literal, not an import: `INSTALL_HINT` is behind
+    /// `cfg(all(windows, feature = "pcap-backend"))` and these tests run on
+    /// every lane. Only structure is asserted, so the wording can move.
     const NPCAP_ERROR: &str = "session error: network capture: Npcap is missing, and the capture needs it. https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe Keep the installer's defaults, then restart this app.";
 
     #[test]
@@ -392,8 +338,8 @@ mod tests {
             "https://dev-libs.wireshark.org/windows/packages/Npcap/npcap-1.88.exe"
         );
         assert!(after.starts_with(" Keep the"), "got: {after}");
-        // Reassembling must give back the original: the banner renders these
-        // three pieces and nothing else, so a lost character is a lost word.
+        // The banner renders these three pieces and nothing else, so a lost
+        // character is a lost word.
         assert_eq!(format!("{before}{url}{after}"), NPCAP_ERROR);
     }
 
@@ -405,9 +351,8 @@ mod tests {
         assert!(split_help_url("see http://example.invalid/x").is_none());
     }
 
-    /// A message whose address is *not* an installer keeps the old inline shape,
-    /// address and all. Only an `.exe` gets the action row — a documentation
-    /// link must never sit under a button offering to download and run it.
+    /// Only an `.exe` gets the action row: a documentation link must never sit
+    /// under a button offering to download and run it.
     #[test]
     fn a_documentation_url_stays_an_inline_link() {
         let view = idle_view();
@@ -436,7 +381,7 @@ mod tests {
             without_error_prefixes("session error: network capture: Npcap is missing."),
             "Npcap is missing."
         );
-        // Unrecognised text survives untouched rather than being trimmed by guess.
+        // Unrecognised text survives untouched rather than trimmed by guess.
         assert_eq!(
             without_error_prefixes("the game window vanished"),
             "the game window vanished"
@@ -449,14 +394,13 @@ mod tests {
         let harness = Harness::new_ui(|ui| {
             let _ = render_status_bar(ui, &view, Some(NPCAP_ERROR), true, &Fetcher::new());
         });
-        // The action is a button; the address is its hover text, not a run of
-        // characters to be selected out of the sentence.
+        // The address is the button's hover text, not characters to select out
+        // of a 270-character sentence.
         harness.get_by_label("Download Npcap");
     }
 
-    /// The shipped message points at an `.exe`, and that one becomes a button
-    /// labelled `Download` — not a 90-character address rendered inline, which
-    /// is what turned this banner into six lines of red.
+    /// A 90-character address rendered inline is what turned this banner into
+    /// six lines of red.
     #[test]
     fn an_installer_url_becomes_a_button_not_an_address() {
         let view = idle_view();
@@ -467,7 +411,6 @@ mod tests {
             let _ = render_status_bar(ui, &view, Some(msg), true, &Fetcher::new());
         });
         harness.get_by_label("Download Npcap");
-        // The address itself is not on screen; it is the button's hover text.
         assert!(
             harness
                 .query_by_label(
@@ -478,21 +421,16 @@ mod tests {
         );
     }
 
-    /// The state is set through `Fetcher`, never by clicking `Restart now`:
-    /// that button really does spawn a copy of the running executable, which in
-    /// a test binary is the test binary.
+    /// Set through `Fetcher`, never by clicking `Restart now`: that button
+    /// really does spawn a copy of the running executable — here, the test.
     fn after_a_failed_restart() -> Fetcher {
         let fetcher = Fetcher::new();
         fetcher.restart_failed("could not restart: access denied".to_owned());
         fetcher
     }
 
-    /// A restart that did not happen must not be handed a download's remedy.
-    ///
-    /// `Retry download` on this path finds the verified installer still on disk,
-    /// takes the reuse fast path and launches a *second* Npcap setup — and sets
-    /// `Launched`, erasing the restart error that was the only thing on screen
-    /// saying anything had gone wrong.
+    /// `Retry download` here would launch a *second* Npcap setup off the
+    /// installer still on disk, and set `Launched`, erasing the restart error.
     #[test]
     fn a_failed_restart_is_not_offered_another_download() {
         let view = idle_view();
@@ -506,9 +444,8 @@ mod tests {
         );
     }
 
-    /// And what it *is* offered is the restart, again, with the reason beside it
-    /// — plus the way out by hand, since a relaunch that failed once will
-    /// usually fail again.
+    /// The way out by hand is offered too, since a relaunch that failed once
+    /// will usually fail again (`current_exe` failing is not weather).
     #[test]
     fn a_failed_restart_keeps_the_restart_and_says_why() {
         let view = idle_view();
@@ -533,7 +470,6 @@ mod tests {
                 &Fetcher::new(),
             );
         });
-        // Shown without the taxonomy prefix the player cannot act on.
         harness.get_by_label("the game window vanished");
     }
 
@@ -584,8 +520,8 @@ mod tests {
         assert!(armed_bar.query_by_label("SPENT").is_none());
         assert!(armed_bar.query_by_label("MATCHES").is_none());
 
-        // The final totals survive a stop (an auto-stop is exactly when the
-        // player wants to read them).
+        // The final totals survive a stop: an auto-stop is exactly when the
+        // player wants to read them.
         let mut controller = Controller::new(Filter::matching_default_items(), Limits::default());
         let _ = controller.handle(Event::Start { now_ms: 0 });
         let _ = controller.handle(Event::Stop);
@@ -599,8 +535,6 @@ mod tests {
     #[test]
     fn idle_start_click_emits_start() {
         let view = idle_view();
-        // `Harness::new_ui`'s bound is `impl FnMut`, so the closure captures
-        // `clicked` mutably; `drop(harness)` releases the borrow before the read.
         let mut clicked = None;
         let mut harness = Harness::new_ui(|ui| {
             if let Some(command) = render_status_bar(ui, &view, None, true, &Fetcher::new()) {
