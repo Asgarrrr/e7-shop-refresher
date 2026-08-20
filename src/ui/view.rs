@@ -5,7 +5,9 @@
 
 use crate::domain::control::{Controller, Limits, Progress, Status};
 use crate::domain::shop::{CatalogId, Crystals, Gold, ShopItem};
-use crate::render::{HAUL_HEADLINERS, format_item, haul_tally, kind_label, status_summary};
+use crate::render::{
+    HAUL_HEADLINERS, format_item, haul_tally, kind_label, merchant_label, status_summary,
+};
 
 /// Every field is `Copy` or `&'static`, so the per-frame copy is free.
 pub(super) struct ViewState {
@@ -146,6 +148,21 @@ pub(super) fn slot_detail(controller: &Controller, index: usize) -> String {
         .and_then(|snapshot| snapshot.slots.get(index))
         .map(|item| format_item(item, index))
         .unwrap_or_default()
+}
+
+/// The Shop tab's heading: the merchant name, or the shared fallback. Built on
+/// demand like [`slot_detail`] rather than folded into [`ViewState`] — a
+/// `String` field there would break the "every field is `Copy` or `&'static`"
+/// invariant this module opens with, and would allocate every frame even while
+/// the merchant sits idle between rolls. Named `merchant_heading` rather than
+/// `merchant_label` so it does not collide with [`crate::render::merchant_label`],
+/// the fallback it calls through to — the same one the console dump reads, so
+/// the two never disagree.
+pub(super) fn merchant_heading(controller: &Controller) -> String {
+    let merchant = controller
+        .last_snapshot()
+        .and_then(|snapshot| snapshot.merchant.as_deref());
+    merchant_label(merchant).to_owned()
 }
 
 /// Pure extraction, allocation-free: the caller holds the controller lock

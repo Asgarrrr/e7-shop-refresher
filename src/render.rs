@@ -134,12 +134,8 @@ pub(crate) fn stop_reason_label(reason: StopReason) -> &'static str {
 }
 
 /// Merchant name, or the shared fallback when the snapshot omits it — the one
-/// place the default label lives.
-///
-/// Gated on the *item*, not the body like [`render_shop`]/[`print_controls`]:
-/// its only caller is `render_shop`'s gated body, so in a `gui` build neither
-/// it nor that caller exists, and there is nothing left to orphan.
-#[cfg(not(feature = "gui"))]
+/// place the default label lives, so the console dump and the GUI header never
+/// disagree.
 pub(crate) fn merchant_label(merchant: Option<&str>) -> &str {
     merchant.unwrap_or("Secret Shop")
 }
@@ -269,9 +265,6 @@ mod tests {
         assert!(format_item(&item, 1).starts_with("slot 2 · "));
     }
 
-    // Gated with the function under test, which no longer exists in a `gui`
-    // build.
-    #[cfg(not(feature = "gui"))]
     #[test]
     fn merchant_label_falls_back_when_absent() {
         assert_eq!(merchant_label(Some("Secret Shop VIP")), "Secret Shop VIP");
