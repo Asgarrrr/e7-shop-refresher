@@ -134,16 +134,37 @@ pub(crate) fn stop_reason_label(reason: StopReason) -> &'static str {
 }
 
 /// Merchant name, or the shared fallback when the snapshot omits it — the one
-/// place the default label lives.
+/// place the default label lives, so the console dump and the GUI header never
+/// disagree.
 pub(crate) fn merchant_label(merchant: Option<&str>) -> &str {
     merchant.unwrap_or("Secret Shop")
 }
 
+/// Prints the snapshot for the console build.
+///
+/// The `#[cfg]` sits on the body, not the item, for the same reason as
+/// [`print_controls`]: the one caller (`Session::run`) stays
+/// feature-independent, and gating the call would leave this `pub(crate)` item
+/// with no caller in a `gui` build — `dead_code` under `-D warnings`.
+///
+/// Gated at all because the windowed build's stdout is an inert sink, so this
+/// was a formatted write per slot per shop message on the session loop, for
+/// nobody. With stdout redirected to a pipe whose reader has exited, `println!`
+/// panics rather than returning — inside `session_loop`, which
+/// `Session::run`'s own comment says must not be poisoned by console I/O.
 pub(crate) fn render_shop(snapshot: &ShopSnapshot) {
-    println!("\n[{}]", merchant_label(snapshot.merchant.as_deref()));
-    for (index, item) in snapshot.slots.iter().enumerate() {
-        println!("  {}", format_item(item, index));
+    #[cfg(not(feature = "gui"))]
+    {
+        println!("\n[{}]", merchant_label(snapshot.merchant.as_deref()));
+        for (index, item) in snapshot.slots.iter().enumerate() {
+            println!("  {}", format_item(item, index));
+        }
     }
+    // The body above is compiled out in the windowed build, leaving `snapshot`
+    // unused; the parameter itself stays because the one caller is
+    // feature-independent.
+    #[cfg(feature = "gui")]
+    let _ = snapshot;
 }
 
 /// `index` is the item's 0-based position, needed for the player-facing slot
@@ -248,6 +269,22 @@ mod tests {
     fn merchant_label_falls_back_when_absent() {
         assert_eq!(merchant_label(Some("Secret Shop VIP")), "Secret Shop VIP");
         assert_eq!(merchant_label(None), "Secret Shop");
+    }
+
+    /// Capturing stdout in a Rust test needs a dependency this crate does not
+    /// have, so this asserts the property structurally instead: in the `gui`
+    /// build `render_shop`'s body is compiled out entirely (see its `#[cfg]`),
+    /// so the real assertion is that `#[cfg]` — this only documents that the
+    /// call still completes on a full snapshot with nothing left unexercised.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_windowed_build_writes_no_shop_line() {
+        let snapshot = ShopSnapshot {
+            merchant: Some("Secret Shop".to_owned()),
+            slots: vec![ShopItem::default(); 6],
+            refresh: None,
+        };
+        render_shop(&snapshot);
     }
 
     #[test]

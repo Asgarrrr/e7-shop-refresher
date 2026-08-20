@@ -15,9 +15,12 @@
 //! construction.
 //!
 //! Ungated and windows-only for the same reason as [`crate::wide`] and
-//! [`crate::system32`]: [`crate::migrate`] (always compiled) and
-//! [`crate::install`] (gui) both rewrite a DACL under an elevated token and
-//! neither can reach the other. A security gate must not exist in two copies.
+//! [`crate::system32`]: [`crate::migrate`] (always compiled) rewrites a DACL
+//! under an elevated token through this gate. [`crate::install`] (gui) no
+//! longer does so in production — it sets a directory's DACL atomically at
+//! creation via `CreateDirectoryW` instead — but still exercises this gate
+//! from its own `#[cfg(test)]` `lock_down`, kept for what it proves about
+//! this module at the OS level. A security gate must not exist in two copies.
 
 use std::fs::File;
 use std::path::Path;
@@ -80,4 +83,18 @@ pub fn open_directory_itself(dir: &Path) -> std::io::Result<File> {
         ));
     }
     Ok(handle)
+}
+
+/// True when `dir` exists and is a plain directory this process may write into
+/// — never a junction, never a symlink, never a file.
+///
+/// The write paths (`crash`, `lib`'s log and config roots) need the *answer*,
+/// not the handle: they hand the path to `create_dir_all` and `OpenOptions`,
+/// which resolve reparse points themselves. This narrows the window between
+/// check and use to whatever those calls take; it does not close it. Closing it
+/// needs handle-relative opens that `std` does not expose, and the trade is
+/// deliberate — refusing a redirected root is worth far more than the residual
+/// race, and the alternative shipped today is no check at all.
+pub fn is_plain_directory(dir: &Path) -> bool {
+    open_directory_itself(dir).is_ok()
 }

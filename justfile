@@ -33,6 +33,27 @@ test:
     cargo test --locked --no-default-features
     cargo test --locked --no-default-features --features gui,actuator
 
+# The release-configuration test lane. Nothing else compiles the
+# `#[cfg(not(debug_assertions))]` arm of `stream::budget`'s accounting tests,
+# and that arm is the assertion behind `Cargo.toml`'s `overflow-checks = true`:
+# a shipped build must saturate and log rather than panic, because a panic from
+# a `Drop` during an unwind aborts with no `crash.log`. Debug and release
+# genuinely test different code here, so this is a lane and not a duplicate.
+#
+# Deliberately NOT wired into `verify` for now. Measured on this machine with
+# a warm cache, back-to-back `just verify` runs with and without this recipe
+# in the dependency list landed anywhere from 1.09x to 3.67x the baseline
+# wall-clock across repeated trials (12.5-20s without, 22-46s with; the
+# recipe alone costs ~6s in isolation, which does not explain the spread) —
+# the variance tracks concurrent cargo/rustc activity from other builds on
+# this shared machine, not a stable cost of the lane itself. That crosses
+# "roughly doubles" often enough to need a clean re-measurement and a human
+# call rather than an automated one made here. Run it explicitly with
+# `just test-release`; add it to `verify`'s dependency list once someone
+# re-measures on an uncontended machine.
+test-release:
+    cargo test --locked --release --no-default-features --features gui,actuator
+
 # Windows only. The capture backend on its own, then the combination that
 # actually ships — `cargo clippy --locked` with no feature flags, i.e.
 # `pcap-backend + gui + actuator`. Checking the pieces separately misses a cfg
@@ -59,10 +80,11 @@ backends:
 #    `cargo-mutants`), so a `verify` that included them would fail on a clean
 #    checkout with an error about a missing subcommand rather than about the
 #    code. Every dependency this crate does *not* have was declined with a
-#    written argument (`docs/tech-debt/_HANDOFF.md`: no `proptest`, no
-#    `tempfile`, no `arrayvec`/`smallvec`); these two stay acceptable precisely
-#    because they are external binaries and appear in neither `Cargo.toml` nor
-#    `Cargo.lock`.
+#    written argument at its point of temptation — no `proptest`
+#    (`capture/ip.rs` and `actuator/plan/geometry.rs`), no `tempfile`, no
+#    `arrayvec`/`smallvec` (`stream/reassembly.rs`); these two stay acceptable
+#    precisely because they are external binaries and appear in neither
+#    `Cargo.toml` nor `Cargo.lock`.
 # 2. They are slow in a way the other lanes are not. `coverage` recompiles the
 #    crate instrumented; `mutants` recompiles it *once per mutant* — measured at
 #    93 mutants for the two `plan` files and 123 for `domain/control/`, on top of
@@ -70,11 +92,28 @@ backends:
 # 3. Neither produces a number that should ever be a threshold. A coverage
 #    percentage turned into a gate is optimised by writing tests that execute
 #    lines without asserting anything, which is the exact defect this crate
-#    already shipped once (`const-003`'s guard test ran every line it cared about
-#    and could not fail). The percentage is a map of where to look, not a score.
+#    already shipped once — the click-grid guard test below ran every line it
+#    cared about and could not fail. The percentage is a map of where to look,
+#    not a score.
 #
 # `.github/workflows/quality.yml` runs both weekly and on demand, for the same
 # reasons, and says so in its own header.
+
+# The dependency-policy gate, runnable before CI says no.
+#
+# Out of `verify` for the first of the three reasons above and only that one:
+# `cargo-deny` is an external binary in neither `Cargo.toml` nor `Cargo.lock`,
+# so a clean checkout would fail with "no such subcommand" rather than with
+# anything about this crate. Unlike `coverage` and `mutants`, what this prints
+# *is* a verdict — `deny.toml` is policy with teeth, and its empty `ignore` list
+# is meant to stay empty (`deny.toml`'s own header says why).
+#
+# Version-pinned to match CI exactly, because a different cargo-deny can
+# disagree about the same `deny.toml`:
+# `cargo install --locked cargo-deny@0.20.2`
+deny:
+    cargo deny check advisories
+    cargo deny check bans licenses sources
 
 # Instrumented line/region coverage on the shipped feature set
 # (`pcap-backend + gui + actuator`), because that is the binary a player runs.
@@ -90,8 +129,8 @@ backends:
 #   *is* counted, and it is always near 100% (test code executes itself), so a
 #   per-file percentage here flatters any file whose tests live beside it.
 #   Stripping those blocks moves the crate from 84.88% of lines to 72.80% of
-#   *production* lines; `docs/tech-debt/30-measurement.md` carries the
-#   production-only ranking that the raw table cannot give.
+#   *production* lines — the per-file, production-only ranking behind that
+#   split lives only in the `--html` report below, not in this summary table.
 # - A file that is nothing but `#[derive(Deserialize)]` shapes reports no
 #   production lines at all — `uplink/protocol.rs` is the whole file — because
 #   derive-generated code is attributed to the macro, not to the call site. Zero
@@ -105,7 +144,7 @@ coverage:
 # Mutation testing on the modules where a surviving mutant costs a player money.
 #
 # This lane exists because of a defect that actually shipped. The guard test
-# written for `const-003` — the invariant "six clickable rows, the top group is
+# written for the click-grid invariant — "six clickable rows, the top group is
 # 0..=3", whose failure clicks the wrong item's Buy button — had six assertions
 # and every one of them was derived from the two constants it was meant to pin.
 # `LAST_TOP_ROW = 2`, `= 4` and `MAX_ROW = 7` each passed the entire suite. A
@@ -129,10 +168,12 @@ coverage:
 # which is not a finding worth a reader's time.
 #
 # Default features on purpose, and this one is measured rather than assumed:
-# `--no-default-features` looks cheaper and is not, because `egui_kittest` is an
-# ungated dev-dependency and every `cargo test` lane therefore builds the whole
-# egui tree anyway. What the default lane buys for that same cost is a stronger
-# verdict — running the reduced lane reported
+# `--no-default-features` looks cheaper and is not free, because `egui_kittest`
+# is an ungated dev-dependency and every `cargo test` lane therefore still
+# builds the egui core anyway (the heavier wgpu/naga/ash stack behind it is now
+# gated behind the `render-png` feature and skipped here — see `Cargo.toml`'s
+# `[dev-dependencies]` note). What the default lane buys for that same cost is
+# a stronger verdict — running the reduced lane reported
 # `Controller::is_recovery_enabled -> false` as a survivor, and it is not one:
 # the test that kills it (`app::tests::setup_enables_recovery_only_when_live`)
 # has two `#[cfg]` bodies and only the `all(windows, feature = "actuator")` one

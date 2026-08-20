@@ -74,13 +74,36 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+/// An environment-named directory, or `None` when it is unset or **relative**.
+///
+/// An elevated process inherits its environment from whatever medium-integrity
+/// process asked for the elevation, so a relative `%APPDATA%` resolves against
+/// a working directory the attacker named. `migrate` has refused that since it
+/// shipped (`migrate::app_data_root_from`); this is the same rule for the paths
+/// that do the writing. `pub(crate)` rather than private: `crash` needs the
+/// same filter for `%LOCALAPPDATA%`, and duplicating the `is_absolute` test in
+/// a third place is exactly what this plan exists to stop.
+#[must_use]
+pub(crate) fn absolute_env_dir(var: &str) -> Option<PathBuf> {
+    absolute_env_dir_from(std::env::var_os(var).map(PathBuf::from))
+}
+
+/// Pure half of [`absolute_env_dir`], so a test can reach the absoluteness
+/// filter with a literal instead of mutating the process environment:
+/// `std::env::set_var` races every `getenv` this parallel harness runs
+/// concurrently (edition 2024 made it `unsafe` for exactly that reason).
+#[must_use]
+fn absolute_env_dir_from(dir: Option<PathBuf>) -> Option<PathBuf> {
+    dir.filter(|dir| dir.is_absolute())
+}
+
 /// Location of the config file. The app owns this file (the GUI's Setup/Apply
 /// writes it) and the player isn't expected to hand-edit it, so it lives out of
 /// the way in per-user roaming app-data rather than beside the exe.
 #[must_use]
 pub fn config_path() -> PathBuf {
     #[cfg(windows)]
-    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    let appdata = absolute_env_dir("APPDATA");
     // `%APPDATA%` has no meaning on a dev machine (mac), so the working
     // directory is the whole policy there.
     #[cfg(not(windows))]
@@ -137,7 +160,7 @@ pub fn seed_config_if_missing(path: &Path) {
 /// stdout there. Same ladder as [`crash`]'s.
 #[must_use]
 pub fn log_dirs() -> Vec<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let local = absolute_env_dir("LOCALAPPDATA");
     log_dirs_from(local.as_deref(), &std::env::temp_dir())
 }
 
@@ -162,10 +185,40 @@ pub fn log_dirs_from(local_appdata: Option<&Path>, temp: &Path) -> Vec<PathBuf> 
 pub struct LogSetup {
     /// Where the log went. `None` when there is no log file at all.
     destination: Option<PathBuf>,
-    /// Candidates that refused, most-preferred first. The `InitError` wraps an
-    /// `io::Error`, so its `Debug` is what separates "antivirus has it open"
-    /// from "the DACL is wrong" from "the disk is full".
-    refusals: Vec<(PathBuf, tracing_appender::rolling::InitError)>,
+    /// Candidates that refused, most-preferred first. `Debug` on the reason is
+    /// what separates "antivirus has it open" from "the DACL is wrong" from
+    /// "the disk is full" from "this is a junction".
+    refusals: Vec<(PathBuf, LogRefusal)>,
+}
+
+/// Why a log-directory candidate was not used.
+///
+/// Two different things can refuse a candidate, and they carry differently
+/// shaped errors: `tracing_appender` never sees the junction case, because the
+/// gate below runs before `Builder::build` gets a chance to create anything
+/// through it.
+enum LogRefusal {
+    /// `Builder::build` itself failed: permissions, a locked file, a full disk.
+    Open(tracing_appender::rolling::InitError),
+    /// `dirhandle::open_directory_itself` refused the app-data root before
+    /// `build` ran — most likely a reparse point, occasionally just missing.
+    #[cfg(windows)]
+    Root(std::io::Error),
+}
+
+// Hand-written rather than `#[derive(Debug)]`: a derive's `fmt` reads its
+// fields for real, but clippy's dead-code pass does not credit that read, so
+// a derived impl leaves both variants reported as "never read" under
+// `--no-default-features` with nothing else in the crate to point at.
+// Matching explicitly here is the same information, visibly used.
+impl std::fmt::Debug for LogRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(err) => write!(f, "Open({err:?})"),
+            #[cfg(windows)]
+            Self::Root(err) => write!(f, "Root({err:?})"),
+        }
+    }
 }
 
 impl LogSetup {
@@ -201,6 +254,31 @@ impl LogSetup {
     }
 }
 
+/// Creates `root` if it is not there yet, then answers whether it is safe to
+/// write into: a plain directory, never a junction or symlink.
+///
+/// `create_dir_all`'s own result is not the authority — its error is dropped
+/// and [`dirhandle::is_plain_directory`] is asked regardless, because that is
+/// the only order that covers both directions this can fail:
+///
+/// * `root` never existed — the single most common first run there is, on a
+///   clean install with no `%LOCALAPPDATA%\arkyve-refresh-shop` yet. This
+///   creates it, `is_plain_directory` finds a plain directory, and logging
+///   proceeds exactly as it did before this gate existed.
+/// * `root` already existed as a junction. `create_dir_all` resolves through
+///   it and reports success — a junction does not stop directory creation
+///   inside its target — but `dirhandle::is_plain_directory` opens with
+///   `FILE_FLAG_OPEN_REPARSE_POINT`, so it still sees the junction itself, not
+///   whatever is on the other end, and the refusal survives.
+///
+/// Same create-then-verify shape as `install::prepare_staging`: creating is
+/// never trusted on its own, a second, independent look decides.
+#[cfg(windows)]
+fn log_root_is_writable(root: &Path) -> bool {
+    let _ = std::fs::create_dir_all(root);
+    dirhandle::is_plain_directory(root)
+}
+
 /// Installs the tracing subscriber over a daily-rotated file, because the
 /// windowed build's stdout and stderr are inert sinks.
 ///
@@ -227,6 +305,25 @@ pub fn install_logging() -> (
     let mut guard = None;
     let mut file_writer = None;
     for dir in log_dirs() {
+        // Checked before `build`, not after: `build` creates the directory and
+        // opens the first file inside it, so a check placed after that call
+        // would only notice a redirected root once the write it exists to
+        // prevent had already gone through it. Windows-only, like `dirhandle`
+        // itself.
+        #[cfg(windows)]
+        if let Some(root) = dir.parent()
+            && !log_root_is_writable(root)
+        {
+            let err = std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a plain directory (a reparse point)",
+                    root.display()
+                ),
+            );
+            setup.refusals.push((dir, LogRefusal::Root(err)));
+            continue;
+        }
         match tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix(APP_DIR)
@@ -242,7 +339,7 @@ pub fn install_logging() -> (
                 setup.destination = Some(dir);
                 break;
             }
-            Err(err) => setup.refusals.push((dir, err)),
+            Err(err) => setup.refusals.push((dir, LogRefusal::Open(err))),
         }
     }
 
@@ -453,6 +550,10 @@ mod tests {
         fn join(&self, name: &str) -> PathBuf {
             self.0.join(name)
         }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
     }
 
     impl Drop for TempDir {
@@ -501,6 +602,23 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_appdata_is_refused_and_falls_back() {
+        // Against `absolute_env_dir_from` with a literal, not a mutated
+        // `%APPDATA%`: `std::env::set_var` races every `getenv` this harness
+        // runs concurrently.
+        let filtered = absolute_env_dir_from(Some(PathBuf::from("relative/appdata")));
+        assert_eq!(
+            filtered, None,
+            "a relative root resolves against a working directory the launcher \
+             named, and must never reach config_path_from"
+        );
+        assert_eq!(
+            config_path_from(filtered.as_deref()),
+            PathBuf::from("config.toml")
+        );
+    }
+
+    #[test]
     fn the_real_config_path_and_log_dirs_agree_on_the_app_dir() {
         // Both read process env, so only the shape is asserted.
         assert!(config_path().ends_with("config.toml"));
@@ -526,6 +644,80 @@ mod tests {
         let dirs = log_dirs_from(None, Path::new("/tmp"));
         assert_eq!(dirs.len(), 1);
         assert!(dirs[0].starts_with("/tmp"));
+    }
+
+    #[test]
+    fn a_relative_localappdata_leaves_only_the_temp_log_dir() {
+        let filtered = absolute_env_dir_from(Some(PathBuf::from("relative/localappdata")));
+        assert_eq!(filtered, None);
+        let dirs = log_dirs_from(filtered.as_deref(), Path::new("C:/Temp"));
+        assert_eq!(
+            dirs.len(),
+            1,
+            "a relative root must drop out, leaving only temp"
+        );
+        assert!(dirs[0].starts_with("C:/Temp"));
+    }
+
+    /// A directory junction, which unlike a symlink an ordinary user can
+    /// create. `mklink` is a `cmd` builtin, so it cannot be spawned directly.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_nonexistent_log_root_is_created_and_accepted() {
+        // Stands in for the single most common first run there is: a clean
+        // install with no `%LOCALAPPDATA%\arkyve-refresh-shop` yet.
+        // `install_logging` cannot be called from a test (the subscriber is
+        // process-global, so a second call panics — see its doc comment), so
+        // this exercises `log_root_is_writable`, the predicate it gates on.
+        let parent = TempDir::new("fresh_log_root");
+        let root = parent.join("arkyve-refresh-shop");
+        assert!(
+            !root.exists(),
+            "the scratch setup must not have created this already"
+        );
+
+        assert!(
+            log_root_is_writable(&root),
+            "a root that has simply never been created must not be refused: \
+             refusing it would leave a first run with no log file at all"
+        );
+        assert!(root.is_dir(), "the root must now exist");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_log_root_is_refused_even_though_create_dir_all_resolves_through_it() {
+        // The bug `log_root_is_writable` exists to avoid: on a junctioned
+        // root, `create_dir_all` resolves through the junction and reports
+        // success (the target already exists), so that success alone must
+        // never be read as "the root is trustworthy".
+        let home = TempDir::new("junctioned_log_home");
+        let victim = TempDir::new("junctioned_log_victim");
+        let root = home.join("arkyve-refresh-shop");
+
+        if !junction(&root, victim.path()) {
+            // Group policy, or a filesystem without reparse points: asserting
+            // on a machine that cannot host the attack proves nothing.
+            eprintln!("skipped: mklink /J is unavailable here");
+            return;
+        }
+
+        assert!(
+            !log_root_is_writable(&root),
+            "a junctioned root must be refused even after create_dir_all resolves through it"
+        );
     }
 
     #[test]

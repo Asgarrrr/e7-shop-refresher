@@ -16,8 +16,8 @@ use std::fmt;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NOT_READY, HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetClientRect, IsHungAppWindow, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetWindowPos,
+    FindWindowW, GetClientRect, GetWindowThreadProcessId, IsHungAppWindow, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
 };
 
 use super::SurfaceError;
@@ -211,6 +211,88 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
     })
 }
 
+/// The pid of the process that currently owns `hwnd`, read once at `acquire`
+/// and re-read by [`verify_identity`] on every later input. This is what
+/// closes the gap a title-and-`HWND` check alone cannot: Windows recycles
+/// `HWND` values, so a *different* process can end up behind the exact
+/// integer this job memorized, with the title still matching because the
+/// title lookup runs again and lands on that same recycled value. The pid
+/// makes that swap detectable without adding a new dependency —
+/// `GetWindowThreadProcessId` sits under `Win32_UI_WindowsAndMessaging`,
+/// already enabled for `FindWindowW` and `GetClientRect`.
+///
+/// A failing call means the handle itself died between the title lookup and
+/// this read — fatal, the same classification [`client_rect`] gives the same
+/// underlying cause (`ERROR_INVALID_WINDOW_HANDLE`).
+fn owning_pid(hwnd: HWND) -> Result<u32, SurfaceError> {
+    let mut pid = 0u32;
+    // SAFETY: `pid` is a `u32` this frame owns and passes as an out-pointer;
+    // the return value (the owning thread id, not `pid` itself) is checked
+    // before `pid` is read, so a failed call cannot surface a stale value as
+    // though Windows had confirmed it.
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if thread_id == 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(SurfaceError::Fatal(format!(
+            "could not read the game window's owning process ({error})"
+        )));
+    }
+    Ok(pid)
+}
+
+/// The guard both backends run before every input reaches `post`/`send`: the
+/// window this job acquired must still be the one the title names, owned by
+/// the same process, at the rect the job read. A reviewer should reject any
+/// new input path that reaches an actual click without going through this.
+///
+/// `titled` is gathered by the caller, not read here — the two backends
+/// resolve it through different driver seams ([`MessageDriver`](post_message)'s
+/// vs. [`InputDriver`](send_input)'s) — and a title mismatch returns before
+/// `owned` is ever called, matching the pre-existing `send_input.rs` behaviour
+/// and the `..._before_input` tests that assert the call log ends at the
+/// title check. `owned` reads the pid and the rect together in one round trip
+/// once the title has matched: both are cheap synchronous reads (unlike
+/// `SetForegroundWindow`, which acts on the desktop), so there is no
+/// correctness reason to make them individually lazy against each other, only
+/// against the title. This function exists so neither backend can carry its
+/// own copy of the *verdict* — only of the reads.
+///
+/// A title match with a *different* `HWND`, or a `HWND` now owned by a
+/// *different* pid, is [`SurfaceError::Fatal`], not `Recoverable`: Windows
+/// recycles handle values, so either mismatch means the window this job
+/// acquired is provably gone (or the value now names a stranger), and that
+/// does not heal while both processes keep running — a `Recoverable` would
+/// make the watchdog re-issue clicks against a target that no longer exists.
+/// A rect mismatch stays `Recoverable`: the window is alive and owned by the
+/// right process, just elsewhere, and the next job's `acquire` reads a fresh
+/// rect.
+///
+/// The residual race is real and not closeable with these APIs: this check
+/// runs before each input, not atomically with it, so a swap inside that
+/// window is not detected.
+fn verify_identity(
+    titled: Hwnd,
+    target: Target,
+    owned: impl FnOnce() -> Result<(u32, ClientRect), SurfaceError>,
+) -> Result<(), SurfaceError> {
+    if titled != target.hwnd {
+        return Err(SurfaceError::Fatal(
+            "the game window title now identifies a different window".to_owned(),
+        ));
+    }
+    let (pid, rect) = owned()?;
+    if pid != target.pid {
+        return Err(SurfaceError::Fatal(format!(
+            "the game window is now owned by a different process (pid {pid}, expected {})",
+            target.pid
+        )));
+    }
+    if rect.is_degenerate() || rect != target.rect {
+        return Err(rect_change_error(rect));
+    }
+    Ok(())
+}
+
 /// Asks Windows, once per acquire, whether this process may drive `hwnd` at
 /// all — before any input is planned against it.
 ///
@@ -307,10 +389,37 @@ pub(super) fn preflight_refusal(error: &std::io::Error) -> SurfaceError {
 /// public associated type (`private_interfaces`); every field and method here is
 /// private.
 ///
+/// # What identifies the window, and what does not
+///
+/// `hwnd` plus `pid` is as far as this goes: the title picks the window,
+/// [`verify_identity`] demands the same `HWND` and the same owning process on
+/// every later input, closing the gap where Windows recycles a handle value
+/// out from under a memorized `HWND`. It does **not** go one step further and
+/// compare the owning process's full image path against an expected Epic
+/// Seven executable (a further Win32 call this crate does not otherwise need,
+/// on a feature this crate does not otherwise enable) — considered for this
+/// plan and deliberately rejected. That check's failure mode is bad and
+/// asymmetric: a regional client, a repacked build, a STOVE relaunch from a
+/// different install path, or a future Epic Seven update renaming its
+/// executable would all read back as "no window found" and halt the watch,
+/// for a player who did nothing wrong and has no way to diagnose it from this
+/// app's side. Set against that, the marginal security gain over the pid
+/// check above is small: pid binding already stops the *swap* this file
+/// exists to close, and an attacker able to run a process on the same desktop
+/// and win the race at `acquire` is not meaningfully more constrained by a
+/// path comparison they can also satisfy by naming their own binary
+/// appropriately in a directory they control. Do not re-add it without
+/// re-litigating that trade-off; if a future need genuinely calls for it,
+/// prefer logging the observed path (`info!`, once per `acquire`) over
+/// refusing on it.
+///
 /// [`Surface::Window`]: super::Surface::Window
 #[derive(Clone, Copy)]
 pub struct Target {
     hwnd: Hwnd,
+    /// The process id [`owning_pid`] read for `hwnd` at `acquire`. Compared,
+    /// not merely stored: see the module doc above for why.
+    pid: u32,
     /// Client area in screen pixels.
     rect: ClientRect,
 }
@@ -323,6 +432,8 @@ mod tests {
 
     pub(super) const GAME_HWND: Hwnd = Hwnd(101);
     pub(super) const OTHER_HWND: Hwnd = Hwnd(202);
+    pub(super) const GAME_PID: u32 = 4_040;
+    pub(super) const OTHER_PID: u32 = 5_050;
 
     pub(super) fn game_rect() -> ClientRect {
         ClientRect {

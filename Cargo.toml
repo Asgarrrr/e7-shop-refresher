@@ -18,6 +18,15 @@ pcap-backend = ["dep:libloading"]
 gui = ["dep:eframe"]
 # Click emulation (SendInput / PostMessageW); elsewhere a job-draining stub.
 actuator = []
+# Off by default: it exists only for `ui::editor`'s PNG helper, which is
+# `#[ignore]`d and run by hand during visual iteration. Enabling it drags the
+# whole wgpu/naga/ash tree into *every* `cargo test` lane, dev-dependencies
+# being ungateable — measured on this machine, `cargo test --locked
+# --no-default-features --no-run` from a clean `target/`: 246 crates / 7m55s
+# with `egui_kittest`'s `wgpu` feature on by default, 202 crates / 2m54s with
+# it off (this feature). Run the PNG test with
+# `cargo test --locked --features render-png -- --ignored render_stop_section_png`.
+render-png = ["egui_kittest/wgpu"]
 
 # `# 0` means zero sites measured on all six CI feature lanes, re-measured each
 # time an entry is added. A `[lints]` table applies to *every* target, tests
@@ -143,6 +152,10 @@ windows-sys = { version = "0.61", features = [
     # restricted to administrators" apart from "this machine has no adapters".
     "Win32_System_Registry",
     "Win32_System_SystemServices",
+    # `CreateDirectoryW` with a `SECURITY_ATTRIBUTES`, so the staging directory
+    # is born with `install::STAGING_DACL` instead of spending a window with
+    # `%TEMP%`'s inherited ACEs.
+    "Win32_Storage_FileSystem",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
@@ -152,8 +165,10 @@ windows-sys = { version = "0.61", features = [
 # Dev-deps cannot be feature-gated, so the console-only test lane builds egui
 # too; the tests themselves are behind `gui`. No `snapshot` — nothing calls
 # `assert_snapshot`, and it pulls three crates into all nine `--locked` lanes.
-# `wgpu` stays: `editor`'s `timing_meter_grip_moves_with_the_range` needs it.
-egui_kittest = { version = "0.35", default-features = false, features = ["wgpu"] }
+# No `wgpu` either: the only consumer is
+# `ui::editor::tests::render_stop_section_png`, gated behind the `render-png`
+# crate feature above (see its comment for the measured cost).
+egui_kittest = { version = "0.35", default-features = false }
 # Paused-clock tests (`start_paused`) for the uplink send timeout.
 tokio = { version = "1", features = ["test-util"] }
 
@@ -193,8 +208,9 @@ codegen-units = 1
 # `catch_unwind`, fatal channel all trigger on a panic, and a wrap is not one —
 # on arithmetic over values the crate does not control. Prerequisite, audited
 # before enabling: a panic from a `Drop` *during an unwind* aborts with no
-# `crash.log`, so all four production `Drop` impls were read and none performs
-# checkable arithmetic.
+# `crash.log`, so the rule is that no production `Drop` impl may perform
+# checkable arithmetic — every one of them was read against that rule and none
+# does.
 overflow-checks = true
 
 # Separate additive profile because `release` must keep `strip = "debuginfo"`

@@ -22,16 +22,19 @@ use arkyve_refresh_shop::{
 };
 
 fn main() -> ExitCode {
-    // Ahead of `install_logging`: the log directory sits inside the
-    // `%LOCALAPPDATA%\<app>` a WinDivert build locked to administrators, so undo
-    // that first or the first post-upgrade run writes into a directory it cannot
-    // open. Findings are reported below, once there is a subscriber.
-    let leftovers = migrate::clean_windivert_leftovers();
-
-    // Before anything can panic: with inert stdout/stderr a worker panic would
-    // otherwise surface only as "session ended". The hook's `tracing` line is a
-    // no-op until the subscriber exists; the file is the record.
+    // First statement: everything after this can panic, including the
+    // elevated Win32 calls `migrate` is about to make, and a panic before the
+    // hook is installed leaves no `crash.log` and no `tracing` line — a
+    // silent vanish in the windowed build. The hook has no dependency on
+    // `migrate`, so nothing after it needs to come first.
     crash::install();
+
+    // Still ahead of `install_logging`, not just ahead of the hook: the log
+    // directory sits inside the `%LOCALAPPDATA%\<app>` a WinDivert build
+    // locked to administrators, so undo that first or the first post-upgrade
+    // run writes into a directory it cannot open. Findings are reported
+    // below, once there is a subscriber.
+    let leftovers = migrate::clean_windivert_leftovers();
 
     // Held to the end of `main`: dropping it flushes the log writer.
     let (_log_guard, log_setup) = install_logging();
@@ -75,6 +78,11 @@ fn main() -> ExitCode {
         Err(err) => {
             // Structured for the file, prose for the player: the prose has
             // newlines that would break one-event-per-line in the log.
+            // `?err` is safe here specifically because a config parse/reparse
+            // failure is redacted at the type: `Error::ConfigParse` and
+            // `Error::ConfigReparse` carry `error::TomlLocation`, not the raw
+            // `toml`/`toml_edit` error, so neither this line nor `report()`
+            // below can render the offending source line.
             tracing::error!(
                 error = ?err,
                 config_path = %config_path.display(),

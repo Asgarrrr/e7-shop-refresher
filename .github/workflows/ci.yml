@@ -26,14 +26,16 @@ on:
 # workflow gets whatever the repository's default is — historically
 # read-and-write on every scope, and still write today for any repo whose
 # setting was never changed — which every third-party action in every job then
-# runs with. Nothing here writes to the repo: the three jobs check out, compile,
+# runs with. Nothing here writes to the repo: the four jobs check out, compile,
 # test, read the dependency graph and read public commits, so `contents: read` is
 # the whole requirement and the rest (packages, issues, pull-requests, id-token,
 # attestations, …) are implicitly set to `none` the moment any scope is named.
 #
-# Declared once at workflow level rather than per job because all three need
+# Declared once at workflow level rather than per job because all four need
 # exactly the same thing; the release workflow does the opposite — `{}` at the
 # top and a scope list per job — because there the two jobs genuinely differ.
+# `lane-consistency` below repeats the declaration at job level anyway — see
+# its own comment for why that is not a second source of truth.
 permissions:
   contents: read
 
@@ -178,6 +180,16 @@ jobs:
         run: cargo test --locked --no-default-features --features pcap-backend
       - name: Test shipped default features (non-elevated tests)
         run: cargo test --locked
+      # The `#[cfg(not(debug_assertions))]` arm of `stream::budget`'s accounting
+      # tests only compiles here: it is the assertion behind `Cargo.toml`'s
+      # `overflow-checks = true`, that a shipped build saturates and logs a
+      # byte-accounting bug rather than panicking, because a panic from a `Drop`
+      # during an unwind aborts with no `crash.log`. Run on both toolchain arms,
+      # same as the four test steps above and with no `if:` gate, because debug
+      # and release genuinely test different code and there is no
+      # toolchain-specific reason to skip either arm.
+      - name: Test release configuration (release-only accounting test)
+        run: cargo test --locked --release --no-default-features --features gui,actuator
 
   dependency-policy:
     name: Dependency policy
@@ -343,3 +355,75 @@ jobs:
             status=1
           fi
           exit $status
+
+  lane-consistency:
+    name: justfile/CI lane consistency
+    runs-on: ubuntu-24.04
+    # `justfile` and this file carry the same eleven `cargo clippy`/`cargo
+    # test` invocations as independent copies, in different formats, tens of
+    # lines apart. Nothing before this job kept them in step, and this repo has
+    # already been bitten by exactly this failure class once:
+    # `quality.yml`'s mutants sharding went out of step and an off-by-one left
+    # shard 0 unevaluated while the lane reported green (see `justfile`'s
+    # `mutants` recipe for the citation). The clippy/test lane lists have the
+    # same coupling, with nothing that asserted it before this job.
+    #
+    # The failure is invisible in review both ways round: a lane added to
+    # `justfile` and not here is a check `just verify`/`just backends` runs
+    # locally but no pull request ever gates on; a lane added here and not to
+    # `justfile` means a clean `just verify` on a tree this job would redden.
+    #
+    # Deliberately the cheapest possible job, modelled on `action-pins` above:
+    # no toolchain, no cargo, no cache — a checkout and a few lines of bash.
+    # Declared explicitly here, matching the workflow-level comment's
+    # "declared rather than inherited" reasoning, rather than resting solely on
+    # inheritance from the block above: this job reads no secrets and needs
+    # nothing beyond the checkout, and repeating the scope on the job itself
+    # means a future job added below it cannot accidentally widen what this one
+    # runs with by editing the shared block.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: The two files' cargo clippy/test lanes must be identical sets
+        run: |
+          set -euo pipefail
+
+          # From the justfile: every line whose trimmed form is a `cargo
+          # clippy`/`cargo test` invocation.
+          grep -E '^[[:space:]]*cargo (clippy|test)[[:space:]]' justfile \
+            | sed -E 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]+/ /g' \
+            | sort -u > just_lanes.txt
+
+          # From ci.yml: every `run:` step — bare `- run:` or `run:` nested
+          # under a `- name:` — whose value is a `cargo clippy`/`cargo test`
+          # invocation. Deliberately narrower than "every cargo line": this
+          # file also builds a release exe and asserts its embedded manifest,
+          # with no `justfile` counterpart and none intended, and widening the
+          # match would drag those in as false mismatches. `cargo fmt --all
+          # --check` runs under `if: matrix.toolchain == '1.92.0'` here and
+          # unconditionally in `justfile` — same command, different guard —
+          # and it is out of scope for the same reason `cargo build` is: this
+          # compares commands, not guards, and fmt is neither clippy nor test.
+          grep -E '^[[:space:]]*(- )?run:[[:space:]]*cargo (clippy|test)[[:space:]]' \
+            .github/workflows/ci.yml \
+            | sed -E 's/^[[:space:]]*(- )?run:[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]+/ /g' \
+            | sort -u > ci_lanes.txt
+
+          # A check that silently matches nothing is worse than no check: if
+          # the recipe format or the `run:` convention ever drift apart, fail
+          # loudly instead of comparing two empty lists and reporting success.
+          # Same guard as `action-pins` above, for the same reason.
+          if [ ! -s just_lanes.txt ] || [ ! -s ci_lanes.txt ]; then
+            echo "::error::extraction matched no cargo clippy/test lanes in justfile and/or ci.yml — this check has stopped checking anything"
+            exit 1
+          fi
+
+          if ! diff -u just_lanes.txt ci_lanes.txt > lanes.diff; then
+            echo "::error::justfile and .github/workflows/ci.yml disagree on their cargo clippy/test lanes"
+            cat lanes.diff
+            exit 1
+          fi
+
+          echo "ok: $(wc -l < just_lanes.txt) cargo clippy/test lanes agree between justfile and ci.yml"

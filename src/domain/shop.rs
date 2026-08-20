@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// wire — a degraded message still reaches the view.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShopSnapshot {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "sanitized_text")]
     pub merchant: Option<String>,
     /// The slots on offer. Tolerant per element — see [`lenient_slots`] for
     /// why a bad slot is dropped rather than failing the snapshot.
@@ -316,6 +316,102 @@ where
     Ok(slots)
 }
 
+/// Cap on any single server-supplied display string.
+///
+/// Generous against a real merchant or set name and far below anything that
+/// could pad a log file: the rotation keeps five files, so an uncapped name is
+/// a lever the server can pull to evict a player's real diagnostic history.
+const MAX_WIRE_TEXT: usize = 120;
+
+/// Strips control characters (replacing each with a single space), caps the
+/// result at [`MAX_WIRE_TEXT`] **characters**, then trims. Shared by
+/// [`sanitized_text`] and [`sanitized_required_text`]; returns whether
+/// anything changed, so the callers can decide whether to log.
+///
+/// Replacing rather than deleting a control character keeps `"a\nb"` from
+/// becoming `"ab"` — two words the server kept apart should not collide just
+/// because the separator was hostile.
+///
+/// Trimmed because `ui::editor::hunt` trims the player's side of the same
+/// comparison (`input.trim()` before a criterion is stored) and
+/// `Filter::matches` compares both sides by exact equality — an untrimmed
+/// wire value would silently stop matching a criterion the player typed
+/// correctly. Trimming happens *after* the cap, not before: truncating at
+/// exactly [`MAX_WIRE_TEXT`] characters can itself land on a space (an
+/// overlong value cut mid-word), so trimming first could leave that
+/// truncation-made space behind untouched.
+fn sanitize_wire_text(raw: String) -> (String, bool) {
+    let mut changed = false;
+    let stripped: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_control() {
+                changed = true;
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let capped: String = if stripped.chars().count() > MAX_WIRE_TEXT {
+        changed = true;
+        stripped.chars().take(MAX_WIRE_TEXT).collect()
+    } else {
+        stripped
+    };
+    let trimmed = capped.trim();
+    if trimmed.len() != capped.len() {
+        changed = true;
+    }
+    (trimmed.to_owned(), changed)
+}
+
+/// Server-supplied display text, with control characters removed and the
+/// length capped. Attaches to `merchant`, `ShopItem::name` and `ShopItem::set`
+/// — every optional display string the wire sends.
+///
+/// These strings reach the rotated log file verbatim as a `tracing` field
+/// (`journal::EventLog::emit_at`), and a `\n` in a field breaks the
+/// one-event-per-line property the whole file is read on — the same property
+/// `lib::fatal` declines to log a multi-line message for. An unbounded name is
+/// the other half: five rotated files can be filled on demand.
+///
+/// Replaces rather than rejects, in keeping with every other tolerant path
+/// here: a snapshot with a hostile name still shows the player their shop.
+fn sanitized_text<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(raw) = Option::<String>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let (cleaned, changed) = sanitize_wire_text(raw);
+    if changed {
+        tracing::debug!(
+            field = "display text",
+            "tolerated a control character or an overlong value in a server-supplied string — sanitized"
+        );
+    }
+    Ok(Some(cleaned))
+}
+
+/// [`sanitized_text`] for a field that is not optional on the Rust side
+/// (`Substat::name`) — the wire still owes a string, just not a clean one.
+fn sanitized_required_text<'de, D>(de: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(de)?;
+    let (cleaned, changed) = sanitize_wire_text(raw);
+    if changed {
+        tracing::debug!(
+            field = "display text",
+            "tolerated a control character or an overlong value in a server-supplied string — sanitized"
+        );
+    }
+    Ok(cleaned)
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ShopItem {
     /// Ties a purchase confirmation back to the slot the player wanted.
@@ -328,7 +424,7 @@ pub struct ShopItem {
     /// Defaults to `Unknown` rather than failing the whole message.
     #[serde(default)]
     pub kind: ItemKind,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "sanitized_text")]
     pub name: Option<String>,
     /// Price in gold. `None` fails *open* everywhere it is read — an unknown
     /// price can never be proven unaffordable. A wire `0` is a real price of
@@ -339,7 +435,7 @@ pub struct ShopItem {
     #[serde(default)]
     pub grade: Option<u8>,
     /// Gear set, by internal id (`set_speed`, `set_immune`, ...).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "sanitized_text")]
     pub set: Option<String>,
     /// Substats and their values, keyed by internal stat name. A nameless or
     /// mistyped entry is dropped: it could never match a name-keyed criterion.
@@ -408,6 +504,7 @@ pub enum ItemKind {
 /// optional: the wire lists blank entries, which no threshold can satisfy.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Substat {
+    #[serde(deserialize_with = "sanitized_required_text")]
     pub name: String,
     #[serde(default)]
     pub value: Option<f64>,
@@ -596,5 +693,58 @@ mod tests {
         let snapshot = parse(r#"{"slots":[{"id":9,"substats":"corrupt"}]}"#);
         assert!(snapshot.slots[0].substats.is_empty());
         assert_eq!(snapshot.slots[0].id, CatalogId::new(9));
+    }
+
+    /// The end-to-end property the sanitizer exists for: a server-supplied
+    /// newline must not be able to open a second line in the journal file.
+    /// `render::format_item` is the exemplar consumer — the GUI table, the
+    /// tooltip and the console line all go through the same field.
+    #[test]
+    fn a_newline_in_a_server_name_cannot_reach_a_journal_line() {
+        let snapshot = parse(r#"{"slots":[{"name":"before\nafter"}]}"#);
+        let line = crate::render::format_item(&snapshot.slots[0], 0);
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(line.contains("before after"), "{line:?}");
+    }
+
+    #[test]
+    fn an_overlong_server_name_is_capped() {
+        let long_name = "x".repeat(500);
+        let snapshot = parse(&serde_json::json!({"slots": [{"name": long_name}]}).to_string());
+        let name = snapshot.slots[0].name.as_deref().expect("name present");
+        assert_eq!(name.chars().count(), MAX_WIRE_TEXT);
+    }
+
+    #[test]
+    fn a_carriage_return_and_a_tab_are_replaced_not_deleted() {
+        let snapshot = parse(r#"{"slots":[{"name":"a\r\nb"}]}"#);
+        let name = snapshot.slots[0].name.as_deref().expect("name present");
+        assert!(!name.chars().any(char::is_control), "{name:?}");
+        let a_index = name.find('a').expect("a present");
+        let b_index = name.find('b').expect("b present");
+        assert!(
+            b_index > a_index + 1,
+            "a and b should stay separated: {name:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_name_is_returned_unchanged() {
+        let snapshot = parse(r#"{"slots":[{"name":"Ancient Coin","set":"set_speed"}]}"#);
+        assert_eq!(snapshot.slots[0].name.as_deref(), Some("Ancient Coin"));
+        assert_eq!(snapshot.slots[0].set.as_deref(), Some("set_speed"));
+    }
+
+    /// `ui::editor::hunt` trims a criterion before storing it (`input.trim()`),
+    /// but replacing a control character with a space, as the sanitizer does,
+    /// can itself leave a trailing space the wire value never had — a "\n" at
+    /// the end of a name becomes a `" "` at the end of a name. Left untrimmed,
+    /// that space is the only difference between the sanitized wire value and
+    /// the player's trimmed criterion, and `Filter::matches` is exact equality:
+    /// the item silently stops matching.
+    #[test]
+    fn a_trailing_control_character_does_not_leave_a_space_behind() {
+        let snapshot = parse(r#"{"slots":[{"name":"Covenant Bookmark\n"}]}"#);
+        assert_eq!(snapshot.slots[0].name.as_deref(), Some("Covenant Bookmark"));
     }
 }

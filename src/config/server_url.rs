@@ -290,4 +290,24 @@ mod tests {
             .expect_err("a non-loopback ws:// must not become a ServerUrl");
         assert!(matches!(error, crate::Error::Config(_)));
     }
+
+    #[test]
+    fn a_bad_server_url_does_not_put_its_userinfo_in_the_error() {
+        // The regression test for the reported bug: `parse` refuses a
+        // non-loopback `ws://`, so `#[serde(try_from = "String")]` fails
+        // *during* `toml::from_str`, and the resulting `toml::de::Error` is
+        // spanned on the `server_url` line — the credential-carrying line
+        // itself, not just the key name. Going through the full `Config`
+        // load path (rather than calling `ServerUrl::parse` directly) is the
+        // point: it is `toml`'s error, not `ServerUrl`'s, that must not
+        // repeat the line.
+        let text = "game_port = 3333\n\
+                     server_url = \"ws://fake-user:fake-secret@example.invalid:9/\"\n";
+        let toml_err = toml::from_str::<crate::config::Config>(text)
+            .expect_err("ws:// to a non-loopback host is refused by ServerUrl::parse");
+        let error: crate::Error = toml_err.into();
+        for rendered in [format!("{error:?}"), error.to_string(), error.report()] {
+            assert!(!rendered.contains("fake-secret"), "{rendered}");
+        }
+    }
 }

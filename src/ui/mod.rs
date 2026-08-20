@@ -25,7 +25,7 @@ use crate::journal::LogLine;
 use crate::watch::HaltSource;
 
 use editor::EditorState;
-use view::{SlotRow, SlotRows, ViewState, slot_detail, view_state};
+use view::{SlotRow, SlotRows, ViewState, merchant_heading, slot_detail, view_state};
 
 /// Where the session's terminal outcome lands (fatal error, crash, or clean
 /// end): written once by the spawn wrapper in `main`, shown as a banner.
@@ -139,10 +139,10 @@ impl eframe::App for ShopApp {
         ui.ctx().request_repaint_after(Duration::from_millis(250));
         // One short hold for both: the projection reads `Copy` state, and rows
         // re-derive only if the shop or checklist moved.
-        let view = {
+        let (view, merchant) = {
             let ctrl = lock_ignoring_poison(&self.handles.controller);
             self.slots.sync(&ctrl);
-            view_state(&ctrl)
+            (view_state(&ctrl), merchant_heading(&ctrl))
         };
         let generation = self.handles.journal.generation();
         if generation != self.journal_generation {
@@ -207,19 +207,16 @@ impl eframe::App for ShopApp {
         // hover fill, other tabs inset text via `theme::EDGE`.
         let controller = &self.handles.controller;
         let detail = |index: usize| slot_detail(&lock_ignoring_poison(controller), index);
-        let rows = self.slots.rows();
+        let pane = ShopPane {
+            view: &view,
+            rows: self.slots.rows(),
+            merchant: &merchant,
+            detail: &detail,
+        };
         let applied = egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::ZERO))
             .show(ui, |ui| {
-                render_tab_content(
-                    ui,
-                    &view,
-                    rows,
-                    self.tab,
-                    &mut self.editor,
-                    session_alive,
-                    &detail,
-                )
+                render_tab_content(ui, &pane, self.tab, &mut self.editor, session_alive)
             })
             .inner;
         // Dispatch first, then record: "applied" state and persistence both key
@@ -341,17 +338,28 @@ fn section_labels(sections: &[config::persist::Section]) -> String {
         .join(", ")
 }
 
+/// Everything the Shop tab's content needs, bundled so `render_tab_content`
+/// stays under clippy's argument limit: none of these four are read by the
+/// `Tab::Setup` arm, only by `Tab::Shop`'s call into `shop::render_shop_tab`.
+struct ShopPane<'a> {
+    view: &'a ViewState,
+    rows: &'a [SlotRow],
+    /// The heading `shop::render_shop_tab` paints — built once per frame by
+    /// `view::merchant_heading`, alongside `detail` rather than inside `view`
+    /// itself. See that function's doc comment for why.
+    merchant: &'a str,
+    detail: &'a dyn Fn(usize) -> String,
+}
+
 /// The active tab's content. One scroll state per tab, so Setup's offset can't
 /// bleed into the table.
 #[must_use]
 fn render_tab_content(
     ui: &mut egui::Ui,
-    view: &ViewState,
-    rows: &[SlotRow],
+    pane: &ShopPane<'_>,
     tab: Tab,
     editor: &mut EditorState,
     session_alive: bool,
-    detail: &dyn Fn(usize) -> String,
 ) -> Vec<Command> {
     match tab {
         // No inset: the shop table bleeds its hover fill to the edges itself.
@@ -359,7 +367,9 @@ fn render_tab_content(
             egui::ScrollArea::vertical()
                 .id_salt("tab-shop")
                 .auto_shrink([false, false])
-                .show(ui, |ui| shop::render_shop_tab(ui, view, rows, detail));
+                .show(ui, |ui| {
+                    shop::render_shop_tab(ui, pane.view, pane.rows, pane.merchant, pane.detail)
+                });
             Vec::new()
         }
         Tab::Setup => render_setup_tab(ui, editor, session_alive),
@@ -427,9 +437,15 @@ mod tests {
         session_alive: bool,
     ) -> Vec<Command> {
         render_tabs(ui, tab);
-        render_tab_content(ui, view, rows, *tab, editor, session_alive, &|_| {
-            String::new()
-        })
+        // No test here reaches the merchant heading — see `src/ui/shop.rs`'s
+        // own tests for that — so this shim only needs a stand-in string.
+        let pane = ShopPane {
+            view,
+            rows,
+            merchant: "Secret Shop",
+            detail: &|_| String::new(),
+        };
+        render_tab_content(ui, &pane, *tab, editor, session_alive)
     }
 
     fn project(controller: &Controller) -> (ViewState, SlotRows) {
