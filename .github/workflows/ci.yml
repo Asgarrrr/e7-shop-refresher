@@ -178,6 +178,16 @@ jobs:
         run: cargo test --locked --no-default-features --features pcap-backend
       - name: Test shipped default features (non-elevated tests)
         run: cargo test --locked
+      # The `#[cfg(not(debug_assertions))]` arm of `stream::budget`'s accounting
+      # tests only compiles here: it is the assertion behind `Cargo.toml`'s
+      # `overflow-checks = true`, that a shipped build saturates and logs a
+      # byte-accounting bug rather than panicking, because a panic from a `Drop`
+      # during an unwind aborts with no `crash.log`. Run on both toolchain arms,
+      # same as the four test steps above and with no `if:` gate, because debug
+      # and release genuinely test different code and there is no
+      # toolchain-specific reason to skip either arm.
+      - name: Test release configuration (release-only accounting test)
+        run: cargo test --locked --release --no-default-features --features gui,actuator
 
   dependency-policy:
     name: Dependency policy

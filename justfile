@@ -33,6 +33,27 @@ test:
     cargo test --locked --no-default-features
     cargo test --locked --no-default-features --features gui,actuator
 
+# The release-configuration test lane. Nothing else compiles the
+# `#[cfg(not(debug_assertions))]` arm of `stream::budget`'s accounting tests,
+# and that arm is the assertion behind `Cargo.toml`'s `overflow-checks = true`:
+# a shipped build must saturate and log rather than panic, because a panic from
+# a `Drop` during an unwind aborts with no `crash.log`. Debug and release
+# genuinely test different code here, so this is a lane and not a duplicate.
+#
+# Deliberately NOT wired into `verify` for now. Measured on this machine with
+# a warm cache, back-to-back `just verify` runs with and without this recipe
+# in the dependency list landed anywhere from 1.09x to 3.67x the baseline
+# wall-clock across repeated trials (12.5-20s without, 22-46s with; the
+# recipe alone costs ~6s in isolation, which does not explain the spread) —
+# the variance tracks concurrent cargo/rustc activity from other builds on
+# this shared machine, not a stable cost of the lane itself. That crosses
+# "roughly doubles" often enough to need a clean re-measurement and a human
+# call rather than an automated one made here. Run it explicitly with
+# `just test-release`; add it to `verify`'s dependency list once someone
+# re-measures on an uncontended machine.
+test-release:
+    cargo test --locked --release --no-default-features --features gui,actuator
+
 # Windows only. The capture backend on its own, then the combination that
 # actually ships — `cargo clippy --locked` with no feature flags, i.e.
 # `pcap-backend + gui + actuator`. Checking the pieces separately misses a cfg
