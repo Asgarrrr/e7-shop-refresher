@@ -26,8 +26,8 @@ use crate::actuator::{Surface, SurfaceError};
 
 use super::dpi::ensure_dpi_awareness;
 use super::{
-    Hwnd, MOVE_SETTLE_MS, Target, WHEEL_DELTA, client_rect, find_game_window, preflight_refusal,
-    probe_window_reachable, rect_change_error, release_twice,
+    Hwnd, MOVE_SETTLE_MS, Target, WHEEL_DELTA, client_rect, find_game_window, owning_pid,
+    preflight_refusal, probe_window_reachable, release_twice, verify_identity,
 };
 
 /// The foreground switch is asynchronous: give it a beat before verifying.
@@ -61,6 +61,10 @@ trait InputDriver: Send {
     fn foreground_window(&mut self) -> Hwnd;
     fn request_foreground(&mut self, hwnd: Hwnd);
     fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError>;
+    /// [`owning_pid`], read once at `acquire` and re-read by every later
+    /// [`verify_placement`](WinSurface::verify_placement) — see [`Target`]'s
+    /// doc comment for why.
+    fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError>;
     fn send(&mut self, event: InputEvent) -> Result<(), SurfaceError>;
     fn sleep(&mut self, duration: Duration);
 }
@@ -94,6 +98,10 @@ impl InputDriver for SystemInputDriver {
 
     fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError> {
         client_rect(hwnd.raw())
+    }
+
+    fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError> {
+        owning_pid(hwnd.raw())
     }
 
     fn send(&mut self, event: InputEvent) -> Result<(), SurfaceError> {
@@ -176,18 +184,12 @@ impl WinSurface {
     /// why [`probe_window_reachable`] needed a hang check and this does not.
     fn verify_placement(&mut self, target: Target) -> Result<(), SurfaceError> {
         let titled = self.driver.find_game_window()?;
-        if titled != target.hwnd {
-            return Err(SurfaceError::Fatal(
-                "the game window title now identifies a different window".to_owned(),
-            ));
-        }
-
-        let rect = self.driver.client_rect(target.hwnd)?;
-        if rect.is_degenerate() || rect != target.rect {
-            return Err(rect_change_error(rect));
-        }
-
-        Ok(())
+        let driver = &mut self.driver;
+        verify_identity(titled, target, move || {
+            let pid = driver.owning_pid(target.hwnd)?;
+            let rect = driver.client_rect(target.hwnd)?;
+            Ok((pid, rect))
+        })
     }
 
     /// The placement reads, plus the demand that the window own the foreground —
@@ -258,7 +260,8 @@ impl Surface for WinSurface {
         let hwnd = self.locate()?;
         self.ensure_foreground(hwnd)?;
         let rect = self.driver.client_rect(hwnd)?;
-        Ok((Target { hwnd, rect }, rect))
+        let pid = self.driver.owning_pid(hwnd)?;
+        Ok((Target { hwnd, rect, pid }, rect))
     }
 
     /// `acquire` minus the one step that acts on the desktop, and *only* that
@@ -273,7 +276,8 @@ impl Surface for WinSurface {
     fn measure(&mut self) -> Result<(Target, ClientRect), SurfaceError> {
         let hwnd = self.locate()?;
         let rect = self.driver.client_rect(hwnd)?;
-        Ok((Target { hwnd, rect }, rect))
+        let pid = self.driver.owning_pid(hwnd)?;
+        Ok((Target { hwnd, rect, pid }, rect))
     }
 
     fn click(
@@ -394,7 +398,9 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    use crate::actuator::win::tests::{GAME_HWND, OTHER_HWND, game_rect, uipi_refusal};
+    use crate::actuator::win::tests::{
+        GAME_HWND, GAME_PID, OTHER_HWND, OTHER_PID, game_rect, uipi_refusal,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum DriverCall {
@@ -403,6 +409,7 @@ mod tests {
         Foreground,
         RequestForeground(Hwnd),
         ClientRect(Hwnd),
+        OwningPid(Hwnd),
         Send(InputEvent),
         Sleep(u64),
     }
@@ -412,6 +419,7 @@ mod tests {
         window: Hwnd,
         foreground: Hwnd,
         rect: ClientRect,
+        pid: u32,
         find_results: VecDeque<Result<Hwnd, SurfaceError>>,
         /// Raw: an `Err` here is the thread's last-error as Win32 would have
         /// left it, so the tests exercise the real classification rather than a
@@ -419,6 +427,7 @@ mod tests {
         probe_results: VecDeque<std::io::Result<()>>,
         foreground_results: VecDeque<Hwnd>,
         rect_results: VecDeque<Result<ClientRect, SurfaceError>>,
+        pid_results: VecDeque<Result<u32, SurfaceError>>,
         send_results: VecDeque<Result<(), SurfaceError>>,
     }
 
@@ -429,10 +438,12 @@ mod tests {
                 window: GAME_HWND,
                 foreground: GAME_HWND,
                 rect: game_rect(),
+                pid: GAME_PID,
                 find_results: VecDeque::new(),
                 probe_results: VecDeque::new(),
                 foreground_results: VecDeque::new(),
                 rect_results: VecDeque::new(),
+                pid_results: VecDeque::new(),
                 send_results: VecDeque::new(),
             }
         }
@@ -484,6 +495,16 @@ mod tests {
                 result
             } else {
                 Ok(state.rect)
+            }
+        }
+
+        fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(DriverCall::OwningPid(hwnd));
+            if let Some(result) = state.pid_results.pop_front() {
+                result
+            } else {
+                Ok(state.pid)
             }
         }
 
@@ -561,6 +582,7 @@ mod tests {
     fn validation_calls() -> Vec<DriverCall> {
         vec![
             DriverCall::FindWindow,
+            DriverCall::OwningPid(GAME_HWND),
             DriverCall::ClientRect(GAME_HWND),
             DriverCall::Foreground,
         ]
@@ -593,6 +615,7 @@ mod tests {
                 DriverCall::Sleep(FOCUS_SETTLE_MS),
                 DriverCall::Foreground,
                 DriverCall::ClientRect(GAME_HWND),
+                DriverCall::OwningPid(GAME_HWND),
             ]
         );
     }
@@ -624,6 +647,7 @@ mod tests {
                 DriverCall::FindWindow,
                 DriverCall::Probe(GAME_HWND),
                 DriverCall::ClientRect(GAME_HWND),
+                DriverCall::OwningPid(GAME_HWND),
             ]
         );
     }
@@ -656,6 +680,72 @@ mod tests {
         expected.push(DriverCall::Sleep(MOVE_SETTLE_MS));
         expected.extend(validation_calls());
         expected.push(DriverCall::Send(InputEvent::Wheel(-2)));
+        assert_eq!(calls(&state), expected);
+    }
+
+    /// Named for the parity this backend and `post_message.rs` share through
+    /// [`verify_identity`](super::verify_identity): the same scenario as
+    /// `different_title_matched_window_is_fatal_before_input` below, under the
+    /// name both backends' test modules use for it.
+    #[test]
+    fn a_title_resolving_to_another_window_mid_job_is_fatal() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+        state.lock().unwrap().window = OTHER_HWND;
+
+        assert!(matches!(
+            surface.click(&target, (1, 2), 3),
+            Err(SurfaceError::Fatal(reason)) if reason.contains("different window")
+        ));
+        assert_eq!(calls(&state), vec![DriverCall::FindWindow]);
+        assert!(sent_events(&state).is_empty());
+    }
+
+    /// Parity with `post_message.rs`'s equivalent: a recycled `HWND` value now
+    /// owned by a different process must be refused exactly like a changed
+    /// title, even though the title and the `HWND` integer both still match.
+    #[test]
+    fn a_changed_owning_process_is_fatal() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+        state.lock().unwrap().pid_results.push_back(Ok(OTHER_PID));
+
+        assert!(matches!(
+            surface.click(&target, (1, 2), 3),
+            Err(SurfaceError::Fatal(reason)) if reason.contains("different process")
+        ));
+        assert_eq!(
+            calls(&state),
+            vec![
+                DriverCall::FindWindow,
+                // `verify_identity` reads the pid and the rect together, in one
+                // round trip, once the title has matched — see its doc comment
+                // for why that is not a correctness gap: both are cheap reads,
+                // unlike the desktop-affecting calls the title check guards.
+                DriverCall::OwningPid(GAME_HWND),
+                DriverCall::ClientRect(GAME_HWND),
+            ]
+        );
+        assert!(sent_events(&state).is_empty());
+    }
+
+    /// The negative control for the two checks above: an unchanged target
+    /// must still click end to end, so the title and pid re-resolution
+    /// cannot pass by refusing everything.
+    #[test]
+    fn an_unchanged_target_still_clicks() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+
+        assert_eq!(surface.click(&target, (400, 500), 25), Ok(()));
+        let mut expected = validation_calls();
+        expected.push(DriverCall::Send(InputEvent::Move((400, 500))));
+        expected.push(DriverCall::Sleep(MOVE_SETTLE_MS));
+        expected.extend(validation_calls());
+        expected.push(DriverCall::Send(InputEvent::LeftDown));
+        expected.push(DriverCall::Sleep(25));
+        expected.extend(validation_calls());
+        expected.push(DriverCall::Send(InputEvent::LeftUp));
         assert_eq!(calls(&state), expected);
     }
 
@@ -701,7 +791,11 @@ mod tests {
         ));
         assert_eq!(
             calls(&state),
-            vec![DriverCall::FindWindow, DriverCall::ClientRect(GAME_HWND)]
+            vec![
+                DriverCall::FindWindow,
+                DriverCall::OwningPid(GAME_HWND),
+                DriverCall::ClientRect(GAME_HWND),
+            ]
         );
     }
 
@@ -748,9 +842,10 @@ mod tests {
         assert_eq!(surface.scroll(&target, (30, 40), 1), Ok(()));
         let actual = calls(&state);
         assert_eq!(
-            &actual[..7],
+            &actual[..8],
             &[
                 DriverCall::FindWindow,
+                DriverCall::OwningPid(GAME_HWND),
                 DriverCall::ClientRect(GAME_HWND),
                 DriverCall::Foreground,
                 DriverCall::RequestForeground(GAME_HWND),
@@ -780,6 +875,7 @@ mod tests {
             calls(&state),
             vec![
                 DriverCall::FindWindow,
+                DriverCall::OwningPid(GAME_HWND),
                 DriverCall::ClientRect(GAME_HWND),
                 DriverCall::Foreground,
                 DriverCall::RequestForeground(GAME_HWND),
