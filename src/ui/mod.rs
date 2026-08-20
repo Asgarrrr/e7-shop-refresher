@@ -28,6 +28,7 @@ use crate::watch::HaltSource;
 
 use capture_health::{CaptureHealthView, render_capture_health};
 use editor::EditorState;
+pub use editor::StartupSettings;
 use view::{SlotRow, SlotRows, ViewState, merchant_heading, slot_detail, view_state};
 
 /// Where the session's terminal outcome lands (fatal error, crash, or clean
@@ -103,18 +104,22 @@ impl ShopApp {
         handles: SessionHandles,
         error: SessionErrorSlot,
         timings: Timings,
+        startup: StartupSettings,
         config_path: PathBuf,
     ) -> Self {
         theme::apply(&cc.egui_ctx);
         // The drafts seed from the controller; `Timings` aren't domain state,
-        // so they seed from the startup config value instead.
+        // so they seed from the startup config value instead — and neither are
+        // the three in `startup`, for a stronger reason: the session never
+        // holds them at all, so the config this process was launched with is
+        // the only place they exist.
         let (editor, slots) = {
             let ctrl = lock_ignoring_poison(&handles.controller);
             let mut slots = SlotRows::default();
             // Synced here so the first frame finds the cache already current.
             slots.sync(&ctrl);
             (
-                EditorState::new(ctrl.filter().clone(), *ctrl.limits(), timings),
+                EditorState::new(ctrl.filter().clone(), *ctrl.limits(), timings, startup),
                 slots,
             )
         };
@@ -248,15 +253,19 @@ impl eframe::App for ShopApp {
         // Dispatch first, then record: "applied" state and persistence both key
         // off what the session actually took.
         let mut delivered = Vec::new();
-        for command in clicked.into_iter().chain(applied) {
+        for command in clicked.into_iter().chain(applied.commands) {
             if deliver_command(&self.handles, command.clone()) {
                 delivered.push(command);
             }
         }
         self.editor.mark_applied(&delivered);
-        // Best-effort: a write failure only costs the on-disk copy, so it is
-        // journaled and moved past.
-        let sections = persisted_sections(&delivered);
+        // Best-effort for the retunes above — a write failure only costs the
+        // on-disk copy, because the session already took them. **Not** for the
+        // restart-only keys appended here: for those the file is the only place
+        // the change can land, so `mark_startup_saved` waits on the result
+        // below rather than running beside `mark_applied`.
+        let mut sections = persisted_sections(&delivered);
+        sections.extend(startup_sections(applied.startup));
         if !sections.is_empty()
             && let Err(err) = config::persist::save(&self.config_path, &sections)
         {
@@ -275,6 +284,10 @@ impl eframe::App for ShopApp {
                 "config.toml not saved ({labels}): {}",
                 err.report()
             )]);
+        } else {
+            // Reached when there was nothing to write, too, which is correct:
+            // an empty `startup` re-seeds the twin with what it already holds.
+            self.editor.mark_startup_saved();
         }
     }
 }
@@ -350,18 +363,49 @@ fn persisted_sections(commands: &[Command]) -> Vec<config::persist::Section> {
         .collect()
 }
 
+/// The restart-only half of the bridge above. Separate from
+/// [`persisted_sections`] because these three reach `config.toml` without ever
+/// reaching the session, so there is no `Command` to read them off — see
+/// `editor::EditorState::mark_startup_saved` for why that difference matters.
+///
+/// One `Section` per field that moved, so an Apply that changed only the port
+/// leaves the backend line exactly as the player wrote it.
+fn startup_sections(edits: editor::StartupEdits) -> Vec<config::persist::Section> {
+    let mut sections = Vec::new();
+    if let Some(port) = edits.game_port {
+        sections.push(config::persist::Section::GamePort(port));
+    }
+    if let Some(dry_run) = edits.dry_run {
+        sections.push(config::persist::Section::DryRun(dry_run));
+    }
+    if let Some(backend) = edits.backend {
+        sections.push(config::persist::Section::Backend(backend));
+    }
+    sections
+}
+
 /// The Setup section titles for the "not saved" report — the same words the UI
 /// uses, so the message points at the block.
 fn section_labels(sections: &[config::persist::Section]) -> String {
-    sections
+    let mut labels: Vec<&str> = sections
         .iter()
         .map(|section| match section {
             config::persist::Section::Filter(_) => "Hunt",
             config::persist::Section::Limits(_) => "Stop",
             config::persist::Section::Timings(_) => "Click timing",
+            // All three live in one collapsible, so one label points at it.
+            // Naming the key instead would send a player looking for a block
+            // called "game_port".
+            config::persist::Section::GamePort(_)
+            | config::persist::Section::DryRun(_)
+            | config::persist::Section::Backend(_) => "Startup",
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect();
+    // The three Startup keys are three sections with one label, and they are
+    // appended together, so a consecutive dedup is enough to keep the report
+    // from reading "Startup, Startup, Startup".
+    labels.dedup();
+    labels.join(", ")
 }
 
 /// Everything the Shop tab's content needs, bundled so `render_tab_content`
@@ -386,7 +430,7 @@ fn render_tab_content(
     tab: Tab,
     editor: &mut EditorState,
     session_alive: bool,
-) -> Vec<Command> {
+) -> editor::Committed {
     match tab {
         // No inset: the shop table bleeds its hover fill to the edges itself.
         Tab::Shop => {
@@ -396,7 +440,7 @@ fn render_tab_content(
                 .show(ui, |ui| {
                     shop::render_shop_tab(ui, pane.view, pane.rows, pane.merchant, pane.detail)
                 });
-            Vec::new()
+            editor::Committed::default()
         }
         Tab::Setup => render_setup_tab(ui, editor, session_alive),
     }
@@ -409,8 +453,8 @@ fn render_setup_tab(
     ui: &mut egui::Ui,
     editor: &mut EditorState,
     session_alive: bool,
-) -> Vec<Command> {
-    let mut clicked = Vec::new();
+) -> editor::Committed {
+    let mut clicked = editor::Committed::default();
     egui::Panel::bottom("setup_commit")
         .frame(
             egui::Frame::side_top_panel(ui.style())
@@ -424,7 +468,11 @@ fn render_setup_tab(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             content_inset(ui, |ui| {
-                ui.add_enabled_ui(session_alive, |ui| editor::edit_sections(ui, editor));
+                // `session_alive` goes *into* `edit_sections` rather than
+                // wrapping it: the Startup section must stay editable on a dead
+                // session, since a wrong `game_port` is one of the reasons the
+                // session is dead. See `editor::commit_row`.
+                editor::edit_sections(ui, editor, session_alive);
             });
         });
     clicked
@@ -471,7 +519,47 @@ mod tests {
             merchant: "Secret Shop",
             detail: &|_| String::new(),
         };
-        render_tab_content(ui, &pane, *tab, editor, session_alive)
+        render_tab_content(ui, &pane, *tab, editor, session_alive).commands
+    }
+
+    /// The second bridge, per field: nothing that did not move gets written.
+    #[test]
+    fn only_the_startup_fields_that_moved_become_sections() {
+        let port = std::num::NonZeroU16::new(4001).expect("4001 is not zero");
+        assert!(startup_sections(editor::StartupEdits::default()).is_empty());
+        assert_eq!(
+            startup_sections(editor::StartupEdits {
+                game_port: Some(port),
+                ..Default::default()
+            }),
+            vec![config::persist::Section::GamePort(port)]
+        );
+        assert_eq!(
+            startup_sections(editor::StartupEdits {
+                game_port: Some(port),
+                dry_run: Some(true),
+                backend: Some(config::ActuatorBackend::Input),
+            }),
+            vec![
+                config::persist::Section::GamePort(port),
+                config::persist::Section::DryRun(true),
+                config::persist::Section::Backend(config::ActuatorBackend::Input),
+            ]
+        );
+    }
+
+    /// The three Startup keys are one collapsible, so the "not saved" report
+    /// must name it once — not three times.
+    #[test]
+    fn the_not_saved_report_names_the_startup_block_once() {
+        let port = std::num::NonZeroU16::new(4001).expect("4001 is not zero");
+        let sections = vec![
+            config::persist::Section::Limits(Limits::default()),
+            config::persist::Section::GamePort(port),
+            config::persist::Section::DryRun(true),
+            config::persist::Section::Backend(config::ActuatorBackend::Input),
+        ];
+        assert_eq!(section_labels(&sections), "Stop, Startup");
     }
 
     fn project(controller: &Controller) -> (ViewState, SlotRows) {
@@ -590,7 +678,12 @@ mod tests {
     fn shop_tab_hides_the_editors() {
         let (view, slots) = idle_view();
         let mut tab = Tab::Shop;
-        let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
+        let mut editor = EditorState::new(
+            Filter::default(),
+            Limits::default(),
+            Timings::default(),
+            StartupSettings::default(),
+        );
         let harness = Harness::new_ui(|ui| {
             render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
         });
@@ -602,7 +695,12 @@ mod tests {
     fn setup_tab_reveals_the_editors() {
         let (view, slots) = idle_view();
         let mut tab = Tab::Shop;
-        let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
+        let mut editor = EditorState::new(
+            Filter::default(),
+            Limits::default(),
+            Timings::default(),
+            StartupSettings::default(),
+        );
         let mut harness = Harness::new_ui(|ui| {
             render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
         });
@@ -618,7 +716,12 @@ mod tests {
     fn empty_shop_tab_shows_the_quick_start() {
         let (view, slots) = idle_view();
         let mut tab = Tab::Shop;
-        let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
+        let mut editor = EditorState::new(
+            Filter::default(),
+            Limits::default(),
+            Timings::default(),
+            StartupSettings::default(),
+        );
         let harness = Harness::new_ui(|ui| {
             render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
         });
@@ -629,7 +732,12 @@ mod tests {
     fn captured_shop_replaces_the_quick_start() {
         let (view, slots) = captured_view();
         let mut tab = Tab::Shop;
-        let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
+        let mut editor = EditorState::new(
+            Filter::default(),
+            Limits::default(),
+            Timings::default(),
+            StartupSettings::default(),
+        );
         let harness = Harness::new_ui(|ui| {
             render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
         });
@@ -650,7 +758,12 @@ mod tests {
         });
         let (view, slots) = project(&controller);
         let mut tab = Tab::Shop;
-        let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
+        let mut editor = EditorState::new(
+            Filter::default(),
+            Limits::default(),
+            Timings::default(),
+            StartupSettings::default(),
+        );
         let harness = Harness::new_ui(|ui| {
             render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
         });
