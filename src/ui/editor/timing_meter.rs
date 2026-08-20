@@ -107,7 +107,18 @@ fn timing_meter(ui: &mut egui::Ui, width: f32, baseline: u64, value: &mut DelayR
 
     // Drag or click sets the random extra: the pointer's x is the target total
     // wait; slack is whatever sits past the baseline, clamped to [0, ruler end].
-    if let Some(pos) = response.interact_pointer_pos() {
+    //
+    // Gated on `dragged() || clicked()` and not on `interact_pointer_pos()`
+    // alone: that returns `Some` from the frame the button goes *down*, before
+    // the press has resolved into either gesture, so merely putting a finger on
+    // a bar rewrote it. The write is destructive and one-way — this ruler ends
+    // at `RULER_MS`, well under `plan::MAX_TIMING_MS`, so a hand-authored
+    // `refreshed = { min_ms = 200, max_ms = 30000 }` collapsed toward `(0, 0)`
+    // on contact (`set_max_ms` brings the floor down with the ceiling), lit
+    // Apply, and `persist::save` wrote the collapse over the player's file.
+    if (response.dragged() || response.clicked())
+        && let Some(pos) = response.interact_pointer_pos()
+    {
         let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
         // `set_max_ms` alone also brings a config-seeded floor down with the
         // ceiling just dragged past it — `DelayRange`'s private fields make a
@@ -129,7 +140,15 @@ fn timing_meter(ui: &mut egui::Ui, width: f32, baseline: u64, value: &mut DelayR
     // so the bar paints past its own rect; the grip clamp below keeps it readable.
     let total = baseline + value.max_ms();
     let base_w = rect.width() * (baseline as f32 / RULER_MS);
-    let total_w = rect.width() * (total as f32 / RULER_MS);
+    // Clamped to the bar, unlike the grip clamp below, which only repositions
+    // the grip and never bounded this rect. `total` can be many times the
+    // ruler — `MAX_TIMING_MS` is 60 000 against a 2 500 ms ruler — and
+    // `ui.painter()` is not clipped to the allocated rect, so a legal
+    // `max_ms = 60000` painted an accent fill ~24× the bar's width: straight
+    // across the fixed resolved-time column beside it and out to the scroll
+    // area's edge, leaving the row a solid band with its own value text
+    // unreadable on top.
+    let total_w = (rect.width() * (total as f32 / RULER_MS)).min(rect.width());
     painter.rect_filled(
         egui::Rect::from_min_size(rect.min, egui::vec2(base_w, rect.height())),
         radius,

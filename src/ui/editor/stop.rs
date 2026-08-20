@@ -77,7 +77,21 @@ pub(super) fn duration_row(ui: &mut egui::Ui, value: &mut Option<u64>) {
             // drag rewrites the stored ms.
             let mut minutes = ms.div_ceil(60_000);
             compact_drag(ui, |ui| {
-                let r = ui.add(egui::DragValue::new(&mut minutes).range(1..=u64::MAX / 60_000));
+                // `clamp_existing_to_range(false)` for the same reason
+                // [`super::optional_field`] carries it, and this row needed it
+                // too: `max_duration_ms = Some(0)` is a legal config value
+                // (nothing in `config` rejects it, and `Controller` reads it as
+                // "stop at once"), it renders as `minutes = 0`, and egui's
+                // default would clamp that existing value up to the range floor
+                // and report the response as *changed* on the first frame. The
+                // handler below would then write 60_000 ms into a draft the
+                // player has not touched, lighting Apply with a one-minute
+                // session cap nobody asked for.
+                let r = ui.add(
+                    egui::DragValue::new(&mut minutes)
+                        .range(1..=u64::MAX / 60_000)
+                        .clamp_existing_to_range(false),
+                );
                 if r.changed() {
                     *ms = minutes.saturating_mul(60_000);
                 }
