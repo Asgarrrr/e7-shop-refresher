@@ -148,7 +148,7 @@ impl Reassembler {
         // A new flow past the cap evicts the stalest one first, so reconnect
         // churn or a forged-source-port flood cannot grow the map unbounded.
         if self.streams.len() >= MAX_STREAMS && !self.streams.contains_key(&key) {
-            self.evict_stalest();
+            self.evict_stalest(&budget);
         }
         let clock = self.clock;
         let half = self.streams.entry(key).or_default();
@@ -233,15 +233,38 @@ impl Reassembler {
 
     /// Drops the least-recently-active stream; called only when a new key
     /// would exceed `MAX_STREAMS`.
-    fn evict_stalest(&mut self) {
-        if let Some(&key) = self
+    ///
+    /// Takes the budget because an eviction *is* an anchor loss, and every
+    /// other anchor loss in this file accounts for itself. This one used to
+    /// be silent, and the case it was silent about is not the hypothetical
+    /// one: capture is port-wide with no host filter, so any burst of foreign
+    /// flows past 64 keys evicts by staleness — and between two shop refreshes
+    /// the quietest flow on that port is the game's own. It loses `baseline`
+    /// and `next_off` mid-message, re-anchors on its next segment as if
+    /// nothing happened, and the missing snapshot appears in no counter and no
+    /// log line. `record_resync` is the same call
+    /// [`Self::push_budgeted`]'s pressure arm makes for the same loss, so a
+    /// crowded-out anchor and a quota-blown one now add up in one number.
+    fn evict_stalest(&mut self, budget: &PipelineBudget) {
+        let Some(&key) = self
             .streams
             .iter()
             .min_by_key(|(_, half)| half.last_active)
             .map(|(key, _)| key)
-        {
-            self.streams.remove(&key);
-        }
+        else {
+            return;
+        };
+        let evicted = self
+            .streams
+            .remove(&key)
+            .expect("the key was just read out of this map");
+        // `clock` counts segments across *all* flows and was bumped for the
+        // arriving one before this call, so the difference is how many packets
+        // from other flows went by while this stream said nothing — the one
+        // number that separates "crowded out" from "went quiet".
+        let segments_since_active = self.clock.saturating_sub(evicted.last_active);
+        budget.record_resync();
+        warn_stream_evicted(budget, evicted, segments_since_active);
     }
 
     /// Resets all state so each flow re-anchors on its next segment. Used
@@ -440,6 +463,56 @@ fn warn_reassembly_pressure(budget: &PipelineBudget, cause: PressureCause) {
         dropped_bytes = stats.dropped_bytes,
         resyncs = stats.resyncs,
         "reassembly pending-byte pressure; state cleared for a fresh anchor"
+    );
+}
+
+/// The rare branch of [`Reassembler::evict_stalest`], out of line for the same
+/// reason as [`warn_reassembly_pressure`] above.
+///
+/// Owns the evicted stream instead of borrowing it, deliberately: the gap
+/// buffer's leases release as it drops, and a line reporting the reassembly
+/// pool is only worth printing once the bytes this eviction just gave back are
+/// actually back. Borrowing would print a total that still counts them.
+///
+/// No `record_drop` accompanies the discarded gap buffer, which looks like an
+/// omission and is not. [`Reassembler::push_budgeted`] states the rule at its
+/// own reset — drop metrics identify the capture the pipeline *refused*, and
+/// chunks thrown away by a recovery are collateral, not extra captures — and
+/// nothing was refused here: the segment that triggered the eviction is
+/// admitted and delivered normally. Counting the collateral only on this path
+/// would make `dropped_segments` mean one thing under quota pressure and
+/// another under table pressure. The bytes are reported below instead, where a
+/// large number is diagnostic without redefining a counter two other paths
+/// share.
+#[cold]
+#[inline(never)]
+fn warn_stream_evicted(budget: &PipelineBudget, evicted: HalfStream, segments_since_active: u64) {
+    // What the evicted flow was in the middle of, in the spirit of
+    // `warn_reassembly_pressure`'s `scope`: in the counters an eviction that
+    // cost a shop refresh and one that discarded a flow which had never
+    // delivered a byte are the same event, and only the first is worth a
+    // player's attention.
+    let loss = if evicted.pending_bytes > 0 {
+        "a flow buffering behind a gap; its half-received message is gone"
+    } else if evicted.next_off > 0 {
+        "a flow mid-stream; its decoder resyncs on the next segment"
+    } else {
+        "a flow that had only anchored; nothing had been delivered from it"
+    };
+    let delivered_bytes = evicted.next_off;
+    let buffered_bytes = evicted.pending_bytes;
+    drop(evicted);
+    let stats = budget.snapshot();
+    warn!(
+        loss,
+        stream_cap = MAX_STREAMS,
+        segments_since_active,
+        delivered_bytes,
+        buffered_bytes,
+        pending_bytes = stats.current_reassembly,
+        resyncs = stats.resyncs,
+        "stream table full: other flows on the capture port crowded out the stalest one, \
+         which must re-anchor"
     );
 }
 
@@ -1088,6 +1161,66 @@ mod tests {
         }
         assert_eq!(r.streams.len(), MAX_STREAMS);
         assert!(r.streams.contains_key(&hot));
+    }
+
+    /// The scenario the eviction path was silent about, end to end.
+    ///
+    /// The game's flow anchors, delivers, and then goes quiet mid-message —
+    /// which is what it does between shop refreshes — while foreign flows on
+    /// the same port (capture is port-wide, no host filter) mint keys until
+    /// the table is full. Staleness then picks the game's own stream. It
+    /// re-anchors on its next segment either way; the point of this test is
+    /// that the loss is now *counted*, on the same `resyncs` number the
+    /// pending-byte pressure arm uses, instead of leaving a missing snapshot
+    /// with no trace anywhere.
+    ///
+    /// Uses `push_budgeted` against one shared budget rather than the `push`
+    /// helper, which mints a throwaway `PipelineBudget` per call and would
+    /// therefore read zero counters no matter what this path recorded.
+    #[test]
+    fn evicting_a_crowded_out_stream_counts_the_lost_anchor() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let game = flow();
+
+        assert_eq!(push(&mut reassembler, seg_on(game, 1000, b"AB")), b"AB");
+        // Mid-message: a segment past a gap, buffered and waiting.
+        assert!(push(&mut reassembler, seg_on(game, 1004, b"EF")).is_empty());
+        assert_eq!(budget.snapshot().resyncs, 0);
+
+        // 63 newcomers fill the table to the cap without evicting anyone; the
+        // 64th is the first key that has nowhere to go, and by then the game's
+        // stream is the least recently active of the 64.
+        for port in 1..=(MAX_STREAMS as u16) {
+            push(&mut reassembler, seg_on(flow_from(port), 1000, b"XY"));
+        }
+
+        assert_eq!(reassembler.streams.len(), MAX_STREAMS);
+        assert!(
+            !reassembler.streams.contains_key(&game),
+            "the quiet flow is the stalest one, so this test must be evicting it"
+        );
+        assert_eq!(
+            budget.snapshot().resyncs,
+            1,
+            "an evicted stream lost its anchor and must be counted like every other anchor loss"
+        );
+        // The declined half of the same decision, pinned so it stays declined:
+        // nothing was *refused* here — the segment that triggered the eviction
+        // was admitted — and `push_budgeted` already rules that chunks a
+        // recovery throws away are collateral rather than extra captures. The
+        // discarded gap buffer is reported in the warning's bytes instead.
+        assert_eq!(budget.snapshot().dropped_segments, 0);
+        // The evicted stream's buffered segment gave its lease back on the way out.
+        assert_eq!(budget.snapshot().current_reassembly, 0);
+
+        // And it does re-anchor, silently as far as the byte stream goes.
+        assert_eq!(push(&mut reassembler, seg_on(game, 9000, b"ZZ")), b"ZZ");
+        drop(reassembler);
+        assert_eq!(budget.snapshot().current_total, 0);
     }
 
     #[test]
