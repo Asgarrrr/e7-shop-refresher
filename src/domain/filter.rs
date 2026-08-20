@@ -663,6 +663,25 @@ mod tests {
         assert_eq!(filter, back);
     }
 
+    /// Pins the interaction with `shop::sanitized_text`: `names`/`set` are
+    /// matched by equality (`Vec::contains`, above), so a sanitized value must
+    /// still equal an unsanitized, normal-length config criterion. A criterion
+    /// itself longer than `MAX_WIRE_TEXT` would never match post-sanitizing —
+    /// worth a follow-up cap on the config side, not fixed here.
+    #[test]
+    fn a_normal_length_name_still_matches_its_criterion_after_sanitizing() {
+        use crate::domain::shop::ShopSnapshot;
+
+        let snapshot: ShopSnapshot =
+            serde_json::from_str(r#"{"slots":[{"name":"ticketrare_name"}]}"#)
+                .expect("snapshot should parse");
+        let filter = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            ..Filter::default()
+        };
+        assert!(filter.matches(&snapshot.slots[0]));
+    }
+
     #[test]
     fn one_failing_criterion_fails_whole() {
         let filter = Filter {
