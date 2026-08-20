@@ -37,6 +37,22 @@
 //! same clamped directory the installer itself is staged in, so the stub's
 //! plugin extraction lands there instead of in the attacker-writable `%TEMP%`
 //! this section opens with.
+//!
+//! **Measured, against the pinned Npcap 1.88 build, 2026-08-21.** That last
+//! sentence was reasoning from NSIS's documented behaviour until then, and
+//! reasoning was not enough: had the stub ignored `TEMP`, the installer would
+//! have succeeded exactly as it does now and this clamp would have been an
+//! inert no-op, with nothing anywhere reporting it. Observed instead, from an
+//! elevated shell while the setup window was up:
+//!
+//! - the staging directory held `nszA82D.tmp\` — the stub's `$PLUGINSDIR` —
+//!   carrying `InstallOptions.dll` and `System.dll`, the plugin DLLs the
+//!   elevated installer loads;
+//! - `%TEMP%` itself held no `ns*` entry at all.
+//!
+//! `icacls` on that directory returned exactly [`STAGING_DACL`]'s two ACEs with
+//! no inherited entry, so what the plugins landed in was the clamp and not a
+//! directory that merely looked like it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
