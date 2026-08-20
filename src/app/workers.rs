@@ -141,9 +141,32 @@ impl SessionWorkers {
                 worker.aborted = true;
             }
         }
+        // A *second* deadline, not a bare await, and this is what makes
+        // `WORKER_SHUTDOWN_GRACE` an actual bound on `shutdown`. `abort()` only
+        // lands at an await point, and the actuator worker spends its time
+        // inside `crate::actuator::blocking`'s `block_in_place`, which has
+        // none: `actuator::win` records that a `SetWindowPos` aimed at a frozen
+        // Epic Seven "does not fail, it never returns". Awaiting that handle
+        // unconditionally parks teardown forever, which parks
+        // `runtime.block_on(app::run(…))` — and tokio's installed handler
+        // swallows the player's second Ctrl+C, so the console build could only
+        // be killed. Only the GUI lane was covered, by `main.rs`'s own
+        // `teardown_failed` timer.
+        //
+        // Dropping the handle detaches rather than kills, which is the honest
+        // outcome: a thread stuck in a Win32 call cannot be reclaimed from
+        // here, and the process is on its way out. Saying so in the log is the
+        // part that was missing.
+        let abandon_at = Instant::now() + WORKER_SHUTDOWN_GRACE;
         for worker in &mut self.tasks {
             if let Some(handle) = worker.handle.take() {
-                report_join(worker.name, worker.aborted, handle.await);
+                match tokio::time::timeout_at(abandon_at, handle).await {
+                    Ok(result) => report_join(worker.name, worker.aborted, result),
+                    Err(_) => error!(
+                        worker = worker.name,
+                        "worker did not exit after abort — detaching it and finishing teardown"
+                    ),
+                }
             }
         }
     }
