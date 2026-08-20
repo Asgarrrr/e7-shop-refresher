@@ -268,7 +268,7 @@ mod tests {
                 assert_eq!(segment.seq, triggering.seq);
                 assert_eq!(segment.payload(), triggering.payload);
             }
-            CaptureEvent::Segment(_) | CaptureEvent::Resync | CaptureEvent::PressureResync => {
+            CaptureEvent::Resync | CaptureEvent::PressureResync => {
                 panic!("expected triggering segment after resync")
             }
         }

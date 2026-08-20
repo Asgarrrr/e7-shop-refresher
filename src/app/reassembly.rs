@@ -87,10 +87,6 @@ pub(super) async fn reassemble_loop_with_pressure(
                 continue;
             }
             CaptureEvent::Budgeted(segment) => segment,
-            #[cfg(test)]
-            CaptureEvent::Segment(segment) => PipelineBudget::new()
-                .admit_capture(segment)
-                .expect("test segment fits capture quota"),
         };
 
         // A SYN re-anchors the sequence space, so holding it behind the
@@ -271,7 +267,7 @@ mod tests {
 
     use super::*;
     use crate::app::fixtures::{
-        initial_anchor_segment, initial_anchor_segment_in, segment_with_capacity,
+        budgeted, initial_anchor_segment, initial_anchor_segment_in, segment_with_capacity,
     };
     use crate::capture::FlowKey;
     use crate::stream::BudgetLimits;
@@ -399,10 +395,14 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(4);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
 
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(1000, b"AB")))
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment(1000, b"AB"),
+            )))
             .await
             .unwrap();
 
@@ -435,10 +435,14 @@ mod tests {
             let (event_tx, event_rx) = mpsc::channel(4);
             let (raw_tx, mut raw_rx) = mpsc::channel(1);
             let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+            let budget = PipelineBudget::new();
             event_tx.send(CaptureEvent::Resync).await.unwrap();
             for index in permutation {
                 event_tx
-                    .send(CaptureEvent::Segment(segments[index].clone()))
+                    .send(CaptureEvent::Budgeted(budgeted(
+                        &budget,
+                        segments[index].clone(),
+                    )))
                     .await
                     .unwrap();
             }
@@ -464,12 +468,13 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(256);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         for index in 0..128u32 {
             event_tx
-                .send(CaptureEvent::Segment(initial_anchor_segment(
-                    1000 + index,
-                    b"X",
+                .send(CaptureEvent::Budgeted(budgeted(
+                    &budget,
+                    initial_anchor_segment(1000 + index, b"X"),
                 )))
                 .await
                 .unwrap();
@@ -485,11 +490,12 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(2);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(
-                1000,
-                &vec![b'X'; crate::stream::INITIAL_ANCHOR_MAX_BYTES],
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment(1000, &vec![b'X'; crate::stream::INITIAL_ANCHOR_MAX_BYTES]),
             )))
             .await
             .unwrap();
@@ -507,18 +513,25 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(3);
         let (raw_tx, mut raw_rx) = mpsc::channel(2);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(
-                1000,
-                &vec![b'A'; crate::stream::INITIAL_ANCHOR_MAX_BYTES - 1],
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment(
+                    1000,
+                    &vec![b'A'; crate::stream::INITIAL_ANCHOR_MAX_BYTES - 1],
+                ),
             )))
             .await
             .unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(
-                1000u32.wrapping_add((crate::stream::INITIAL_ANCHOR_MAX_BYTES - 1) as u32),
-                b"BC",
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment(
+                    1000u32.wrapping_add((crate::stream::INITIAL_ANCHOR_MAX_BYTES - 1) as u32),
+                    b"BC",
+                ),
             )))
             .await
             .unwrap();
@@ -537,9 +550,13 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(2);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(1000, b"AB")))
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment(1000, b"AB"),
+            )))
             .await
             .unwrap();
         drop(event_tx);
@@ -553,9 +570,13 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(2);
         let (raw_tx, raw_rx) = mpsc::channel(1);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(1000, b"AB")))
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment(1000, b"AB"),
+            )))
             .await
             .unwrap();
         tokio::task::yield_now().await;
@@ -579,14 +600,21 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(4);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(1000, b"AB")))
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment(1000, b"AB"),
+            )))
             .await
             .unwrap();
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(9000, b"XY")))
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment(9000, b"XY"),
+            )))
             .await
             .unwrap();
 
@@ -602,9 +630,13 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(3);
         let (raw_tx, mut raw_rx) = mpsc::channel(2);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(1000, b"AB")))
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment(1000, b"AB"),
+            )))
             .await
             .unwrap();
         tokio::task::yield_now().await;
@@ -612,7 +644,10 @@ mod tests {
         assert_eq!(recv_exact(&mut raw_rx, 2).await, b"AB");
 
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(1002, b"CD")))
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment(1002, b"CD"),
+            )))
             .await
             .unwrap();
         assert_eq!(recv_exact(&mut raw_rx, 2).await, b"CD");
@@ -627,6 +662,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(6);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
         let first = initial_anchor_segment(1000, b"AB").flow;
         let second = FlowKey {
             client: SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), 52000)),
@@ -639,7 +675,10 @@ mod tests {
             initial_anchor_segment_in(first, 1000, false, b"AB"),
             initial_anchor_segment_in(second, 2000, false, b"UV"),
         ] {
-            event_tx.send(CaptureEvent::Segment(segment)).await.unwrap();
+            event_tx
+                .send(CaptureEvent::Budgeted(budgeted(&budget, segment)))
+                .await
+                .unwrap();
         }
         tokio::task::yield_now().await;
         tokio::time::advance(INITIAL_ANCHOR_WINDOW).await;
@@ -654,13 +693,17 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(5);
         let (raw_tx, mut raw_rx) = mpsc::channel(1);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         for segment in [
             initial_anchor_segment(0, b"CDEF"),
             initial_anchor_segment(2, b"EFGH"),
             initial_anchor_segment(u32::MAX - 1, b"ABCD"),
         ] {
-            event_tx.send(CaptureEvent::Segment(segment)).await.unwrap();
+            event_tx
+                .send(CaptureEvent::Budgeted(budgeted(&budget, segment)))
+                .await
+                .unwrap();
         }
         tokio::task::yield_now().await;
         tokio::time::advance(INITIAL_ANCHOR_WINDOW).await;
@@ -675,16 +718,21 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(6);
         let (raw_tx, mut raw_rx) = mpsc::channel(2);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
         let first = initial_anchor_segment(1000, b"AB").flow;
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                first, 999, true, b"",
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment_in(first, 999, true, b""),
             )))
             .await
             .unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment(1000, b"AB")))
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment(1000, b"AB"),
+            )))
             .await
             .unwrap();
         assert_eq!(recv_exact(&mut raw_rx, 2).await, b"AB");
@@ -694,14 +742,16 @@ mod tests {
             server: first.server,
         };
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                second, 4999, true, b"",
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment_in(second, 4999, true, b""),
             )))
             .await
             .unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                second, 5000, false, b"XY",
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment_in(second, 5000, false, b"XY"),
             )))
             .await
             .unwrap();
@@ -715,23 +765,27 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(5);
         let (raw_tx, mut raw_rx) = mpsc::channel(2);
         let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
         let flow = initial_anchor_segment(1000, b"old").flow;
         event_tx.send(CaptureEvent::Resync).await.unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                flow, 1000, false, b"old",
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment_in(flow, 1000, false, b"old"),
             )))
             .await
             .unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                flow, 8999, true, b"",
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment_in(flow, 8999, true, b""),
             )))
             .await
             .unwrap();
         event_tx
-            .send(CaptureEvent::Segment(initial_anchor_segment_in(
-                flow, 9000, false, b"new",
+            .send(CaptureEvent::Budgeted(budgeted(
+                &budget,
+                initial_anchor_segment_in(flow, 9000, false, b"new"),
             )))
             .await
             .unwrap();
@@ -740,5 +794,45 @@ mod tests {
         assert_eq!(recv_exact(&mut raw_rx, 3).await, b"new");
         drop(event_tx);
         task.await.unwrap();
+    }
+
+    /// The old `#[cfg(test)]` fixture re-admitted every segment against its own
+    /// throwaway `PipelineBudget::new()`, so no test could ever see a burst's
+    /// leases outlive the burst — each segment's lease belonged to a budget
+    /// nobody else held a reference to. With one budget shared for the whole
+    /// burst, this pins the thing that fixture made impossible to assert: every
+    /// byte the anchor window held is released once the burst is flushed and
+    /// the forwarded chunks are dropped.
+    #[tokio::test(start_paused = true)]
+    async fn the_anchor_burst_releases_every_lease_it_held() {
+        let (event_tx, event_rx) = mpsc::channel(4);
+        let (raw_tx, mut raw_rx) = mpsc::channel(4);
+        let task = tokio::spawn(reassemble_loop(event_rx, raw_tx));
+        let budget = PipelineBudget::new();
+
+        event_tx.send(CaptureEvent::Resync).await.unwrap();
+        for segment in [
+            initial_anchor_segment(1000, b"AB"),
+            initial_anchor_segment(1002, b"CD"),
+            initial_anchor_segment(1004, b"EF"),
+        ] {
+            event_tx
+                .send(CaptureEvent::Budgeted(budgeted(&budget, segment)))
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            budget.snapshot().current_total > 0,
+            "the buffered burst must still be holding its leases"
+        );
+
+        tokio::time::advance(INITIAL_ANCHOR_WINDOW).await;
+        assert_eq!(recv_exact(&mut raw_rx, 6).await, b"ABCDEF");
+
+        drop(event_tx);
+        task.await.unwrap();
+        drop(raw_rx);
+        assert_eq!(budget.snapshot().current_total, 0);
     }
 }
