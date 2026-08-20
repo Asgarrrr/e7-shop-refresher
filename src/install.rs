@@ -35,12 +35,49 @@
 //! the neighbouring reason: `create_new` refuses to follow a symlink or to
 //! reuse anything already sitting at the path, so an elevated write cannot be
 //! aimed out of `%TEMP%` by something planted there first.
+//!
+//! # Why it is not held open *in* `%TEMP%`
+//!
+//! That handle binds the installer's bytes. It binds nothing about the
+//! directory they sit in, and `CreateProcess` puts the image's own directory
+//! **first** in the child's DLL search order — ahead of System32, behind only
+//! the `KnownDLLs` section. Measured on the dev machine: that section holds 37
+//! entries and not one of `version`, `uxtheme`, `dwmapi`, `riched20`, `msimg32`
+//! or `winmm` is among them, which is most of what an NSIS setup stub imports.
+//! So a `%TEMP%\version.dll` written by exactly the medium-integrity same-user
+//! process the section above assumes — `icacls %TEMP%` grants the interactive
+//! user `(I)(OI)(CI)(F)` — is loaded into the **elevated** installer without
+//! ever touching the file the pin covers. The hash cannot see it: it verifies
+//! the exe, and the attack arrives as a sibling.
+//!
+//! So the download lands in a per-run directory this process creates inside
+//! `%TEMP%` and immediately clamps to Administrators and SYSTEM with a
+//! protected DACL ([`STAGING_DACL`]) — the same Win32 the `WinDivert` cleanup
+//! in [`crate::migrate`] exists to *undo*, used here where it belongs: on a
+//! directory whose only content is an executable an administrator token is
+//! about to run, and never on the one holding the player's logs.
+//!
+//! The other half of that finding does not survive contact and is written down
+//! so it is not tried again: a parent cannot switch the image directory off for
+//! its child. `CreateProcess` takes no search-order flag,
+//! `SetDefaultDllDirectories` only ever changes the process that calls it, and
+//! `CWDIllegalInDllSearch` is a machine-wide setting rather than something a
+//! launcher hands over. The one lever that is real is the child's *current*
+//! directory, which is inherited and otherwise points at wherever the player
+//! started this app from; [`Fetcher::run`] aims it at the clamped directory too.
+//! That covers the current-directory slot in the search order and nothing else.
+//! Staging out of `%TEMP%` is what covers the image-directory slot, and there is
+//! no substitute for it.
+//!
+//! What none of this reaches is what the installer does once it is running:
+//! Npcap's NSIS stub extracts its own plugins into its own `%TEMP%\ns*.tmp` and
+//! loads them from there, and no choice available to this module changes that.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing::{info, warn};
 
@@ -49,6 +86,28 @@ use crate::npcap::{INSTALLER_BYTES, INSTALLER_SHA256, INSTALLER_URL, TEMP_INSTAL
 /// Ceiling on the download, in seconds, handed to `curl`. Generous: the measured
 /// time is under a second, and a player on hotel Wi-Fi is not a failure.
 const FETCH_TIMEOUT_SECS: u32 = 120;
+
+/// Name prefix of the directory the verified installer is staged in.
+///
+/// Deliberately not [`crate::APP_DIR`]: `%TEMP%\arkyve-refresh-shop\logs` is
+/// this crate's fallback log directory (`crate::log_dirs_from`), and
+/// [`STAGING_DACL`] applied there would take the log away from every unelevated
+/// run — which is the exact failure [`crate::migrate`] ships to undo on machines
+/// that already suffered it. The staging directory has to be somewhere nothing
+/// else of ours lives, and this prefix is what [`sweep_old_staging`] recognises.
+const STAGING_PREFIX: &str = "arkyve-npcap-staging-";
+
+/// The DACL the staging directory is clamped to, in SDDL.
+///
+/// `D:P` — **protected**, so none of `%TEMP%`'s own ACEs are inherited into it.
+/// That is the whole point: measured with `icacls %TEMP%`, the interactive user
+/// is granted `(I)(OI)(CI)(F)`, and the interactive user is who the module
+/// header's attacker is. `(A;OICI;FA;;;BA)` and `(A;OICI;FA;;;SY)` grant full
+/// access to `BUILTIN\Administrators` and `LocalSystem`, inherited by whatever
+/// is created inside, and to nobody else. This process holds an administrator
+/// token (`build.rs` manifests it) so it is on the inside of that list, and so
+/// is the installer it launches; the attacker is not.
+const STAGING_DACL: &str = "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)";
 
 /// What the banner shows while this runs.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -179,10 +238,25 @@ impl Fetcher {
     }
 
     fn run(self) {
+        // Before the download, not after it: this is what decides *where* the
+        // bytes land, and a file written into `%TEMP%` and then moved would have
+        // spent the interval beside anything a same-user process cares to plant.
+        if let Err(reason) = staging_ready() {
+            warn!(reason = %reason, "the Npcap installer was not obtained");
+            self.set(Progress::Failed(reason));
+            return;
+        }
         let target = installer_path();
         match self.fetch_and_check(&target) {
             Ok(verified) => {
-                let spawned = Command::new(&target).spawn();
+                // `current_dir`, not the inherited one: the child's current
+                // directory is a slot in its DLL search order, and this process
+                // inherited its own from whatever started the app — a Desktop, a
+                // download folder, the game's directory. The clamped staging
+                // directory is the one place on this path nothing can be planted
+                // in. It does not touch the *image* directory slot; see the
+                // module header for why nothing can.
+                let spawned = Command::new(&target).current_dir(staging_dir()).spawn();
                 // Only now: until `CreateProcess` has returned, this handle is
                 // the whole reason the path still holds the hashed bytes. See
                 // the module header.
@@ -214,6 +288,11 @@ impl Fetcher {
     /// file from an interrupted run is replaced rather than trusted. The reused
     /// copy goes through the same locked handle as a fresh one, so the fast path
     /// is not the weak path.
+    ///
+    /// "Already there" now means *within this run*: the staging directory is
+    /// created per process and an earlier run's is swept, so a restarted app
+    /// downloads again. That is a measured second against a directory whose
+    /// contents this process cannot vouch for — see [`staging_dir`].
     fn fetch_and_check(&self, target: &Path) -> Result<File, String> {
         if let Ok(existing) = open_locked(target) {
             if verify(&existing).is_ok() {
@@ -301,6 +380,18 @@ fn download() -> Result<Vec<u8>, String> {
         return Err("this Windows has no curl.exe to download with".to_owned());
     }
     let out = Command::new(curl)
+        // `--disable` first, and it only works first: it tells curl not to read
+        // its default config file. On Windows that file is `%APPDATA%\_curlrc`
+        // — a path any medium-integrity process of the same user can create,
+        // and a config file may set *any* option, `--output` included. Without
+        // this flag the same swap-the-file attacker the paragraph above
+        // describes does not need to plant a `curl.exe` at all: they drop a
+        // `_curlrc` naming an output path and a source, the player clicks
+        // Download once, and this process's administrator token writes
+        // attacker-chosen bytes wherever they asked. The hash pin cannot see
+        // it for the same reason it cannot see a planted `curl.exe`: it hashes
+        // what curl printed, long after curl has already written the file.
+        .arg("--disable")
         .args(["--fail", "--silent", "--show-error", "--location"])
         .args(["--max-time", &FETCH_TIMEOUT_SECS.to_string()])
         .args(["--max-filesize", &INSTALLER_BYTES.to_string()])
@@ -404,9 +495,325 @@ fn curl_path() -> PathBuf {
 }
 
 /// Where the download lands. The name is version-stamped and lives with the
-/// version — see [`TEMP_INSTALLER_NAME`].
+/// version — see [`TEMP_INSTALLER_NAME`]; the directory is this module's, and
+/// the module header is why.
 fn installer_path() -> PathBuf {
-    std::env::temp_dir().join(TEMP_INSTALLER_NAME)
+    staging_dir().join(TEMP_INSTALLER_NAME)
+}
+
+/// The directory the verified installer is staged in, chosen once per process.
+///
+/// Still under `%TEMP%`: that is the right home for something this app launches
+/// and then cannot clean up after itself, and it is the only user-scoped
+/// location that is not also holding logs or config. Never *at* `%TEMP%`, for
+/// the reason in the module header.
+///
+/// The name carries the process id and the clock, and neither is load-bearing —
+/// nothing here trusts an attacker's ignorance of a path. It buys two things a
+/// fixed name does not. Two runs of the app cannot collide over one directory,
+/// which matters because [`prepare_staging`] insists on creating the directory
+/// rather than adopting one. And a name that could be worked out ahead of time
+/// could be *occupied* ahead of time, which would turn that same insistence into
+/// a Download button an attacker can hold shut for as long as they like.
+///
+/// Pure: it computes a path and touches no disk, so a test can assert what it
+/// chose without an elevated process creating anything.
+fn staging_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        std::env::temp_dir().join(format!("{STAGING_PREFIX}{}-{stamp:x}", std::process::id()))
+    })
+}
+
+/// Creates and clamps the staging directory, once per process.
+///
+/// Once, and the answer — failure included — is kept: [`staging_dir`] names one
+/// path per process, so a second attempt would find the directory this one
+/// created and [`prepare_staging`]'s `create_dir` would refuse it. Caching the
+/// error is also what keeps a player clicking Download on a machine where the
+/// DACL cannot be written from re-running the whole dance each time.
+fn staging_ready() -> Result<(), String> {
+    static PREPARED: OnceLock<Result<(), String>> = OnceLock::new();
+    PREPARED
+        .get_or_init(|| prepare_staging(staging_dir()))
+        .clone()
+}
+
+/// Sweeps what earlier runs left, creates `dir`, clamps it, and proves it empty.
+///
+/// `create_dir` and not `create_dir_all`: anything already at this path was put
+/// there by someone else — [`staging_dir`] picks a fresh name per run — and a
+/// refusal is the only safe reading of that. It is also why the sweep runs
+/// first and cannot be folded into the create.
+///
+/// The emptiness check is the second half of the clamp, not a formality. The
+/// directory is born with `%TEMP%`'s inherited ACEs on it and only loses them
+/// when [`lock_down`] returns, so there is a window — microseconds, and it
+/// requires a process already watching the tree — in which a `version.dll` could
+/// be dropped in. A file in a directory that was created empty a moment ago is
+/// that, and the run is abandoned.
+///
+/// **What this does not close, stated rather than glossed:** in the same window
+/// the directory could be removed and re-created by the attacker, who would then
+/// own it, and an owner can rewrite the DACL this function just applied. The
+/// emptiness check does not see that — the swapped directory is empty too. The
+/// fix is to create the directory with its DACL already on it, atomically, which
+/// means `CreateDirectoryW` with a `SECURITY_ATTRIBUTES`; there is no `std` API
+/// that passes one, and the `windows-sys` feature that exposes the call —
+/// `Win32_Storage_FileSystem` — is not enabled in `Cargo.toml`. Alternatively
+/// the swap is *detectable*: an elevated process's objects are owned by
+/// `BUILTIN\Administrators` (measured on the dev machine, and the same
+/// measurement `crate::migrate`'s header records), a filtered token cannot set
+/// that owner, so reading the owner back would tell the two apart.
+///
+/// What the window can **no longer** do is pass the clamp off as done. Replacing
+/// the path with a junction used to be the quiet version of this swap: the DACL
+/// landed on the reparse point, this function returned `Ok`, and the installer
+/// was then written and launched inside the attacker's directory with the whole
+/// staging story intact on paper. [`lock_down`] refuses a reparse point now, so
+/// that swap ends the download instead of hollowing it out. What is left is the
+/// loud version — the attacker owns a real directory and rewrites its DACL —
+/// which costs a download this app abandons.
+fn prepare_staging(dir: &Path) -> Result<(), String> {
+    sweep_old_staging(dir);
+
+    std::fs::create_dir(dir).map_err(|err| {
+        format!(
+            "the installer's download directory could not be created ({err}); \
+             nothing was downloaded"
+        )
+    })?;
+
+    if let Err(err) = lock_down(dir, STAGING_DACL) {
+        let _ = std::fs::remove_dir(dir);
+        return Err(format!(
+            "the installer's download directory could not be secured ({err}); \
+             nothing was downloaded"
+        ));
+    }
+
+    match std::fs::read_dir(dir).map(|mut entries| entries.next().is_some()) {
+        Ok(false) => Ok(()),
+        Ok(true) => {
+            let _ = std::fs::remove_dir_all(dir);
+            Err(
+                "something was written into the installer's download directory \
+                 as it was being created; nothing was downloaded"
+                    .to_owned(),
+            )
+        }
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(dir);
+            Err(format!(
+                "the installer's download directory could not be read back ({err}); \
+                 nothing was downloaded"
+            ))
+        }
+    }
+}
+
+/// Deletes the staging directories of runs that are over.
+///
+/// Best-effort, and it has to exist: [`STAGING_DACL`] puts these out of reach of
+/// the unelevated player, so nothing else on the machine will ever remove them —
+/// not the player, not Disk Cleanup. An elevated run leaving an undeletable
+/// megabyte in `%TEMP%` on every download is the same kind of litter
+/// [`crate::migrate`] was written to clear up, and the cheapest place to not
+/// create it is here.
+///
+/// "Out of reach" is measured, not assumed, and it was the opposite of what was
+/// expected: `%TEMP%` grants the interactive user `FILE_DELETE_CHILD`, which is
+/// normally enough to delete a child whose own DACL grants nothing, and it is
+/// still not enough here — `a_staged_directory_stops_inheriting_the_users_full_control`
+/// gets `ERROR_ACCESS_DENIED` from `remove_dir` on an *empty* clamped directory
+/// it owns. Being the owner buys `READ_CONTROL` and `WRITE_DAC` and neither of
+/// those is `DELETE`. So the sweep genuinely needs the administrator token, and
+/// the test has to hand the rights back before it can tidy up.
+///
+/// A directory belonging to a run that is still going is protected by nothing
+/// here — `remove_dir_all` simply fails, because the installer inside is held by
+/// [`open_locked`] or mapped by the process it was launched into, and neither
+/// grants `FILE_SHARE_DELETE`.
+fn sweep_old_staging(current: &Path) {
+    let Some(parent) = current.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STAGING_PREFIX)
+        {
+            continue;
+        }
+        let path = entry.path();
+        if path == current {
+            continue;
+        }
+        // Both spellings, because the name may have been taken by a file rather
+        // than a directory — planted, or left by a crash — and either way this
+        // run wants it gone before `create_dir` looks.
+        if std::fs::remove_dir_all(&path).is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Puts `sddl`'s DACL on `dir` as a *protected* one, so nothing is inherited
+/// from the parent. Called with [`STAGING_DACL`], which is what makes `%TEMP%`'s
+/// full-control-for-the-user ACE stop at the staging directory's door.
+///
+/// The descriptor is parsed from SDDL rather than assembled from `InitializeAcl`
+/// plus two `CreateWellKnownSid` calls plus two `AddAccessAllowedAceEx` calls:
+/// that is the same two ACEs in five times the `unsafe`, and the string is the
+/// readable form of the thing being claimed.
+///
+/// `PROTECTED_DACL_SECURITY_INFORMATION` is passed alongside
+/// `DACL_SECURITY_INFORMATION` rather than left to the `P` in the string, and it
+/// is not redundant: `SetSecurityInfo` takes an `ACL`, not a descriptor, so
+/// the control word the `P` set is never handed to it. The information argument
+/// is the only place the protect bit can come from.
+///
+/// Addressed through a handle from `crate::dirhandle::open_directory_itself`,
+/// which refuses a reparse point outright. `%TEMP%` is writable by any same-user
+/// medium-integrity process, so between [`prepare_staging`]'s `create_dir` and
+/// this call the directory can be removed and replaced by a junction.
+///
+/// What that used to cost is worth stating precisely, because the obvious guess
+/// is wrong and was measured to be wrong: `SetNamedSecurityInfoW` does *not*
+/// follow a junction, so the old name-based call did not put [`STAGING_DACL`] on
+/// the target — it put it on the reparse point itself and returned success. The
+/// damage was quieter than that and no less total: the protected DACL ends up on
+/// an object no file is ever written to, while [`installer_path`] resolves
+/// *through* the junction, so the installer is downloaded into, verified in and
+/// launched from a directory the attacker still controls. Every guarantee in
+/// this module's staging story would hold on paper and none of it on disk.
+///
+/// Refusing the open is what turns that into a failed download. The gate is
+/// shared with `crate::migrate` rather than copied because it is the same
+/// argument — act on the object you checked, not on the name you checked.
+///
+/// `sddl` is a parameter and not the constant inlined for one reason, recorded
+/// so it is not "simplified" away: a clamped directory cannot be deleted by an
+/// unelevated owner (see [`sweep_old_staging`]), so the test that proves the
+/// clamp took has no other way to clean up after itself than to call this again
+/// with a DACL that grants the rights back. There is one production caller and
+/// it passes [`STAGING_DACL`].
+#[cfg(windows)]
+fn lock_down(dir: &Path, sddl: &str) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    // Before anything is parsed: if the name no longer refers to a plain
+    // directory, there is nothing here worth clamping and the error says which
+    // of the two it was.
+    // Before anything is parsed: if the name no longer refers to a plain
+    // directory, there is nothing here worth clamping and the error says which
+    // of the two it was.
+    let handle = crate::dirhandle::open_directory_itself(dir)?;
+
+    let sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `sddl` is a valid null-terminated UTF-16 string owned by this frame
+    // and alive across the call. `descriptor` is a live stack slot, written only
+    // on success with a single `LocalAlloc` block that owns the ACL as well. The
+    // size out-parameter is documented as optional and is not wanted. Failure
+    // allocates nothing, which is why the early return below frees nothing.
+    let built = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if built == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut present = 0;
+    let mut defaulted = 0;
+    // SAFETY: `descriptor` is the block the call above allocated and reported
+    // success for, and nothing has freed it. The three out-parameters are stack
+    // slots that outlive the call. `dacl` is written to point *into* that block,
+    // so every read of it below happens before the one `LocalFree`.
+    let read =
+        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) };
+    // GetLastError is per-thread and the very next Win32 call clobbers it: read
+    // it here, not after the `SetSecurityInfo` below.
+    let read_err = std::io::Error::last_os_error();
+
+    let outcome = if read == 0 {
+        Err(read_err)
+    } else if present == 0 || dacl.is_null() {
+        // Never passed on. `SetSecurityInfo` reads a null `pDacl` as
+        // "install a *null* DACL", which grants full access to everyone — the
+        // same trap `migrate::reset_dacl_to_inherited`'s doc comment is written
+        // around, and here it would hand the attacker the very directory this
+        // call exists to take away from them. `STAGING_DACL` names two ACEs so
+        // this is unreachable; it is checked because the cost of being wrong is
+        // the whole fix, silently.
+        Err(std::io::Error::other(
+            "the staging descriptor parsed with no DACL in it",
+        ))
+    } else {
+        // SAFETY: `handle` is an open directory handle carrying `WRITE_DAC`,
+        // kept alive across the call by the borrow, and validated as a plain
+        // directory rather than a reparse point. `dacl` is the non-null ACL
+        // inside the descriptor above, which the call copies rather than
+        // retains. The owner, group and SACL pointers are null, which is "do not
+        // change" for the information bits not requested. Failure mode: a
+        // `WIN32_ERROR` return, handled below.
+        let status = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null(),
+            )
+        };
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(status as i32))
+        }
+    };
+
+    // SAFETY: the only `LocalFree` in this function, on the only path that
+    // reaches it, freeing the block the parse allocated exactly once. `dacl`
+    // pointed into it and is not read again.
+    unsafe { LocalFree(descriptor.cast()) };
+    outcome
+}
+
+/// The fetcher is only reachable from the Windows capture path; this exists so
+/// the module compiles on a dev machine. It carries no guarantee, and needs
+/// none — nothing calls it, in the same way [`open_locked`]'s non-Windows arm
+/// carries no sharing guarantee.
+#[cfg(not(windows))]
+fn lock_down(_dir: &Path, _sddl: &str) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Starts a second copy of this executable, for the caller to follow with a
@@ -667,6 +1074,356 @@ mod tests {
             "the planted file must be left untouched, not overwritten"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The finding the staging directory exists for. `open_locked` pins the
+    /// installer's bytes and nothing pins its neighbours, while the image's own
+    /// directory is first in the child's DLL search order — so an installer run
+    /// straight out of `%TEMP%` loads whatever `version.dll` a same-user process
+    /// left lying there, into an administrator token, without disturbing the
+    /// hash at all.
+    #[test]
+    fn the_installer_is_never_staged_in_the_shared_temp_root() {
+        let temp = std::env::temp_dir();
+        let installer = installer_path();
+        assert_ne!(
+            installer.parent(),
+            Some(temp.as_path()),
+            "the verified installer must not sit beside whatever a same-user process \
+             can plant in %TEMP%: its own directory is first in its DLL search order"
+        );
+        assert_eq!(installer.parent(), Some(staging_dir()));
+        assert_eq!(
+            installer.file_name(),
+            Some(std::ffi::OsStr::new(TEMP_INSTALLER_NAME))
+        );
+        assert!(staging_dir().starts_with(&temp), "{:?}", staging_dir());
+        assert!(
+            staging_dir()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(STAGING_PREFIX)),
+            "{:?} — the sweep only recognises this prefix",
+            staging_dir()
+        );
+        assert_ne!(
+            staging_dir(),
+            temp.join(crate::APP_DIR).as_path(),
+            "and never the fallback log root: an admins-only DACL there is exactly \
+             what `crate::migrate` exists to undo"
+        );
+    }
+
+    /// Asserted against the OS rather than against the SDDL string, for the same
+    /// reason the share-mode test above is: a DACL is invisible at the call site
+    /// that depends on it. Elevation-independent — the owner of a directory
+    /// always keeps `READ_CONTROL`, so the read-back works whether `cargo test`
+    /// runs filtered (a dev machine) or elevated (the CI runner, see the
+    /// `[[bin]]` note in `Cargo.toml`).
+    #[cfg(windows)]
+    #[test]
+    fn a_staged_directory_stops_inheriting_the_users_full_control() {
+        use windows_sys::Win32::Security::SE_DACL_PROTECTED;
+
+        let dir = std::env::temp_dir().join(format!(
+            "{STAGING_PREFIX}dacl-fixture-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir(&dir);
+        std::fs::create_dir(&dir).expect("the fixture directory");
+
+        let (before, _) = dacl_of(&dir);
+        assert_eq!(
+            before & SE_DACL_PROTECTED,
+            0,
+            "a directory created under %TEMP% inherits its ACEs — including the \
+             interactive user's full control. That is the hole."
+        );
+
+        lock_down(&dir, STAGING_DACL).expect("clamp the fixture");
+
+        let (after, aces) = dacl_of(&dir);
+        assert_ne!(
+            after & SE_DACL_PROTECTED,
+            0,
+            "the staging directory must stop inheriting from %TEMP% entirely"
+        );
+        assert_eq!(
+            aces, 2,
+            "exactly the two ACEs `STAGING_DACL` names — Administrators and SYSTEM"
+        );
+
+        // The clamp is real enough that this test cannot tidy up after itself
+        // without undoing it: measured, `remove_dir` on the empty directory it
+        // just created answers `ERROR_ACCESS_DENIED`, because `%TEMP%`'s
+        // `FILE_DELETE_CHILD` does not stand in for a `DELETE` the new DACL does
+        // not grant.
+        //
+        // Undone by name rather than through `lock_down`, and the reason is
+        // worth recording because it is surprising: measured with a bare
+        // `CreateFileW` on a clamped directory, an unelevated owner is refused
+        // `READ_CONTROL`, `WRITE_DAC` and both together alike — the implicit
+        // owner rights do not survive `STAGING_DACL`. So `lock_down`'s handle
+        // gate cannot re-open what it has just clamped, while the name-based
+        // API still can. That costs production nothing — `prepare_staging`
+        // clamps a directory it created moments earlier and never re-clamps —
+        // and it is only this fixture that needs the other spelling.
+        hand_back_full_control(&dir).expect("hand the fixture back");
+        std::fs::remove_dir(&dir).expect("the fixture is deletable once un-clamped");
+    }
+
+    /// The staging directory lives in `%TEMP%`, which any same-user
+    /// medium-integrity process can write. If it is removed and re-created as a
+    /// junction between [`prepare_staging`]'s `create_dir` and its clamp, the
+    /// old name-based DACL write clamped the *reparse point* and reported
+    /// success — measured, not assumed: `SetNamedSecurityInfoW` does not follow
+    /// a junction, so the target keeps its own DACL. That is the dangerous
+    /// outcome rather than the harmless one, because files resolve the other
+    /// way: [`installer_path`] goes *through* the junction, so the protection
+    /// sits on an object nothing is written to while the installer lands in the
+    /// attacker's directory.
+    ///
+    /// Hence the assertion below is about the link, not its target. A test
+    /// asserting the target was untouched would pass against the unfixed code
+    /// too, and prove nothing.
+    ///
+    /// Deliberately not named with `STAGING_PREFIX`: [`sweep_old_staging`] would
+    /// be entitled to delete it out from under a concurrently running test.
+    #[test]
+    #[cfg(windows)]
+    fn a_junction_in_place_of_the_staging_directory_is_refused_not_followed() {
+        use windows_sys::Win32::Security::SE_DACL_PROTECTED;
+
+        let root = std::env::temp_dir().join(format!(
+            "arkyve-staging-junction-fixture-{}",
+            std::process::id()
+        ));
+        let victim = root.join("victim");
+        let link = root.join("link");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&victim).expect("the victim directory");
+
+        // A directory junction needs no privilege at all, unlike a symlink —
+        // which is exactly why this is reachable by the attacker in the first
+        // place, and why this test can build it on an unelevated machine.
+        let made = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&victim)
+            .output()
+            .expect("run mklink");
+        assert!(
+            made.status.success(),
+            "the fixture needs a real junction, not a skipped test: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+
+        let refused = lock_down(&link, STAGING_DACL);
+
+        // Checked before the error, so that a regression reports the thing that
+        // matters rather than its symptom. Against the unfixed code this reads
+        // `SE_DACL_PROTECTED`: the clamp landed on the junction and `lock_down`
+        // answered `Ok` — a staging directory that reports itself secured while
+        // every file written to it goes somewhere else.
+        let (link_dacl, _) = dacl_of(&link);
+        assert_eq!(
+            link_dacl & SE_DACL_PROTECTED,
+            0,
+            "nothing may be clamped when the path turns out to be a junction"
+        );
+        assert!(
+            refused.is_err(),
+            "a reparse point in place of the staging directory must be refused"
+        );
+        let (victim_dacl, _) = dacl_of(&victim);
+        assert_eq!(
+            victim_dacl & SE_DACL_PROTECTED,
+            0,
+            "and the target keeps its own DACL, as it did before the fix too"
+        );
+
+        // `remove_dir` unlinks the junction; `remove_dir_all` on the root would
+        // otherwise have to decide what to do about it.
+        std::fs::remove_dir(&link).expect("unlink the junction");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Puts an everyone-full-control DACL back on `dir`, by name.
+    ///
+    /// Fixture cleanup only, and it is the one thing in this module that is
+    /// *deliberately* name-based: see the comment at its call site for why the
+    /// handle gate cannot be used here, and note that nothing it does is a
+    /// security operation — it hands rights away rather than taking them.
+    #[cfg(windows)]
+    fn hand_back_full_control(dir: &Path) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+            SetNamedSecurityInfoW,
+        };
+        use windows_sys::Win32::Security::{
+            ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR,
+        };
+
+        let sddl: Vec<u16> = "D:(A;OICI;FA;;;WD)"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `sddl` is a valid null-terminated UTF-16 string alive across
+        // the call; `descriptor` is a live stack slot written only on success
+        // with one `LocalAlloc` block. The size out-parameter is optional.
+        let built = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(built, 0, "parse the fixture's give-it-back DACL");
+
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut present = 0;
+        let mut defaulted = 0;
+        // SAFETY: `descriptor` is the block allocated above and not yet freed;
+        // the three out-parameters are stack slots outliving the call.
+        let read = unsafe {
+            GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+        };
+        assert_ne!(read, 0, "read the parsed DACL back");
+        assert!(
+            present != 0 && !dacl.is_null(),
+            "a null DACL grants everyone"
+        );
+
+        // SAFETY: `wide` is a valid null-terminated UTF-16 path alive for the
+        // call, `dacl` points into the descriptor above and is copied rather
+        // than retained, and the owner/group/SACL pointers are null meaning
+        // "do not change".
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null(),
+            )
+        };
+
+        // SAFETY: the only `LocalFree` on the only path that reaches it.
+        unsafe { LocalFree(descriptor.cast()) };
+
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(status as i32))
+        }
+    }
+
+    /// Reads back `(control word, ACE count)` for a path's DACL.
+    #[cfg(windows)]
+    fn dacl_of(dir: &Path) -> (u16, u16) {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR,
+        };
+
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let mut dacl: *mut ACL = ptr::null_mut();
+
+        // SAFETY: `wide` is a valid null-terminated UTF-16 path alive across the
+        // call. `dacl` and `descriptor` are live stack slots; on success the call
+        // allocates one `LocalAlloc` block for the descriptor, with `dacl`
+        // pointing into it. The owner, group and SACL out-parameters are optional
+        // and passed null.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS, "reading the DACL of {dir:?}");
+        assert!(
+            !dacl.is_null(),
+            "a null DACL would grant everyone everything"
+        );
+
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        // SAFETY: `descriptor` is the block the call above allocated and reported
+        // success for; `control` and `revision` are stack slots outliving the call.
+        let ok = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+        assert_ne!(ok, 0, "reading the control word of {dir:?}");
+        // SAFETY: `dacl` is the non-null ACL header inside that same live block.
+        let aces = unsafe { (*dacl).AceCount };
+        // SAFETY: the one `LocalFree`, freeing that block exactly once; neither
+        // `dacl` nor `descriptor` is read afterwards.
+        unsafe { LocalFree(descriptor.cast()) };
+
+        (control, aces)
+    }
+
+    /// The other half of the staging directory: it is per-run, and a run cannot
+    /// delete its own on the way out — the installer it launched is still mapped.
+    /// Without this sweep an elevated app would leave an undeletable megabyte in
+    /// `%TEMP%` on every download, which is the litter `crate::migrate` exists to
+    /// clear up, freshly re-created.
+    #[test]
+    fn an_earlier_runs_staging_directory_is_swept_and_its_neighbours_are_not() {
+        let parent = std::env::temp_dir().join(format!("arkyve-sweep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir(&parent).expect("the scratch parent");
+
+        let stale = parent.join(format!("{STAGING_PREFIX}older-run"));
+        let mine = parent.join(format!("{STAGING_PREFIX}this-run"));
+        // The name the sweep must never touch: `%TEMP%\arkyve-refresh-shop\logs`
+        // is where this crate's logs go when `%LOCALAPPDATA%` is unavailable.
+        let logs = parent.join(crate::APP_DIR);
+        std::fs::create_dir(&stale).expect("the stale sibling");
+        std::fs::create_dir(&mine).expect("this run's directory");
+        std::fs::create_dir(&logs).expect("the log root");
+        std::fs::write(logs.join("keep.log"), b"a player's log").expect("write the log");
+
+        sweep_old_staging(&mine);
+
+        assert!(!stale.exists(), "an earlier run's directory must be swept");
+        assert!(
+            mine.is_dir(),
+            "the sweep must not delete the directory this run is about to use"
+        );
+        assert!(
+            logs.join("keep.log").is_file(),
+            "the sweep must not reach anything but its own prefix"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     #[test]
