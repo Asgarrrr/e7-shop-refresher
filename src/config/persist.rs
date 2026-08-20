@@ -7,6 +7,7 @@
 //! The one exception is [`strip_retired_keys`], which deletes the retired
 //! `[capture]` / `[forward]` keys once — see its docs for why.
 
+use std::io::Write as _;
 use std::path::Path;
 
 use serde::Serialize;
@@ -90,7 +91,25 @@ fn replace_file(path: &Path, contents: &str) -> Result<()> {
     // never truncates the hand-authored config. On any failure, remove the temp
     // so a read-only or locked target doesn't accrete a stale `config.toml.tmp`.
     let tmp = path.with_extension("toml.tmp");
-    if let Err(source) = std::fs::write(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path)) {
+    // `sync_all` before the rename, and that is what makes the sentence above
+    // true rather than nearly true. `fs::write` returns once the bytes are in
+    // the page cache; the rename that follows is metadata, and NTFS can commit
+    // it durably while the data behind it is still unwritten. Lose power in
+    // that window and the next launch finds a zero-length `config.toml` —
+    // which is not an error anywhere downstream, because `Config` is
+    // `#[serde(default)]`, so it parses as an all-default config and
+    // `seed_config_if_missing` declines to restore it (the file exists). Every
+    // filter, limit, timing and hand-written comment would be gone with
+    // nothing logged: exactly the loss this function promises to prevent, on
+    // the one failure it had not covered.
+    let durable_write = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(source) = durable_write() {
         let _ = std::fs::remove_file(&tmp);
         return Err(Error::ConfigWrite {
             path: path.to_path_buf(),
