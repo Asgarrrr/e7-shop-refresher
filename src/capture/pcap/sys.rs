@@ -81,6 +81,7 @@ struct PcapIf {
 /// bytes, not the 24 a 64-bit `time_t` would give. Wrong is not a crash —
 /// `caplen` would read the timestamp's tail — hence [`is_plausible_caplen`].
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct PcapPktHdr {
     tv_sec: i32,
     tv_usec: i32,
@@ -286,6 +287,56 @@ impl Wpcap {
         // NUL-terminated buffer, valid until the next call on that handle, and
         // this copies it out first.
         unsafe { cstr(text) }
+    }
+}
+
+#[cfg(test)]
+impl Wpcap {
+    /// Builds a table from caller-supplied functions, pinned by a `Library` the
+    /// caller already holds.
+    ///
+    /// The `_lib` field's contract is "these pointers are valid while this stays
+    /// loaded", and a test satisfies it by handing over a real, already-loaded
+    /// system library — see `dll_candidates`' own test
+    /// ([`tests::the_search_flags_still_load_a_system_dll_by_absolute_path`]),
+    /// which loads one for the same reason. The `unsafe extern "C" fn` items a
+    /// test passes in are `'static`, so they outlive any `Library` regardless;
+    /// the field is doing no work for them and that is fine — it is still the
+    /// one true precondition, so it still has to be satisfied.
+    ///
+    /// Only `next_ex`, `stats`, `geterr` and `close` are parameters: those are
+    /// the only four entry points [`capture_loop`] and [`Handle`]'s [`Drop`]
+    /// reach. The other nine are wired to stubs that panic if called — see
+    /// `tests::unreachable_*` — which is itself an assertion that this loop
+    /// touches nothing else.
+    ///
+    /// Private, not `pub(super)`: every caller lives in `tests`, a descendant
+    /// of this module, so a wider visibility would only leak `PcapPktHdr` and
+    /// `PcapStat` — both deliberately private to this file — into the
+    /// signature for no caller that needs it.
+    fn from_fns(
+        lib: libloading::Library,
+        next_ex: unsafe extern "C" fn(*mut PcapT, *mut *mut PcapPktHdr, *mut *const u8) -> c_int,
+        stats: unsafe extern "C" fn(*mut PcapT, *mut PcapStat) -> c_int,
+        geterr: unsafe extern "C" fn(*mut PcapT) -> *mut c_char,
+        close: unsafe extern "C" fn(*mut PcapT),
+    ) -> Self {
+        Self {
+            _lib: lib,
+            findalldevs: tests::unreachable_findalldevs,
+            freealldevs: tests::unreachable_freealldevs,
+            open_live: tests::unreachable_open_live,
+            close,
+            datalink: tests::unreachable_datalink,
+            datalink_val_to_name: tests::unreachable_datalink_val_to_name,
+            compile: tests::unreachable_compile,
+            setfilter: tests::unreachable_setfilter,
+            freecode: tests::unreachable_freecode,
+            next_ex,
+            stats,
+            geterr,
+            lib_version: tests::unreachable_lib_version,
+        }
     }
 }
 
@@ -805,6 +856,65 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    // The nine entry points `capture_loop` and `Handle::drop` must never reach.
+    // Panicking, not a silent no-op, so a future change that makes the loop
+    // call a fourth or fifth entry point fails loudly here instead of shipping
+    // unnoticed.
+
+    pub(super) unsafe extern "C" fn unreachable_findalldevs(
+        _: *mut *mut PcapIf,
+        _: *mut c_char,
+    ) -> c_int {
+        panic!("capture_loop must not call pcap_findalldevs")
+    }
+
+    pub(super) unsafe extern "C" fn unreachable_freealldevs(_: *mut PcapIf) {
+        panic!("capture_loop must not call pcap_freealldevs")
+    }
+
+    pub(super) unsafe extern "C" fn unreachable_open_live(
+        _: *const c_char,
+        _: c_int,
+        _: c_int,
+        _: c_int,
+        _: *mut c_char,
+    ) -> *mut PcapT {
+        panic!("capture_loop must not call pcap_open_live")
+    }
+
+    pub(super) unsafe extern "C" fn unreachable_datalink(_: *mut PcapT) -> c_int {
+        panic!("capture_loop must not call pcap_datalink")
+    }
+
+    pub(super) unsafe extern "C" fn unreachable_datalink_val_to_name(_: c_int) -> *const c_char {
+        panic!("capture_loop must not call pcap_datalink_val_to_name")
+    }
+
+    pub(super) unsafe extern "C" fn unreachable_compile(
+        _: *mut PcapT,
+        _: *mut BpfProgram,
+        _: *const c_char,
+        _: c_int,
+        _: c_uint,
+    ) -> c_int {
+        panic!("capture_loop must not call pcap_compile")
+    }
+
+    pub(super) unsafe extern "C" fn unreachable_setfilter(
+        _: *mut PcapT,
+        _: *mut BpfProgram,
+    ) -> c_int {
+        panic!("capture_loop must not call pcap_setfilter")
+    }
+
+    pub(super) unsafe extern "C" fn unreachable_freecode(_: *mut BpfProgram) {
+        panic!("capture_loop must not call pcap_freecode")
+    }
+
+    pub(super) unsafe extern "C" fn unreachable_lib_version() -> *const c_char {
+        panic!("capture_loop must not call pcap_lib_version")
+    }
 
     #[test]
     fn a_full_funnel_drops_the_frame_and_flags_capture_loss_without_parking_the_thread() {
