@@ -115,18 +115,33 @@ impl std::error::Error for DelayRangeError {}
 /// them, carrying no invariant. It exists only as the `#[serde(try_from)]` hook:
 /// deriving `Deserialize` on the newtype itself would let serde fill the private
 /// fields directly and skip the check, which is the whole defect this pair fixes.
+///
+/// Both keys are `Option`, not bare `u64` under `#[serde(default)]`, because
+/// the two absences mean different things and the flat default conflated them.
+/// `refreshed = { min_ms = 200 }` is a legal, ordinary thing to write — one
+/// number, "always wait 200 ms extra" — and it used to fill `max_ms` with 0,
+/// fail `try_new` as [`DelayRangeError::Reversed`], and print advice for a
+/// mistake the player did not make ("swap them"). `config::parse`'s salvage
+/// then dropped the range to `0..=0`, so the line silently stopped applying.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawDelayRange {
-    min_ms: u64,
-    max_ms: u64,
+    min_ms: Option<u64>,
+    max_ms: Option<u64>,
 }
 
 impl TryFrom<RawDelayRange> for DelayRange {
     type Error = DelayRangeError;
 
     fn try_from(raw: RawDelayRange) -> Result<Self, Self::Error> {
-        DelayRange::try_new(raw.min_ms, raw.max_ms)
+        let min_ms = raw.min_ms.unwrap_or(0);
+        // A floor with no ceiling is a fixed delay, which is what the range
+        // `min..=min` already spells. A ceiling with no floor keeps the `0`
+        // above, which is `DelayRange::ceiling`'s shape and the one both
+        // in-app producers make. Neither absence can reverse the range, so
+        // only a pair the player really did write backwards reaches the error.
+        let max_ms = raw.max_ms.unwrap_or(min_ms);
+        DelayRange::try_new(min_ms, max_ms)
     }
 }
 
@@ -643,6 +658,30 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("fixed 600 ms delay"), "{message}");
+    }
+
+    #[test]
+    fn one_bound_written_alone_is_a_range_and_not_a_reversed_pair() {
+        // `{ min_ms = 200 }` is an ordinary thing to write and used to be read
+        // as `(200, 0)` — `Reversed`, reported with advice ("swap them") for a
+        // mistake the player did not make, after which `config::parse`'s
+        // salvage dropped the whole range to `0..=0` and the line silently
+        // stopped applying.
+        let floor_only: DelayRange =
+            toml::from_str("min_ms = 200").expect("a floor alone is a fixed delay");
+        assert_eq!(floor_only, DelayRange::try_new(200, 200).expect("legal"));
+        // The mirror case keeps the `0` floor, which is `DelayRange::ceiling`'s
+        // shape and what both in-app producers make.
+        let ceiling_only: DelayRange =
+            toml::from_str("max_ms = 400").expect("a ceiling alone is a 0..=max range");
+        assert_eq!(ceiling_only, DelayRange::ceiling(400));
+        // An empty table is still the default, and a pair really written
+        // backwards is still refused.
+        assert_eq!(
+            toml::from_str::<DelayRange>("").expect("an absent table is the default"),
+            DelayRange::default()
+        );
+        assert!(toml::from_str::<DelayRange>("min_ms = 600\nmax_ms = 100").is_err());
     }
 
     #[test]
