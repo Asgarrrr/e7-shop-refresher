@@ -300,6 +300,15 @@ fn move_cursor(at: (i32, i32)) -> Result<(), SurfaceError> {
         // `.max(1)` above turns that into a width of 1, and the ratio then
         // leaves i32 entirely. Landing on the desktop edge is wrong but
         // bounded; a wrapped `as i32` would aim anywhere.
+        //
+        // Which is a panic guard on an unreachable path, not a misclick on a
+        // reachable one — worth stating, because `.max(1)` reads as a live case.
+        // Getting here means `acquire` already found the game window, proved it
+        // reachable, pulled it to the foreground and measured a client rect
+        // `Viewport::of` accepted as at least 16:9. A session whose virtual
+        // screen has no extent has none of those. `docs/tech-debt/09-num.md`'s
+        // `num-008` rules the same way and files the `NonZeroI32` spelling that
+        // would make the guard unremovable as a nit for whoever next opens this.
         dx: dx.clamp(0, ABSOLUTE_COORD_MAX) as i32,
         dy: dy.clamp(0, ABSOLUTE_COORD_MAX) as i32,
         mouseData: 0,

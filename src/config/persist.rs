@@ -125,9 +125,13 @@ const RETIRED_KEYS: &[(&str, &[&str])] = &[
 /// `[filter]`, `[limits]` and `[actuator.timings]`, so without this the
 /// startup warning would never stop firing. `CaptureConfig` and
 /// `ForwardConfig` hold *only* retired keys, so stripping always empties —
-/// and removes — the header too, but never a comment the player wrote (see
-/// [`tidy`]), and never a table this pass did not touch
+/// and removes — the header too, and never a table this pass did not touch
 /// (`config.example.toml` ships both headers with every key commented out).
+///
+/// It does remove commented-out *assignments* of those keys, wherever in the
+/// file they sit, including ones the player typed — see [`tidy`] for why that
+/// is the narrowest correct scope rather than an overreach. What it never
+/// touches is prose, or a commented assignment of any key that still exists.
 ///
 /// # Errors
 ///
@@ -267,6 +271,28 @@ fn strip_table(root: &mut Table, table: &str, keys: &[&str], removed: &mut Vec<S
 /// even when it names a retired key, and it runs only for the keys of a
 /// table this pass edited. A comment *inside* a removed section outlives it:
 /// the accepted cost of never touching a comment we are not sure about.
+///
+/// # Why the commented-key sweep is whole-document
+///
+/// It looks like the one unscoped thing here, and the scope is deliberate.
+/// [`RETIRED_KEYS`] names four keys, and none of them is a live key of *any*
+/// table in the schema — `buffer_size`, `server_to_client` and
+/// `client_to_server` exist nowhere else, and `filter` is a table header
+/// (`[filter]`), never an assignment. So a `# <one of the four> = …` line can
+/// only ever be a commented-out spelling of a retired key, whichever section it
+/// was written under, and removing it is this pass's whole purpose.
+///
+/// Scoping it to the edited section would be worse, not safer: the tables being
+/// stripped are removed *wholesale* (both structs hold only retired keys), so a
+/// commented sibling left behind is a comment `toml_edit` re-homes under the
+/// next header — `# filter = "tcp and tcp.SrcPort == 3333"` reading as
+/// `reconnect.filter`, which is the exact defect the paragraphs above describe
+/// and the reason this text pass exists.
+///
+/// Two narrowings already bound it: this runs only for the keys of a table the
+/// tree pass edited, and that pass runs only on a file that actually *set* a
+/// retired key. A file seeded from `config.example.toml` — which ships all four
+/// commented out and none of them set — is never rewritten at all.
 fn tidy(text: &str, headers: &[&str], keys: &[&str]) -> String {
     let mut out = String::with_capacity(text.len());
     // A dropped header leaves the blank line before it *and* the one before
