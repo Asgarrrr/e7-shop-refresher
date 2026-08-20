@@ -483,10 +483,16 @@ mod tests {
 
     #[test]
     fn backoff_below_the_floor_is_raised_to_it_and_cannot_grow_past_the_cap() {
-        let mut below_floor = Backoff::new(Duration::from_millis(1), Duration::from_millis(10));
-        assert_eq!(below_floor.current(), RECONNECT_FLOOR);
+        // A cap genuinely above the floor, reachable by doubling, so both
+        // halves of this test's name are actually exercised.
+        let mut below_floor = Backoff::new(Duration::from_millis(1), Duration::from_millis(250));
+        assert_eq!(below_floor.current(), Duration::from_millis(100));
         below_floor.advance();
-        assert_eq!(below_floor.current(), RECONNECT_FLOOR);
+        assert_eq!(below_floor.current(), Duration::from_millis(200));
+        below_floor.advance();
+        assert_eq!(below_floor.current(), Duration::from_millis(250));
+        below_floor.advance();
+        assert_eq!(below_floor.current(), Duration::from_millis(250));
     }
 
     #[test]

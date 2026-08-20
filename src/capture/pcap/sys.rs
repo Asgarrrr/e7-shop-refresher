@@ -1340,21 +1340,15 @@ mod tests {
     #[test]
     fn a_caplen_outside_the_snaplen_is_rejected_as_a_pkthdr_layout_error() {
         assert!(is_plausible_caplen(1));
-        assert!(is_plausible_caplen(SNAPLEN_CAPLEN));
-        assert!(!is_plausible_caplen(0));
-        assert!(!is_plausible_caplen(SNAPLEN_CAPLEN + 1));
+        // The actual snaplen, pinned as a literal rather than through the
+        // constant under test, so a change to `SNAPLEN` cannot silently widen
+        // what this test accepts.
+        assert!(is_plausible_caplen(262_144));
+        assert!(!is_plausible_caplen(0)); // a zero-length "packet" cannot exist
+        assert!(!is_plausible_caplen(262_145));
         // What a 64-bit `timeval` would produce: a microsecond count read as a
         // length, mostly out of bounds and caught here.
         assert!(!is_plausible_caplen(999_999));
-        assert!(!is_plausible_caplen(0)); // a zero-length "packet" cannot exist
-    }
-
-    #[test]
-    fn the_windows_pcap_pkthdr_is_sixteen_bytes_because_its_timeval_is_two_longs() {
-        // The real gate is the `const _` beside the struct, since a release
-        // build on this lane never evaluates a test.
-        assert_eq!(size_of::<PcapPktHdr>(), 16);
-        assert_eq!(size_of::<PcapStat>(), 24);
     }
 
     #[test]
