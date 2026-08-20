@@ -17,10 +17,11 @@
 //! an APIPA address while Wi-Fi carried the traffic. [`crate::stream`] dedupes
 //! by TCP sequence number, so the duplicates cost nothing.
 //!
-//! [`link`] is the frame-to-IP strip, the only layer with no FFI; [`sys`] is
-//! the `wpcap.dll` boundary, deliberately one file — its header says why.
+//! [`super::link`] is the frame-to-IP strip, the only layer with no FFI — which
+//! is why it lives one level up, outside this backend's feature gate, and is
+//! tested by every lane rather than only the two that build a backend. [`sys`]
+//! is the `wpcap.dll` boundary, deliberately one file — its header says why.
 
-mod link;
 mod sys;
 
 use std::num::NonZeroU16;
@@ -210,7 +211,7 @@ impl PcapSource {
     ///
     /// Blocking, and quick: nothing here waits on a human, unlike the backend
     /// it replaced. A device that fails to open, or reports a link type
-    /// [`link::LinkStrip`] can't see past, is logged and skipped so one
+    /// [`super::link::LinkStrip`] can't see past, is logged and skipped so one
     /// refusing adapter doesn't block a machine with a dozen virtual ones. Only
     /// zero usable devices is fatal.
     ///

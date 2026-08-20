@@ -8,8 +8,9 @@
 //! `Handle` retains the `*mut PcapT` — auditable only because that field, and
 //! every `*mut PcapT` in the crate, is private to this file. Splitting
 //! `open_device` from `capture_loop` would make it `pub(super)` and spread
-//! the check over three files. [`super::link`] carries no pointer; it is the
-//! one that left.
+//! the check over three files. [`crate::capture::link`] carries no pointer; it
+//! is the one that left — and it left this directory entirely, so its tests run
+//! in lanes that never build a backend.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;
@@ -19,8 +20,8 @@ use std::sync::mpsc::{Sender, SyncSender, TrySendError};
 
 use tracing::{debug, info_span, warn};
 
-use super::link::{LinkStrip, UnsupportedDatalink};
 use super::{AdapterFailure, short_device_name};
+use crate::capture::link::{LinkStrip, UnsupportedDatalink};
 use crate::error::{Error, Result};
 
 /// Size libpcap requires of every error buffer: it writes up to this many
@@ -55,6 +56,20 @@ const OPTIMIZE_FILTER: c_int = 1;
 const FILTER_NETMASK: c_uint = 0;
 
 /// `pcap_next_ex` return codes. Anything else is an error on the handle.
+///
+/// The negative codes deliberately get no constants and no arms of their own.
+/// `-1` (`PCAP_ERROR`) is already handled correctly by the catch-all, which
+/// reads the text libpcap set for it. `-2` (`PCAP_ERROR_BREAK`) is returned
+/// after `pcap_breakloop` and at the end of a savefile, and this crate does
+/// neither: `grep -rn breakloop src/` finds nothing — teardown is the stop flag
+/// plus [`READ_TIMEOUT_MS`] — and every handle here comes from `pcap_open_live`.
+/// An arm matching it would be a branch no test could reach except by scripting
+/// the code it exists for.
+///
+/// What `-2` *does* need is for the catch-all to survive it, because it is one
+/// of the codes libpcap leaves the error buffer empty for. That is
+/// [`failure_reason`]'s job, and it covers every future code the same way
+/// without anyone having to enumerate them first.
 const NEXT_EX_OK: c_int = 1;
 const NEXT_EX_TIMEOUT: c_int = 0;
 
@@ -724,7 +739,8 @@ pub(super) fn capture_loop(
             _ => {
                 // SAFETY: the handle is still live and exclusively this thread's;
                 // `pcap_geterr` reads its internal error buffer.
-                error = Some(unsafe { wpcap.error_text(handle.handle) });
+                let text = unsafe { wpcap.error_text(handle.handle) };
+                error = Some(failure_reason(text, rc));
                 break;
             }
         }
@@ -761,6 +777,29 @@ pub(super) fn capture_loop(
         delivered,
         unstrippable,
         overflowed,
+    }
+}
+
+/// Why an adapter died, guaranteed to be something a player can read.
+///
+/// `pcap_geterr` hands back the handle's error buffer, and nothing obliges
+/// libpcap to have filled it — it sets the buffer for the codes documented as
+/// setting it, and leaves it alone for the rest. An empty buffer used to travel
+/// the entire way intact: through [`capture_loop`]'s `warn!`, into
+/// [`AdapterFailure::error`], into `PcapSource::reap_failures`' `"{device}: {}"`
+/// and finally into the `Error::Capture` the status bar shows — where it reads
+/// as a device name, a colon, and nothing at all. A player reporting *that* has
+/// told us only that something failed.
+///
+/// The return code is the one fact always available, so it stands in. It is not
+/// a good message; it is a message, and it is one an issue can be searched for.
+///
+/// [`AdapterFailure::error`]: super::AdapterFailure::error
+fn failure_reason(text: String, rc: c_int) -> String {
+    if text.trim().is_empty() {
+        format!("pcap_next_ex returned {rc} and set no error text")
+    } else {
+        text
     }
 }
 
@@ -956,10 +995,21 @@ mod tests {
         }
 
         /// `-1` is libpcap's own `PCAP_ERROR`; any code outside `{0, 1}` lands
-        /// on `capture_loop`'s `_ =>` arm, so the exact value is not the point.
+        /// on `capture_loop`'s `_ =>` arm.
+        ///
+        /// The exact value used to be beside the point. It no longer is:
+        /// [`failure_reason`] puts the code into the message when the error
+        /// buffer is empty, so a test that cares which code it scripted should
+        /// use [`Self::error_code`] and say so.
         fn error() -> Self {
+            Self::error_code(-1)
+        }
+
+        /// [`Self::error`] with a chosen return code, for the tests that assert
+        /// on what the code itself produces.
+        fn error_code(rc: c_int) -> Self {
             Self {
-                rc: -1,
+                rc,
                 header: None,
                 data: None,
                 stop_after: false,
@@ -1220,8 +1270,10 @@ mod tests {
 
     /// A minimal untagged Ethernet frame carrying an IPv4 `EtherType`, for
     /// `LinkStrip::Ethernet` to strip. Rebuilt here rather than reused from
-    /// `link::tests::ethernet_frame` because that helper is private to link's
-    /// own test module (`PLAN.md` keeps `link.rs` out of this plan's scope).
+    /// `crate::capture::link`'s `tests::ethernet_frame`, because that helper is
+    /// private to that module's own `#[cfg(test)]` block — and should stay
+    /// there. What this file needs is a frame shaped enough to reach the funnel;
+    /// what that one builds is a frame shaped to exercise the strip itself.
     fn ethernet_frame_with_ip_payload(payload: &[u8]) -> Vec<u8> {
         let mut frame = vec![0xAAu8; 12]; // dst + src MAC, unread by the strip
         frame.extend_from_slice(&0x0800u16.to_be_bytes()); // EtherType: IPv4
@@ -1573,6 +1625,59 @@ mod tests {
             .try_recv()
             .expect("a negative rc reports a failure");
         assert_eq!(failure.error, "pcap_next_ex: the adapter vanished");
+    }
+
+    /// The failure a player would otherwise be asked to report as
+    /// `\Device\NPF_{...}: ` — a device name, a colon and nothing.
+    ///
+    /// `-2` is `PCAP_ERROR_BREAK`, one of the codes libpcap does not set the
+    /// error buffer for. No handle in this crate can currently return it (see
+    /// [`NEXT_EX_OK`]'s doc), which is exactly why this is scripted: the empty
+    /// buffer it stands for is reachable on any code, including the `-1` the
+    /// test above uses when the adapter dies without a message.
+    #[test]
+    fn a_failure_with_no_error_text_names_the_return_code_instead_of_saying_nothing() {
+        let (packets_tx, packets_rx) = sync_channel(1);
+        let (failed_tx, failed_rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture_loss = AtomicBool::new(false);
+
+        // `scripted_wpcap` resets the error text to empty, which is what a
+        // libpcap that set no message looks like. Nothing calls
+        // `set_geterr_text` here on purpose.
+        let wpcap = Arc::new(scripted_wpcap([ScriptedCall::error_code(-2)], &stop));
+        let handle = scripted_handle(wpcap, LinkStrip::Fixed(0));
+
+        let counters = capture_loop(handle, &packets_tx, &failed_tx, &stop, &capture_loss);
+
+        assert_eq!(counters.delivered, 0);
+        assert!(packets_rx.try_recv().is_err());
+        let failure = failed_rx
+            .try_recv()
+            .expect("a negative rc reports a failure even with no text");
+        assert!(
+            !failure.error.trim().is_empty(),
+            "an adapter's death must never be reported with a blank reason"
+        );
+        assert!(
+            failure.error.contains("-2"),
+            "the return code is the only fact left, so it has to be in there: {}",
+            failure.error
+        );
+    }
+
+    /// Whitespace is not a message. A buffer libpcap left as a space would
+    /// otherwise pass an `is_empty` check and reach the player as a blank.
+    #[test]
+    fn an_all_whitespace_error_buffer_counts_as_no_message_at_all() {
+        assert_eq!(
+            failure_reason("   ".to_owned(), -1),
+            "pcap_next_ex returned -1 and set no error text"
+        );
+        assert_eq!(
+            failure_reason("the adapter vanished".to_owned(), -1),
+            "the adapter vanished"
+        );
     }
 
     #[test]
