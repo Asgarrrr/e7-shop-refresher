@@ -133,9 +133,16 @@ fn rect_change_error(observed: ClientRect) -> SurfaceError {
 /// Both backends route through here rather than each implementing the same
 /// three-state decision independently.
 ///
-/// `revalidate` re-establishes the target (a no-op for a backend that has no
+/// `revalidate` re-checks the target (a no-op for a backend that has no
 /// per-event validation), `release` posts or injects the button-up, and `what`
 /// names the release in the fatal message.
+///
+/// `revalidate` may only *look*. It runs with the button still down, where the
+/// game is measuring a press whose planned length is 40–90 ms, so a check that
+/// sleeps or tries to restore something turns the click into a long-press —
+/// see [`send_input`]'s `release_after_down`, which is the only implementation
+/// that has anything to check here and says so at length. Its `Err` is a verdict
+/// about the click, reported after the release, never a reason to delay one.
 fn release_twice(
     revalidate: impl FnOnce() -> Result<(), SurfaceError>,
     mut release: impl FnMut() -> Result<(), SurfaceError>,

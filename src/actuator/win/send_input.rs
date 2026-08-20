@@ -33,6 +33,12 @@ use super::{
 };
 
 /// The foreground switch is asynchronous: give it a beat before verifying.
+///
+/// It is only ever paid *before* a press. 100 ms is longer than the whole hold
+/// a click plans (40–90 ms, `Jitter::press_ms`), so a beat spent between the
+/// `LEFTDOWN` and the `LEFTUP` would more than double the press the game
+/// measures — see [`WinSurface::release_after_down`], which is the one place
+/// that could have reached it from there and deliberately does not.
 const FOCUS_SETTLE_MS: u64 = 100;
 
 /// Full range of a `MOUSEEVENTF_ABSOLUTE` coordinate — a Win32 protocol
@@ -176,15 +182,24 @@ impl WinSurface {
         Ok(())
     }
 
-    /// Re-establishes that the acquired title still names this exact HWND,
-    /// that its planned screen rectangle is unchanged and usable, and that it
-    /// owns the foreground. The ordering is part of the safety contract.
+    /// Everything [`validate_target`](Self::validate_target) checks that is a
+    /// pure *read*: the acquired title still names this exact HWND, and its
+    /// planned screen rectangle is unchanged and usable. The ordering is part of
+    /// the safety contract.
+    ///
+    /// Split out from `validate_target` rather than inlined twice because
+    /// [`release_after_down`](Self::release_after_down) needs exactly this half
+    /// and must not have the other: `FindWindowW`, `GetClientRect` and
+    /// `ClientToScreen` are answered out of window-manager state without ever
+    /// entering Epic Seven's message loop — contrast `SetWindowPos` in
+    /// [`probe_window_reachable`], which does, and is why that call needed a hang
+    /// check — so these three cost their syscalls and cannot wait on anything.
     ///
     /// `target` arrives from the caller — the executor's guard, holding what
     /// `acquire` produced — rather than out of a field this type kept: everything
     /// checked below is about the *world* having moved, which is the only failure
     /// left once "was there an acquire at all" is carried by the type.
-    fn validate_target(&mut self, target: Target) -> Result<(), SurfaceError> {
+    fn verify_placement(&mut self, target: Target) -> Result<(), SurfaceError> {
         let titled = self.driver.find_game_window()?;
         if titled != target.hwnd {
             return Err(SurfaceError::Fatal(
@@ -197,7 +212,48 @@ impl WinSurface {
             return Err(rect_change_error(rect));
         }
 
+        Ok(())
+    }
+
+    /// The placement reads, plus the demand that the window own the foreground —
+    /// restoring it if it does not. What every event is guarded by *before* it is
+    /// injected, since `SendInput` aims at whoever holds the foreground.
+    fn validate_target(&mut self, target: Target) -> Result<(), SurfaceError> {
+        self.verify_placement(target)?;
         self.ensure_foreground(target.hwnd)
+    }
+
+    /// [`validate_target`](Self::validate_target) with the acting taken out: the
+    /// same placement reads, and a bare look at who owns the foreground in place
+    /// of a demand to own it.
+    ///
+    /// This is what a check is allowed to be while the left button is down. It
+    /// can still answer the only question that matters there — did this click
+    /// land where the job aimed it — but it cannot call `SetForegroundWindow`,
+    /// cannot sleep [`FOCUS_SETTLE_MS`], and so cannot stretch the press.
+    ///
+    /// `Recoverable`, where [`ensure_foreground`](Self::ensure_foreground)'s
+    /// refusal is `Fatal`, and the difference is what was actually learned. There
+    /// the app *asked* for the foreground and Windows still refused it after a
+    /// full settle, which is a condition that does not heal while both processes
+    /// keep running. Here nothing was asked: someone else simply owns the
+    /// foreground this instant — an alt-tab, a notification, the player replying
+    /// to a message — and the next job's `acquire` pulls the game back in front
+    /// as a matter of course. That is `Recoverable`'s own definition, the world
+    /// moving under a job, and halting the watch on it would end a session on a
+    /// keystroke the player is entitled to make. If the foreground really has
+    /// become unobtainable, the retry's `acquire` is where that is discovered —
+    /// by the code that tries for it, which is the only code entitled to say so.
+    fn observe_target(&mut self, target: Target) -> Result<(), SurfaceError> {
+        self.verify_placement(target)?;
+        if self.driver.foreground_window() != target.hwnd {
+            return Err(SurfaceError::Recoverable(
+                "the game window lost the foreground while the left button was held, so the click \
+                 did not land in it"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn send_guarded(&mut self, target: Target, event: InputEvent) -> Result<(), SurfaceError> {
@@ -205,15 +261,40 @@ impl WinSurface {
         self.driver.send(event)
     }
 
-    /// This backend's half of [`release_twice`]: revalidate, then `LEFTUP`.
+    /// This backend's half of [`release_twice`]: *look*, then `LEFTUP`.
+    ///
+    /// Look, not validate, and the word is the whole decision. Once the button is
+    /// down the only obligation left is to get it up on schedule, so nothing here
+    /// may block, sleep, or try to put anything right. This used to call the full
+    /// [`validate_target`](Self::validate_target), which does all three: on a
+    /// foreground lost mid-hold it calls `SetForegroundWindow` and then sleeps
+    /// [`FOCUS_SETTLE_MS`], so a planned 40–90 ms press (`Jitter::press_ms`)
+    /// became a 140–190 ms one — and 190 ms is not a slow click, it is a
+    /// different gesture, which is exactly what a game reading a long-press
+    /// would make of it. Activating windows while the button is held is the
+    /// second half of the same mistake: whatever the recovery lands on receives
+    /// a button that went down somewhere else.
+    ///
+    /// Recovery has two legitimate homes and this is neither. Before the press,
+    /// where `send_guarded` already pulls the window forward and refuses the
+    /// `LEFTDOWN` if it cannot — `focus_loss_during_move_settle_blocks_left_down`
+    /// pins that, and it is why the case reaching here is only ever a loss during
+    /// the hold itself. And after the release, in the next job's `acquire`.
+    ///
+    /// What is *not* dropped is the finding. A click released over a window that
+    /// no longer owned the foreground did not land where the job aimed it, and the
+    /// caller has to hear that even though the release itself succeeded —
+    /// releasing promptly must not become releasing quietly. `release_twice`'s
+    /// first slot is where that verdict goes: its `Err` is returned once the
+    /// button is provably up, and the button goes up on every path through it.
     ///
     /// The borrow has to be split by hand because both closures want
-    /// `&mut self` — hence the raw pointer-free dance of validating first into a
+    /// `&mut self` — hence the raw pointer-free dance of looking first into a
     /// `Result` and handing `release_twice` a closure that only needs the driver.
     fn release_after_down(&mut self, target: Target) -> Result<(), SurfaceError> {
-        let validated = self.validate_target(target);
+        let observed = self.observe_target(target);
         let driver = &mut self.driver;
-        release_twice(|| validated, || driver.send(InputEvent::LeftUp), "LEFTUP")
+        release_twice(|| observed, || driver.send(InputEvent::LeftUp), "LEFTUP")
     }
 }
 
@@ -530,6 +611,16 @@ mod tests {
             .collect()
     }
 
+    /// Where a call landed in the recorded sequence. Panics rather than returning
+    /// an `Option`: every caller is asserting *about* the call, so its absence is
+    /// the test failing, not a case to handle.
+    fn index_of(calls: &[DriverCall], wanted: &DriverCall) -> usize {
+        calls
+            .iter()
+            .position(|call| call == wanted)
+            .unwrap_or_else(|| panic!("{wanted:?} was never recorded in {calls:?}"))
+    }
+
     fn validation_calls() -> Vec<DriverCall> {
         vec![
             DriverCall::FindWindow,
@@ -811,43 +902,75 @@ mod tests {
         );
     }
 
+    /// The hold the game measures is the hold the job planned, even when the
+    /// foreground goes elsewhere while the button is down.
+    ///
+    /// This replaces `focus_is_restored_before_guarded_left_up`, which asserted
+    /// the opposite — that `RequestForeground` came before the `LEFTUP` — and was
+    /// pinning the defect. Restoring focus there meant `SetForegroundWindow` plus
+    /// a `FOCUS_SETTLE_MS` sleep *inside* the press: 90 + 100 ms held, which the
+    /// game reads as a long-press rather than a click. Do not re-add it; the
+    /// foreground is restored before the `LEFTDOWN`
+    /// (`focus_loss_during_move_settle_blocks_left_down`) and again at the next
+    /// `acquire`, which are the two moments recovery costs nothing.
     #[test]
-    fn focus_is_restored_before_guarded_left_up() {
+    fn a_foreground_lost_mid_press_does_not_stretch_the_hold() {
         let (mut surface, state) = fake_surface();
         let target = acquire_and_clear(&mut surface, &state);
+        // Focus survives the move and the press, then goes elsewhere while the
+        // button is held — the one window in which a click can be turned into a
+        // gesture nobody planned.
         state
             .lock()
             .unwrap()
             .foreground_results
-            .extend([GAME_HWND, GAME_HWND, OTHER_HWND, GAME_HWND]);
+            .extend([GAME_HWND, GAME_HWND, OTHER_HWND]);
 
-        assert_eq!(surface.click(&target, (30, 40), 5), Ok(()));
+        // 90 ms is the top of `Jitter::press_ms`'s 40..=90 band: the longest hold
+        // the planner can actually emit, so this is the worst case.
+        let verdict = surface.click(&target, (30, 40), 90);
+
         let actual = calls(&state);
-        let request = actual
+        let held = &actual[index_of(&actual, &DriverCall::Send(InputEvent::LeftDown))
+            ..index_of(&actual, &DriverCall::Send(InputEvent::LeftUp))];
+        let held_ms: u64 = held
             .iter()
-            .position(|call| *call == DriverCall::RequestForeground(GAME_HWND))
-            .unwrap();
-        let up = actual
-            .iter()
-            .position(|call| *call == DriverCall::Send(InputEvent::LeftUp))
-            .unwrap();
-        assert!(request < up);
+            .filter_map(|call| match *call {
+                DriverCall::Sleep(ms) => Some(ms),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(held_ms, 90, "the press must be the planned one: {held:?}");
+        assert!(
+            !held.contains(&DriverCall::RequestForeground(GAME_HWND)),
+            "nothing may act on the desktop while the button is down: {held:?}"
+        );
+        // Released promptly is not released quietly: the click did not land in
+        // the game, and the caller is told so.
+        assert!(matches!(
+            verdict,
+            Err(SurfaceError::Recoverable(reason)) if reason.contains("lost the foreground")
+        ));
         assert_eq!(sent_events(&state).last(), Some(&InputEvent::LeftUp));
     }
 
     #[test]
-    fn refused_focus_after_left_down_still_sends_unguarded_left_up() {
+    fn a_foreground_lost_after_left_down_still_sends_unguarded_left_up() {
         let (mut surface, state) = fake_surface();
         let target = acquire_and_clear(&mut surface, &state);
         state
             .lock()
             .unwrap()
             .foreground_results
-            .extend([GAME_HWND, GAME_HWND, OTHER_HWND, OTHER_HWND]);
+            .extend([GAME_HWND, GAME_HWND, OTHER_HWND]);
 
+        // Recoverable, not Fatal: nothing refused this app the foreground, it
+        // merely observed someone else holding it, and the next `acquire` takes
+        // it back. Halting the watch would make an alt-tab mid-click a stop the
+        // player has to undo by hand.
         assert!(matches!(
             surface.click(&target, (30, 40), 5),
-            Err(SurfaceError::Fatal(reason)) if reason.contains("could not focus")
+            Err(SurfaceError::Recoverable(reason)) if reason.contains("lost the foreground")
         ));
         assert_eq!(
             sent_events(&state),
@@ -902,14 +1025,17 @@ mod tests {
         {
             let mut fake = state.lock().unwrap();
             fake.foreground_results
-                .extend([GAME_HWND, GAME_HWND, OTHER_HWND, OTHER_HWND]);
+                .extend([GAME_HWND, GAME_HWND, OTHER_HWND]);
             fake.send_results
                 .extend([Ok(()), Ok(()), Err(blocked_input()), Ok(())]);
         }
 
+        // The retry got the button up, so the fault worth reporting is the one
+        // that says the click missed — not the transient refusal of the first
+        // `LEFTUP`, which the second one answered.
         assert!(matches!(
             surface.click(&target, (30, 40), 5),
-            Err(SurfaceError::Fatal(reason)) if reason.contains("could not focus")
+            Err(SurfaceError::Recoverable(reason)) if reason.contains("lost the foreground")
         ));
         assert_eq!(
             sent_events(&state)
@@ -927,7 +1053,7 @@ mod tests {
         {
             let mut fake = state.lock().unwrap();
             fake.foreground_results
-                .extend([GAME_HWND, GAME_HWND, OTHER_HWND, OTHER_HWND]);
+                .extend([GAME_HWND, GAME_HWND, OTHER_HWND]);
             fake.send_results
                 .extend([Ok(()), Ok(()), Err(blocked_input()), Err(blocked_input())]);
         }
