@@ -79,6 +79,19 @@ exceptions = [
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
+# The TLS decision from `Cargo.toml`'s `tokio-tungstenite` entry, turned into a
+# gate. rustls + webpki-roots is chosen so a single-file exe carries its own
+# roots and never asks the OS trust store; `tokio-tungstenite` also ships a
+# `native-tls` feature, and a feature slip would add a second TLS stack to an
+# elevated binary without reddening `[licenses]` (all MIT/Apache) or
+# `[advisories]`. Nothing here is in `Cargo.lock` today — these entries are
+# inert until something tries.
+deny = [
+    { name = "native-tls" },
+    { name = "openssl-sys" },
+    { name = "schannel" },
+    { name = "security-framework" },
+]
 
 [sources]
 unknown-registry = "deny"
