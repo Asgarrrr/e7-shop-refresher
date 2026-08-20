@@ -30,6 +30,12 @@ pub mod app;
 pub mod capture;
 pub mod config;
 pub mod crash;
+// Windows-only and ungated for the same reason `wide` and `system32` are:
+// `migrate` (always compiled) and `install` (gui) both rewrite a DACL while
+// holding an elevated token, neither can reach the other, and the gate that
+// keeps a junction from redirecting that rewrite must not exist in two copies.
+#[cfg(windows)]
+pub mod dirhandle;
 pub mod domain;
 pub mod error;
 pub mod journal;
