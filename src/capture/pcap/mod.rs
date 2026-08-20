@@ -2,9 +2,9 @@
 //!
 //! `WinDivert`, the backend this replaced, needed a kernel driver load and
 //! administrator rights; Npcap runs driverless for ordinary users (`AdminOnly`
-//! off by default). The exe still requires administrator for the actuator,
-//! not capture: it cannot click a window at higher integrity, and Epic Seven
-//! inherits that from STOVE.
+//! off by default) — see `docs/capture-backend-choice.md`. The exe still
+//! requires administrator for the actuator, not capture: it cannot click a
+//! window at higher integrity, and Epic Seven inherits that from STOVE.
 //!
 //! `wpcap.dll` is loaded by hand because static linking needs the Npcap SDK to
 //! build and kills the shipped exe in the Windows loader, before `main`, on any

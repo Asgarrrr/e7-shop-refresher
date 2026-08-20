@@ -194,7 +194,8 @@ Npcap replaced a driver of this project's own: that predecessor needed a
 kernel driver load and administrator rights to run, where Npcap runs
 driverless for ordinary users (`AdminOnly` off by default — see
 `src/capture/pcap/mod.rs`'s module doc). The specific measurements that
-motivated the switch lived only in a design note this tree no longer carries.
+motivated the switch are in
+[`docs/capture-backend-choice.md`](docs/capture-backend-choice.md).
 
 ## Configuration
 
