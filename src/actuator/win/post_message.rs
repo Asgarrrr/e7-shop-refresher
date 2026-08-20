@@ -19,7 +19,7 @@ use crate::actuator::{Surface, SurfaceError, shield};
 use super::dpi::ensure_dpi_awareness;
 use super::{
     Hwnd, MOVE_SETTLE_MS, Target, WHEEL_DELTA, client_rect, find_game_window, preflight_refusal,
-    probe_window_reachable, rect_change_error, release_twice,
+    probe_window_reachable, release_twice, verify_identity,
 };
 
 /// Posted messages are retrieved before queued hardware input: a freshly
@@ -170,12 +170,14 @@ impl MessageSurface {
         Ok(())
     }
 
+    /// Re-resolves the title before comparing the rect, matching
+    /// `send_input.rs`'s `verify_placement` exactly (both funnel through
+    /// [`verify_identity`]): the two backends must refuse the same
+    /// changed-identity target the same way, not merely a moved one.
     fn verify(&mut self, target: Target) -> Result<(), SurfaceError> {
-        let rect = self.driver.client_rect(target.hwnd)?;
-        if rect == target.rect {
-            return Ok(());
-        }
-        Err(rect_change_error(rect))
+        let titled = self.driver.find_game_window()?;
+        let driver = &mut self.driver;
+        verify_identity(titled, target, move || driver.client_rect(target.hwnd))
     }
 }
 
@@ -530,6 +532,7 @@ mod tests {
         assert_eq!(
             calls(&state),
             vec![
+                MessageCall::FindWindow,
                 MessageCall::ClientRect(GAME_HWND),
                 MessageCall::ShieldRaise(GAME_HWND, game_rect()),
                 MessageCall::Sleep(SHIELD_DRAIN_MS),
@@ -633,8 +636,55 @@ mod tests {
         ));
         assert_eq!(
             calls(&state),
-            vec![MessageCall::ClientRect(GAME_HWND)],
+            vec![MessageCall::FindWindow, MessageCall::ClientRect(GAME_HWND)],
             "a moved window must be refused before the shield is touched or anything is posted"
+        );
+    }
+
+    /// Parity with `send_input.rs`'s `different_title_matched_window_is_fatal_before_input`:
+    /// the default backend must refuse a recycled `HWND` value exactly like the
+    /// fallback does, not merely a moved rect.
+    #[test]
+    fn a_title_resolving_to_another_window_mid_job_is_fatal() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+        state.lock().unwrap().find_results.push_back(Ok(OTHER_HWND));
+
+        assert!(matches!(
+            surface.click(&target, (30, 40), 5),
+            Err(SurfaceError::Fatal(reason)) if reason.contains("different window")
+        ));
+        assert_eq!(
+            calls(&state),
+            vec![MessageCall::FindWindow],
+            "a title now naming a different window must be refused before the shield is \
+             touched or anything is posted"
+        );
+    }
+
+    /// The negative control for the check above: an unchanged target must
+    /// still click end to end, so the new title re-resolution cannot pass by
+    /// refusing everything.
+    #[test]
+    fn an_unchanged_target_still_clicks() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+
+        assert_eq!(surface.click(&target, (30, 40), 5), Ok(()));
+
+        let lparam = pack_point(target.to_client((30, 40))).unwrap();
+        assert_eq!(
+            calls(&state),
+            vec![
+                MessageCall::FindWindow,
+                MessageCall::ClientRect(GAME_HWND),
+                MessageCall::ShieldRaise(GAME_HWND, game_rect()),
+                MessageCall::Post(GAME_HWND, WM_MOUSEMOVE, 0, lparam),
+                MessageCall::Sleep(MOVE_SETTLE_MS),
+                MessageCall::Post(GAME_HWND, WM_LBUTTONDOWN, MK_LBUTTON as usize, lparam),
+                MessageCall::Sleep(5),
+                MessageCall::Post(GAME_HWND, WM_LBUTTONUP, 0, lparam),
+            ]
         );
     }
 
@@ -688,6 +738,7 @@ mod tests {
         assert_eq!(
             calls(&state),
             vec![
+                MessageCall::FindWindow,
                 MessageCall::ClientRect(GAME_HWND),
                 MessageCall::ShieldRaise(GAME_HWND, game_rect()),
                 MessageCall::Post(GAME_HWND, WM_MOUSEMOVE, 0, client_lparam),

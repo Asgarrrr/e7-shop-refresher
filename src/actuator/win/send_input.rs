@@ -27,7 +27,7 @@ use crate::actuator::{Surface, SurfaceError};
 use super::dpi::ensure_dpi_awareness;
 use super::{
     Hwnd, MOVE_SETTLE_MS, Target, WHEEL_DELTA, client_rect, find_game_window, preflight_refusal,
-    probe_window_reachable, rect_change_error, release_twice,
+    probe_window_reachable, release_twice, verify_identity,
 };
 
 /// The foreground switch is asynchronous: give it a beat before verifying.
@@ -176,18 +176,8 @@ impl WinSurface {
     /// why [`probe_window_reachable`] needed a hang check and this does not.
     fn verify_placement(&mut self, target: Target) -> Result<(), SurfaceError> {
         let titled = self.driver.find_game_window()?;
-        if titled != target.hwnd {
-            return Err(SurfaceError::Fatal(
-                "the game window title now identifies a different window".to_owned(),
-            ));
-        }
-
-        let rect = self.driver.client_rect(target.hwnd)?;
-        if rect.is_degenerate() || rect != target.rect {
-            return Err(rect_change_error(rect));
-        }
-
-        Ok(())
+        let driver = &mut self.driver;
+        verify_identity(titled, target, move || driver.client_rect(target.hwnd))
     }
 
     /// The placement reads, plus the demand that the window own the foreground —
@@ -656,6 +646,44 @@ mod tests {
         expected.push(DriverCall::Sleep(MOVE_SETTLE_MS));
         expected.extend(validation_calls());
         expected.push(DriverCall::Send(InputEvent::Wheel(-2)));
+        assert_eq!(calls(&state), expected);
+    }
+
+    /// Named for the parity this backend and `post_message.rs` share through
+    /// [`verify_identity`](super::verify_identity): the same scenario as
+    /// `different_title_matched_window_is_fatal_before_input` below, under the
+    /// name both backends' test modules use for it.
+    #[test]
+    fn a_title_resolving_to_another_window_mid_job_is_fatal() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+        state.lock().unwrap().window = OTHER_HWND;
+
+        assert!(matches!(
+            surface.click(&target, (1, 2), 3),
+            Err(SurfaceError::Fatal(reason)) if reason.contains("different window")
+        ));
+        assert_eq!(calls(&state), vec![DriverCall::FindWindow]);
+        assert!(sent_events(&state).is_empty());
+    }
+
+    /// The negative control for the check above: an unchanged target must
+    /// still click end to end, so the title re-resolution cannot pass by
+    /// refusing everything.
+    #[test]
+    fn an_unchanged_target_still_clicks() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+
+        assert_eq!(surface.click(&target, (400, 500), 25), Ok(()));
+        let mut expected = validation_calls();
+        expected.push(DriverCall::Send(InputEvent::Move((400, 500))));
+        expected.push(DriverCall::Sleep(MOVE_SETTLE_MS));
+        expected.extend(validation_calls());
+        expected.push(DriverCall::Send(InputEvent::LeftDown));
+        expected.push(DriverCall::Sleep(25));
+        expected.extend(validation_calls());
+        expected.push(DriverCall::Send(InputEvent::LeftUp));
         assert_eq!(calls(&state), expected);
     }
 

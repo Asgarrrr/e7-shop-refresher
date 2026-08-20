@@ -211,6 +211,45 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
     })
 }
 
+/// The guard both backends run before every input reaches `post`/`send`: the
+/// window this job acquired must still be the one the title names, at the
+/// rect the job read. A reviewer should reject any new input path that
+/// reaches an actual click without going through this.
+///
+/// `titled` is gathered by the caller, not read here — the two backends
+/// resolve it through different driver seams ([`MessageDriver`](post_message)'s
+/// vs. [`InputDriver`](send_input)'s) — but `rect` is taken as a thunk rather
+/// than an already-read value: a title mismatch must stop *before* the rect is
+/// ever fetched, matching the pre-existing `send_input.rs` behaviour and the
+/// `..._before_input` tests that assert the call log ends at the title check.
+/// This function exists so neither backend can carry its own copy of the
+/// *verdict* — only of the reads.
+///
+/// A title match with a *different* `HWND` is [`SurfaceError::Fatal`], not
+/// `Recoverable`: Windows recycles handle values, so a mismatch here means the
+/// window this job acquired is provably gone (or the value now names a
+/// stranger), and that does not heal while both processes keep running — a
+/// `Recoverable` would make the watchdog re-issue clicks against a target that
+/// no longer exists. The residual race is real and not closeable with these
+/// APIs: this check runs before each input, not atomically with it, so a swap
+/// inside that window is not detected.
+fn verify_identity(
+    titled: Hwnd,
+    target: Target,
+    rect: impl FnOnce() -> Result<ClientRect, SurfaceError>,
+) -> Result<(), SurfaceError> {
+    if titled != target.hwnd {
+        return Err(SurfaceError::Fatal(
+            "the game window title now identifies a different window".to_owned(),
+        ));
+    }
+    let rect = rect()?;
+    if rect.is_degenerate() || rect != target.rect {
+        return Err(rect_change_error(rect));
+    }
+    Ok(())
+}
+
 /// Asks Windows, once per acquire, whether this process may drive `hwnd` at
 /// all — before any input is planned against it.
 ///
