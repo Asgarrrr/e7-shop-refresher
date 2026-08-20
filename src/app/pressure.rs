@@ -10,8 +10,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::mpsc;
 use tracing::error;
 
-#[cfg(test)]
-use crate::capture::Segment;
 use crate::stream::{BudgetedSegment, PipelineBudget};
 
 /// `stream.rs` reasons about "a 512-slot channel" when it justifies its size
@@ -22,9 +20,6 @@ pub(super) const CAPTURE_EVENT_QUEUE: usize = 512;
 pub(super) enum CaptureEvent {
     /// A byte-admitted TCP segment to reassemble.
     Budgeted(BudgetedSegment),
-    /// Test-only compatibility path; production admits before enqueueing.
-    #[cfg(test)]
-    Segment(Segment),
     /// Shop Watch was just re-enabled after a pause: the reassembler must
     /// re-anchor a fresh origin (the bytes during the pause are lost).
     Resync,
@@ -37,6 +32,12 @@ pub(super) enum CaptureEvent {
 /// field on the largest variant silently inflates tens of KiB of resident
 /// memory. `stream.rs`'s canaries pin the *fields*; this pins the queued enum.
 /// If it fires, re-measure — do not box a variant without saying why here.
+///
+/// Re-measured 2026-08-20 after the `#[cfg(test)]`-only `Segment` variant was
+/// deleted: still 120. `Budgeted(BudgetedSegment)` was already the largest
+/// variant (it carries the `PayloadLease`'s `PipelineBudget` handle on top of
+/// the same flow/seq/syn/payload shape `Segment` had), so removing `Segment`
+/// dropped a variant without shrinking the enum.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     size_of::<CaptureEvent>() == 120,

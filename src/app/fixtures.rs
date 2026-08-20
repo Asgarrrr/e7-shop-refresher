@@ -5,6 +5,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use crate::capture::{FlowKey, Segment};
+use crate::stream::{BudgetedSegment, PipelineBudget};
 
 pub(super) fn initial_anchor_segment(seq: u32, payload: &[u8]) -> Segment {
     initial_anchor_segment_in(
@@ -38,4 +39,17 @@ pub(super) fn segment_with_capacity(seq: u32, len: usize, capacity: usize) -> Se
     let mut segment = initial_anchor_segment(seq, &[]);
     segment.payload = payload;
     segment
+}
+
+/// A segment admitted against `budget`, so a test's leases live and die on the
+/// same accounting the pump uses.
+///
+/// The pump used to accept a bare `Segment` and re-admit it against a fresh
+/// `PipelineBudget::new()`, which meant every ordering test ran with lease
+/// lifetimes no shipped frame has. Handing the budget in is what makes a
+/// released-against-the-wrong-stage bug visible.
+pub(super) fn budgeted(budget: &PipelineBudget, seg: Segment) -> BudgetedSegment {
+    budget
+        .admit_capture(seg)
+        .expect("test segment fits capture quota")
 }
