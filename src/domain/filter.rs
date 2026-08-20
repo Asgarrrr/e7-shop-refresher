@@ -666,8 +666,11 @@ mod tests {
     /// Pins the interaction with `shop::sanitized_text`: `names`/`set` are
     /// matched by equality (`Vec::contains`, above), so a sanitized value must
     /// still equal an unsanitized, normal-length config criterion. A criterion
-    /// itself longer than `MAX_WIRE_TEXT` would never match post-sanitizing —
-    /// worth a follow-up cap on the config side, not fixed here.
+    /// itself longer than `MAX_WIRE_TEXT` would never match post-sanitizing,
+    /// but killing one needs both a criterion and a server value each over 120
+    /// characters: the longest real value in the repo is 20 characters
+    /// (`Wondrous Potion Vial`), the longest set id 11 (`set_counter`),
+    /// substat names 5 or fewer. Investigated 2026-08-20, no action.
     #[test]
     fn a_normal_length_name_still_matches_its_criterion_after_sanitizing() {
         use crate::domain::shop::ShopSnapshot;
@@ -677,6 +680,26 @@ mod tests {
                 .expect("snapshot should parse");
         let filter = Filter {
             names: vec!["ticketrare_name".to_owned()],
+            ..Filter::default()
+        };
+        assert!(filter.matches(&snapshot.slots[0]));
+    }
+
+    /// The hazard this plan closes: `shop::sanitize_wire_text` used to leave a
+    /// trailing space where a control character had been, while
+    /// `ui::editor::hunt` trims the player's criterion before storing it. A
+    /// name that survives the wire as `"Covenant Bookmark\n"` must still equal
+    /// the trimmed criterion the player typed — if the sanitizer's trim ever
+    /// regresses, this is the test that notices, not the helper-level one.
+    #[test]
+    fn a_trimmed_criterion_still_matches_a_name_that_had_trailing_whitespace_on_the_wire() {
+        use crate::domain::shop::ShopSnapshot;
+
+        let snapshot: ShopSnapshot =
+            serde_json::from_str(r#"{"slots":[{"name":"Covenant Bookmark\n"}]}"#)
+                .expect("snapshot should parse");
+        let filter = Filter {
+            names: vec!["Covenant Bookmark".to_owned()],
             ..Filter::default()
         };
         assert!(filter.matches(&snapshot.slots[0]));
