@@ -26,8 +26,16 @@
 //! `CreateProcess` takes no search-order flag, `SetDefaultDllDirectories`
 //! changes only its own process, `CWDIllegalInDllSearch` is machine-wide. The
 //! child's *current* directory is the one settable slot; the image-directory
-//! slot has no substitute for staging. Out of reach either way: Npcap's NSIS
-//! stub loads its own plugins from its own `%TEMP%\ns*.tmp`.
+//! slot has no substitute for staging.
+//!
+//! Npcap's NSIS stub loads its own plugins from its own `%TEMP%\ns*.tmp`, and
+//! that *was* out of reach for exactly as long as the child inherited the
+//! launcher's `%TEMP%` unchanged. It does not have to: `GetTempPath` reads
+//! `TMP` then `TEMP` from the child's own environment, not a fixed location,
+//! and [`Fetcher::run`] sets both to [`staging_dir`] before spawning — the
+//! same clamped directory the installer itself is staged in, so the stub's
+//! plugin extraction lands there instead of in the attacker-writable `%TEMP%`
+//! this section opens with.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -150,10 +158,9 @@ impl Fetcher {
         let target = installer_path();
         match self.fetch_and_check(&target) {
             Ok(verified) => {
-                // The child's current directory is a slot in its DLL search
-                // order and the inherited one is wherever the app was started
-                // from. Not the *image* slot; see the header.
-                let spawned = Command::new(&target).current_dir(staging_dir()).spawn();
+                // See `installer_command`'s doc for why `current_dir`, `TEMP`
+                // and `TMP` are set the way they are.
+                let spawned = installer_command(&target).spawn();
                 // Only once `CreateProcess` has returned: until then this handle
                 // is why the path still holds the hashed bytes.
                 drop(verified);
@@ -347,6 +354,31 @@ fn installer_path() -> PathBuf {
     staging_dir().join(TEMP_INSTALLER_NAME)
 }
 
+/// The `Command` [`Fetcher::run`] spawns, built but not spawned — a test can
+/// inspect it (`get_envs`, `get_current_dir`) without launching Npcap's
+/// installer.
+///
+/// `current_dir`: the child's current directory is a slot in its DLL search
+/// order and the inherited one is wherever the app was started from — not the
+/// *image* slot; see the module header.
+///
+/// `TEMP`/`TMP`: the NSIS stub resolves its plugin directory through
+/// `GetTempPath`, which reads `TMP` then `TEMP` — set both, so the stub's own
+/// extraction lands in the directory this process already clamped rather than
+/// the attacker-writable `%TEMP%` the module header opens with. Not
+/// `env_clear`: the child still needs `SystemRoot`, `windir`, `PATH` and the
+/// profile variables to run at all, and `__COMPAT_LAYER` plus the proxy
+/// variables still reach it unchanged — a curated allowlist is a larger
+/// project than this fix.
+fn installer_command(target: &Path) -> Command {
+    let mut command = Command::new(target);
+    command
+        .current_dir(staging_dir())
+        .env("TEMP", staging_dir())
+        .env("TMP", staging_dir());
+    command
+}
+
 /// Chosen once per process. Under `%TEMP%` because this app cannot clean up
 /// after the installer it launches, never *at* `%TEMP%` per the module header.
 ///
@@ -367,8 +399,8 @@ fn staging_dir() -> &'static Path {
 }
 
 /// The answer is cached, failure included: [`staging_dir`] names one path per
-/// process, so a second attempt would hit [`prepare_staging`]'s `create_dir`
-/// refusing the directory this one created.
+/// process, so a second attempt would hit [`prepare_staging`]'s
+/// `create_dir_clamped` refusing the directory this one created.
 fn staging_ready() -> Result<(), String> {
     static PREPARED: OnceLock<Result<(), String>> = OnceLock::new();
     PREPARED
@@ -376,41 +408,48 @@ fn staging_ready() -> Result<(), String> {
         .clone()
 }
 
-/// Sweeps what earlier runs left, creates `dir`, clamps it, and proves it empty.
+/// Sweeps what earlier runs left, creates `dir` already clamped, and proves it
+/// empty.
 ///
-/// `create_dir`, not `create_dir_all`: [`staging_dir`] picks a fresh name per
-/// run, so anything already there was put there by someone else — which is also
-/// why the sweep runs first. The emptiness check is the second half of the
-/// clamp: the directory is born with `%TEMP%`'s inherited ACEs and loses them
-/// only when [`lock_down`] returns, leaving a microsecond window for a
-/// `version.dll`.
+/// `create_dir_clamped`, not `create_dir` then `lock_down`: [`staging_dir`]
+/// picks a fresh name per run, so anything already there was put there by
+/// someone else — which is also why the sweep runs first.
+/// `create_dir_clamped` passes [`STAGING_DACL`] to `CreateDirectoryW` as part
+/// of the same call that creates the object, so the directory is never born
+/// with `%TEMP%`'s inherited ACEs — there is no interval, microsecond or
+/// otherwise, in which it exists but is not yet clamped for a `version.dll` to
+/// land in. That interval is exactly what the earlier create-then-clamp
+/// sequence had, and what let a same-user process win the race, delete the
+/// directory before it lost `%TEMP%`'s permissive ACEs, and re-create it under
+/// its own ownership: empty, so the check below would have passed, and free to
+/// rewrite the DACL. An unelevated owner of a *clamped* directory has no such
+/// move — measured in [`sweep_old_staging`], it is refused `DELETE`
+/// outright — so nothing outside this call can touch `dir` between
+/// `create_dir_clamped` returning and this function's own return.
 ///
-/// **What this does not close:** in that same window the attacker can remove and
-/// re-create the directory, owning it and free to rewrite the DACL just applied
-/// — and it is empty, so the check passes. Closing it needs the DACL applied
-/// atomically at creation, `CreateDirectoryW` with a `SECURITY_ATTRIBUTES`: no
-/// `std` API passes one and `windows-sys`'s `Win32_Storage_FileSystem` is not
-/// enabled. It is at least *detectable*: measured, an elevated process's objects
-/// are owned by `BUILTIN\Administrators` and a filtered token cannot set that
-/// owner. The quieter junction version is already closed — [`lock_down`] refuses
-/// a reparse point — so what remains costs the attacker an abandoned download.
+/// `lock_down` does **not** run again here, and that is deliberate, not an
+/// oversight: with the DACL applied atomically there is no window left for its
+/// reparse-point refusal to guard at this call site, and calling it anyway
+/// would cost more than a redundant `SetSecurityInfo` — measured, re-opening
+/// an *already-clamped* directory for `WRITE_DAC` is refused even to the
+/// process that just created it, unless that process's token actually carries
+/// `BUILTIN\Administrators` enabled (true for this app, which always runs
+/// elevated, but not for the `cargo test` process that exercises this
+/// function directly). `lock_down` stays in this file, `#[cfg(test)]` now: see
+/// its own doc for what it still proves through its read-back test. The
+/// emptiness check below is belt-and-suspenders for the same reason
+/// `lock_down` does not run here at all: creation and clamp are one atomic
+/// call, so the check should never observe `dir` non-empty, but it stays cheap
+/// and catches the gap if that assumption is ever wrong.
 fn prepare_staging(dir: &Path) -> Result<(), String> {
     sweep_old_staging(dir);
 
-    std::fs::create_dir(dir).map_err(|err| {
+    create_dir_clamped(dir, STAGING_DACL).map_err(|err| {
         format!(
             "the installer's download directory could not be created ({err}); \
              nothing was downloaded"
         )
     })?;
-
-    if let Err(err) = lock_down(dir, STAGING_DACL) {
-        let _ = std::fs::remove_dir(dir);
-        return Err(format!(
-            "the installer's download directory could not be secured ({err}); \
-             nothing was downloaded"
-        ));
-    }
 
     match std::fs::read_dir(dir).map(|mut entries| entries.next().is_some()) {
         Ok(false) => Ok(()),
@@ -465,50 +504,33 @@ fn sweep_old_staging(current: &Path) {
             continue;
         }
         // Both spellings: the name may have been taken by a file — planted, or
-        // left by a crash — and either way it must be gone before `create_dir`.
+        // left by a crash — and either way it must be gone before
+        // `create_dir_clamped`.
         if std::fs::remove_dir_all(&path).is_err() {
             let _ = std::fs::remove_file(&path);
         }
     }
 }
 
-/// A *protected* DACL, which is what makes `%TEMP%`'s full-control-for-the-user
-/// ACE stop at the staging directory's door. SDDL rather than `InitializeAcl`
-/// plus two `CreateWellKnownSid` plus two `AddAccessAllowedAceEx`: the same two
-/// ACEs in five times the `unsafe`. `PROTECTED_DACL_SECURITY_INFORMATION` is not
-/// redundant with the string's `P` — `SetSecurityInfo` takes an `ACL`, not a
-/// descriptor, so the control word the `P` set never reaches it.
+/// Parses `sddl` into a security descriptor, the one
+/// `ConvertStringSecurityDescriptorToSecurityDescriptorW` call `lock_down`
+/// (test-only, see its own doc) and [`create_dir_clamped`] both act through
+/// rather than each carrying their own copy.
 ///
-/// Addressed through `crate::dirhandle::open_directory_itself`, which refuses a
-/// reparse point, because the directory can be swapped for a junction between
-/// [`prepare_staging`]'s `create_dir` and this call. Measured, against the
-/// obvious guess: `SetNamedSecurityInfoW` does *not* follow a junction, so the
-/// old name-based call clamped the reparse point and reported success while
-/// [`installer_path`] resolved *through* it. Act on the object you checked, not
-/// the name — the same gate `crate::migrate` uses.
-///
-/// `sddl` is a parameter, not the constant inlined — do not simplify that away.
-/// An unelevated owner cannot delete a clamped directory (see
-/// [`sweep_old_staging`]), so the test proving the clamp took can only tidy up
-/// by calling this again with a DACL granting the rights back.
+/// Returns the raw block on success. The caller owns it from that point and
+/// must free it with exactly one `LocalFree`, on every exit path — this
+/// function never frees it, since the only reason to call it is to still need
+/// the descriptor afterward.
 #[cfg(windows)]
-fn lock_down(dir: &Path, sddl: &str) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
+fn parse_security_descriptor(
+    sddl: &str,
+) -> std::io::Result<windows_sys::Win32::Security::PSECURITY_DESCRIPTOR> {
     use std::ptr;
 
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
-        SetSecurityInfo,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
-    use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    };
-
-    // Before anything is parsed: a name that is no longer a plain directory has
-    // nothing here worth clamping.
-    let handle = crate::dirhandle::open_directory_itself(dir)?;
+    use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
 
     let sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
 
@@ -527,6 +549,63 @@ fn lock_down(dir: &Path, sddl: &str) -> std::io::Result<()> {
     if built == 0 {
         return Err(std::io::Error::last_os_error());
     }
+    Ok(descriptor)
+}
+
+/// A *protected* DACL, which is what makes `%TEMP%`'s full-control-for-the-user
+/// ACE stop at the staging directory's door. SDDL rather than `InitializeAcl`
+/// plus two `CreateWellKnownSid` plus two `AddAccessAllowedAceEx`: the same two
+/// ACEs in five times the `unsafe`. `PROTECTED_DACL_SECURITY_INFORMATION` is not
+/// redundant with the string's `P` — `SetSecurityInfo` takes an `ACL`, not a
+/// descriptor, so the control word the `P` set never reaches it.
+///
+/// Addressed through `crate::dirhandle::open_directory_itself`, which refuses a
+/// reparse point — `SetNamedSecurityInfoW` does *not* follow a junction
+/// (measured), so a name-based call would clamp the reparse point and report
+/// success while [`installer_path`] resolved *through* it. Act on the object
+/// you checked, not the name — the same gate `crate::migrate` uses.
+///
+/// [`prepare_staging`] no longer calls this: it creates `dir` through
+/// [`create_dir_clamped`] instead, already clamped, so there is no interval in
+/// which an unelevated process could swap the name for a junction — an owner
+/// refused `DELETE` (measured, [`sweep_old_staging`]) cannot remove the name
+/// to replace it, and `CreateDirectoryW` itself fails outright rather than
+/// following a reparse point already sitting on the path. That leaves this
+/// function without a caller in this file outside its own test below, which
+/// exercises it directly against a directory still in the *pre*-clamp,
+/// %TEMP%-inherited state `create_dir_clamped` no longer produces — the one
+/// shape this function still needs to handle correctly, and the reason it
+/// stays rather than being deleted.
+///
+/// `sddl` is a parameter, not the constant inlined — do not simplify that away.
+/// An unelevated owner cannot delete a clamped directory (see
+/// [`sweep_old_staging`]), so the test proving the clamp took can only tidy up
+/// by calling this again with a DACL granting the rights back.
+///
+/// `#[cfg(test)]`: with [`prepare_staging`] no longer a caller, this function
+/// is reachable only from its own tests below and the junction-refusal test
+/// further down. Kept for what those tests still prove about
+/// `crate::dirhandle::open_directory_itself` and `SetSecurityInfo` at the OS
+/// level — see the module-level reasoning above — not because production code
+/// still calls it.
+#[cfg(test)]
+#[cfg(windows)]
+fn lock_down(dir: &Path, sddl: &str) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    // Before anything is parsed: a name that is no longer a plain directory has
+    // nothing here worth clamping.
+    let handle = crate::dirhandle::open_directory_itself(dir)?;
+
+    let descriptor = parse_security_descriptor(sddl)?;
 
     let mut dacl: *mut ACL = ptr::null_mut();
     let mut present = 0;
@@ -579,10 +658,64 @@ fn lock_down(dir: &Path, sddl: &str) -> std::io::Result<()> {
     outcome
 }
 
-/// Dev-machine stub; nothing off Windows reaches the fetcher.
+/// Dev-machine stub; nothing off Windows reaches the fetcher. `#[cfg(test)]`
+/// for the same reason as the Windows version above: no production caller.
+#[cfg(test)]
 #[cfg(not(windows))]
 fn lock_down(_dir: &Path, _sddl: &str) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Creates `dir` with `sddl` already its DACL — `CreateDirectoryW` takes a
+/// `SECURITY_ATTRIBUTES` directly, so the object exists and is clamped in the
+/// one call. No `std::fs` API passes a `SECURITY_ATTRIBUTES` through, which is
+/// why [`prepare_staging`] used to create first and clamp after; see its doc
+/// for what that interval cost.
+#[cfg(windows)]
+fn create_dir_clamped(dir: &Path, sddl: &str) -> std::io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let descriptor = parse_security_descriptor(sddl)?;
+
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let attrs = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+
+    // SAFETY: `wide` is a valid null-terminated UTF-16 path alive across the
+    // call; `attrs` is a live stack value whose `lpSecurityDescriptor` is the
+    // block `parse_security_descriptor` just allocated and has not yet been
+    // freed; `CreateDirectoryW` only reads through both pointers and does not
+    // retain either past its return.
+    let created = unsafe { CreateDirectoryW(wide.as_ptr(), &attrs) };
+    let create_err = std::io::Error::last_os_error();
+
+    // SAFETY: the only `LocalFree`, freeing the parse's block exactly once;
+    // `CreateDirectoryW` above only read from it and kept no reference to it.
+    unsafe { LocalFree(descriptor.cast()) };
+
+    if created == 0 {
+        return Err(create_err);
+    }
+    Ok(())
+}
+
+/// Dev-machine stub; nothing off Windows reaches the fetcher.
+#[cfg(not(windows))]
+fn create_dir_clamped(dir: &Path, _sddl: &str) -> std::io::Result<()> {
+    std::fs::create_dir(dir)
 }
 
 /// Starts a second copy of this executable, for the caller to follow with a
@@ -846,6 +979,29 @@ mod tests {
         );
     }
 
+    /// `Command::get_envs` returns the explicitly-set overrides — exactly the
+    /// property under test — without spawning anything, so this runs on every
+    /// platform and never launches Npcap's installer.
+    #[test]
+    fn the_child_environment_points_temp_at_the_staging_directory() {
+        let command = installer_command(&installer_path());
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+
+        let staging = Some(staging_dir().as_os_str());
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("TEMP")),
+            Some(&staging),
+            "the NSIS stub reads TMP then TEMP through GetTempPath; both must \
+             point at the directory this process already clamped, not whatever \
+             %TEMP% the launcher inherited"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("TMP")),
+            Some(&staging),
+            "GetTempPath is checked in this order — TMP first"
+        );
+    }
+
     /// Against the OS, not the SDDL string: a DACL is invisible at the call site
     /// that depends on it. Works filtered or elevated, since a directory's owner
     /// always keeps `READ_CONTROL`.
@@ -888,6 +1044,52 @@ mod tests {
         // unelevated owner of a clamped directory is refused `READ_CONTROL`,
         // `WRITE_DAC` and both together, so `lock_down`'s handle gate cannot
         // re-open what it just clamped. Production never re-clamps.
+        hand_back_full_control(&dir).expect("hand the fixture back");
+        std::fs::remove_dir(&dir).expect("the fixture is deletable once un-clamped");
+    }
+
+    /// [`create_dir_clamped`] directly — not [`prepare_staging`], whose
+    /// emptiness check afterward opens the directory it just clamped to list
+    /// its contents, and that (measured, same as [`lock_down`]'s handle gate
+    /// below) needs the elevated token this app always runs under, which a
+    /// `cargo test` process does not have. That is a pre-existing property of
+    /// [`prepare_staging`], not one this test is about.
+    ///
+    /// What this test is about is testable unelevated: [`dacl_of`] only needs
+    /// `READ_CONTROL`, which the read-back test above shows a clamped
+    /// directory's own creator keeps regardless of elevation. No [`lock_down`]
+    /// call runs between the directory's creation and this read-back, so it
+    /// fails if [`create_dir_clamped`] ever regresses to a plain
+    /// `std::fs::create_dir` — exactly the create-then-clamp window step 3
+    /// closes.
+    #[cfg(windows)]
+    #[test]
+    fn a_freshly_prepared_staging_directory_is_already_protected() {
+        use windows_sys::Win32::Security::SE_DACL_PROTECTED;
+
+        let dir = std::env::temp_dir().join(format!(
+            "{STAGING_PREFIX}atomic-fixture-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir(&dir);
+
+        create_dir_clamped(&dir, STAGING_DACL)
+            .expect("the directory is created and clamped in the one call");
+
+        let (after, aces) = dacl_of(&dir);
+        assert_ne!(
+            after & SE_DACL_PROTECTED,
+            0,
+            "a freshly created staging directory must already be protected — \
+             there was no `lock_down` call in between to have done it"
+        );
+        assert_eq!(
+            aces, 2,
+            "exactly the two ACEs `STAGING_DACL` names — Administrators and SYSTEM"
+        );
+
+        // Same cleanup as the read-back test above, for the same reason: an
+        // unelevated owner of a clamped directory cannot delete it.
         hand_back_full_control(&dir).expect("hand the fixture back");
         std::fs::remove_dir(&dir).expect("the fixture is deletable once un-clamped");
     }
