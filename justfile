@@ -97,6 +97,22 @@ backends:
 # `.github/workflows/quality.yml` runs both weekly and on demand, for the same
 # reasons, and says so in its own header.
 
+# The dependency-policy gate, runnable before CI says no.
+#
+# Out of `verify` for the first of the three reasons above and only that one:
+# `cargo-deny` is an external binary in neither `Cargo.toml` nor `Cargo.lock`,
+# so a clean checkout would fail with "no such subcommand" rather than with
+# anything about this crate. Unlike `coverage` and `mutants`, what this prints
+# *is* a verdict — `deny.toml` is policy with teeth, and its empty `ignore` list
+# is meant to stay empty (`deny.toml`'s own header says why).
+#
+# Version-pinned to match CI exactly, because a different cargo-deny can
+# disagree about the same `deny.toml`:
+# `cargo install --locked cargo-deny@0.20.2`
+deny:
+    cargo deny check advisories
+    cargo deny check bans licenses sources
+
 # Instrumented line/region coverage on the shipped feature set
 # (`pcap-backend + gui + actuator`), because that is the binary a player runs.
 #
