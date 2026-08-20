@@ -58,9 +58,10 @@ const PROMISCUOUS: c_int = 0;
 /// the driver, so it is worth optimizing once at open time.
 const OPTIMIZE_FILTER: c_int = 1;
 
-/// Netmask handed to `pcap_compile`. The filter below uses no broadcast-relative
-/// primitive (`ip broadcast` and friends), which is the only thing the netmask
-/// feeds, so zero is correct rather than merely tolerated.
+/// Netmask handed to `pcap_compile`. No rung of [`super::filter_candidates`]
+/// uses a broadcast-relative primitive (`ip broadcast` and friends), which is
+/// the only thing the netmask feeds, so zero is correct rather than merely
+/// tolerated — `vlan` shifts decoding offsets and reads none of it.
 const FILTER_NETMASK: c_uint = 0;
 
 /// `pcap_next_ex` return codes. Only these four are defined for a live handle.
@@ -486,17 +487,17 @@ pub(super) fn enumerate(wpcap: &Wpcap) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Opens `device`, checks its link type and installs the kernel-side filter.
+/// Opens `device`, checks its link type and installs the first kernel-side
+/// filter it will accept.
 ///
 /// The `Err` is the human-readable reason this adapter is unusable, not a fatal
 /// error: the caller logs it and moves on to the next one.
 pub(super) fn open_device(
     wpcap: &Arc<Wpcap>,
     device: &str,
-    filter: &str,
+    filters: &[String],
 ) -> std::result::Result<Handle, String> {
     let device_c = CString::new(device).map_err(|_| "device name contains a NUL".to_owned())?;
-    let filter_c = CString::new(filter).map_err(|_| "filter contains a NUL".to_owned())?;
     let mut errbuf = [0 as c_char; PCAP_ERRBUF_SIZE];
 
     // SAFETY: `device_c` and `errbuf` outlive the call and are, respectively, a
@@ -540,6 +541,78 @@ pub(super) fn open_device(
     })?;
     handle.strip = strip;
 
+    let installed =
+        install_first_accepted(device, filters, |filter| install_filter(&handle, filter))?;
+
+    debug!(
+        device = %device,
+        link = %datalink_name,
+        datalink,
+        ?strip,
+        filter = %installed,
+        "adapter opened and filtered"
+    );
+    Ok(handle)
+}
+
+/// Installs the first filter in `filters` that this adapter's libpcap accepts,
+/// and returns it.
+///
+/// The ladder exists because the preferred filter names `vlan`, a keyword
+/// [`super::filter_candidates`] argues for at length and that a libpcap old or
+/// unusual enough could refuse. A refused *filter* must not cost the adapter:
+/// [`open_device`]'s `Err` makes its caller skip the device entirely, so
+/// treating "this build doesn't know `vlan`" as "this adapter is unusable"
+/// would turn one blind spot into no capture at all. Falling back to the
+/// untagged-only filter leaves such a machine exactly where it was before the
+/// VLAN arms were added, which is the worst outcome this is willing to have.
+///
+/// Generic over the installer for the reason [`super::start_capture_threads`]
+/// is generic over the spawner: the ladder is pure control flow, while the
+/// thing it walks needs a live `pcap_t` and therefore a machine with Npcap.
+fn install_first_accepted<'a>(
+    device: &str,
+    filters: &'a [String],
+    install: impl Fn(&str) -> std::result::Result<(), String>,
+) -> std::result::Result<&'a str, String> {
+    let mut refused = Vec::new();
+    for filter in filters {
+        match install(filter) {
+            Ok(()) => {
+                if !refused.is_empty() {
+                    // Only on a fallback, and only once per adapter. It is the
+                    // one line that tells a reader of `logs\*.log` why a
+                    // machine on tagged VLANs still sees nothing, which is
+                    // otherwise indistinguishable from the bug this fixes.
+                    warn!(
+                        device = %short_device_name(device),
+                        refused = %refused.join("; "),
+                        installed = %filter,
+                        "this adapter's libpcap refused the VLAN-aware kernel filter; \
+                         capturing with the untagged-only one instead, so tagged frames \
+                         on this adapter stay invisible"
+                    );
+                }
+                return Ok(filter);
+            }
+            Err(reason) => refused.push(format!("{filter}: {reason}")),
+        }
+    }
+    Err(format!(
+        "no kernel filter could be installed — {}",
+        refused.join("; ")
+    ))
+}
+
+/// Compiles one filter expression and copies it into the driver.
+///
+/// Takes `&Handle` rather than the raw pointer so that its safety argument
+/// stays the type's rather than this function's: a `Handle` exists only around
+/// a live `pcap_t` that exactly one thread can name, which is what every
+/// `unsafe` block below needs and all it needs.
+fn install_filter(handle: &Handle, filter: &str) -> std::result::Result<(), String> {
+    let wpcap = &handle.wpcap;
+    let filter_c = CString::new(filter).map_err(|_| "filter contains a NUL".to_owned())?;
     let mut program = BpfProgram {
         bf_len: 0,
         bf_insns: std::ptr::null_mut(),
@@ -565,7 +638,7 @@ pub(super) fn open_device(
     if compiled != 0 {
         // SAFETY: the handle is live and exclusively this thread's.
         let reason = unsafe { wpcap.error_text(handle.handle) };
-        return Err(format!("pcap_compile({filter}): {reason}"));
+        return Err(format!("pcap_compile: {reason}"));
     }
     // SAFETY: the handle is live and exclusively this thread's, and `program` was
     // filled by the successful compile above. `pcap_setfilter` copies the program
@@ -579,18 +652,10 @@ pub(super) fn open_device(
     // once — this is the only `pcap_freecode` on it, and it is unreachable when
     // the compile failed.
     unsafe { (wpcap.freecode)(&mut program) };
-    if let Some(failure) = failure {
-        return Err(format!("pcap_setfilter: {failure}"));
+    match failure {
+        Some(failure) => Err(format!("pcap_setfilter: {failure}")),
+        None => Ok(()),
     }
-
-    debug!(
-        device = %device,
-        link = %datalink_name,
-        datalink,
-        ?strip,
-        "adapter opened and filtered"
-    );
-    Ok(handle)
 }
 
 // --- Capture thread --------------------------------------------------------
@@ -701,7 +766,8 @@ pub(super) fn capture_loop(
             // siblings keep alive, so the disconnect it would otherwise wait
             // for never arrives. `delivered` travels with it because that is
             // what decides whether this death is the session's — every frame
-            // counted there passed `tcp and src port {game_port}`. A failed
+            // counted there passed this adapter's kernel filter, which admits
+            // the game server's source port and nothing else. A failed
             // send means the source is already gone, which is the one case
             // where nobody needs telling.
             let _ = failed.send(AdapterFailure {
@@ -833,6 +899,7 @@ fn warn_capture_loss(lost: c_uint, stats: PcapStat) {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
     use std::sync::mpsc::sync_channel;
     use std::time::Duration;
 
@@ -891,6 +958,67 @@ mod tests {
             forward(&sender, b"third", &capture_loss, &mut overflowed),
             Forwarded::SourceGone
         ));
+    }
+
+    #[test]
+    fn a_libpcap_that_refuses_the_vlan_keyword_keeps_its_adapter_on_the_plain_filter() {
+        // The shape of an older or unusual libpcap: `pcap_compile` rejects the
+        // `vlan` keyword. Before the ladder, `open_device` returned that as the
+        // adapter's refusal reason and `open` skipped the device — so a fix for
+        // a blind spot on tagged frames would have cost such a machine its
+        // capture entirely. Here it costs it only the VLAN arms.
+        let filters = super::super::filter_candidates(NonZeroU16::new(3333).expect("not zero"));
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let installed = install_first_accepted(r"\Device\NPF_{OLD}", &filters, |filter| {
+            attempted.borrow_mut().push(filter.to_owned());
+            if filter.contains("vlan") {
+                return Err("syntax error".to_owned());
+            }
+            Ok(())
+        })
+        .expect("the plain filter is still installable, so the adapter is still usable");
+
+        assert_eq!(installed, filters[1], "it falls back exactly one rung");
+        assert_eq!(
+            attempted.borrow().len(),
+            2,
+            "and only after the capable one was actually tried"
+        );
+        assert_eq!(attempted.borrow()[0], filters[0]);
+    }
+
+    #[test]
+    fn an_adapter_that_takes_the_vlan_filter_never_sees_the_plain_one() {
+        let filters = super::super::filter_candidates(NonZeroU16::new(3333).expect("not zero"));
+        let attempted = std::cell::Cell::new(0usize);
+        let installed = install_first_accepted(r"\Device\NPF_{MODERN}", &filters, |_| {
+            attempted.set(attempted.get() + 1);
+            Ok(())
+        })
+        .expect("a modern libpcap takes the first rung");
+        assert_eq!(installed, filters[0]);
+        assert_eq!(
+            attempted.get(),
+            1,
+            "the ladder stops at the first rung that holds"
+        );
+    }
+
+    #[test]
+    fn an_adapter_that_refuses_every_filter_is_still_refused_and_says_why_for_each() {
+        // The other half of the fail-safe: falling back must not become
+        // swallowing. A device whose filters all fail is unusable, and the
+        // caller's zero-usable-device message is built out of these reasons.
+        let filters = super::super::filter_candidates(NonZeroU16::new(3333).expect("not zero"));
+        let reason = install_first_accepted(r"\Device\NPF_{GONE}", &filters, |_| {
+            Err("the handle is dead".to_owned())
+        })
+        .expect_err("no filter installed means no usable adapter");
+        assert!(reason.contains("the handle is dead"), "{reason}");
+        assert!(
+            reason.contains("vlan"),
+            "the rung that was tried first: {reason}"
+        );
     }
 
     #[test]

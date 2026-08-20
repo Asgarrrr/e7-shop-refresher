@@ -139,8 +139,9 @@ pub(super) struct AdapterFailure {
     pub(super) device: String,
     /// Frames this adapter pulled off the wire before it died.
     ///
-    /// Every one of them passed the kernel filter `tcp and src port
-    /// {game_port}`, so a non-zero count means this adapter was on the path
+    /// Every one of them passed whichever rung of [`filter_candidates`] this
+    /// adapter accepted, and every rung is the game server's source port and
+    /// nothing else, so a non-zero count means this adapter was on the path
     /// the game server's traffic actually takes — which is the whole reason
     /// its death matters while an idle sibling's does not.
     pub(super) delivered: u64,
@@ -300,14 +301,12 @@ impl PcapSource {
         let wpcap = Arc::new(wpcap);
 
         let devices = enumerate(&wpcap)?;
-        // Only the game server's own source port: everything else is
-        // discarded in the driver rather than copied to user space first.
-        let filter = format!("tcp and src port {game_port}");
+        let filters = filter_candidates(game_port);
 
         let mut handles = Vec::new();
         let mut refused = Vec::new();
         for device in &devices {
-            match open_device(&wpcap, device, &filter) {
+            match open_device(&wpcap, device, &filters) {
                 Ok(handle) => handles.push(handle),
                 Err(reason) => {
                     warn!(device = %device, reason = %reason, "skipping adapter");
@@ -356,7 +355,11 @@ impl PcapSource {
         info!(
             adapters = threads.len(),
             skipped = refused.len(),
-            filter = %filter,
+            // The filter this asked every adapter for. An adapter whose
+            // libpcap refused it is capturing on a later rung of
+            // [`filter_candidates`] and said so in its own warning; there is
+            // no single filter to name here any more.
+            filter = %filters[0],
             snaplen = SNAPLEN,
             queue_depth = FRAME_QUEUE_DEPTH,
             "Npcap capture open (passive copy; originals untouched)"
@@ -378,6 +381,67 @@ impl PcapSource {
             PcapStop { stop },
         ))
     }
+}
+
+/// The kernel filters this backend offers one adapter, most capable first.
+///
+/// A ladder, not a set: [`open_device`] installs the first rung that adapter's
+/// libpcap accepts and keeps capturing on it. Both rungs admit only the game
+/// server's own source port, so everything else is still discarded in the
+/// driver rather than copied to user space first.
+///
+/// # What the single filter this replaces could not see
+///
+/// `tcp and src port {game_port}` compiles, on `DLT_EN10MB`, to an `EtherType`
+/// test at offset 12. On an 802.1Q-tagged frame offset 12 holds the tag
+/// protocol identifier `0x8100`, not `0x0800`, so the test fails and the
+/// driver discards the frame before this process is woken. That made every
+/// line of `link::ethernet_payload_offset`'s VLAN handling unreachable: a
+/// tagged frame could not get to it, so the diagnostic tell its comment
+/// promises — `unparsed` climbing beside `delivered` — could not appear
+/// either. A player behind VLAN tags saw `delivered == 0`, which this backend
+/// reads as "the adapters are open but the filter matches no traffic", and got
+/// no diagnosis past that.
+///
+/// # Why the expression is shaped exactly like this
+///
+/// `vlan` in libpcap is not a predicate. It tests the current link type for a
+/// tag *and then shifts every subsequent decoding offset by four*, for the
+/// remainder of the expression as the parser reads it. Parentheses group the
+/// boolean; they do not scope that shift back. Two consequences, both
+/// load-bearing:
+///
+/// - The untagged arm has to be written **to the left** of the first `vlan`.
+///   To its right it would be compiled against the shifted offsets and would
+///   then match only tagged frames — the same blind spot, inverted, and
+///   invisible on a machine that has no tags to test with.
+/// - Each further `vlan` shifts four more, which is what makes the third arm a
+///   double-tag matcher (802.1ad outer plus 802.1Q inner) without saying so:
+///   it is read after the second arm's shift is already in effect, so its own
+///   `vlan` tests offset 16 and its `tcp` tests offset 20. `link`'s
+///   `MAX_VLAN_TAGS` strips exactly that depth, so filter and strip now admit
+///   the same frames.
+///
+/// The parentheses around every arm are not decoration. `pcap-filter(7)`:
+/// "Alternation and concatenation have equal precedence and associate left to
+/// right" — `and` does **not** bind tighter than `or` here, unlike almost every
+/// other language that has both. Unparenthesised, `A or vlan and A` parses as
+/// `(A or vlan) and A`: a different filter, which compiles.
+///
+/// # Why the first rung can only ever widen, and the second rung exists anyway
+///
+/// Every arm after the first is joined with `or` and read after it, so nothing
+/// added here can subtract a frame the old filter admitted; a wrong arm costs
+/// at most some frames `parse_segment` then rejects. The failure this change
+/// could still cause is an expression that does not *compile* — [`open_device`]
+/// treats a filter it cannot install as a refused adapter, so on a libpcap too
+/// old or too unusual to know `vlan` this would turn a partial outage into a
+/// total one. Hence the second rung, which is the previous filter, byte for
+/// byte.
+fn filter_candidates(game_port: NonZeroU16) -> [String; 2] {
+    let untagged = format!("tcp and src port {game_port}");
+    let tagged = format!("({untagged}) or (vlan and {untagged}) or (vlan and vlan and {untagged})");
+    [tagged, untagged]
 }
 
 /// Starts one named thread per adapter, and — the reason this is a function at
@@ -876,6 +940,78 @@ mod tests {
         assert!(!source.threads.is_empty(), "at least one adapter must open");
         println!("adapters capturing: {}", source.threads.len());
         stop.stop();
+    }
+
+    /// Splits a filter on its top-level `or`s. Crude on purpose — it only has
+    /// to handle the one shape [`filter_candidates`] builds, and a parser that
+    /// could handle more would be a second thing to get wrong.
+    fn top_level_arms(filter: &str) -> Vec<&str> {
+        let mut arms = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        for (at, &byte) in filter.as_bytes().iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                _ if depth == 0 && filter[at..].starts_with(" or ") => {
+                    arms.push(filter[start..at].trim());
+                    start = at + " or ".len();
+                }
+                _ => {}
+            }
+        }
+        arms.push(filter[start..].trim());
+        arms
+    }
+
+    #[test]
+    fn the_untagged_arm_is_left_of_every_vlan_keyword_because_vlan_shifts_what_follows_it() {
+        let [tagged, _] = filter_candidates(game_port());
+        let arms = top_level_arms(&tagged);
+        assert_eq!(arms.len(), 3, "untagged, one tag, two tags: {tagged}");
+
+        // The whole bug this filter fixes, and the whole way a fix could go
+        // wrong, is which side of `vlan` a term is read on: `vlan` shifts every
+        // decoding offset after it by four, so an untagged arm written to its
+        // right would match tagged frames only — the same outage, inverted, and
+        // unobservable on a machine with no tags to test against.
+        let first_vlan = tagged.find("vlan").expect("a vlan arm");
+        let untagged_arm = tagged.find("tcp and src port").expect("an untagged arm");
+        assert!(
+            untagged_arm < first_vlan,
+            "the untagged arm must be read before any offset shift: {tagged}"
+        );
+        assert!(!arms[0].contains("vlan"), "{}", arms[0]);
+        // And each further arm adds exactly one more shift on top of the last,
+        // which is what makes them one tag and then two.
+        assert_eq!(arms[1].matches("vlan").count(), 1, "{}", arms[1]);
+        assert_eq!(arms[2].matches("vlan").count(), 2, "{}", arms[2]);
+
+        for arm in &arms {
+            // libpcap gives `and` and `or` *equal* precedence, left to right,
+            // so an unparenthesised arm would silently regroup: `A or vlan and
+            // A` is `(A or vlan) and A`, which compiles and is not this filter.
+            assert!(
+                arm.starts_with('(') && arm.ends_with(')'),
+                "every arm must be parenthesised against libpcap's flat precedence: {arm}"
+            );
+            assert!(arm.contains("tcp and src port 3333"), "{arm}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_rung_is_the_filter_this_backend_shipped_before_vlan_was_handled() {
+        // Not a restatement of the code: this rung is what a machine whose
+        // libpcap refuses `vlan` gets, and its whole value is that it is the
+        // *previous* behaviour rather than an approximation of it. A drift here
+        // would mean the fail-safe path is itself a change nobody measured.
+        let [tagged, untagged] = filter_candidates(game_port());
+        assert_eq!(untagged, "tcp and src port 3333");
+        assert!(!untagged.contains("vlan"));
+        assert!(
+            tagged.len() > untagged.len(),
+            "the ladder runs most capable first"
+        );
     }
 
     #[test]
