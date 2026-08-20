@@ -148,7 +148,8 @@ hand, "Npcap is not installed" is just a line in the window's journal.
 - **Build machine**: Rust >= 1.92 and the MSVC toolchain (`link.exe`). No C
   compiler and no SDK: `wpcap.dll` is resolved at runtime, so the build needs
   nothing from Npcap and CI compiles and tests this on runners that do not have
-  it installed.
+  it installed. `cargo build --release` alone needs nothing beyond that; the
+  quality commands below additionally need `just` (`cargo install just`).
 
 ## Build
 
@@ -189,9 +190,11 @@ message instead of panicking:
 cargo test --no-default-features
 ```
 
-[`docs/capture-backend-choice.md`](docs/capture-backend-choice.md) explains why
-Npcap replaced a driver of our own, including the two measurements that
-overturned the previous decision.
+Npcap replaced a driver of this project's own: that predecessor needed a
+kernel driver load and administrator rights to run, where Npcap runs
+driverless for ordinary users (`AdminOnly` off by default — see
+`src/capture/pcap/mod.rs`'s module doc). The specific measurements that
+motivated the switch lived only in a design note this tree no longer carries.
 
 ## Configuration
 

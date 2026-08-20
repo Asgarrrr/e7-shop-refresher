@@ -208,8 +208,9 @@ codegen-units = 1
 # `catch_unwind`, fatal channel all trigger on a panic, and a wrap is not one —
 # on arithmetic over values the crate does not control. Prerequisite, audited
 # before enabling: a panic from a `Drop` *during an unwind* aborts with no
-# `crash.log`, so all four production `Drop` impls were read and none performs
-# checkable arithmetic.
+# `crash.log`, so the rule is that no production `Drop` impl may perform
+# checkable arithmetic — every one of them was read against that rule and none
+# does.
 overflow-checks = true
 
 # Separate additive profile because `release` must keep `strip = "debuginfo"`

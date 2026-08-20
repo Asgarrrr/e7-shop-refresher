@@ -296,9 +296,9 @@ mod tests {
         // `truncate`/`drain(..start)` pair, which panics if the range isn't
         // inside the frame.
         //
-        // `20-test.md`'s `test-007` asked for `proptest`. Declined: the
-        // contract is "`None` or a valid `Segment`, never panics", so there is
-        // no counterexample to minimise, only a seed to re-run.
+        // `proptest` was declined here too: the contract is "`None` or a
+        // valid `Segment`, never panics", so there is no counterexample to
+        // minimise, only a seed to re-run.
         let mut state = 0x5EED_1234_ABCD_0001_u64;
 
         // (a) Unstructured: pure garbage, every length from empty to past an

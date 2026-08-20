@@ -15,9 +15,12 @@
 //! construction.
 //!
 //! Ungated and windows-only for the same reason as [`crate::wide`] and
-//! [`crate::system32`]: [`crate::migrate`] (always compiled) and
-//! [`crate::install`] (gui) both rewrite a DACL under an elevated token and
-//! neither can reach the other. A security gate must not exist in two copies.
+//! [`crate::system32`]: [`crate::migrate`] (always compiled) rewrites a DACL
+//! under an elevated token through this gate. [`crate::install`] (gui) no
+//! longer does so in production — it sets a directory's DACL atomically at
+//! creation via `CreateDirectoryW` instead — but still exercises this gate
+//! from its own `#[cfg(test)]` `lock_down`, kept for what it proves about
+//! this module at the OS level. A security gate must not exist in two copies.
 
 use std::fs::File;
 use std::path::Path;

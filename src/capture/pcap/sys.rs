@@ -7,9 +7,9 @@
 //! [`unsafe impl Send for Handle`](Handle) below claims nothing but the owning
 //! `Handle` retains the `*mut PcapT` — auditable only because that field, and
 //! every `*mut PcapT` in the crate, is private to this file. Splitting
-//! `open_device` from `capture_loop` (`docs/tech-debt/24-proj.md`) would make
-//! it `pub(super)` and spread the check over three files. [`super::link`]
-//! carries no pointer; it is the one that left.
+//! `open_device` from `capture_loop` would make it `pub(super)` and spread
+//! the check over three files. [`super::link`] carries no pointer; it is the
+//! one that left.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;

@@ -80,10 +80,11 @@ backends:
 #    `cargo-mutants`), so a `verify` that included them would fail on a clean
 #    checkout with an error about a missing subcommand rather than about the
 #    code. Every dependency this crate does *not* have was declined with a
-#    written argument (`docs/tech-debt/_HANDOFF.md`: no `proptest`, no
-#    `tempfile`, no `arrayvec`/`smallvec`); these two stay acceptable precisely
-#    because they are external binaries and appear in neither `Cargo.toml` nor
-#    `Cargo.lock`.
+#    written argument at its point of temptation — no `proptest`
+#    (`capture/ip.rs` and `actuator/plan/geometry.rs`), no `tempfile`, no
+#    `arrayvec`/`smallvec` (`stream/reassembly.rs`); these two stay acceptable
+#    precisely because they are external binaries and appear in neither
+#    `Cargo.toml` nor `Cargo.lock`.
 # 2. They are slow in a way the other lanes are not. `coverage` recompiles the
 #    crate instrumented; `mutants` recompiles it *once per mutant* — measured at
 #    93 mutants for the two `plan` files and 123 for `domain/control/`, on top of
@@ -91,8 +92,9 @@ backends:
 # 3. Neither produces a number that should ever be a threshold. A coverage
 #    percentage turned into a gate is optimised by writing tests that execute
 #    lines without asserting anything, which is the exact defect this crate
-#    already shipped once (`const-003`'s guard test ran every line it cared about
-#    and could not fail). The percentage is a map of where to look, not a score.
+#    already shipped once — the click-grid guard test below ran every line it
+#    cared about and could not fail. The percentage is a map of where to look,
+#    not a score.
 #
 # `.github/workflows/quality.yml` runs both weekly and on demand, for the same
 # reasons, and says so in its own header.
@@ -127,8 +129,8 @@ deny:
 #   *is* counted, and it is always near 100% (test code executes itself), so a
 #   per-file percentage here flatters any file whose tests live beside it.
 #   Stripping those blocks moves the crate from 84.88% of lines to 72.80% of
-#   *production* lines; `docs/tech-debt/30-measurement.md` carries the
-#   production-only ranking that the raw table cannot give.
+#   *production* lines — the per-file, production-only ranking behind that
+#   split lives only in the `--html` report below, not in this summary table.
 # - A file that is nothing but `#[derive(Deserialize)]` shapes reports no
 #   production lines at all — `uplink/protocol.rs` is the whole file — because
 #   derive-generated code is attributed to the macro, not to the call site. Zero
@@ -142,7 +144,7 @@ coverage:
 # Mutation testing on the modules where a surviving mutant costs a player money.
 #
 # This lane exists because of a defect that actually shipped. The guard test
-# written for `const-003` — the invariant "six clickable rows, the top group is
+# written for the click-grid invariant — "six clickable rows, the top group is
 # 0..=3", whose failure clicks the wrong item's Buy button — had six assertions
 # and every one of them was derived from the two constants it was meant to pin.
 # `LAST_TOP_ROW = 2`, `= 4` and `MAX_ROW = 7` each passed the entire suite. A

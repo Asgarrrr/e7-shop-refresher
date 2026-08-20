@@ -514,11 +514,11 @@ mod tests {
     }
 
     /// The three properties `to_screen` is *defined* by, over a lattice of
-    /// window shapes. Do not replace it with `proptest` (`20-test.md`'s
-    /// `test-007`): the function is piecewise linear, so its behaviour is all at
-    /// boundaries — exactly 16:9, the aspect cap, the anchor and design-space
-    /// edges — which a lattice hits deliberately and random rects hit by luck,
-    /// and a generator would build its rects with the arithmetic under test.
+    /// window shapes. Do not replace it with `proptest`: the function is
+    /// piecewise linear, so its behaviour is all at boundaries — exactly
+    /// 16:9, the aspect cap, the anchor and design-space edges — which a
+    /// lattice hits deliberately and random rects hit by luck, and a
+    /// generator would build its rects with the arithmetic under test.
     #[test]
     fn to_screen_maps_every_shape_inside_the_client_area() {
         // Heights a real window takes, plus the extremes; extra width walks the

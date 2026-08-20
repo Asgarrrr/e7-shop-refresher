@@ -1,12 +1,11 @@
 name: Quality
 # The measurement lanes: how much of the crate the tests *reach* (coverage) and
-# how much of it they would *notice changing* (mutation). Both answer the
-# sentence `docs/tech-debt/README.md` ends its "Method and its limits" section
-# with — "No reviewer measured test coverage, because no CI lane does — which is
-# precisely how `test-001` survived" — and the defect that motivated the
-# mutation half is on record too: the guard test shipped for `const-003`, the one
-# pinning "six clickable rows, the top group is 0..=3", had six assertions and
-# every one of them was a tautology over the two constants it was meant to pin.
+# how much of it they would *notice changing* (mutation). Both exist because no
+# CI lane had ever measured test coverage before this one, and the defect that
+# motivated the mutation half is on record too: the guard test shipped for the
+# click-grid invariant, "six clickable rows, the top group is 0..=3", had six
+# assertions and every one of them was a tautology over the two constants it
+# was meant to pin.
 # `LAST_TOP_ROW = 2`, `= 4` and `MAX_ROW = 7` each passed the whole suite while
 # `buy_job` planned a scroll-to-bottom for a row still at scroll-top — a click on
 # the wrong item's Buy button, with the player's gold behind it. A human found
@@ -181,8 +180,8 @@ jobs:
         # a quarter of them was never mutated and another quarter never ran. A
         # green-looking coverage claim that is silently three-quarters of a
         # measurement is the same failure mode this whole workflow exists to
-        # answer — the tautological `const-003` guard test in the header, which
-        # also passed while asserting nothing.
+        # answer — the tautological click-grid guard test described in the
+        # header, which also passed while asserting nothing.
         #
         # It cannot be caught locally either: the justfile's `mutants` recipe
         # passes no `--shard`, so a maintainer's run covers everything and says
@@ -215,12 +214,13 @@ jobs:
 
       # The scope is not "the crate": it is the five files where a surviving
       # mutant costs a player money or wedges the loop. `plan/geometry.rs` and
-      # `plan/jobs.rs` are the row/slot/scroll arithmetic `const-003` is about —
-      # a wrong row is a click on the wrong item's Buy button. `domain/control/`
-      # is the buy decision, the stop reasons and the recovery ladder: a mutant
-      # surviving there is a limit that does not stop, a refresh that double-bills,
-      # or a watchdog that halts blaming the game. Everything else in the crate is
-      # in scope for a human's judgement, not for a weekly robot's: the Win32
+      # `plan/jobs.rs` are the row/slot/scroll arithmetic the click-grid
+      # invariant is about — a wrong row is a click on the wrong item's Buy
+      # button. `domain/control/` is the buy decision, the stop reasons and
+      # the recovery ladder: a mutant surviving there is a limit that does not
+      # stop, a refresh that double-bills, or a watchdog that halts blaming
+      # the game. Everything else in the crate is in scope for a human's
+      # judgement, not for a weekly robot's: the Win32
       # backends need a real window, `capture/pcap/` needs Npcap and a live NIC,
       # and the UI modules are asserted through `egui_kittest` where a surviving
       # mutant usually means "no pixel changed", which is not a finding.
