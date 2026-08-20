@@ -1,12 +1,10 @@
 //! Link-layer stripping: a captured frame in, the IP packet inside it out.
 //!
-//! Pure functions over a byte slice, no `wpcap.dll` symbol and no raw
-//! pointer — the seam that can be cut without touching the soundness
-//! argument in [`super::sys`]. It's also where the next bug will land: the
-//! VLAN path below is `⚠ Untested` (no adapter measured here produces a
-//! tagged frame), and a wrong strip length doesn't fail loudly — it hands
-//! `parse_segment` bytes off by a few. Most of this backend's tests live
-//! here for that reason.
+//! No `wpcap.dll` symbol and no raw pointer, so this is the seam that can be
+//! cut without touching the soundness argument in [`super::sys`]. It is also
+//! where the next bug will land: the VLAN path below is `⚠ Untested`, and a
+//! wrong strip length doesn't fail loudly — it hands `parse_segment` bytes off
+//! by a few. Most of this backend's tests live here for that reason.
 
 use std::ffi::c_int;
 
@@ -20,9 +18,9 @@ const DLT_RAW_ALT: c_int = 101;
 
 /// How to get from a captured frame to the IP packet inside it.
 ///
-/// Chosen per device from `pcap_datalink()`, never hardcoded: the same machine
-/// hands out Ethernet framing on a NIC, a four-byte pseudo-header on the
-/// loopback adapter, and bare IP on some VPN interfaces.
+/// Chosen per device from `pcap_datalink()`, never hardcoded: one machine hands
+/// out Ethernet framing on a NIC, a four-byte pseudo-header on loopback, and
+/// bare IP on some VPN interfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LinkStrip {
     /// `DLT_EN10MB`: 14 bytes, plus 4 for each VLAN tag.
@@ -77,17 +75,17 @@ impl LinkStrip {
 /// tags.
 ///
 /// A tagged frame pushes `EtherType` four bytes further per tag, so a fixed
-/// 14-byte strip would hand `parse_segment` garbage — the tag stack's last
-/// four bytes followed by the IP header.
+/// 14-byte strip would hand `parse_segment` the tag stack's last four bytes
+/// followed by the IP header.
 ///
-/// ⚠ **Untested.** The measured machine has `VlanSupport=0`, so no tagged
-/// frame was ever observed; this path exists so a player who does run
-/// tagged VLANs doesn't see a silent parse failure. Symptom if broken:
-/// `unparsed` climbing in lockstep with `delivered`.
+/// ⚠ **Untested.** The measured machine has `VlanSupport=0`, so no tagged frame
+/// was ever observed; this exists so a player who does run tagged VLANs doesn't
+/// see a silent parse failure. Symptom if broken: `unparsed` climbing in
+/// lockstep with `delivered`.
 fn ethernet_payload_offset(frame: &[u8]) -> Option<usize> {
     let mut at = ETHERTYPE_OFFSET;
-    // `<=` so that `MAX_VLAN_TAGS` tags are accepted and the (MAX+1)-th is what
-    // falls through to `None`.
+    // `<=` so `MAX_VLAN_TAGS` tags are accepted and the (MAX+1)-th falls
+    // through to `None`.
     for _ in 0..=MAX_VLAN_TAGS {
         let field = frame.get(at..at + 2)?;
         let ethertype = u16::from_be_bytes([field[0], field[1]]);
@@ -150,8 +148,8 @@ mod tests {
             LinkStrip::Fixed(4).ip_bytes(b"\x02\x00\x00\x00ip"),
             Some(b"ip".as_slice())
         );
-        // A four-byte loopback header with nothing behind it is an empty packet,
-        // not a failure; one byte short of the header is a failure.
+        // A loopback header with nothing behind it is an empty packet, not a
+        // failure; one byte short of the header is a failure.
         assert_eq!(
             LinkStrip::Fixed(4).ip_bytes(b"\x02\x00\x00\x00"),
             Some(b"".as_slice())
@@ -212,8 +210,7 @@ mod tests {
 
     #[test]
     fn the_stripped_bytes_of_a_real_ethernet_frame_parse_as_a_segment() {
-        // End-to-end shape of this backend: Ethernet frame in, `parse_segment`
-        // out. A wrong strip length shows up here as `None`.
+        // A wrong strip length shows up here as `None`.
         use etherparse::PacketBuilder;
 
         const GAME_PORT: u16 = 3333;

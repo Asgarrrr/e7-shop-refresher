@@ -1,10 +1,8 @@
 //! The capture pump: the blocking receive loop, and the three cold reports it
 //! keeps out of its own body.
 //!
-//! Runs on a dedicated OS thread (`super::workers` owns the thread and the
-//! `catch_unwind` around this loop) and talks to reassembly through exactly
-//! two things from `super::pressure`: the [`CaptureEvent`] channel and the
-//! [`PressureResync`] marker.
+//! Runs on a dedicated OS thread owned by `super::workers`, and talks to
+//! reassembly only through [`CaptureEvent`] and the [`PressureResync`] marker.
 
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, warn};
@@ -15,20 +13,15 @@ use crate::watch::WatchGate;
 
 use super::pressure::{CaptureEvent, PressureResync};
 
-/// How many admitted segments between two "capture progress" lines. The
-/// *absence* of that line in a long log is the diagnostic: the backend is
-/// reporting nothing on the configured port.
+/// The *absence* of a "capture progress" line in a long log is the diagnostic:
+/// the backend is reporting nothing on the configured port.
 const CAPTURE_PROGRESS_EVERY: u64 = 1000;
 
-/// The three rare reports of the per-packet loop, out of line.
-///
-/// `#[cold]` + `#[inline(never)]` keeps only the branch test in
-/// [`capture_loop_budgeted`]'s body: with `codegen-units = 1`, LLVM would
-/// otherwise inline the tracing callsite machinery and the `PipelineStats`
-/// construction (which takes the budget mutex) into the per-packet hot path,
-/// for branches that fire once a session or never. Scale is small — one port,
-/// 82 matched packets in the feasibility probe — so this is about hot-body
-/// layout and readability, not throughput.
+/// The three rare reports of the per-packet loop, out of line: `#[cold]` +
+/// `#[inline(never)]` stops LLVM hoisting the tracing machinery and the
+/// mutex-taking `PipelineStats` construction into the hot path for branches
+/// that fire once a session or never. At this crate's scale that is about
+/// hot-body layout, not throughput.
 #[cold]
 #[inline(never)]
 fn report_backend_loss(budget: &PipelineBudget) {
@@ -41,8 +34,8 @@ fn report_backend_loss(budget: &PipelineBudget) {
     );
 }
 
-/// See [`report_backend_loss`] for why this is out of line. Reports every stage
-/// because a byte-pressure event is diagnosed by *which* stage is holding bytes.
+/// Out of line, as [`report_backend_loss`]. Reports every stage because a
+/// byte-pressure event is diagnosed by *which* stage holds the bytes.
 #[cold]
 #[inline(never)]
 fn report_byte_pressure(budget: &PipelineBudget) {
@@ -59,8 +52,8 @@ fn report_byte_pressure(budget: &PipelineBudget) {
     );
 }
 
-/// See [`report_backend_loss`] for why this is out of line. Slots, not bytes, ran
-/// out here, so only the capture stage's own numbers are relevant.
+/// Out of line, as [`report_backend_loss`]. Slots ran out here, not bytes, so
+/// only the capture stage's own numbers are relevant.
 #[cold]
 #[inline(never)]
 fn report_metadata_queue_full(budget: &PipelineBudget) {
@@ -75,11 +68,8 @@ fn report_metadata_queue_full(budget: &PipelineBudget) {
     );
 }
 
-/// Capture loop (synchronous context). Stops when the pipeline closes.
-///
-/// A recv error ends the loop AND is reported through `fatal`: tracing is
-/// inert in the windowed build, so the session loop must journal the failure
-/// and turn it into an error outcome the player can see.
+/// A recv error ends the loop AND is reported through `fatal`: tracing is inert
+/// in the windowed build, so only the session loop can show the player.
 pub(super) fn capture_loop_budgeted(
     mut source: Box<dyn PacketSource>,
     tx: mpsc::Sender<CaptureEvent>,
@@ -97,8 +87,8 @@ pub(super) fn capture_loop_budgeted(
             Ok(segment) => segment,
             Err(err) => {
                 if !*shutdown.borrow() {
-                    // `Error::Capture`'s `Display` already opens with "network
-                    // capture: "; a prefix here would double the kind.
+                    // `Error::Capture`'s `Display` already opens with
+                    // "network capture: "; a prefix would double the kind.
                     error!(error = ?err, "capture interrupted");
                     let _ = fatal.blocking_send(err.to_string());
                 }
@@ -106,24 +96,23 @@ pub(super) fn capture_loop_budgeted(
             }
         };
 
-        // shutdown_recv may first yield a packet already queued in the driver.
-        // Discard it and drop the source rather than forwarding after teardown.
+        // A packet already queued in the driver may arrive after the signal;
+        // discard it rather than forward after teardown.
         if *shutdown.borrow() {
             break;
         }
 
         let enabled = gate.is_enabled();
-        // Off -> on: the reassembler must re-anchor before the next byte, or
-        // it treats the jump as an unfillable gap and stops delivering. The
-        // marker retries later instead of blocking for space — parking this
-        // thread would back up the backend's callback queue.
+        // Off -> on: the reassembler must re-anchor before the next byte or it
+        // treats the jump as an unfillable gap. The marker retries rather than
+        // block for space; parking here backs up the backend's callbacks.
         if enabled && !was_enabled {
             pending_player_resync = true;
         }
         was_enabled = enabled;
 
         if !enabled {
-            continue; // Shop Watch off: emit nothing.
+            continue;
         }
         if tx.is_closed() {
             break;
@@ -133,8 +122,7 @@ pub(super) fn capture_loop_budgeted(
         if pending_player_resync {
             match tx.try_send(CaptureEvent::Resync) {
                 Ok(()) => pending_player_resync = false,
-                // Every byte ahead of the marker belongs to the epoch the
-                // resync discards anyway, so dropping it loses nothing.
+                // These bytes belong to the epoch the resync discards anyway.
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     budget.record_drop(capacity);
                     continue;
@@ -144,7 +132,7 @@ pub(super) fn capture_loop_budgeted(
         }
 
         // A backend-side loss breaks continuity like byte pressure, so it
-        // reuses the counted, lossless resync protocol instead of stalling.
+        // reuses the same counted, lossless resync protocol.
         if source.take_capture_loss() && pressure_resync.request(&budget) {
             report_backend_loss(&budget);
         }
@@ -180,19 +168,16 @@ pub(super) fn capture_loop_budgeted(
                 }
             }
             // Matched on the error, not the variant: destructuring
-            // `Full(CaptureEvent::Budgeted(segment))` to read `segment.capacity()`
-            // left a second `Full(_)` arm that could only be `unreachable!` — a
-            // panic on the per-packet path of a `catch_unwind`-wrapped thread, for
-            // an impossibility. `capacity`, taken above, is the same number
-            // `admit_capture` charges the lease (`BudgetedSegment::capacity` ==
-            // `lease.bytes`).
+            // `Full(CaptureEvent::Budgeted(_))` would leave a second arm that
+            // could only be `unreachable!` — a panic on the per-packet path for
+            // an impossibility. `capacity` is what `admit_capture` charged.
             Err(mpsc::error::TrySendError::Full(event)) => {
                 budget.record_drop(capacity);
                 if pressure_resync.request(&budget) {
                     report_metadata_queue_full(&budget);
                 }
-                // Explicit: the lease inside releases the reserved bytes as it
-                // goes, and it must go before the retry below asks for space.
+                // The lease inside releases its bytes on drop, and must do so
+                // before the retry below asks for space.
                 drop(event);
                 pressure_resync.try_enqueue(&tx);
             }

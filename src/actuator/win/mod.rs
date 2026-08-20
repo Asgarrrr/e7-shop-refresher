@@ -3,16 +3,9 @@
 //! (`SendInput`, real cursor, foreground — the fallback). No window is ever
 //! resized: `to_screen` covers any aspect from 16:9 up, refuses narrower.
 //!
-//! # Why the seam is here
-//!
-//! The two backends share no state and are selected between in `src/app/mod.rs`,
-//! so each owns a file: [`send_input`] and [`post_message`]. This root holds what
-//! both need and neither owns — the *window*: naming it ([`Hwnd`], [`Target`]),
-//! finding it ([`find_game_window`]), measuring it ([`client_rect`]), proving
-//! this process may drive it at all ([`probe_window_reachable`],
-//! [`preflight_refusal`]), and the two verdicts both backends must reach
-//! identically ([`rect_change_error`], [`release_twice`]). [`dpi`] is separate
-//! because it is a process precondition, not a window one.
+//! This root holds what neither backend owns: the window itself, and the two
+//! verdicts both must reach identically ([`rect_change_error`],
+//! [`release_twice`]).
 
 mod dpi;
 mod post_message;
@@ -39,24 +32,17 @@ const WHEEL_DELTA: i32 = 120;
 /// Cursor settle between the absolute move and the button/wheel events.
 const MOVE_SETTLE_MS: u64 = 30;
 
-/// A window handle, carried as the `isize` this module has always carried it as.
+/// A window handle, carried as an `isize`.
 ///
-/// The integer representation is load-bearing (see [`Target`]): `HWND` is a raw
-/// pointer, so a bare `HWND` in a struct would make the executor's future
-/// `!Send`. Before this type existed the handle was a bare `isize` travelling
-/// beside other `isize`s — in [`post`], the LPARAM parameter has the same width,
-/// and [`pack_point`]'s result (a packed coordinate pair) returned exactly the
-/// handle's type, so `post(lparam, WM_LBUTTONDOWN, MK_LBUTTON as usize,
-/// target.hwnd)` compiled and would have handed a coordinate pair to
-/// `PostMessageW` as a window handle: `FALSE` + `ERROR_INVALID_WINDOW_HANDLE`,
-/// classified `Recoverable` by [`post_refusal`], so the watchdog would retry a
-/// click that can never land. Do not go back to a bare `isize` here.
+/// Do not go back to a bare `isize`. An integer it must be — a bare `HWND` is a
+/// raw pointer and would make the executor's future `!Send` — but a bare `isize`
+/// is interchangeable with [`pack_point`]'s packed coordinates and [`post`]'s
+/// LPARAM, so `post(lparam, WM_LBUTTONDOWN, MK_LBUTTON as usize, target.hwnd)`
+/// compiled: `PostMessageW` took a coordinate pair as a window handle, and
+/// [`post_refusal`] classified the `ERROR_INVALID_WINDOW_HANDLE` `Recoverable`,
+/// so the watchdog retried a click that can never land.
 ///
-/// `#[repr(transparent)]` states the layout the `as HWND` casts throughout this
-/// module already relied on implicitly. Every Win32 call still receives the
-/// exact ABI type, obtained through [`Hwnd::raw`] at the call itself.
-///
-/// `Send` needs no `unsafe impl`: the inner value is an `isize`.
+/// `#[repr(transparent)]` states what the `as HWND` casts already relied on.
 ///
 /// [`post`]: post_message::post
 /// [`pack_point`]: post_message::pack_point
@@ -66,10 +52,9 @@ const MOVE_SETTLE_MS: u64 = 30;
 pub(super) struct Hwnd(isize);
 
 impl Hwnd {
-    /// Wraps what Win32 just handed back. A null handle is *not* refused here —
-    /// `FindWindowW`'s null is checked by [`find_game_window`], and
-    /// `GetForegroundWindow`'s null is a legitimate "nobody has focus" that
-    /// `ensure_foreground` compares like any other handle.
+    /// A null handle is *not* refused here: `FindWindowW`'s null is checked by
+    /// [`find_game_window`], and `GetForegroundWindow`'s null is a legitimate
+    /// "nobody has focus" that `ensure_foreground` compares like any other.
     pub(super) fn new(handle: HWND) -> Self {
         Self(handle as isize)
     }
@@ -81,11 +66,10 @@ impl Hwnd {
 }
 
 /// [`Hwnd::raw`] hands the inner integer straight to Win32 as a pointer, so the
-/// wrapper must stay exactly the ABI type's width; this guards that. Adding a
-/// second field is then a deliberate decision, not a silent break.
+/// wrapper must stay exactly the ABI type's width.
 const _: () = assert!(size_of::<Hwnd>() == size_of::<HWND>());
 
-/// Handles are conventionally read in hex, and wrapping the integer would
+/// Handles are read in hex everywhere else, and wrapping the integer would
 /// otherwise have taken `{:#x}` away.
 impl fmt::LowerHex for Hwnd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -99,20 +83,16 @@ impl fmt::UpperHex for Hwnd {
     }
 }
 
-/// Hex, for the same reason: a decimal handle is unrecognizable next to the
-/// value any Win32 tool would show for it.
+/// Hex too, and this is what a failing assertion prints.
 impl fmt::Debug for Hwnd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Hwnd({self:#x})")
     }
 }
 
-/// The verdict when the window is no longer where the job planned it.
-///
-/// One definition for both backends: a window with no client area is minimized,
-/// anything else has moved or been resized. Both are `Recoverable` — the window
-/// is alive, just elsewhere, and the next job's `acquire()` re-reads a fresh
-/// rect, so the watchdog's retry self-heals it.
+/// The verdict when the window is no longer where the job planned it. Both are
+/// `Recoverable`: the window is alive, just elsewhere, and the next job's
+/// `acquire()` re-reads a fresh rect.
 fn rect_change_error(observed: ClientRect) -> SurfaceError {
     SurfaceError::Recoverable(if observed.is_degenerate() {
         "the game window was minimized mid-job".to_owned()
@@ -123,25 +103,14 @@ fn rect_change_error(observed: ClientRect) -> SurfaceError {
 
 /// The one implementation of "never leave the left button held".
 ///
-/// A successful button-down must always be paired with a release attempt, so the
-/// release is *not* guarded by the target check: it cannot initiate a click and
-/// is strictly safer than leaving the game seeing a held button. Refusal is
-/// retried exactly once, and the retry's own verdict decides which fault is
-/// reported — if the second release also fails the game is left holding the
-/// button, and that, not the first refusal, is the fault worth telling.
+/// The release is *not* guarded by the target check: it cannot initiate a click
+/// and is strictly safer than leaving the game seeing a held button. Refusal is
+/// retried once; if the second release also fails, that — not the first
+/// refusal — is the fault worth telling.
 ///
-/// Both backends route through here rather than each implementing the same
-/// three-state decision independently.
-///
-/// `revalidate` re-checks the target (a no-op for a backend that has no
-/// per-event validation), `release` posts or injects the button-up, and `what`
-/// names the release in the fatal message.
-///
-/// `revalidate` may only *look*. It runs with the button still down, where the
-/// game is measuring a press whose planned length is 40–90 ms, so a check that
-/// sleeps or tries to restore something turns the click into a long-press —
-/// see [`send_input`]'s `release_after_down`, which is the only implementation
-/// that has anything to check here and says so at length. Its `Err` is a verdict
+/// `revalidate` may only *look*: it runs with the button down, so a check that
+/// sleeps or restores something stretches the press into a long-press (the
+/// numbers are on `send_input`'s `FOCUS_SETTLE_MS`). Its `Err` is a verdict
 /// about the click, reported after the release, never a reason to delay one.
 fn release_twice(
     revalidate: impl FnOnce() -> Result<(), SurfaceError>,
@@ -154,7 +123,7 @@ fn release_twice(
             Err(error) => error,
         },
         // The target is unsafe, but the button may be down: release anyway, and
-        // report the reason the target was refused rather than inventing one.
+        // report why the target was refused rather than inventing a reason.
         Err(error) => match release() {
             Ok(()) => return Err(error),
             Err(_) => error,
@@ -170,23 +139,12 @@ fn release_twice(
 }
 
 /// Null-terminated UTF-16, the shape W-suffixed Win32 calls want.
-///
-/// `capture::pcap` had a byte-identical copy of this, down to the sizing
-/// argument; both now read [`crate::wide`], which carries that argument once.
 pub(super) use crate::wide::wide;
 
 /// [`GAME_WINDOW_TITLE`] as the NUL-terminated UTF-16 `FindWindowW` wants,
-/// encoded once at compile time.
-///
-/// `find_game_window` runs before *every* injected event — `validation_calls()`
-/// pins it at three times inside a single `click` — so encoding at run time
-/// would repeat the same allocation dozens of times per job. This has nothing
-/// left to encode or allocate at run time.
-///
-/// The title is ASCII, hence one UTF-16 unit per byte; the `assert!` keeps that
-/// true and turns a future non-ASCII character into a build failure instead of a
-/// silent truncation. The last unit stays the `0` the array is initialized
-/// with — the terminator the W-suffixed call reads.
+/// encoded at compile time because `find_game_window` runs before *every*
+/// injected event — three times inside one `click`. The `assert!` turns a future
+/// non-ASCII character into a build failure rather than a silent truncation.
 static GAME_WINDOW_TITLE_W: [u16; GAME_WINDOW_TITLE.len() + 1] = {
     let bytes = GAME_WINDOW_TITLE.as_bytes();
     let mut units = [0u16; GAME_WINDOW_TITLE.len() + 1];
@@ -205,14 +163,11 @@ static GAME_WINDOW_TITLE_W: [u16; GAME_WINDOW_TITLE.len() + 1] = {
 /// No window at all: nothing to retry against — fatal.
 fn find_game_window() -> Result<HWND, SurfaceError> {
     // SAFETY: `GAME_WINDOW_TITLE_W` is a `static` NUL-terminated UTF-16 buffer,
-    // so it outlives the call outright, and a null class filter means "any
-    // class". The returned handle is borrowed, not owned: nothing to free, and
-    // NULL is the documented not-found answer.
+    // so it outlives the call, and the returned handle is borrowed, not owned.
     let hwnd = unsafe { FindWindowW(std::ptr::null(), GAME_WINDOW_TITLE_W.as_ptr()) };
     if hwnd.is_null() {
-        // Captured before any other Win32 call, which would overwrite the
-        // thread's last-error slot: "not found" and "denied" look identical
-        // in a bug report without it.
+        // Before any other Win32 call overwrites the thread's last-error slot:
+        // without it, "not found" and "denied" read alike.
         let error = std::io::Error::last_os_error();
         return Err(SurfaceError::Fatal(format!(
             "no \"{GAME_WINDOW_TITLE}\" window found ({error})"
@@ -230,9 +185,9 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
         right: 0,
         bottom: 0,
     };
-    // SAFETY: `rect` is an already-initialized `RECT` owned by this frame and
-    // written in place; the return value is checked before any field is read,
-    // so a failed call can never surface garbage coordinates.
+    // SAFETY: `rect` is an initialized `RECT` this frame owns; the return value
+    // is checked before any field is read, so a failed call cannot surface
+    // garbage coordinates.
     if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
         let error = std::io::Error::last_os_error();
         return Err(SurfaceError::Fatal(format!(
@@ -259,82 +214,38 @@ fn client_rect(hwnd: HWND) -> Result<ClientRect, SurfaceError> {
 /// Asks Windows, once per acquire, whether this process may drive `hwnd` at
 /// all — before any input is planned against it.
 ///
-/// # Why this exists
+/// Epic Seven runs at *high* integrity (`STOVE.exe` declares
+/// `requireAdministrator`, the game inherits it) and UIPI refuses input from
+/// below that level without either backend naming the cause: the `Message`
+/// backend retries `shield::raise`'s `ERROR_ACCESS_DENIED` forever, and
+/// `SendInput` "will not indicate the failure was caused by UIPI blocking" — it
+/// reports one event injected while nothing moves. Only a preflight sees it.
 ///
-/// Epic Seven always runs at *high* integrity: players launch it through
-/// `STOVE.exe`, whose manifest declares `requireAdministrator`, and the game
-/// inherits the level from its launcher (measured on a real install:
-/// `EpicSeven.exe` high). UIPI refuses input from any process below that level,
-/// so an unelevated instance of this app cannot reach the window, and neither
-/// backend fails in a way that names the cause:
+/// Not `PostMessageW(WM_NULL)`, which is on UIPI's default allow-list and would
+/// pass in exactly the case this exists to catch. Measured on Windows 11 26200,
+/// a medium-integrity prober against a high-integrity window: `TRUE` for
+/// `WM_NULL`, `FALSE` + `ERROR_ACCESS_DENIED` for every mouse message this
+/// backend posts, `WM_USER`, `WM_APP` and every form of `SetWindowPos`. The four
+/// `SWP_NO*` flags change nothing, so this is inert where it is allowed, unlike
+/// a real mouse message that would nudge the game's own cursor tracking.
 ///
-/// - The default `Message` backend gets `ERROR_ACCESS_DENIED` from the shield's
-///   `SetWindowPos`, previously reported as "the window is gone or its queue is
-///   full" and retried forever.
-/// - The `Input` backend fails **silently**. `SendInput` is documented as
-///   "neither `GetLastError` nor the return value will indicate the failure was
-///   caused by UIPI blocking": it reports one event injected, the executor
-///   reports success, and nothing moves in the game. No per-call error
-///   classification can see that, so the diagnosis has to be a preflight.
-///
-/// The exe is manifested `requireAdministrator` (see `build.rs`) so the normal
-/// run is not the failing one; this probe is a safety net for the cases that
-/// still slip through — a declined elevation on a build without the forced
-/// manifest, a `-gnu` or hand-linked binary carrying none, a debugger launching
-/// this process at medium integrity, or STOVE changing what it does. In each,
-/// the alternative is not an error but a silence: clicks reported as delivered,
-/// nothing moving on screen.
-///
-/// # Why a no-op `SetWindowPos`, not `PostMessageW(WM_NULL)`
-///
-/// `WM_NULL` does not work: it is on UIPI's default allow-list. Measured on
-/// Windows 11 26200 — a medium-integrity prober against a high-integrity window
-/// answered `TRUE` for `WM_NULL` and `FALSE` + `ERROR_ACCESS_DENIED` for
-/// `WM_MOUSEMOVE`, `WM_LBUTTONDOWN`, `WM_MOUSEWHEEL` (the three this backend
-/// actually posts), `WM_USER`, `WM_APP` and every form of `SetWindowPos`. A
-/// `WM_NULL` probe would have passed in exactly the situation it was written to
-/// catch.
-///
-/// `SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE` asks Win32 to
-/// change nothing: no geometry, no Z-order, no focus — inert on a window we can
-/// reach, unlike a synthetic mouse message which would nudge the game's own
-/// cursor tracking, and refused on one we cannot through the same gate
-/// `shield::raise` hits a moment later.
-///
-/// # Why the hang check comes first
-///
-/// `SetWindowPos` on another process's window is synchronous *in the target's
-/// message loop*: Win32 delivers `WM_WINDOWPOSCHANGING` and waits for that
-/// thread to answer, and there is no timeout parameter — `SendMessageTimeout`
-/// has one, `SetWindowPos` does not. So against a frozen Epic Seven this call
-/// does not fail, it never returns, and it is reached through
-/// [`blocking`](crate::actuator::blocking) → `block_in_place`: the actuator task
-/// parks on a runtime worker and stays parked. Every later job is queued behind
-/// a call that will not come back, nothing is journaled, and the wedge outlives
-/// window close — `JoinHandle::abort` cannot interrupt a thread inside a Win32
-/// call any more than one inside `thread::sleep`.
-///
-/// [`IsHungAppWindow`] is the OS's own answer to that question and sends
-/// nothing, so it cannot itself block. It narrows rather than closes the hole: a
-/// game that freezes between this check and the call below still parks the task.
-/// What it removes is the case that actually happens — a game already frozen
-/// when the job starts — turning a permanent silent wedge into a `Recoverable`
-/// with a sentence the player can act on, which the watchdog then retries.
+/// The hang check comes first because `SetWindowPos` on another process's window
+/// is synchronous *in that process's message loop* with no timeout: against a
+/// frozen Epic Seven it never returns, and under `block_in_place` that parks the
+/// actuator task for good, past `JoinHandle::abort`'s reach.
+/// [`IsHungAppWindow`] sends nothing, so it cannot itself block.
 fn probe_window_reachable(hwnd: HWND) -> std::io::Result<()> {
     // SAFETY: `hwnd` is the handle `find_game_window` just returned; the call
-    // reads window-manager state, takes no pointer, borrows nothing past the
-    // call, and answers FALSE for a window that died in between.
+    // takes no pointer and answers FALSE for a window that died in between.
     if unsafe { IsHungAppWindow(hwnd) } != 0 {
-        // Not `last_os_error`: nothing failed. The code is what `preflight_refusal`
-        // classifies on, and `ERROR_NOT_READY` is the closest documented truth —
-        // the window is there and is not answering.
+        // Not `last_os_error`: nothing failed. `preflight_refusal` classifies on
+        // the code, and `ERROR_NOT_READY` is the closest documented truth.
         return Err(std::io::Error::from_raw_os_error(ERROR_NOT_READY as i32));
     }
-    // SAFETY: `hwnd` is the handle `find_game_window` just returned; a window
-    // that died in between is reported as FALSE rather than faulting. The null
-    // insert-after handle is ignored under `SWP_NOZORDER`, the geometry is inert
-    // under `SWP_NOMOVE | SWP_NOSIZE`, and nothing is borrowed past the call —
-    // Win32 keeps no pointer into this frame.
+    // SAFETY: `hwnd` is the handle `find_game_window` just returned, and a
+    // window that died in between is reported as FALSE rather than faulting. The
+    // null insert-after handle is ignored under `SWP_NOZORDER`, and Win32 keeps
+    // no pointer into this frame.
     let answered = unsafe {
         SetWindowPos(
             hwnd,
@@ -357,30 +268,17 @@ fn probe_window_reachable(hwnd: HWND) -> std::io::Result<()> {
 /// The verdict a refused preflight produces, and the one line the player gets.
 ///
 /// Fatal, not recoverable: an integrity-level mismatch cannot heal while both
-/// processes keep running, so retrying loops forever without explaining itself.
-/// The executor's `fail` puts this text in the journal at acquire time, before
-/// the first click, instead of after the executor has already given up.
+/// processes keep running. The refusal itself is the signal and the branch below
+/// only picks wording — `ERROR_ACCESS_DENIED` was measured for a UIPI-blocked
+/// window (see [`probe_window_reachable`]) but Microsoft does not document it,
+/// so another code must still stop the loop and still point at the likely cause.
 ///
-/// The refusal itself is the signal: the branch below only picks wording. The
-/// code was measured to be `ERROR_ACCESS_DENIED` for a UIPI-blocked window (see
-/// [`probe_window_reachable`]) but Microsoft does not document it, so a future
-/// Windows answering something else must still stop the loop and still point at
-/// the likely cause.
-///
-/// Do not tell the player to "relaunch Epic Seven without administrator
-/// rights" — that is impossible. Epic Seven is started by `STOVE.exe`, which
-/// declares `requireAdministrator` in its own manifest, so a player using the
-/// normal launcher has no unelevated way to run the game. The side that can
-/// change is this app, which is why the advice is to restart *it* as
-/// administrator.
+/// Do not tell the player to "relaunch Epic Seven without administrator rights":
+/// `STOVE.exe` declares `requireAdministrator`, so there is no unelevated way to
+/// start the game. The side that can change is this app.
 pub(super) fn preflight_refusal(error: &std::io::Error) -> SurfaceError {
-    // The one arm that is not fatal, and the only one where nothing was refused:
-    // a frozen game is the most transient fault this preflight can meet — it
-    // heals when the game answers again, or when the player kills it — so it
-    // drops the job and leaves the watch armed for the watchdog's retry.
-    // Halting here would make a two-second stall a stop the player has to undo
-    // by hand. See [`probe_window_reachable`]'s "why the hang check comes
-    // first" for why this is detected at all rather than waited out.
+    // The one arm that is not fatal: nothing was refused, and a frozen game
+    // heals, so halting would make a two-second stall a stop to undo by hand.
     if error.raw_os_error() == Some(ERROR_NOT_READY as i32) {
         return SurfaceError::Recoverable(
             "the game window has stopped responding, so no click aimed at it would be read — \
@@ -401,15 +299,13 @@ pub(super) fn preflight_refusal(error: &std::io::Error) -> SurfaceError {
     SurfaceError::Fatal(format!("{cause} ({error})"))
 }
 
-/// One acquired game window: the handle, and the client area that was measured on
-/// it. This is [`Surface::Window`] for both Windows backends — the value
-/// `acquire` hands out and every later call hands back, making "input without
-/// an acquire" unrepresentable rather than merely refused.
+/// One acquired game window: [`Surface::Window`] for both Windows backends, the
+/// value `acquire` hands out and every later call hands back, making "input
+/// without an acquire" unrepresentable rather than merely refused.
 ///
-/// `pub` only so the two `impl Surface` blocks — one per backend module — do not
-/// name a private type in a public associated type (`private_interfaces`).
-/// Opaque either way: every field and every method is private to this module
-/// tree.
+/// `pub` only so the two `impl Surface` blocks do not name a private type in a
+/// public associated type (`private_interfaces`); every field and method here is
+/// private.
 ///
 /// [`Surface::Window`]: super::Surface::Window
 #[derive(Clone, Copy)]
@@ -419,10 +315,8 @@ pub struct Target {
     rect: ClientRect,
 }
 
-/// `pub(super)` rather than private: both backend test modules use these shared
-/// fixtures — the two handles, the client rect they were measured on, and the
-/// `GetLastError` values the UIPI story rests on — and duplicating a fixture
-/// would duplicate the measurement it records.
+/// `pub(super)` rather than private: both backend test modules share these
+/// fixtures, and duplicating one would duplicate the measurement it records.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,11 +333,8 @@ mod tests {
         }
     }
 
-    /// What a UIPI-blocked call actually answers, measured on Windows 11 26200
-    /// with a medium-integrity prober against a high-integrity window:
-    /// `PostMessageW` of every mouse message and `SetWindowPos` in every form
-    /// return FALSE with this code. Microsoft documents none of that, which is
-    /// why the code chooses wording only and never the verdict.
+    /// What a UIPI-blocked call answers, measured on Windows 11 26200. Microsoft
+    /// documents none of it, hence a classifier that picks wording only.
     pub(super) fn uipi_refusal() -> std::io::Error {
         std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
     }
@@ -461,14 +352,12 @@ mod tests {
         assert!(reason.contains("higher integrity level"), "{reason}");
         assert!(reason.contains("STOVE launcher"), "{reason}");
         assert!(reason.contains("restart it as administrator"), "{reason}");
-        // STOVE is manifested `requireAdministrator`, so no player can start
-        // Epic Seven unelevated through it — this advice must never appear.
+        // STOVE is manifested `requireAdministrator`: this advice would be
+        // impossible to follow.
         assert!(!reason.contains("without administrator rights"), "{reason}");
     }
 
-    /// The verdict hangs on the call failing, not on the code being 5 — the
-    /// code is undocumented, and a Windows that answered something else must
-    /// still stop the loop rather than click into the void.
+    /// The verdict hangs on the call failing, not on the code being 5.
     #[test]
     fn a_preflight_refused_with_any_other_code_is_still_fatal_and_still_points_at_the_cause() {
         let SurfaceError::Fatal(reason) = preflight_refusal(&dead_handle()) else {
@@ -478,18 +367,8 @@ mod tests {
         assert!(!reason.contains("without administrator rights"), "{reason}");
     }
 
-    /// `IsHungAppWindow`'s answer, and the one arm of this classifier that is not
-    /// fatal.
-    ///
-    /// Both halves matter. `Recoverable`, because a frozen game heals — on its
-    /// own or when the player kills it — and halting the watch would make a
-    /// two-second stall a stop they have to undo by hand. And detected at all,
-    /// because the alternative is not an error: `SetWindowPos` on another
-    /// process's window waits in *that* process's message loop with no timeout,
-    /// so the preflight this replaces never returned, and it runs under
-    /// `block_in_place` — the actuator task parks on a runtime worker, every
-    /// later job queues behind it, and `abort` cannot reach a thread inside a
-    /// Win32 call.
+    /// `IsHungAppWindow`'s answer: the one arm of this classifier that is not
+    /// fatal, because a frozen game heals.
     #[test]
     fn a_frozen_game_window_is_waited_out_rather_than_halted() {
         let hung = std::io::Error::from_raw_os_error(ERROR_NOT_READY as i32);
@@ -497,14 +376,11 @@ mod tests {
             panic!("a game that stopped answering is the most transient fault here");
         };
         assert!(reason.contains("stopped responding"), "{reason}");
-        // The integrity-level advice would be a lie here, and it is the one
-        // sentence in this file that asks the player to restart the app.
+        // The integrity-level advice would be a lie here.
         assert!(!reason.contains("restart it as administrator"), "{reason}");
     }
 
-    /// Handles are read in hex everywhere else (Spy++, `WinDbg`, a bug report), so
-    /// wrapping the integer must not cost `{:#x}` — and `Debug`, which is what a
-    /// failing assertion prints, uses it.
+    /// Wrapping the integer must not cost `{:#x}`.
     #[test]
     fn a_handle_formats_as_hex_in_every_form() {
         let hwnd = Hwnd(0x00AB_CDEF);

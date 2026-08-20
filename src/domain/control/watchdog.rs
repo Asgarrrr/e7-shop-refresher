@@ -11,24 +11,20 @@ const EXPECT_SNAPSHOT_MS: u64 = 10_000;
 const EXPECT_PURCHASE_MS: u64 = 10_000;
 
 /// One millisecond past the ladder's rung-`rung` deadline; `rung` counts from 1
-/// (first timeout), through 2 (re-issue), to 3 (honest halt).
+/// (first timeout), through 2 (re-issue), to 3 (honest halt). Exact multiples,
+/// because every escalation re-grants a *full* window.
 ///
-/// Test-only, and it lives *here* rather than in either test module because two
-/// suites need it (`control::tests` and `app::session::tests`): do not let
-/// either re-spell these deadlines as bare `10_001` / `20_001` / `30_001`
-/// literals — a change to the window would then move only one of them.
-///
-/// Every escalation re-grants a *full* window rather than shortening it, which is
-/// what makes the rungs exact multiples.
+/// Shared by two suites (`control::tests`, `app::session::tests`): do not let
+/// either re-spell these as bare `10_001` / `20_001` / `30_001` literals — a
+/// change to the window would then move only one of them.
 #[cfg(test)]
 pub(crate) const fn past_rung(rung: u64) -> u64 {
     rung * EXPECT_SNAPSHOT_MS + 1
 }
 
-// `past_rung` collapses the two windows into one number, which is honest only
-// while they are equal. They are separate constants because they answer to
-// different evidence (a shop response vs. a purchase echo), so this is the check
-// that the collapse stays true rather than an assumption.
+// `past_rung` collapses the two windows into one number, honest only while
+// they are equal. They stay separate because they answer to different evidence
+// (a shop response vs. a purchase echo), so the collapse is checked.
 #[cfg(test)]
 const _: () = assert!(
     EXPECT_SNAPSHOT_MS == EXPECT_PURCHASE_MS,
@@ -88,10 +84,9 @@ impl Expectation {
         }
     }
 
-    /// One rung higher, fresh full deadline. Saturating rather than bare `+`:
-    /// the cap is the ladder's `match` arms in [`Controller::watchdog`] (rung ≥ 2
-    /// halts and clears the expectation), which is non-local reasoning the
-    /// operator should not depend on.
+    /// One rung higher, fresh full deadline. Saturating, not `+`: the only cap
+    /// is [`Controller::watchdog`]'s `match` arms (rung ≥ 2 halts), non-local
+    /// reasoning the operator should not depend on.
     fn escalate(self, now_ms: u64) -> Self {
         Self {
             attempt: self.attempt.saturating_add(1),
@@ -102,10 +97,9 @@ impl Expectation {
 
 impl Controller {
     /// The recovery ladder, run from ticks once a deadline lapses: miss #1 →
-    /// blind confirm re-click (free — nothing clickable sits under a closed
-    /// modal), miss #2 → full re-issue, miss #3 → honest halt. Suspended
-    /// while the link is down: no proof can arrive over a dead wire, and the
-    /// reconnect backoff alone outlasts the whole ladder.
+    /// blind confirm re-click (free), miss #2 → full re-issue, miss #3 →
+    /// honest halt. Suspended while the link is down — no proof can arrive
+    /// over a dead wire, and the reconnect backoff outlasts the whole ladder.
     pub(super) fn watchdog(&mut self, now_ms: u64) -> Vec<Action> {
         if !self.link_up {
             return Vec::new();
@@ -120,23 +114,21 @@ impl Controller {
             }
             (Proof::Snapshot, 1) => {
                 // Through the gate on purpose: the re-issue re-counts and
-                // re-debits (`max_spend` is a ceiling promise, so
-                // overcounting fails safe) and may halt honestly on a limit
-                // instead of double-rolling.
+                // re-debits (overcounting fails safe against a ceiling) and may
+                // halt honestly on a limit instead of double-rolling.
                 let actions: Vec<Action> = self
                     .refresh_or_halt(now_ms)
                     .into_iter()
-                    // Pass-through by design: only `Refresh` is relabelled, and
-                    // leaving every other action alone stays right for any
-                    // variant `Action` gains. Not a swallowed case — do not
-                    // expand this arm into a variant list.
+                    // Pass-through by design — do not expand this arm into a
+                    // variant list. Only `Refresh` is relabelled; leaving the
+                    // rest alone stays right for any variant `Action` gains.
                     .map(|action| match action {
                         Action::Refresh => Action::Recover(Recovery::Refresh),
                         other => other,
                     })
                     .collect();
-                // Some ⇔ emit_refresh ran and armed a fresh rung zero (a
-                // halt cleared it instead): the ladder must not reset itself.
+                // Some ⇔ emit_refresh ran and armed a fresh rung zero (a halt
+                // cleared it instead): the ladder must not reset itself.
                 if self.expectation.is_some() {
                     self.expectation = Some(expectation.escalate(now_ms));
                 }
@@ -152,17 +144,17 @@ impl Controller {
                     targets: self.recovery_buy_targets(),
                 })]
             }
-            // The wildcard is for the *rung* dimension only (rung ≥ 2 is the
-            // halt); the proof dimension is spelled out so a new `Proof` variant
-            // is a compile error here instead of an immediate halt that blames
-            // the game. Clippy cannot see this — the scrutinee is a tuple.
+            // The wildcard covers the *rung* dimension only (rung ≥ 2 halts);
+            // the proof dimension is spelled out so a new `Proof` is a compile
+            // error rather than an immediate halt blaming the game. Clippy
+            // cannot see this — the scrutinee is a tuple.
             (Proof::Snapshot | Proof::Purchase, _) => self.halt(StopReason::Unresponsive),
         }
     }
 
-    /// The outstanding buys, rebuilt by identity from the checklist against
-    /// the stored snapshot — never re-filtered: a mid-pause filter swap must
-    /// not redraw what the pause is waiting on.
+    /// The outstanding buys, rebuilt by identity from the checklist against the
+    /// stored snapshot, never re-filtered: a mid-pause filter swap must not
+    /// redraw what the pause is waiting on.
     fn recovery_buy_targets(&self) -> Vec<BuyTarget> {
         let Some(snapshot) = self.last_snapshot.as_ref() else {
             return Vec::new();
@@ -181,9 +173,9 @@ impl Controller {
             .collect()
     }
 
-    /// The outage may have swallowed the awaited proof mid-flight: re-grant
-    /// a full deadline. The rung already climbed is kept — a retry that
-    /// never got its answer must still escalate, not restart the ladder.
+    /// The outage may have swallowed the awaited proof: re-grant a full
+    /// deadline, keeping the rung already climbed — a retry that never got its
+    /// answer must still escalate, not restart the ladder.
     pub(super) fn on_link_up(&mut self, now_ms: u64) -> Vec<Action> {
         self.link_up = true;
         if let Some(expectation) = self.expectation {

@@ -1,15 +1,11 @@
 //! The Setup surface: draft filter/limits/timings owned by the window, the
 //! widgets that edit them, and the single Apply that commits the changed
-//! drafts to the session. Laid out as three groups by the player's real
-//! priority — Hunt (what to buy) and Stop (when to quit) always open, Click
-//! timing (expert tuning) collapsed — under one primary action.
+//! drafts to the session. Hunt (what to buy) and Stop (when to quit) open on
+//! arrival; Click timing is expert tuning and stays folded.
 
-// One file per section, plus the timing group's painting. A section file
-// holds the parts that work on a `Filter` / `Limits` / `Timings` value handed
-// in by the caller; everything reaching into `EditorState` — the three
-// `*_body` functions, `preset_row`, the commit bar — stays here. Grouping the
-// drafts (the `24-proj.md` prerequisite, open in `_HANDOFF.md`) would let the
-// bodies move down too.
+// A section file holds the parts that work on a `Filter` / `Limits` /
+// `Timings` handed in by the caller; everything reaching into `EditorState`
+// stays here.
 mod hunt;
 mod stop;
 mod timing;
@@ -30,40 +26,31 @@ use crate::domain::control::Limits;
 #[cfg(test)]
 use crate::domain::filter::SubstatReq;
 use crate::domain::filter::{Filter, HUNTABLE_KINDS};
-// The two money caps this tab edits; `currency_row` lends each one its raw
-// number for the frame the drag widget needs it.
+// `currency_row` lends each cap its raw number for the frame the drag needs it.
 use crate::domain::shop::{Crystals, Gold};
-// The checkbox row reads `HUNTABLE_KINDS`; only the tests still name a kind
-// directly.
+// Only the tests still name a kind directly; the checkbox row reads `HUNTABLE_KINDS`.
 #[cfg(test)]
 use crate::domain::shop::ItemKind;
 use crate::render::kind_label;
 
-/// Draft criteria owned by the window until Apply pushes them to the session;
-/// seeded from the controller's live criteria (and the startup timings).
-/// Each draft carries the last-applied copy beside it so Apply lights up only
-/// on a real change and sends nothing that has not moved. Apply both retunes
-/// the live session and writes the changed sections back to config.toml (via
-/// `config::persist`, format-preserving, best-effort).
+/// Draft criteria owned by the window until Apply pushes them to the session.
+/// Apply retunes the live session and writes the changed sections back to
+/// config.toml, best-effort.
 pub(super) struct EditorState {
     filter: Filter,
     limits: Limits,
     timings: Timings,
-    /// The values the session is actually running: a draft is "dirty" (and
-    /// Apply enabled) exactly when it differs from its applied twin.
+    /// A draft is dirty — Apply lit — exactly when it differs from its twin.
     applied_filter: Filter,
     applied_limits: Limits,
     applied_timings: Timings,
     name_input: String,
     set_input: String,
     substat_input: String,
-    /// Per-section disclosure, journal-style. Hunt and Stop open on arrival (the
-    /// first things a player sets); the expert Click timing block stays folded.
     hunt_open: bool,
     stop_open: bool,
     timing_open: bool,
-    /// Within the Click timing section: whether the Custom mode segment is
-    /// selected, revealing the per-action bars inline under the presets.
+    /// Whether the Custom segment is selected, revealing the per-action bars.
     fine_tune_open: bool,
 }
 
@@ -87,11 +74,8 @@ impl EditorState {
     }
 
     /// Re-seeds the applied twins from the commands the session *actually*
-    /// took. This is the only writer of the twins: [`commit_row`] emits, the
-    /// shell delivers, and a draft counts as applied only once its command
-    /// cleared the bounded queue. The value is read back out of the command
-    /// rather than off the draft, so the twin can only ever record what was
-    /// handed over. Non-`Set*` commands (Start/Stop) are none of its business.
+    /// took, so a draft counts as applied only once its command cleared the
+    /// bounded queue. Read out of the command, never off the draft.
     pub(super) fn mark_applied(&mut self, delivered: &[Command]) {
         for command in delivered {
             match command {
@@ -104,12 +88,8 @@ impl EditorState {
     }
 }
 
-/// The whole Setup surface in one pass: the three sections over the Apply
-/// footer, stacked in a single `ui`. The live window mounts them in separate
-/// panels ([`edit_sections`] in the scroll, [`commit_row`] pinned to the
-/// bottom) so Apply never scrolls out of reach; this lets the test harness
-/// drive both at once. Session is assumed alive — the pinned path passes the
-/// real flag.
+/// The whole Setup surface in one `ui` so a test can drive sections and Apply
+/// at once; the live window mounts them as separate panels.
 #[cfg(test)]
 fn edit_setup(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
     edit_sections(ui, editor);
@@ -117,16 +97,10 @@ fn edit_setup(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
     commit_row(ui, editor, true)
 }
 
-/// The three journal-style collapsible sections (Hunt / Stop / Click timing) —
-/// the scrolling body of the Setup tab, without the commit bar.
+/// The three collapsible sections — the Setup tab's scrolling body.
 pub(super) fn edit_sections(ui: &mut egui::Ui, editor: &mut EditorState) {
-    // The section bar trails a peek of what it holds while folded, keeping the
-    // intent visible without the controls. The summary is built only when the
-    // section is folded (the bar drops it once open), so an expanded Setup tab
-    // doesn't re-allocate discarded strings every frame. No space is inserted
-    // *between* collapsed bars: they tile on the item spacing alone so their
-    // hover strips meet with no dead seam (see `theme::collapsing_section`). An
-    // open body gets its own trailing space to stand off the next bar.
+    // Summaries are built only while folded. No space between collapsed bars:
+    // they tile on item spacing alone so hover strips meet with no dead seam.
     let hunt = (!editor.hunt_open).then(|| hunt_summary(&editor.filter));
     section(ui, "Hunt", hunt.as_deref(), &mut editor.hunt_open);
     if editor.hunt_open {
@@ -147,9 +121,7 @@ pub(super) fn edit_sections(ui: &mut egui::Ui, editor: &mut EditorState) {
     }
 }
 
-/// One collapsible section bar (journal key) plus the breathing room its open
-/// body needs. `summary` (present only while folded) trails the title; click
-/// toggles `open`.
+/// One collapsible section bar plus the breathing room its open body needs.
 fn section(ui: &mut egui::Ui, title: &str, summary: Option<&str>, open: &mut bool) {
     if theme::collapsing_section(ui, title, summary, *open) {
         *open = !*open;
@@ -159,23 +131,16 @@ fn section(ui: &mut egui::Ui, title: &str, summary: Option<&str>, open: &mut boo
     }
 }
 
-/// `n singular` / `n plural`, e.g. `1 refresh` / `3 refreshes`. `usize` because
-/// two of the four callers pass a `len()`; the `u32` limits reach it via a
-/// saturating `try_from`, not `as`, so the widening is never an unchecked
-/// cast even on a 16-bit target.
+/// `n singular` / `n plural`, e.g. `1 refresh` / `3 refreshes`.
 fn count_label(n: usize, singular: &str, plural: &str) -> String {
     format!("{n} {}", if n == 1 { singular } else { plural })
 }
 
-/// Hunt: the item-interest criteria — what the loop buys. Open on arrival,
-/// since without at least one criterion the loop refuses to arm.
+/// Hunt: what the loop buys. Without a criterion the loop refuses to arm.
 fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     ui.horizontal(|ui| {
-        // No "unknown" box, and there can be none: the list is `HuntKind::ALL`,
-        // and `HuntKind` has no catch-all variant. The old box's one effect was
-        // writing `kinds = ["unknown"]`, which the next launch refused to load
-        // (fatally, no main window) — removing it fixed the symptom; the type
-        // makes it unspellable.
+        // Driven by `HUNTABLE_KINDS`: an "unknown" box wrote
+        // `kinds = ["unknown"]`, which the next launch refused to load.
         for kind in HUNTABLE_KINDS {
             let mut on = editor.filter.kinds.contains(&kind);
             if ui.checkbox(&mut on, kind_label(kind)).changed() {
@@ -213,14 +178,10 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
         .show(ui, |ui| {
             optional_value(ui, "min substats", &mut editor.filter.min_substats, 1);
             ui.end_row();
-            // The grade floor belongs here and not in a row of its own: it is
-            // an optional numeric criterion like the two around it, and the
-            // whole reason it needed adding is that a player who set it in
-            // config.toml had nowhere to see it. See [`grade_value`] for why it
-            // is `optional_value`'s twin rather than another call to it.
+            // See [`grade_value`] for why the floor is a twin of the above.
             grade_value(ui, &mut editor.filter.min_grade);
             ui.end_row();
-            // Seeded above the covenant-bookmark price so a fresh cap still
+            // Seeded above the covenant-bookmark price, so a fresh cap still
             // matches the default hunt targets.
             currency_row(&mut editor.filter.max_price, Gold::get, Gold::new, |cap| {
                 optional_value(ui, "max price (gold)", cap, 300_000)
@@ -231,11 +192,7 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     ui.checkbox(&mut editor.filter.include_sold_out, "include sold out");
 }
 
-/// Stop: the run's safety rails, laid as a small squared checkbox, the unit
-/// in the left column, and the cap flush-right. An armed rail's checkbox
-/// fills the app's blue (`theme::accent_checkbox`), the only active color
-/// here; its number is a borderless drag field. An unset rail reads a faint
-/// "none". Rows keep the panel's 8px rhythm.
+/// Stop: the run's safety rails, one ledger row each.
 fn stop_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     ui.weak("Stop the run at the first limit it reaches.");
     ui.add_space(theme::SP_SM);
@@ -250,11 +207,8 @@ fn stop_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     duration_row(ui, &mut editor.limits.max_duration_ms);
 }
 
-/// The arming semantics of every optional criterion, in one place: unchecked
-/// writes `None`; a freshly checked box seeds a non-zero value; an
-/// already-present value is left exactly as it is. All three editors (Hunt's
-/// grid cells, the Stop rails, the duration rail) resolve their toggle
-/// through this.
+/// Arming, for every optional criterion: unchecked writes `None`, a freshly
+/// checked box seeds a non-zero value, an existing value is left alone.
 fn arm_optional<T>(armed: bool, value: &mut Option<T>, seed: T) {
     if armed {
         value.get_or_insert(seed);
@@ -263,22 +217,12 @@ fn arm_optional<T>(armed: bool, value: &mut Option<T>, seed: T) {
     }
 }
 
-/// Drives an optional *currency* field through the same widget every other
-/// optional criterion uses, by lending it the raw number for one frame.
-///
-/// `optional_value` and `limit_row` are generic over `egui::emath::Numeric`,
-/// and neither [`Gold`] nor [`Crystals`] implements it — deliberately:
-/// `src/domain/` compiles under `--no-default-features`, with no egui in the
-/// graph, so the impl would pull an optional GUI dependency into the ledger
-/// types to spare two call sites a wrapper. A `Numeric` newtype around the
-/// newtype was rejected too: it would buy those two call sites a type whose
-/// only purpose is to be dragged.
-///
-/// The round-trip is exact and perturbs nothing downstream: `new`/`get` are a
-/// wrapper, not a conversion, so [`commit_row`]'s bit-exact dirty check sees
-/// the value it would have seen either way, and [`arm_optional`]'s seeding is
-/// unchanged since the seed crosses as a raw number too. The scratch dies
-/// with the frame, so no unwrapped amount is storable.
+/// Lends an optional *currency* field its raw number for one frame, so it can
+/// use the same widget as every other criterion. Neither [`Gold`] nor
+/// [`Crystals`] implements `egui::emath::Numeric` deliberately: `src/domain/`
+/// compiles under `--no-default-features`, and the impl would pull egui into
+/// the ledger types. The round-trip is exact, so [`commit_row`]'s bit-exact
+/// dirty check is unaffected.
 fn currency_row<T: Copy>(
     value: &mut Option<T>,
     get: impl Fn(T) -> u32,
@@ -296,21 +240,14 @@ fn optional_field<T: egui::emath::Numeric>(ui: &mut egui::Ui, value: &mut T) -> 
     bounded_field(ui, value, T::from_f64(1.0)..=T::MAX)
 }
 
-/// The same field over an explicit range, for a criterion the game only
-/// defines on a closed set of values ([`hunt::grade_value`] is the one).
+/// The same field over an explicit range, for a criterion the game defines on
+/// a closed set of values ([`hunt::grade_value`] is the one).
 ///
-/// `clamp_existing_to_range` is **off** deliberately: without it, a value
-/// already present — `max_refreshes = 0` seeded from config.toml — is
-/// silently rewritten to 1 on first render, desyncing the draft and making
-/// Apply send a value the player never chose (see
-/// `seeded_zero_limit_is_not_silently_clamped`). Shared so the fix lives once.
-/// [`stop::duration_row`] can't use it: it drags whole minutes derived from
-/// stored ms, with its own range/write-back, sharing only [`arm_optional`].
-///
-/// Note what the flag does *not* switch off: a value the player drags or types
-/// is still clamped to the range. That is the half a bounded criterion needs —
-/// a seeded value survives untouched, and the player cannot author one outside
-/// the domain.
+/// `clamp_existing_to_range(false)` is exactly the pair a bounded criterion
+/// needs: existing values are not clamped — a seeded `max_refreshes = 0`
+/// survives instead of being silently rewritten to 1, see
+/// `seeded_zero_limit_is_not_silently_clamped` — while dragged and typed values
+/// still are.
 fn bounded_field<T: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     value: &mut T,
@@ -323,51 +260,39 @@ fn bounded_field<T: egui::emath::Numeric>(
     )
 }
 
-/// Click timing: each click waits a fixed tuned delay, plus a random extra the
-/// player dials in so the loop never clicks like a metronome. One draggable
-/// bar per action on a shared time ruler — solid segment for the fixed wait,
-/// bright for the random extra — grouped by phase. Folded by default.
+/// Click timing: a fixed tuned delay per click, plus a random extra the player
+/// dials in so the loop never clicks like a metronome.
 fn timing_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     ui.label("How human should the clicks look?");
     ui.add_space(theme::SP_SM);
-    // `active` is the lit segment (`Some(preset)`, or `None` for Custom). It
-    // carries the detected preset out so the hint reuses this lookup instead
-    // of scanning the timings again.
+    // Carried out so the hint reuses this lookup rather than rescanning.
     let active = preset_row(ui, editor);
     ui.add_space(theme::SP_SM);
-    // The per-pass estimate is folded into the hint sentence rather than a
-    // separate stat row (a lone number there read as a misplaced KPI); in
-    // Custom the range tracks the bars live.
+    // In the hint sentence, not a stat row, where a lone number read as a
+    // misplaced KPI.
     ui.weak(format!(
         "{} About {} per pass.",
         mode_hint(active),
         pass_estimate(&editor.timings)
     ));
 
-    // The eight bars live inline under the mode control, revealed by the
-    // Custom segment — no nested collapse.
     if active.is_none() {
         ui.add_space(theme::SP_SM);
         fine_tune_body(ui, &mut editor.timings);
     }
 }
 
-/// The humanization mode as one segmented control: the three presets plus a
-/// Custom segment that reveals the per-action bars. The active segment is the
-/// preset the timings match, or Custom when fine-tuning is open or the
-/// timings match no preset. Clicking a preset overwrites every action's
-/// random extra — and only that, see [`TimingPreset::applied_to`] — then hides
-/// the bars; clicking Custom reveals them without touching the timings.
-/// Returns `Some(preset)` for a preset, `None` for Custom.
+/// The humanization mode as one segmented control. Clicking a preset
+/// overwrites every action's random extra — and only that, see
+/// [`TimingPreset::applied_to`] — then hides the bars; Custom reveals them
+/// without touching the timings, and returns `None`.
 fn preset_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Option<TimingPreset> {
     let detected = TimingPreset::from_timings(&editor.timings);
     // Custom wins whenever the bars are open or the mix matches no preset, so
     // a config-seeded custom timing lands there with bars ready.
     let custom = editor.fine_tune_open || detected.is_none();
-    // A raised rounded strip split into snug segments, so the three presets
-    // read as one control rather than bare labels. The active segment fills
-    // with `ACCENT` (egui's selection fill); unselected labels mute until
-    // hovered.
+    // Snug segments in one strip, so the presets read as a control rather than
+    // bare labels.
     egui::Frame::new()
         .fill(theme::STRIPE)
         .corner_radius(egui::CornerRadius::same(8))
@@ -380,11 +305,9 @@ fn preset_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Option<TimingPrese
                 for preset in TimingPreset::ALL {
                     let selected = !custom && detected == Some(preset);
                     if ui.selectable_label(selected, preset.label()).clicked() {
-                        // `applied_to`, not `timings()`: the segment sets the
-                        // random ceilings, which is all it claims to set. The
-                        // bare value carries `min_ms = 0` on all eight
-                        // actions, so assigning it silently dropped every
-                        // config-set floor into the file on the next Apply.
+                        // `applied_to`, not `timings()`: the bare value carries
+                        // `min_ms = 0` on all eight actions, so assigning it
+                        // dropped every config-set floor on the next Apply.
                         editor.timings = preset.applied_to(&editor.timings);
                         editor.fine_tune_open = false;
                     }
@@ -394,45 +317,36 @@ fn preset_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Option<TimingPrese
                 }
             });
         });
-    // Reflect the pre-click state (as `custom` above): `None` when Custom is lit.
+    // The pre-click state, so the hint below matches the segment on screen.
     if custom { None } else { detected }
 }
 
-/// The single commit: one primary Apply that emits every draft that moved. The
-/// applied twins are *not* touched here — the shell re-seeds them through
-/// [`EditorState::mark_applied`] for the commands the session actually took,
-/// so a click lost to a saturated queue leaves Apply lit instead of claiming a
-/// setting nobody received. Disabled until something changed, and — when the
-/// filter is the change — until it is restricted enough to arm (the domain
-/// only gates arming on the filter, so timing/limit-only edits apply even
-/// while it sits unrestricted). Left of the button, a peek names the dirty
-/// sections (or why Apply is dark). Disabled wholesale once the session is
-/// dead — the click would vanish into a closed channel.
+/// One primary Apply that emits every draft that moved. The twins are *not*
+/// touched here — [`EditorState::mark_applied`] re-seeds them from what the
+/// session took, so a click lost to a saturated queue leaves Apply lit instead
+/// of claiming a setting nobody received. Disabled while nothing changed, while
+/// a changed filter is too unrestricted to arm, and once the session is dead.
 #[must_use]
 pub(super) fn commit_row(
     ui: &mut egui::Ui,
     editor: &mut EditorState,
     session_alive: bool,
 ) -> Vec<Command> {
-    // Bit-exact on purpose, `required_substats[].min`'s `f64` included: these are
-    // change detection since the last write, not numeric tests. "Did this draft
-    // move?" is answered by the same equality the twin was seeded with, so an
-    // epsilon would make a real edit invisible. What the exactness *cannot*
-    // survive is a non-finite `min` (`NaN != NaN` lights Apply forever): the
-    // loader rejects one and `substat_reqs` cannot produce one, so no `Filter`
-    // reaching here carries it.
+    // Bit-exact on purpose, `min`'s `f64` included: this is change detection,
+    // not a numeric test, so an epsilon would make a real edit invisible. It
+    // cannot survive a non-finite `min` (`NaN != NaN` lights Apply forever),
+    // which is why neither the loader nor `substat_reqs` admits one.
     let dirty_filter = editor.filter != editor.applied_filter;
     let dirty_limits = editor.limits != editor.applied_limits;
     let dirty_timings = editor.timings != editor.applied_timings;
     let dirty = dirty_filter || dirty_limits || dirty_timings;
-    // Only a *changed* filter must clear the arming bar; an already-applied
-    // restricted filter lets limit/timing edits through untouched.
+    // Only a *changed* filter clears the arming bar, so an already-applied one
+    // lets limit/timing edits through.
     let blocked = dirty_filter && editor.filter.is_unrestricted();
 
     let mut commands = Vec::new();
     ui.horizontal(|ui| {
         // The blocking reason wins the peek slot: it explains the dark button.
-        // Otherwise, name the dirty sections so Apply's target is legible.
         if blocked {
             ui.weak("add at least one hunt criterion before Apply");
         } else if let Some(summary) = dirty_summary(dirty_filter, dirty_limits, dirty_timings) {
@@ -446,9 +360,6 @@ pub(super) fn commit_row(
                 .inner
                 .clicked();
             if clicked {
-                // Only *emit* here; the twins are re-seeded by
-                // [`EditorState::mark_applied`] once the shell confirms
-                // delivery.
                 if dirty_filter {
                     commands.push(Command::SetFilter(editor.filter.clone()));
                 }
@@ -464,10 +375,8 @@ pub(super) fn commit_row(
     commands
 }
 
-/// The pending-edit peek for the commit bar: the section labels with unsaved
-/// drafts, e.g. `Hunt, Stop edited`. `None` when nothing moved. Labels mirror
-/// the section titles so the peek points straight at the collapsible that
-/// changed.
+/// The commit bar's peek, e.g. `Hunt, Stop edited`. Labels mirror the section
+/// titles so it points at the collapsible that changed.
 fn dirty_summary(filter: bool, limits: bool, timings: bool) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     if filter {
@@ -495,13 +404,9 @@ mod tests {
         }
     }
 
-    /// Drive `edit_setup` once, capturing whatever Apply committed. `run`
-    /// settles over several frames; only a non-empty commit is latched, so
-    /// the final quiet frame can't wipe it.
+    /// Drive `edit_setup` once, capturing whatever Apply committed. Only a
+    /// non-empty commit is latched, so the final quiet frame can't wipe it.
     fn run_setup(editor: &mut EditorState) -> Vec<Command> {
-        // `Harness::new_ui` takes `impl FnMut`, so the closure captures `sent`
-        // mutably like `editor` — no interior mutability needed;
-        // `drop(harness)` releases the borrow.
         let mut sent = Vec::new();
         let mut harness = Harness::new_ui(|ui| {
             let commands = edit_setup(ui, editor);
@@ -517,8 +422,6 @@ mod tests {
 
     #[test]
     fn apply_sends_only_the_changed_draft() {
-        // Applied twin is the default filter; the dirty draft is the named one,
-        // so Apply commits exactly SetFilter — limits and timings never moved.
         let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
         editor.filter = named_filter();
         assert_eq!(
@@ -529,8 +432,6 @@ mod tests {
 
     #[test]
     fn apply_leaves_the_draft_dirty_until_the_shell_confirms() {
-        // `commit_row` only emits; the twins move on `mark_applied`, called
-        // with the commands the session actually took (see `commit_row`'s docs).
         let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
         editor.filter = named_filter();
         let commands = run_setup(&mut editor);
@@ -539,14 +440,13 @@ mod tests {
 
         editor.mark_applied(&commands);
         assert_eq!(editor.filter, editor.applied_filter);
-        // Now that it landed, Apply goes dark and sends nothing more.
         assert!(run_setup(&mut editor).is_empty());
     }
 
     #[test]
     fn mark_applied_ignores_the_status_bar_commands() {
-        // Start/Stop/Toggle ride the same dispatch list as the Setup commits;
-        // they carry no draft and must never re-seed one.
+        // These ride the same dispatch list and carry no draft, so they must
+        // never re-seed one.
         let mut editor = EditorState::new(Filter::default(), Limits::default(), Timings::default());
         editor.filter = named_filter();
         editor.mark_applied(&[Command::Start, Command::Stop, Command::Toggle]);
@@ -561,11 +461,9 @@ mod tests {
 
     #[test]
     fn a_non_finite_substat_threshold_cannot_survive_a_render() {
-        // `Config::validate` refuses `min = nan`, but egui's DragValue parses
-        // typed text with `f64::from_str`, which accepts "nan"/"inf" — either
-        // would light Apply forever (`NaN != NaN`) while `value >= min`
-        // matched nothing. Seeded directly here; rendering the row must snap
-        // it back.
+        // `DragValue` parses typed text with `f64::from_str`, which accepts
+        // "nan"/"inf" — either lights Apply forever while matching nothing, so
+        // rendering the row must snap it back.
         let filter = Filter {
             required_substats: vec![SubstatReq {
                 name: "speed".to_owned(),
@@ -584,8 +482,7 @@ mod tests {
 
     #[test]
     fn apply_blocked_while_the_dirty_filter_is_unrestricted() {
-        // Clearing the only criterion leaves the draft dirty but unrestricted:
-        // the loop would refuse it, so Apply must not send it.
+        // The draft is dirty but unrestricted: the loop would refuse it.
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         editor.filter.names.clear();
         assert!(editor.filter.is_unrestricted());
@@ -607,8 +504,6 @@ mod tests {
 
     #[test]
     fn commit_bar_names_the_dirty_section() {
-        // A changed limit lights the Stop peek beside Apply, so the pinned bar
-        // reads as a pending-changes summary rather than a lone button.
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         editor.limits.max_refreshes = Some(5);
         let mut harness = Harness::new_ui(|ui| {
@@ -632,20 +527,16 @@ mod tests {
 
     #[test]
     fn a_config_set_grade_floor_can_be_seen_and_cleared() {
-        // The half of the bug the summary can't cover: `min_grade = 4` in
-        // config.toml had no widget at all, so the one criterion actually
-        // restricting the hunt was invisible *and* uncorrectable — the player
-        // could only watch the loop refresh and buy nothing. The floor now
-        // renders at its seeded value (unclamped, like every other seeded
-        // criterion), and unticking it clears it back to `None`.
+        // With no widget for it, a config-set floor was the one criterion
+        // restricting the hunt and was invisible *and* uncorrectable.
         let filter = Filter {
             min_grade: Some(2),
             ..named_filter()
         };
         let mut editor = EditorState::new(filter, Limits::default(), Timings::default());
         {
-            // Scoped so the assertion below can read the draft the harness
-            // borrows: a first render alone must not move the value.
+            // Scoped so the assert below can read the draft: a first render
+            // alone must not move the value.
             let mut harness = Harness::new_ui(|ui| {
                 edit_setup(ui, &mut editor);
             });
@@ -663,9 +554,7 @@ mod tests {
 
     #[test]
     fn arming_the_grade_floor_seeds_the_epic_grade() {
-        // Ticking the box must land on a floor the game has — the seed is
-        // `hunt::GRADE_MAX`, the value config.example.toml documents — and the
-        // change must be committable like any other criterion.
+        // The seed must be a floor the game has: `hunt::GRADE_MAX`.
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         let mut harness = Harness::new_ui(|ui| {
             edit_setup(ui, &mut editor);
@@ -695,8 +584,6 @@ mod tests {
 
     #[test]
     fn open_timing_shows_the_mode_control_not_the_bars() {
-        // Opening Click timing on a preset shows the segmented mode control; the
-        // eight bars stay hidden until the Custom segment is chosen.
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         editor.timing_open = true;
         let mut harness = Harness::new_ui(|ui| {
@@ -710,8 +597,6 @@ mod tests {
 
     #[test]
     fn the_custom_segment_reveals_and_hides_the_bars() {
-        // Clicking Custom reveals the bars inline; clicking a preset overwrites
-        // the timings and folds them away again — no nested disclosure.
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         editor.timing_open = true;
         let mut harness = Harness::new_ui(|ui| {
@@ -727,9 +612,8 @@ mod tests {
 
     #[test]
     fn hunt_kinds_exclude_the_unknown_bucket() {
-        // Ticking "?" used to write `kinds = ["unknown"]`, which the next
-        // launch refused to load (see `hunt_body`). The row is now driven by
-        // `HuntKind::ALL`, so a fourth box can't appear without a fourth kind.
+        // Do not re-add an "unknown" box: it wrote `kinds = ["unknown"]`, which
+        // the next launch refused to load (see `hunt_body`).
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         let harness = Harness::new_ui(|ui| {
             edit_setup(ui, &mut editor);
@@ -747,7 +631,6 @@ mod tests {
 
     #[test]
     fn clicking_a_preset_writes_its_timings() {
-        // The preset control overwrites the timing draft; Apply then commits it.
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         editor.timing_open = true;
         let mut harness = Harness::new_ui(|ui| {
@@ -761,11 +644,9 @@ mod tests {
 
     #[test]
     fn clicking_a_preset_keeps_a_config_set_delay_floor() {
-        // The click that used to cost a setting. `refreshed = { min_ms = 200,
-        // max_ms = 800 }` is the shape config.example.toml documents; seeded
-        // from it, the tab reads "Custom", and one click on Human replaced the
-        // whole draft with ranges starting at 0 — which Apply then wrote to
-        // disk through `persist::save`, wholesale, with no undo.
+        // The click that used to cost a setting: over a config-set floor, one
+        // preset click replaced the draft with ranges starting at 0, which
+        // Apply then wrote to disk with no undo.
         let floored = Timings {
             refreshed: DelayRange::try_new(200, 800).expect("a valid fixture range"),
             ..Timings::default()
@@ -788,8 +669,8 @@ mod tests {
             TimingPreset::Human.timings().refreshed.max_ms(),
             "while the ceiling is the one just chosen"
         );
-        // And the click is legible: the Human segment lights rather than the
-        // control falling back to Custom over a floor it does not edit.
+        // And the segment lights, rather than falling back to Custom over a
+        // floor it does not edit.
         assert_eq!(
             TimingPreset::from_timings(&editor.timings),
             Some(TimingPreset::Human)
@@ -798,9 +679,8 @@ mod tests {
 
     #[test]
     fn collapsed_sections_tile_with_no_hover_gap() {
-        // Folded bars must meet edge-to-edge: a gap between hit/fill rects
-        // leaves a dead seam where hovering lights a bar the pointer isn't
-        // over (fill covers only the inner bar; egui hit-tests wider).
+        // egui hit-tests wider than the fill, so a gap between the two leaves a
+        // dead seam where hovering lights a bar the pointer isn't over.
         let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
         editor.hunt_open = false;
         editor.stop_open = false;
@@ -819,8 +699,8 @@ mod tests {
 
     #[test]
     fn seeded_zero_limit_is_not_silently_clamped() {
-        // A config-seeded 0 (halts the run at the first check) must survive
-        // rendering unchanged — the old DragValue clamp rewrote it to 1.
+        // A config-seeded 0 (halt at the first check) must survive rendering —
+        // the old `DragValue` clamp rewrote it to 1.
         let limits = Limits {
             max_refreshes: Some(0),
             ..Limits::default()
@@ -842,7 +722,6 @@ mod tests {
             max_refreshes: Some(7),
             ..Limits::default()
         };
-        // The filter is unchanged from its applied twin, so only the limit ships.
         assert_eq!(run_setup(&mut editor), vec![Command::SetLimits(expected)]);
     }
 
@@ -870,8 +749,7 @@ mod tests {
             });
         harness.run();
         let image = harness.render().expect("wgpu render");
-        // Set ARKYVE_RENDER_DIR to collect the frames somewhere durable; the
-        // temp directory keeps this runnable for any developer.
+        // Set `ARKYVE_RENDER_DIR` to collect the frames somewhere durable.
         let path = std::env::var_os("ARKYVE_RENDER_DIR")
             .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
             .join("stop.png");

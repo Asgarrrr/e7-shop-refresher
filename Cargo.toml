@@ -9,67 +9,32 @@ publish = false
 
 [features]
 default = ["pcap-backend", "gui", "actuator"]
-# Npcap capture backend — the only one, and the shipped default. Taps every
-# adapter through `wpcap.dll` and needs no privilege of its own: it was proven
-# end to end from an ordinary *unelevated* process (capture → reassembly →
-# uplink → decoded snapshot → refresh job). The exe is still manifested
-# `requireAdministrator`, but for the actuator and not for this — see
-# `build.rs`. Pulls `libloading` because the DLL is resolved at runtime rather
-# than linked (a static link would need the Npcap SDK to build and would kill
-# the exe in the Windows loader on a machine without Npcap). Off in the two
-# portable lanes, where `app::build_source` returns "no capture backend" instead.
+# Npcap tap through `wpcap.dll`, needing no privilege of its own: the exe's
+# `requireAdministrator` is for the actuator (see `build.rs`). `libloading`
+# because the DLL is resolved at runtime — a static link would need the Npcap SDK
+# and would kill the exe in the Windows loader on a machine without Npcap.
 pcap-backend = ["dep:libloading"]
-# egui window over the session (dashboard + player commands). Disable for the
-# console-only build.
+# egui window over the session. Disable for the console-only build.
 gui = ["dep:eframe"]
-# Click-emulation input backends (SendInput / PostMessageW). Only act on
-# Windows; elsewhere the executor is replaced by a job-draining stub.
+# Click emulation (SendInput / PostMessageW); elsewhere a job-draining stub.
 actuator = []
 
-# The lint policy, in the one place `rust-analyzer`, a plain `cargo build` and a
-# reader of this manifest all see it. Until now it existed only as the six
-# `cargo clippy … -- -D warnings` invocations in `.github/workflows/ci.yml` and
-# the `justfile`, which no editor can read. Every entry below measures **zero
-# sites** on all six feature lanes and on both matrix toolchains, so nothing
-# here is a migration. (Four when this was written; the `gui`-alone and
-# `actuator`-alone lanes came later, and the claim is re-measured against all
-# six each time an entry is added.)
-#
-# A `[lints]` table applies to *every* target, the test harness included. That is
-# why `clippy::unwrap_used` (257 sites, all of them in tests, where `unwrap` in a
-# fixture is the correct spelling) and `clippy::panic` (19, likewise) are **not**
-# here — they belong in a `#![cfg_attr(not(test), warn(…))]` at the crate root.
-# The five below measure zero in the test harness as well, so the table is the
-# right home for them.
-#
-# Deliberately *not* enabled, each measured and argued in `docs/tech-debt/25-lint.md`:
-# whole-group `pedantic` (161 sites) and `nursery` (121) — nearly all of them are
-# this crate doing something deliberate with the reason written at the site;
-# `clippy::cargo` (29 unactionable `multiple_crate_versions` out of the eframe
-# tree, already covered better by `cargo deny`'s `[bans]`); `missing_docs` (141,
-# on a `publish = false` binary); `expect_used` (13 shipped sites where the
-# message *is* the invariant); `indexing_slicing` (3, all provably in bounds).
+# `# 0` means zero sites measured on all six CI feature lanes, re-measured each
+# time an entry is added. A `[lints]` table applies to *every* target, tests
+# included, which is why `clippy::unwrap_used` (257 sites, all fixtures) and
+# `clippy::panic` (19) live in a `#![cfg_attr(not(test), warn(…))]` at the crate
+# root instead.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [] } # 0 — every cfg string matches a declared feature
 trivial_casts = "warn"                               # 0
-# `size_of`/`align_of` and friends joined the prelude in 1.80, so `std::mem::` in
-# front of them is noise that reads as a different function. Measured across
-# `--all-targets --all-features`, test harness included, which is where 21 of the
-# original 22 sites were.
+# `size_of`/`align_of` joined the prelude in 1.80; `std::mem::` in front of them
+# reads as a different function.
 unused_qualifications = "warn" # 0
-# A `pub` item that no path outside the crate can reach is a claim the module
-# graph contradicts. Enabled *instead of* `clippy::redundant_pub_crate`, not
-# beside it: for the `pub(crate)` items inside the private `mod render` and
-# `mod pcap`, `redundant_pub_crate`'s only suggestion is `pub` — and taking it
-# makes every one of them fire here instead (verified by applying it). The two
-# lints have no common fixed point for a private module, and of the pair this is
-# the one that catches a real error rather than a spelling.
-#
-# The count is lane-dependent, so it is stated per lane rather than as one
-# number: `--all-targets` measures **15** on the default features and **12** on
-# `--no-default-features`, the difference being `mod pcap`, which is gated on
-# `windows` + `pcap-backend`. An earlier commit message and the audit synthesis
-# both said "13", which matches neither lane — re-measured and corrected.
+# Enabled *instead of* `clippy::redundant_pub_crate`, not beside it: for the
+# `pub(crate)` items in the private `mod render` and `mod pcap` that lint's only
+# suggestion is `pub`, which makes every one of them fire here instead (verified
+# by applying it). No common fixed point, and this is the one that catches an
+# error rather than a spelling.
 unreachable_pub = "warn" # 0
 
 [lints.clippy]
@@ -79,26 +44,17 @@ suspicious = { level = "deny", priority = -1 }  # 0
 style = { level = "warn", priority = -1 }       # 0
 complexity = { level = "warn", priority = -1 }  # 0
 perf = { level = "warn", priority = -1 }        # 0
-# This is an FFI-heavy crate — `windows-sys` plus a runtime-loaded `wpcap.dll` —
-# and every `unsafe` block in it already carries a real `// SAFETY:`. New unsafe
-# arrives with every Win32 call added, so turn the convention into a check.
+# New unsafe arrives with every Win32 call added. Deleting a `// SAFETY:` comment
+# fails the build under CI's `-D warnings`.
 undocumented_unsafe_blocks = "warn" # 0
-# The other half of that convention: a `// SAFETY:` above a block holding several
-# Win32 calls answers for whichever one the reader guesses. One call per block
-# makes the comment and the operation line up.
+# One `// SAFETY:` over several Win32 calls answers for whichever the reader guesses.
 multiple_unsafe_ops_per_block = "warn" # 0
-# Two nursery lints, named individually — the whole group is 121 sites and argued
-# down in `docs/tech-debt/25-lint.md`. Both are at 0 and both caught something
-# real on the way there. Nursery means a future clippy may widen them; if one
-# starts producing false positives, demote that line rather than the group.
+# Nursery, named individually: a future clippy may widen them, so demote the
+# line rather than the group.
 redundant_clone = "warn"     # 0
 format_push_string = "warn"  # 0
-# Pedantic, named individually for the same reason as the two above: this crate's
-# docs navigate by identifier (`WinDivert`, `QinQ`, `EtherType`, `DryRun`,
-# `dry_run`), and an unbackticked one reads as prose while linking to nothing. It
-# went from 18 sites to 0 the honest way — every one of them was a real identifier
-# except `domain::filter`'s "ANDed", which was reworded to "combined with a
-# logical AND" because backticking English would have been the wrong fix.
+# These docs navigate by identifier; an unbackticked one reads as prose while
+# linking to nothing.
 doc_markdown = "warn"        # 0
 # Zero in the test harness too, unlike `unwrap_used`/`panic` above.
 todo = "warn"           # 0
@@ -106,45 +62,16 @@ unimplemented = "warn"  # 0
 dbg_macro = "warn"      # 0
 mem_forget = "warn"     # 0
 exit = "warn"           # 0
-# The one panic macro the ratchet used to miss, and the only one that got in:
-# a per-packet `Resync::from_u8` fallback, three doors from `stream/budget.rs`'s
-# reporters, which argue at length that this pipeline must saturate-and-log
-# rather than abort a player's session. `unwrap_used` and `panic` need the
-# crate-root `cfg_attr(not(test), …)` because fixtures use them, but
-# `unreachable!` measures **0** on all six lanes for `--lib --bins` *and* for
-# `--all-targets` — not one token of it is left under `src/`, `examples/`,
-# `tests/` or `build.rs` — so it belongs here, ungated.
+# Ungated: this pipeline saturates and logs rather than aborting a session.
 unreachable = "warn"    # 0
-# The module-layout convention, pinned instead of merely observed: eleven
-# directory modules, every one of them a `mod.rs`, and since `src/config.rs`
-# became `src/config/mod.rs` there is no exception left. The entry could not
-# have been added before that move — one exception is one diagnostic, and
-# `-D warnings` turns one diagnostic into six red lanes.
-#
-# **The lint is `self_named_module_files`, and the two names are the opposite way
-# round from how they read.** `clippy::mod_module_files` *bans* `mod.rs` and asks
-# for the self-named layout; it is the entry `docs/tech-debt/_HANDOFF.md`'s
-# `proj-009` asks for by name, on a measurement of "9 sites" that were in fact
-# the nine `mod.rs` files the convention exists to keep. Re-measured before
-# enabling anything, `-W clippy::mod_module_files --all-targets` scores
-# **10 / 13 / 12 / 11 / 11 / 14** on the six CI feature lanes (the spread is the
-# cfg-gated `pcap`, `win` and `ui` trees), so that entry would redden every one
-# of them and reverse the convention it was meant to protect. This one scores
-# **0** on all six, and the zero is probe-validated rather than trusted: a
-# scratch `src/probe.rs` beside a `src/probe/` scores 1, so the count is a real
-# measurement and not a cached silence.
+# **The two lint names are the opposite way round from how they read.**
+# `clippy::mod_module_files` *bans* `mod.rs` and would redden all six lanes,
+# reversing the convention it looks like it protects. This one pins it.
 self_named_module_files = "warn" # 0
 
-# rustdoc was the one lane nothing gated, and it was not clean. `just doc` and
-# the CI step both run `--document-private-items`, which is the right mode for a
-# `publish = false` binary: the cross-reference network these docs navigate by is
-# mostly between internal items, so that is the only way it gets checked at all.
-#
-# The levels are here rather than in a `RUSTDOCFLAGS="-D warnings"` on the
-# command line so that `just doc`, the CI step and an editor cannot disagree, and
-# so that a rustdoc lint added by a future stable release only *warns* instead of
-# turning the `stable` matrix arm red. Every one below is warn-by-default and
-# measures zero sites today.
+# Here rather than a command-line `RUSTDOCFLAGS="-D warnings"`, so `just doc`, CI
+# and an editor cannot disagree and a lint added by a future stable release only
+# *warns* instead of reddening a matrix arm.
 [lints.rustdoc]
 broken_intra_doc_links = "deny"
 redundant_explicit_links = "deny"
@@ -152,10 +79,8 @@ invalid_codeblock_attributes = "deny"
 invalid_html_tags = "deny"
 invalid_rust_codeblocks = "deny"
 bare_urls = "deny"
-# Measured, and contrary to what the lint's name suggests: rustdoc reports a
-# public doc linking to a private item *even under* `--document-private-items`,
-# where the target is rendered and the link works. The lint exists for published
-# crates, whose private items are absent from the output. Five such links are
+# Contrary to the name, rustdoc reports a public doc linking to a private item
+# *even under* `--document-private-items`, where the link works. Five are
 # deliberate here.
 private_intra_doc_links = "allow"
 
@@ -169,11 +94,10 @@ tokio = { version = "1", features = [
     "io-util",
     "signal",
 ] }
-# rustls + webpki-roots: the hosted server is wss:// behind Cloudflare, and a
-# single-file exe should not depend on the OS trust store. connect_async picks
-# up the rustls connector automatically once the feature is on.
+# rustls + webpki-roots: the server is wss:// behind Cloudflare, and a
+# single-file exe should not depend on the OS trust store.
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
-# Direct rustls dep only to pull the `ring` provider and install it in main();
+# Direct dep only to pull the `ring` provider and install it in main();
 # tokio-tungstenite enables rustls with no provider, which panics at handshake.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
@@ -185,25 +109,21 @@ toml_edit = { version = "0.25", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-# The windowed build has no console: stdout is an inert sink, so every log
-# would be lost. Logs go to a daily-rotated file under %LOCALAPPDATA%.
+# The windowed build's stdout is an inert sink, so every log would be lost.
 tracing-appender = "0.2"
-# glow renderer only: targets are Windows (player) and macOS (dev); the
-# default wgpu/x11/wayland stacks would only slow the build down.
+# glow only: targets are Windows and macOS, so wgpu/x11/wayland is build time
+# spent on nothing.
 eframe = { version = "0.35", optional = true, default-features = false, features = [
     "glow",
     "default_fonts",
 ] }
 
 [target.'cfg(windows)'.dependencies]
-# Runtime resolution of `wpcap.dll` for the Npcap backend. Never a link-time
-# dependency: see the `pcap-backend` feature comment above.
+# Runtime resolution of `wpcap.dll`, never a link-time dependency: see
+# `pcap-backend` above.
 libloading = { version = "0.8", optional = true }
 # Not optional, unlike the two above: `migrate` needs it in *every* Windows
-# build to undo the admins-only DACL a WinDivert build left on the app-data
-# directory, including the `--no-default-features` one. Three features used to
-# each turn it on with `dep:windows-sys`, which is how a lane could end up
-# without it.
+# build, `--no-default-features` included, to undo the admins-only DACL.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -211,15 +131,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     # `BCryptHash`, for the SHA-256 that verifies the Npcap installer before an
-    # elevated process is allowed to run it (`install`).
+    # elevated process runs it (`install`).
     "Win32_Security_Cryptography",
     # `GetModuleHandleW`, for the window class the actuator drives.
     "Win32_System_LibraryLoader",
-    # `GetSystemDirectoryW`, for the two absolute `wpcap.dll` candidates and for
-    # the `curl.exe` the Npcap download runs. Read from the OS rather than from
-    # `%SystemRoot%` because an elevated process inherits its environment from
-    # the one that asked for the elevation, and both callers use the answer to
-    # pick something to execute or load (`system32::directory`).
+    # `GetSystemDirectoryW` (`system32::directory`), asked of the OS rather than
+    # read from `%SystemRoot%`, which an elevated process inherits from whoever
+    # asked for the elevation — and both callers execute or load the answer.
     "Win32_System_SystemInformation",
     # `HKLM\...\npcap\Parameters\AdminOnly`: the one read that tells "Npcap is
     # restricted to administrators" apart from "this machine has no adapters".
@@ -231,93 +149,56 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-# Headless widget-interaction tests for the ui module (no renderer needed).
-# Dev-deps cannot be feature-gated: the console-only test lane builds egui
-# once too; the kittest tests themselves are behind the `gui` feature.
-# No `snapshot`: nothing in the crate calls `assert_snapshot`/`try_snapshot`,
-# there is no `snapshots/` directory and no `.snap` file, and the feature is not
-# free — it pulls `dify`, `open` and `tempfile` into the resolution of all nine
-# `--locked` lanes. It also contradicted the reason `eframe` is restricted to
-# `glow` twenty lines up. The alternative considered and rejected was keeping it
-# for `tempfile`: `crash.rs`'s test module carries its own ~20-line RAII
-# `TempFile` guard, so nothing here needs `tempfile` compiled at all.
-# `wgpu` stays: `editor`'s `timing_meter_grip_moves_with_the_range` builds its
-# harness with `HarnessBuilder::wgpu()`, so the renderer is a real dependency
-# even though nothing snapshots.
+# Dev-deps cannot be feature-gated, so the console-only test lane builds egui
+# too; the tests themselves are behind `gui`. No `snapshot` — nothing calls
+# `assert_snapshot`, and it pulls three crates into all nine `--locked` lanes.
+# `wgpu` stays: `editor`'s `timing_meter_grip_moves_with_the_range` needs it.
 egui_kittest = { version = "0.35", default-features = false, features = ["wgpu"] }
 # Paused-clock tests (`start_paused`) for the uplink send timeout.
 tokio = { version = "1", features = ["test-util"] }
 
 # `test = false` because `build.rs` stamps `/MANIFESTUAC:requireAdministrator`
-# onto every *bin* target, and cargo builds `src/main.rs` a second time as a
-# test harness that inherits it. Windows then refuses to start that harness from
-# an ordinary shell — `cargo test` dies with "the requested operation requires
-# elevation" (os error 740) after the 666 lib tests have already passed, so the
-# whole suite reports failure on any developer machine that is not running
-# elevated. It costs nothing to switch off: `src/main.rs` contains no `#[test]`
-# and no `mod tests`, so the harness this suppresses was always empty. CI only
-# escaped because a GitHub Windows runner executes elevated with UAC filtering
-# off.
+# onto every *bin*; cargo builds `src/main.rs` a second time as a test harness
+# that inherits it; Windows refuses to start that harness unelevated, so
+# `cargo test` dies with os error 740 after every lib test has passed. The
+# harness was always empty — `src/main.rs` has no `#[test]`.
 [[bin]]
 name = "arkyve-refresh-shop"
 path = "src/main.rs"
 test = false
 
-# Dashboard preview with injected mock data — lets the egui UI be seen on a
-# machine with no capture backend (mac dev). Reuses the real `ShopApp`; needs
-# eframe, hence the `gui` feature.
+# Dashboard preview with injected mock data, so the UI can be seen on a machine
+# with no capture backend. Reuses the real `ShopApp`, hence `gui`.
 [[example]]
 name = "ui_preview"
 required-features = ["gui"]
 
 # Dependencies are compiled once and reused by every dev and test build; at
-# opt-level 0 an egui/glow UI is visibly sluggish (see `examples/ui_preview`)
-# and the kittest lane crawls. Our own crate stays unoptimized and debuggable.
+# opt-level 0 an egui/glow UI is visibly sluggish and the kittest lane crawls.
 [profile.dev.package."*"]
 opt-level = 2
 
 [profile.release]
-# Thin, not fat, and the reason is recorded rather than assumed: nothing in this
-# crate has ever been profiled or benchmarked (no `benches/`, no criterion, and
-# the one end-to-end capture test is `#[ignore]`d because it needs a real
-# adapter), so "fat is faster here" would be exactly the unmeasured claim the
-# rest of this manifest avoids. Thin already gives cross-crate inlining across
-# the lib → bin/example boundary, which is the only inlining that matters in a
-# single-crate binary with `codegen-units = 1`. Revisit with a measurement — see
-# `[profile.profiling]` below for the build that can produce one — not with a
-# preference.
+# Thin, not fat: nothing here has been profiled, so "fat is faster" would be an
+# unmeasured claim, and thin already gives the lib → bin inlining that is the
+# only kind that matters in a single-crate binary. Revisit with a measurement
+# from `[profile.profiling]`.
 lto = "thin"
 # Not `strip = true`: that drops the symbol table too, and `crash.rs`'s
-# `Backtrace::force_capture()` — the product's only post-mortem channel —
-# then records bare addresses. Debug info goes, symbol names stay.
+# `Backtrace::force_capture()` — the only post-mortem channel — then records bare
+# addresses.
 strip = "debuginfo"
 codegen-units = 1
-# Integer overflow was the one class of fault that bypassed every diagnostic this
-# product has: `crash.rs`'s panic hook, the per-worker `catch_unwind` in
-# `SessionWorkers::spawn`, the fatal channel into the session loop and the
-# symbolised backtrace above all trigger on a panic, and a wrap is not one. The
-# arithmetic here runs on values the crate does not control — TCP payload
-# lengths, sequence deltas, wire prices and gold balances, `GetSystemMetrics`
-# results, config millisecond counts — so a wrap is a wrong click or a stalled
-# pipeline that a player reports as "it stopped working" over a log file showing
-# nothing at all. Now it is a `crash.log` entry instead.
-#
-# The prerequisite, audited before enabling this: a panic raised from a `Drop`
-# *during an unwind* aborts the process with no banner and no `crash.log` (see
-# `stream/budget.rs`'s `PipelineBudget::release`). All four production `Drop` impls were
-# read — `PayloadLease` (saturating arithmetic only), `capture::pcap::Handle`
-# (one FFI close), `capture::pcap::PcapSource` (an atomic store and joins),
-# `actuator::win::MessageSurface` (`cleanup` → `shield::hide`, one FFI call) —
-# and none of them performs checkable arithmetic. The cost is a few percent on
-# integer-heavy loops, and this pipeline is I/O-bound end to end. Note the dev
-# and test profiles have had overflow checks on all along, dependencies
-# included, so the whole suite already runs under them.
+# The one fault class that bypassed every diagnostic here — panic hook,
+# `catch_unwind`, fatal channel all trigger on a panic, and a wrap is not one —
+# on arithmetic over values the crate does not control. Prerequisite, audited
+# before enabling: a panic from a `Drop` *during an unwind* aborts with no
+# `crash.log`, so all four production `Drop` impls were read and none performs
+# checkable arithmetic.
 overflow-checks = true
 
-# Symbols and line numbers for a profiler, without disturbing what ships:
-# `release` must keep `strip = "debuginfo"` because `crash.rs` depends on it, so
-# a profiling build has to be a separate, purely additive profile. Nothing that
-# ships uses this one.
+# Separate additive profile because `release` must keep `strip = "debuginfo"`
+# for `crash.rs`.
 [profile.profiling]
 inherits = "release"
 debug = 1

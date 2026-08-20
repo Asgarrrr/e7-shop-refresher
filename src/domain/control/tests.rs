@@ -1,12 +1,6 @@
 //! Behavioural specification for the refresh-loop controller: what each
 //! [`Event`] does to the state machine, and which [`Action`]s come back.
-//!
-//! Ordered roughly as the loop runs, and grouped so a reader can find the rule
-//! they doubt: shared fixtures, then arming and refusal, snapshot evaluation
-//! (pause, auto-resume, purchase echoes), the dedup and re-buy guards that make
-//! a re-opened shop cheap, gold-aware buy planning, lifecycle no-ops and honest
-//! halt labels, the stop limits and their priority order, buy-target geometry,
-//! the recovery watchdog ladder, and finally the haul tally.
+//! Ordered roughly as the loop runs.
 //!
 //! Time is a plain `now_ms` argument, so every deadline here is exact and
 //! nothing sleeps.
@@ -15,17 +9,13 @@ use super::*;
 use crate::domain::shop::ItemKind::{self, Equipment, Token};
 use crate::domain::shop::{CatalogId, Crystals, Gold, PurchaseLimit, ShopItem};
 
-/// A fixture crystal amount. Spelled `xtl(3)` rather than `Crystals::new(3)`
-/// so a budget assertion still reads as one line — the same shorthand `cid`
-/// gives [`CatalogId`] below, and the reason both exist: the newtypes must not
-/// cost this suite its readability, or the next author will reach for the raw
-/// number.
+/// A fixture crystal amount, so a budget assertion still reads as one line.
 const fn xtl(raw: u32) -> Crystals {
     Crystals::new(raw)
 }
 
 /// A fixture gold amount. Separate from [`xtl`] on purpose: a test that means
-/// gold has to say gold, which is the property under test in half this file.
+/// gold has to say gold, the property under test in half this file.
 const fn gold(raw: u32) -> Gold {
     Gold::new(raw)
 }
@@ -67,8 +57,7 @@ fn meta(crystal_balance: u32, cost: u32) -> RefreshMeta {
     }
 }
 
-/// A fixture catalog id. Panics on `0` — which is exactly what [`CatalogId`]
-/// exists to make impossible: the wire's "no id" is `None`, not a magic number.
+/// A fixture catalog id. Panics on `0`, which [`CatalogId`] makes unspellable.
 fn cid(id: u32) -> CatalogId {
     CatalogId::new(id).expect("a fixture catalog id is never zero")
 }
@@ -93,9 +82,7 @@ fn target(slot: u8, id: Option<u32>) -> BuyTarget {
     }
 }
 
-/// A purchase echo naming `item`. `0` is not spellable as an id any more, so
-/// the "the server omitted it" case has its own fixture below rather than being
-/// this one called with a magic argument.
+/// A purchase echo naming `item`; the idless case has its own fixture below.
 fn buy(item: u32, now_ms: u64) -> Event {
     Event::Purchase {
         item: Some(cid(item)),
@@ -159,9 +146,7 @@ fn start_arms_watching_without_refresh() {
 
 #[test]
 fn start_refused_while_filter_unrestricted() {
-    // The invariant lives here, not in the callers: no command producer
-    // may arm a hunt-everything loop, and the refusal is explicit so the
-    // caller can render the reason.
+    // The invariant lives here, not in the callers.
     let mut ctrl = Controller::new(Filter::default(), Limits::default());
     assert_eq!(
         ctrl.handle(Event::Start { now_ms: 0 }),
@@ -191,9 +176,8 @@ fn unrestricted_filter_swap_is_ignored() {
 
 #[test]
 fn is_refusal_flags_only_the_refused_verdict() {
-    // The app reads acceptance from this verdict, not the action count: only
-    // Action::Refused is a refusal, everything else (including an empty list,
-    // which contains no refusal) means the event applied.
+    // The app reads acceptance from this verdict, not the action count: an
+    // empty list contains no refusal, so the event applied.
     assert!(Action::Refused(RefusalReason::UnrestrictedFilter).is_refusal());
     assert!(!Action::Refresh.is_refusal());
     assert!(
@@ -252,7 +236,7 @@ fn tick_enforces_a_tightened_count_limit_while_watching() {
         ..Limits::default()
     }));
     assert_eq!(ctrl.status(), Status::Watching);
-    // Without any new shop, the next tick must halt: the gate can't linger on.
+    // No new shop will come to carry the gate: the tick has to.
     let actions = ctrl.handle(Event::Tick { now_ms: 2 });
     assert_eq!(actions, vec![Action::Halt(StopReason::MaxRefreshes)]);
     assert_eq!(ctrl.status(), Status::Stopped(StopReason::MaxRefreshes));
@@ -351,9 +335,8 @@ fn auto_resume_respects_limits() {
 
 #[test]
 fn stop_clears_the_checklist() {
-    // Catalog ids are stable per item and snapshots stored while Stopped are
-    // never evaluated: a checklist outliving the hunt would keep flagging
-    // yesterday's matches as "wanted" in the view.
+    // Ids are stable per item, so a checklist outliving the hunt would keep
+    // flagging yesterday's matches as "wanted" in the view.
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     assert_eq!(ctrl.checklist(), &[cid(102)]);
@@ -367,8 +350,7 @@ fn max_matches_halts_after_the_goal_item_is_bought() {
         max_matches: Some(1),
         ..Limits::default()
     });
-    // The match trips max_matches, but the found item is the point of the
-    // hunt: pause and buy it first.
+    // The match trips max_matches, but the found item is the point: buy first.
     let actions = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     assert_eq!(
         actions,
@@ -377,7 +359,6 @@ fn max_matches_halts_after_the_goal_item_is_bought() {
         }]
     );
     assert_eq!(ctrl.status(), Status::Paused);
-    // The buy clears the pause; the resume gate halts instead of refreshing.
     let actions = ctrl.handle(buy(102, 2));
     assert_eq!(actions, vec![Action::Halt(StopReason::MaxMatches)]);
     assert!(ctrl.checklist().is_empty());
@@ -413,8 +394,7 @@ fn replayed_echo_of_consumed_purchase_is_ignored() {
     ));
     let _ = ctrl.handle(snap(two_hits, 1));
     assert!(ctrl.handle(buy(100, 2)).is_empty());
-    // The wire may replay an echo: the id already left the checklist,
-    // so the duplicate must not stand in for the remaining item's buy.
+    // The replay must not stand in for the remaining item's buy.
     assert!(ctrl.handle(buy(100, 3)).is_empty());
     assert_eq!(ctrl.status(), Status::Paused);
     assert_eq!(ctrl.checklist(), &[cid(102)]);
@@ -423,14 +403,11 @@ fn replayed_echo_of_consumed_purchase_is_ignored() {
 #[test]
 fn an_idless_match_pauses_until_a_new_shop() {
     let mut ctrl = started(Limits::default());
-    // The bare fixture leaves every id absent (`with_ids` is what supplies them),
-    // so the match is untrackable: no echo can ever name it.
+    // The bare fixture leaves every id absent, so no echo can name the match.
     let _ = ctrl.handle(snap(hit_shop(None), 1));
     assert_eq!(ctrl.status(), Status::Paused);
     assert!(ctrl.checklist().is_empty());
-    // No echo can clear an untrackable match; only a new shop unpauses. This used
-    // to be spelled `buy(0, 2)` — a `0` standing in for "the server sent no id",
-    // which is now a shape of its own rather than a value.
+    // No echo can clear an untrackable match; only a new shop unpauses.
     assert!(ctrl.handle(buy_unidentified(2)).is_empty());
     assert_eq!(ctrl.status(), Status::Paused);
     let actions = ctrl.handle(snap(with_ids(dud_shop(None)), 3));
@@ -484,9 +461,8 @@ fn reopened_shop_after_buy_does_not_double_refresh() {
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
-    // Re-opening the shop after the buy re-delivers the same roll with
-    // the bought slot decremented: same identity (limit is excluded),
-    // so the fingerprint that survived the auto-resume mutes it.
+    // A re-open re-delivers the roll with the bought slot decremented: same
+    // identity (`limit` is excluded), so the surviving fingerprint mutes it.
     let mut reopened = with_ids(hit_shop(None));
     reopened.slots[2].limit = Some(PurchaseLimit {
         remaining: 0,
@@ -502,16 +478,14 @@ fn reopened_shop_after_buy_does_not_double_refresh() {
 
 #[test]
 fn restart_reopen_does_not_rebuy_a_bought_item() {
-    // The wire never says sold-out and `Start` clears the dedup identity:
-    // without the roll-scoped bought set, re-opening the shop after a
-    // restart would re-click the already-bought slot.
+    // The wire never says sold-out and `Start` clears the dedup identity, so
+    // only the roll-scoped `bought` set stops the re-click.
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
     let _ = ctrl.handle(Event::Stop);
     let _ = ctrl.handle(Event::Start { now_ms: 3 });
-    // Same roll re-delivered on re-open: the match still shows, but the
-    // bought slot is dead stock — display-only, hunted over.
+    // The match still shows, but the bought slot is dead stock: display-only.
     let actions = ctrl.handle(snap(with_ids(hit_shop(None)), 4));
     assert_eq!(
         actions,
@@ -551,8 +525,7 @@ fn restart_reopen_keeps_unbought_match_clickable() {
 
 #[test]
 fn new_roll_makes_a_bought_id_buyable_again() {
-    // Ids are stable per item type: a genuinely new roll relisting a bought
-    // id is fresh stock and must be buyable again.
+    // Ids are stable per item type, so a new roll relisting one is fresh stock.
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
@@ -572,9 +545,7 @@ fn new_roll_makes_a_bought_id_buyable_again() {
 
 #[test]
 fn an_idless_echo_never_enters_the_bought_set() {
-    // There is no `0` to store any more — an echo without an id is `None`, which
-    // the `if let Some(item) = item` in `on_purchase` cannot push. This pins that
-    // it also accumulates no phantom state, which is what the sentinel risked.
+    // `bought` is the re-buy guard: an entry nothing can match only grows it.
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(hit_shop(None), 1)); // untrackable match: Paused
     assert!(ctrl.handle(buy_unidentified(2)).is_empty());
@@ -583,8 +554,8 @@ fn an_idless_echo_never_enters_the_bought_set() {
 
 #[test]
 fn fail_open_reevaluation_does_not_rebuy() {
-    // An unidentifiable snapshot (an id is 0) re-evaluates while Watching,
-    // but it must neither reset the bought set nor re-click a bought slot.
+    // An unidentifiable snapshot re-evaluates while Watching, but must neither
+    // reset `bought` nor re-click a bought slot.
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     assert_eq!(ctrl.handle(buy(102, 2)), vec![Action::Refresh]);
@@ -657,7 +628,6 @@ fn pre_start_snapshot_then_identical_after_start_is_evaluated() {
     let mut ctrl = controller(Limits::default());
     assert!(ctrl.handle(snap(with_ids(dud_shop(None)), 1)).is_empty());
     let _ = ctrl.handle(Event::Start { now_ms: 2 });
-    // Stored but never acted on: the same shop must evaluate after start.
     let actions = ctrl.handle(snap(with_ids(dud_shop(None)), 3));
     assert_eq!(actions, vec![Action::Refresh]);
 }
@@ -751,9 +721,8 @@ fn fail_open_snapshot_keeps_last_identity() {
 
 #[test]
 fn sold_out_only_match_keeps_hunting() {
-    // A sold-out slot can match (include_sold_out) but nobody can buy it:
-    // pausing would park the loop until the hourly rotation, so the match
-    // is shown and the hunt continues in the same batch.
+    // Nobody can buy a sold-out slot, so pausing would park the loop until the
+    // hourly rotation: show the match and hunt on, in the same batch.
     let filter = Filter {
         kinds: vec![Equipment],
         include_sold_out: true,
@@ -782,8 +751,8 @@ fn sold_out_only_match_keeps_hunting() {
 
 #[test]
 fn untrackable_but_in_stock_match_still_pauses() {
-    // One matched slot is sold out, the other has no id but is in stock:
-    // the player can still buy the latter, so the manual-flow pause stays.
+    // One match is sold out, the other idless but in stock: the player can
+    // still buy that one, so the manual-flow pause stays.
     let filter = Filter {
         kinds: vec![Equipment],
         include_sold_out: true,
@@ -812,13 +781,11 @@ fn echoed_gold_blocks_unaffordable_next_match() {
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     assert_eq!(ctrl.status(), Status::Paused);
-    // The buy echoes a 100k balance...
     assert_eq!(
         ctrl.handle(buy_with_gold(102, 100_000, 2)),
         vec![Action::Refresh]
     );
-    // ...so the next match, priced 184k, is beyond reach: shown, never
-    // clicked, and the hunt continues.
+    // 100k echoed, next match priced 184k: shown, never clicked, hunt continues.
     let mut pricey = with_ids(hit_shop(None));
     for item in &mut pricey.slots {
         item.id = item.id.map(|id| cid(id.get() + 100));
@@ -840,8 +807,7 @@ fn echoed_gold_blocks_unaffordable_next_match() {
 
 #[test]
 fn gold_debits_cumulatively_within_one_shop() {
-    // 200k on hand, two 184k matches: the first is clickable, the second is
-    // not — the first buy will have spent the purse.
+    // 200k on hand, two 184k matches: the first buy spends the purse.
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     let _ = ctrl.handle(buy_with_gold(102, 200_000, 2));
@@ -867,8 +833,7 @@ fn gold_debits_cumulatively_within_one_shop() {
 
 #[test]
 fn unknown_gold_restricts_nothing() {
-    // No echo yet: a priced match stays clickable — the estimate fails
-    // open, it never vetoes buys on ignorance.
+    // No echo yet: the estimate fails open, never vetoing on ignorance.
     let mut ctrl = started(Limits::default());
     let mut priced = with_ids(hit_shop(None));
     priced.slots[2].price = Some(gold(999_999_999));
@@ -882,22 +847,14 @@ fn unknown_gold_restricts_nothing() {
     assert_eq!(ctrl.status(), Status::Paused);
 }
 
-/// An empty purse is a *known* balance, and it is the asymmetry that pays for
-/// [`Gold`](crate::domain::shop::Gold) not folding `0` to `None` the way
-/// [`CatalogId`] does.
-///
-/// `unknown_gold_restricts_nothing` above pins the other half: `None` fails
-/// open. If a wire `"gold": 0` decoded to `None` — the fold `CatalogId` uses,
-/// which is the obvious thing to copy — the two would collapse into one and a
-/// broke player's shop would read as fully buyable, i.e. the tool would click
-/// Buy on every match it can see and get nothing back but watchdog escalations.
-/// The 0 and the absence have to disagree, so the test asserts both in one
-/// place.
+/// Why [`Gold`](crate::domain::shop::Gold) does not fold `0` to `None` the way
+/// [`CatalogId`] does; `unknown_gold_restricts_nothing` pins the other half.
+/// Collapsed, a broke player's shop would read as fully buyable.
 #[test]
 fn a_zero_gold_balance_is_known_and_vetoes_every_priced_match() {
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
-    // The buy drains the purse: the echo says zero, and zero is a fact.
+    // The buy drains the purse, and the echoed zero is a fact.
     let _ = ctrl.handle(buy_with_gold(102, 0, 2));
     assert_eq!(ctrl.gold_balance(), Some(gold(0)));
 
@@ -907,8 +864,7 @@ fn a_zero_gold_balance_is_known_and_vetoes_every_priced_match() {
     }
     priced.slots[2].price = Some(gold(1));
     let actions = ctrl.handle(snap(priced, 3));
-    // Shown (the player may still have a stone to spend), never clicked, and
-    // the hunt goes on — the same verdict as any other unaffordable match.
+    // Shown, never clicked, hunt goes on — as for any unaffordable match.
     assert_eq!(
         actions,
         vec![
@@ -926,8 +882,7 @@ fn unknown_price_with_known_gold_fails_open() {
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1));
     let _ = ctrl.handle(buy_with_gold(102, 10, 2)); // 10 gold left, known
-    // The next match omits its price: it cannot be proven unaffordable,
-    // so it stays clickable.
+    // The next match omits its price, so it cannot be proven unaffordable.
     let mut fresh = with_ids(hit_shop(None));
     for item in &mut fresh.slots {
         item.id = item.id.map(|id| cid(id.get() + 100));
@@ -1000,8 +955,8 @@ fn stop_is_idempotent_when_stopped() {
 
 #[test]
 fn stop_while_idle_is_a_no_op() {
-    // A session that never ran did not stop: no Stop producer (console, GUI
-    // button, teardown) may turn Idle into "stopped: player stopped".
+    // A session that never ran did not stop: no producer may turn Idle into
+    // "stopped: player stopped".
     let mut ctrl = controller(Limits::default());
     assert!(ctrl.handle(Event::Stop).is_empty());
     assert_eq!(ctrl.status(), Status::Idle);
@@ -1113,9 +1068,8 @@ fn balance_equal_to_cost_still_affords_one_refresh() {
 
 #[test]
 fn a_budget_that_divides_by_the_cost_is_fully_spent() {
-    // The other boundary of the same policy: the look-ahead gate is `>`, not
-    // `>=`, so a budget the cost divides exactly is spent to the last crystal
-    // instead of leaving the player's last refresh unbought.
+    // The look-ahead gate is `>`, not `>=`, so an exactly-divisible budget is
+    // spent to the last crystal rather than leaving one refresh unbought.
     let mut ctrl = started(Limits {
         max_spend: Some(xtl(6)),
         ..Limits::default()
@@ -1138,9 +1092,8 @@ fn a_budget_that_divides_by_the_cost_is_fully_spent() {
 
 #[test]
 fn stop_reason_priority_order() {
-    // Table-driven so a failure names the pair that broke: this pins the
-    // *ordering* of `stop_reason`'s clauses, which is exactly the kind of thing
-    // that gets reordered by accident.
+    // Pins the *ordering* of `stop_reason`'s clauses, which is exactly the kind
+    // of thing that gets reordered by accident.
     let all_limits = Limits {
         max_refreshes: Some(0),
         max_spend: Some(xtl(0)),
@@ -1193,8 +1146,7 @@ fn stop_reason_priority_order() {
 
 #[test]
 fn max_matches_zero_blocks_first_refresh() {
-    // Symmetric with max_refreshes_zero: an already-reached matches limit
-    // gates the loop before it spends anything.
+    // Symmetric with max_refreshes_zero: gated before anything is spent.
     let mut ctrl = started(Limits {
         max_matches: Some(0),
         ..Limits::default()
@@ -1206,8 +1158,7 @@ fn max_matches_zero_blocks_first_refresh() {
 
 #[test]
 fn out_of_funds_uses_debited_balance_estimate() {
-    // Meta arrives once (balance 9, cost 3) then never again: the debited
-    // estimate must still trigger OutOfFunds, not refresh forever.
+    // Meta arrives once (balance 9, cost 3) and never again.
     let mut ctrl = started(Limits::default());
     assert_eq!(
         ctrl.handle(snap(dud_shop(Some(meta(9, 3))), 1)),
@@ -1222,8 +1173,8 @@ fn out_of_funds_uses_debited_balance_estimate() {
 
 #[test]
 fn max_spend_enforced_without_meta_via_constant_cost() {
-    // Budget 7, no meta ever: the constant 3-crystal cost tracks spend
-    // from the very first refresh — two fit, a third would cross.
+    // Budget 7, no meta ever: the constant 3 tracks spend from the first
+    // refresh — two fit, a third would cross.
     let mut ctrl = started(Limits {
         max_spend: Some(xtl(7)),
         ..Limits::default()
@@ -1237,8 +1188,7 @@ fn max_spend_enforced_without_meta_via_constant_cost() {
 
 #[test]
 fn wire_cost_overrides_the_constant() {
-    // A server-sent cost of 5 replaces the constant: one refresh fits
-    // the budget of 7, the next would cross.
+    // Cost 5 against a budget of 7: one refresh fits, the next would cross.
     let mut ctrl = started(Limits {
         max_spend: Some(xtl(7)),
         ..Limits::default()
@@ -1254,10 +1204,8 @@ fn wire_cost_overrides_the_constant() {
 
 #[test]
 fn a_wire_cost_of_zero_falls_back_to_the_constant() {
-    // A zero is the one cost that switches both money gates off at once, so it
-    // is refused rather than believed. Budget 7 with the constant 3: two
-    // refreshes fit, a third would cross — the same schedule as the no-meta
-    // test above, which is the point.
+    // Zero switches both money gates off, so it is refused. Budget 7 with the
+    // constant 3 gives the same schedule as the no-meta test above — the point.
     let mut ctrl = started(Limits {
         max_spend: Some(xtl(7)),
         ..Limits::default()
@@ -1283,9 +1231,8 @@ fn a_wire_cost_of_zero_falls_back_to_the_constant() {
 
 #[test]
 fn a_wire_cost_of_zero_still_reaches_out_of_funds() {
-    // The other half: `stop_reason` compares the balance against the floored
-    // cost, not against the wire's zero — otherwise `balance < 0` is never true
-    // and the loop refreshes on an empty wallet forever.
+    // `stop_reason` weighs the balance against the floored cost: against the
+    // wire's zero, `balance < 0` is never true and the loop never stops.
     let mut ctrl = started(Limits::default());
     let actions = ctrl.handle(snap(dud_shop(Some(meta(2, 0))), 1));
     assert_eq!(actions, vec![Action::Halt(StopReason::OutOfFunds)]);
@@ -1391,9 +1338,8 @@ fn timeout_fires_via_tick_while_paused() {
 
 #[test]
 fn an_elapsed_duration_halts_at_the_refresh_gate() {
-    // The deadline is checked in two places, and this is the copy that guards
-    // the emission point: without it a snapshot (or a buy echo) landing after
-    // the deadline pays for one more refresh before the next tick stops it.
+    // The copy of the deadline check that guards the emission point: without
+    // it, an arrival after the deadline buys one more refresh.
     let mut ctrl = started(Limits {
         max_duration_ms: Some(1_000),
         ..Limits::default()
@@ -1422,7 +1368,6 @@ fn now_before_started_no_underflow() {
         ..Limits::default()
     });
     let _ = ctrl.handle(Event::Start { now_ms: 1_000 });
-    // A now_ms earlier than the start saturates to zero elapsed.
     assert!(ctrl.handle(Event::Tick { now_ms: 500 }).is_empty());
     assert_eq!(ctrl.status(), Status::Watching);
 }
@@ -1431,7 +1376,6 @@ fn now_before_started_no_underflow() {
 fn filter_changed_applies_next_snapshot_only() {
     let mut ctrl = started(Limits::default());
     assert_eq!(ctrl.handle(snap(dud_shop(None), 1)), vec![Action::Refresh]);
-    // No re-evaluation of the stored snapshot on the spot.
     let token_filter = Filter {
         kinds: vec![Token],
         ..Filter::default()
@@ -1484,9 +1428,8 @@ fn buy_target_slot_clamps_oversized_position() {
 
 #[test]
 fn buy_targets_align_with_checklist() {
-    // Three matches: trackable, id omitted, sold out. Exactly the targets
-    // with `id: Some` form the checklist — the actuator clicks what the
-    // auto-resume waits on, nothing else.
+    // Three matches: trackable, idless, sold out. Exactly the `id: Some`
+    // targets form the checklist, so the actuator clicks what the resume awaits.
     let filter = Filter {
         kinds: vec![Equipment],
         include_sold_out: true,
@@ -1516,8 +1459,8 @@ fn buy_targets_align_with_checklist() {
 
 #[test]
 fn recovery_disabled_never_arms_the_watchdog() {
-    // Off is player-paced advice and DryRun never yields wire feedback:
-    // deadlines would self-halt both, so only live wiring arms them.
+    // Off is player-paced advice and DryRun yields no wire feedback: deadlines
+    // would self-halt both.
     let mut ctrl = started(Limits::default());
     assert_eq!(
         ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
@@ -1543,12 +1486,12 @@ fn snapshot_watchdog_reclicks_confirm_then_reissues_then_halts() {
     );
     // Deadline not reached: quiet.
     assert!(ctrl.handle(tick(10_000)).is_empty());
-    // Miss #1: free blind confirm re-click (safe on the shop screen).
+    // Miss #1: free blind confirm re-click.
     assert_eq!(
         ctrl.handle(tick(past_rung(1))),
         vec![Action::Recover(Recovery::ConfirmRefresh)]
     );
-    // Miss #2: paid full re-issue, counted and debited like any refresh.
+    // Miss #2: paid re-issue, counted and debited like any refresh.
     assert_eq!(
         ctrl.handle(tick(past_rung(2))),
         vec![Action::Recover(Recovery::Refresh)]
@@ -1566,10 +1509,8 @@ fn snapshot_watchdog_reclicks_confirm_then_reissues_then_halts() {
 
 #[test]
 fn watchdog_reissue_respects_limits() {
-    // The paid rung goes through the same gate as any refresh: an exhausted
-    // limit halts honestly instead of double-rolling. The count gates moved
-    // into the ladder — the in-flight roll is already paid for, so a quiet
-    // tick must not discard it.
+    // The paid rung goes through the same gate as any refresh, so an exhausted
+    // limit halts honestly instead of double-rolling.
     let mut ctrl = recovering(Limits {
         max_refreshes: Some(1),
         ..Limits::default()
@@ -1599,8 +1540,7 @@ fn new_snapshot_rearms_a_fresh_snapshot_deadline() {
         ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
         vec![Action::Refresh]
     );
-    // A genuinely new shop before the deadline: the awaited proof arrived,
-    // and the advised refresh arms a fresh full window.
+    // The awaited proof arrives, and the advised refresh arms a fresh window.
     let mut next = with_ids(dud_shop(None));
     for item in &mut next.slots {
         item.id = item.id.map(|id| cid(id.get() + 100));
@@ -1617,8 +1557,7 @@ fn new_snapshot_rearms_a_fresh_snapshot_deadline() {
 
 #[test]
 fn duplicate_snapshot_keeps_the_snapshot_expectation() {
-    // A re-open re-delivers the same roll: not the awaited new shop, so
-    // the deadline keeps running.
+    // A re-open is not the awaited new shop, so the deadline keeps running.
     let mut ctrl = recovering(Limits::default());
     assert_eq!(
         ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
@@ -1636,8 +1575,7 @@ fn duplicate_snapshot_keeps_the_snapshot_expectation() {
 
 #[test]
 fn slotless_snapshot_keeps_the_snapshot_expectation() {
-    // A degraded slotless message is not shop content: the refresh's proof
-    // is still owed.
+    // A degraded message is not shop content: the refresh's proof is still owed.
     let mut ctrl = recovering(Limits::default());
     assert_eq!(
         ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
@@ -1691,8 +1629,7 @@ fn accepted_echo_resets_the_purchase_deadline_and_attempt() {
         ctrl.handle(tick(past_rung(1))),
         vec![Action::Recover(Recovery::ConfirmBuy)]
     );
-    // Proof of life: one echo lands — the ladder restarts at rung zero
-    // with a full window for the remaining buy.
+    // Proof of life: the ladder restarts at rung zero with a full window.
     assert!(ctrl.handle(buy(100, 12_000)).is_empty());
     assert!(ctrl.handle(tick(21_000)).is_empty());
     assert_eq!(
@@ -1703,8 +1640,8 @@ fn accepted_echo_resets_the_purchase_deadline_and_attempt() {
 
 #[test]
 fn pause_without_checklist_never_arms_the_watchdog() {
-    // An untrackable (id-0) match pauses for the player, not the game: no
-    // echo can ever arrive, so a deadline would always halt the session.
+    // An untrackable match pauses for the player, not the game: no echo can
+    // arrive, so a deadline would always halt the session.
     let mut ctrl = recovering(Limits::default());
     let _ = ctrl.handle(snap(hit_shop(None), 1)); // fixture ids all 0
     assert_eq!(ctrl.status(), Status::Paused);
@@ -1715,9 +1652,8 @@ fn pause_without_checklist_never_arms_the_watchdog() {
 
 #[test]
 fn dead_stock_batch_arms_snapshot_not_purchase() {
-    // Nothing in the batch is buyable: the hunt continues in the same
-    // batch, so the deadline watches for the next shop — not for echoes
-    // that cannot come.
+    // Nothing is buyable, so the deadline watches for the next shop, not for
+    // echoes that cannot come.
     let filter = Filter {
         kinds: vec![Equipment],
         include_sold_out: true,
@@ -1749,8 +1685,8 @@ fn dead_stock_batch_arms_snapshot_not_purchase() {
 
 #[test]
 fn buy_reissue_ignores_a_mid_pause_filter_swap() {
-    // The re-issue rebuilds targets from the checklist by identity: a new
-    // filter must not redraw (or drop) what the pause is waiting on.
+    // Targets are rebuilt from the checklist by identity, so a new filter must
+    // not redraw or drop what the pause is waiting on.
     let mut ctrl = recovering(Limits::default());
     let _ = ctrl.handle(snap(with_ids(hit_shop(None)), 1)); // checklist [102]
     let token_filter = Filter {
@@ -1782,8 +1718,7 @@ fn restart_carries_no_stale_expectation() {
     let _ = ctrl.handle(snap(with_ids(dud_shop(None)), 1));
     let _ = ctrl.handle(Event::Stop);
     let _ = ctrl.handle(Event::Start { now_ms: 2 });
-    // No refresh issued yet in this session: a leftover deadline firing
-    // here would recover a click nobody sent.
+    // A leftover deadline here would recover a click nobody sent.
     assert_eq!(ctrl.expectation, None);
     assert!(ctrl.handle(tick(past_rung(1))).is_empty());
     assert_eq!(ctrl.status(), Status::Watching);
@@ -1791,8 +1726,8 @@ fn restart_carries_no_stale_expectation() {
 
 #[test]
 fn max_matches_resolution_halt_clears_the_expectation() {
-    // The pause resolves by buying, then the resume gate halts on the
-    // reached limit: the halt must also disarm the purchase deadline.
+    // The pause resolves by buying and the resume gate halts on the reached
+    // limit: that halt must also disarm the purchase deadline.
     let mut ctrl = recovering(Limits {
         max_matches: Some(1),
         ..Limits::default()
@@ -1808,12 +1743,10 @@ fn max_matches_resolution_halt_clears_the_expectation() {
 
 #[test]
 fn timeout_beats_the_watchdog_on_the_same_tick() {
-    // Both the session timer and the watchdog deadline lapse on the same
-    // tick: the honest label is the player's own limit, not the game's
-    // silence.
+    // Both deadlines lapse together: the honest label is the player's own
+    // limit, not the game's silence.
     let mut ctrl = recovering(Limits {
-        // Deliberately the same instant as rung 1: that coincidence is what
-        // this test is about, so it is derived, not re-typed.
+        // Derived, not re-typed: the coincidence with rung 1 is the point.
         max_duration_ms: Some(past_rung(1)),
         ..Limits::default()
     });
@@ -1825,8 +1758,6 @@ fn timeout_beats_the_watchdog_on_the_same_tick() {
 
     // Same while Watching on a refresh in flight.
     let mut ctrl = recovering(Limits {
-        // Deliberately the same instant as rung 1: that coincidence is what
-        // this test is about, so it is derived, not re-typed.
         max_duration_ms: Some(past_rung(1)),
         ..Limits::default()
     });
@@ -1840,8 +1771,7 @@ fn timeout_beats_the_watchdog_on_the_same_tick() {
 #[test]
 fn link_down_suspends_the_watchdog() {
     // The reconnect backoff caps above the whole ladder: left running, an
-    // outage would escalate into a paid double-roll and a halt blaming the
-    // game.
+    // outage escalates into a paid double-roll and a halt blaming the game.
     let mut ctrl = recovering(Limits::default());
     let _ = ctrl.handle(snap(with_ids(dud_shop(None)), 1));
     assert!(ctrl.handle(Event::LinkDown).is_empty());
@@ -1860,8 +1790,8 @@ fn link_up_regrants_a_full_deadline() {
     );
     let _ = ctrl.handle(Event::LinkDown);
     assert!(ctrl.handle(tick(25_000)).is_empty());
-    // Back up: a full fresh window, but the climbed rung is kept — the
-    // retry never got its answer, so the next miss escalates.
+    // A fresh window, but the climbed rung is kept: the retry never got its
+    // answer, so the next miss escalates.
     assert!(ctrl.handle(Event::LinkUp { now_ms: 25_000 }).is_empty());
     assert!(ctrl.handle(tick(34_999)).is_empty());
     assert_eq!(
@@ -1872,8 +1802,7 @@ fn link_up_regrants_a_full_deadline() {
 
 #[test]
 fn purchase_echo_while_watching_leaves_snapshot_expectation_alone() {
-    // A stray echo (an unmatched manual buy) is not the proof a refresh
-    // waits on: only a snapshot may clear or re-arm it.
+    // A stray echo is not the proof a refresh waits on.
     let mut ctrl = recovering(Limits::default());
     let _ = ctrl.handle(snap(with_ids(dud_shop(None)), 1));
     assert!(ctrl.handle(buy(999, 2)).is_empty());
@@ -1883,8 +1812,7 @@ fn purchase_echo_while_watching_leaves_snapshot_expectation_alone() {
     );
 }
 
-/// A shop whose slots carry both ids and names, so a purchase echo (id only)
-/// resolves back to the item's wire name for the haul tally.
+/// Slots carrying ids *and* names, so an id-only echo resolves to a wire name.
 fn named_shop() -> ShopSnapshot {
     let named = |id: u32, name: Option<&str>| ShopItem {
         id: Some(cid(id)),
@@ -1920,7 +1848,6 @@ fn haul_tallies_bought_items_by_resolved_name() {
 
 #[test]
 fn haul_counts_a_repeated_echo_once_per_roll() {
-    // A replayed echo of the same buy in the same roll must not double-count.
     let mut ctrl = controller(Limits::default());
     let _ = ctrl.handle(snap(named_shop(), 0));
     let _ = ctrl.handle(buy(100, 1));
@@ -1934,15 +1861,13 @@ fn haul_resets_on_start() {
     let _ = ctrl.handle(snap(named_shop(), 0));
     let _ = ctrl.handle(buy(100, 1));
     assert_eq!(ctrl.haul().count("ticketrare_name"), 1);
-    // A new run starts a fresh haul; last run's take is not this run's.
     assert!(ctrl.handle(Event::Start { now_ms: 2 }).is_empty());
     assert_eq!(ctrl.haul().count("ticketrare_name"), 0);
 }
 
 #[test]
 fn haul_ignores_a_buy_after_the_run_stops() {
-    // A manual buy once the run has stopped is the player's own, not the
-    // loop's — it must not inflate the stopped run's haul.
+    // A buy after the stop is the player's own, not the loop's.
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(named_shop(), 0));
     let _ = ctrl.handle(buy(100, 1));
@@ -1954,8 +1879,8 @@ fn haul_ignores_a_buy_after_the_run_stops() {
 
 #[test]
 fn haul_drops_a_stale_echo_after_the_roll_rotates() {
-    // A buy's echo replayed after a fresh roll has rotated the stock out finds
-    // no slot for its id — dropping it, not bucketing it as a phantom Other.
+    // An echo landing after the stock rotated finds no slot for its id, and is
+    // dropped rather than bucketed as a phantom Other.
     let mut ctrl = started(Limits::default());
     let _ = ctrl.handle(snap(named_shop(), 0));
     let _ = ctrl.handle(buy(100, 1));

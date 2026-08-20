@@ -1,7 +1,6 @@
 //! Sequence-space reassembly: ordering, deduplication, gaps, SYN incarnations,
-//! and the one-shot initial anchor burst. The relative-offset rule is
-//! documented on the parent module. This half treats a payload as an opaque
-//! [`BudgetedChunk`] and decides *what* to buffer; [`super::budget`] decides
+//! and the one-shot initial anchor burst. The relative-offset rule is on the
+//! parent module. This half decides *what* to buffer; [`super::budget`] decides
 //! *if there is room*.
 
 use std::collections::btree_map::Entry;
@@ -24,9 +23,8 @@ const MAX_STREAMS: usize = 64;
 /// Segments held during the one-shot initial anchor window.
 ///
 /// Ordering is isolated per flow: each flow's slots are replaced with its
-/// sequence-ordered segments, preserving inter-flow cadence while leaving
-/// [`Reassembler`] the sole authority for overlap, dedup, gaps, and SYN
-/// incarnations.
+/// sequence-ordered segments, which preserves inter-flow cadence and leaves
+/// [`Reassembler`] the sole authority for overlap, dedup, gaps and SYNs.
 pub(crate) struct InitialBurst {
     segments: Vec<BudgetedSegment>,
     payload_bytes: usize,
@@ -52,8 +50,7 @@ impl InitialBurst {
     ///
     /// # Panics
     ///
-    /// Panics if the segment would exceed either cap — check
-    /// [`Self::would_exceed`] first. Guards the 256 KiB / 128-segment bound.
+    /// Panics unless [`Self::would_exceed`] was checked first.
     pub(crate) fn push(&mut self, segment: BudgetedSegment) {
         assert!(
             !self.would_exceed(&segment),
@@ -72,23 +69,25 @@ impl InitialBurst {
         );
     }
 
-    /// Whether the burst has reached either cap. `>=` on both terms: segment
-    /// count lands on its cap exactly, but bytes rarely hit 262 144 exactly,
-    /// so equality would leave the bound resting on `would_exceed` alone.
+    /// Whether the burst has reached either cap. `>=` on both terms: the byte
+    /// total rarely lands on 262 144 exactly, and equality alone would leave
+    /// the bound resting on `would_exceed`.
     pub(crate) fn is_at_limit(&self) -> bool {
         self.segments.len() >= INITIAL_ANCHOR_MAX_SEGMENTS
             || self.payload_bytes >= INITIAL_ANCHOR_MAX_BYTES
     }
 
     pub(crate) fn into_ordered(self) -> Vec<BudgetedSegment> {
-        // Slice-iterator `collect` is exact-size (TrustedLen): one allocation; the map just needs a capacity hint.
         let slots: Vec<_> = self.segments.iter().map(|segment| segment.flow).collect();
+        // One flow is the ordinary case; several is the port-wide accident.
         let mut flows: HashMap<_, Vec<BudgetedSegment>> = HashMap::with_capacity(1);
         for segment in self.segments {
             flows.entry(segment.flow).or_default().push(segment);
         }
         for segments in flows.values_mut() {
-            // A valid TCP window is smaller than the signed half-space — select an origin first for a transitive sort key.
+            // `seq_diff` is not a transitive order on its own, so sort against
+            // an origin: a valid TCP window is smaller than the signed
+            // half-space, so every segment measures from it unambiguously.
             let origin = segments
                 .iter()
                 .map(segment_data_seq)
@@ -101,7 +100,7 @@ impl InitialBurst {
                 })
                 .expect("a burst flow is never empty");
             segments.sort_by_key(|segment| seq_diff(segment_data_seq(segment), origin));
-            // Reversed so the replay below can `pop` from the back, instead of a second map just for `pop_front`.
+            // Reversed so the replay below can `pop` from the back.
             segments.reverse();
         }
 
@@ -130,13 +129,12 @@ impl Reassembler {
         Self::default()
     }
 
-    /// Integrates a segment, returning the bytes that became contiguous. See
-    /// [`ReassemblyOutcome`] for what `Chunks` vs `Pressure` means.
+    /// Integrates a segment, returning the bytes that became contiguous.
     ///
     /// FIN is not modelled: a segment reordered ahead of a gap keeps its
-    /// buffered payload until the gap fills. On `Pressure`, the caller must
-    /// re-anchor (`AnchorState::AwaitingFirst`) instead of waiting on a gap
-    /// fill that can never arrive.
+    /// buffered payload until the gap fills, which is why `Pressure` obliges
+    /// the caller to re-anchor (`AnchorState::AwaitingFirst`) rather than wait
+    /// on a fill that can never arrive.
     pub(crate) fn push_budgeted(&mut self, segment: BudgetedSegment) -> ReassemblyOutcome {
         let key = segment.flow;
         let dropped_capacity = segment.capacity();
@@ -145,8 +143,6 @@ impl Reassembler {
         if segment.syn && self.syn_starts_new_incarnation(&segment) {
             self.streams.remove(&key);
         }
-        // A new flow past the cap evicts the stalest one first, so reconnect
-        // churn or a forged-source-port flood cannot grow the map unbounded.
         if self.streams.len() >= MAX_STREAMS && !self.streams.contains_key(&key) {
             self.evict_stalest(&budget);
         }
@@ -154,34 +150,19 @@ impl Reassembler {
         let half = self.streams.entry(key).or_default();
         half.last_active = clock;
         let outcome = half.push(segment.seq, segment.syn, segment.into_payload());
-        // Exhaustive by construction: a new `HalfOutcome` variant becomes a
-        // compile error here, not a runtime panic that kills the session.
         match outcome {
             HalfOutcome::Chunks(chunks) => ReassemblyOutcome::Chunks(chunks),
             HalfOutcome::Pressure(cause) => {
-                // The two refusals inside `buffer_future` have very different
-                // blast radii, and this arm used to apply the wider one to
-                // both. `MAX_PENDING_BYTES` is a *per-stream* cap (8 MiB) and
-                // half `REASSEMBLY_STAGE_BYTES`, so a single stream reaches it
-                // without the shared pool being anywhere near full — the
-                // compile-time assert in the parent module exists to keep it
-                // that way. Capture is port-wide (`tcp and src port …`, no host
-                // filter), so a connection lingering from before a reconnect,
-                // or anything else sending from that port, mints a second
-                // `FlowKey`, loses one segment, and piles 8 MiB behind the gap.
-                // Clearing the whole map then took the game's own flow with it:
-                // it lost `baseline` and `next_off` mid-message and had to
-                // re-anchor, costing that refresh's shop snapshot, over a quota
-                // it never touched. Only the stream that overflowed is dropped
-                // now. It has to re-anchor regardless — FIN is not modelled, so
-                // the gap it is waiting behind will never be filled — but that
-                // is one flow's continuity, not everyone's.
-                //
-                // Shared-stage exhaustion is the opposite case and keeps the
-                // wide reset: the bytes that have to be handed back before
-                // *anyone* can buffer again are precisely the other streams'
-                // pending buffers, so dropping all of them is the recovery
-                // rather than collateral damage.
+                // Sized to the failure. `MAX_PENDING_BYTES` is a *per-stream*
+                // cap and half of `REASSEMBLY_STAGE_BYTES`, so one stream fills
+                // it with the shared pool still slack; capture is port-wide
+                // (`tcp and src port …`, no host filter), so a stray flow can
+                // pile 8 MiB behind one lost segment. Clearing every stream for
+                // that cost the game's own flow its `baseline` and `next_off`
+                // mid-message — a shop refresh — over a quota it never touched.
+                // Shared-stage exhaustion is the opposite: the bytes that must
+                // come back before *anyone* can buffer again are the other
+                // streams' pending buffers, so the wide reset is the recovery.
                 match cause {
                     PressureCause::Stream => {
                         self.streams.remove(&key);
@@ -207,12 +188,11 @@ impl Reassembler {
         flatten_chunks(self.push_budgeted(admitted))
     }
 
-    /// Returns whether this SYN starts a new incarnation of an already
-    /// tracked connection (the caller then drops the stale sequence space).
-    ///
-    /// Only two SYNs of a connection reach here — the handshake SYN-ACK and
-    /// its retransmissions, since the client's own SYN travels the uncaptured
-    /// direction. A SYN on an untracked flow simply anchors.
+    /// Whether this SYN starts a new incarnation of an already tracked
+    /// connection, so the caller can drop the stale sequence space. Only the
+    /// handshake SYN-ACK and its retransmissions reach here — the client's own
+    /// SYN travels the uncaptured direction — and a SYN on an untracked flow
+    /// simply anchors.
     fn syn_starts_new_incarnation(&self, segment: &BudgetedSegment) -> bool {
         debug_assert!(segment.syn);
 
@@ -223,28 +203,23 @@ impl Reassembler {
         if half.syn_seq == Some(segment.seq) {
             return false;
         }
-        // The handshake SYN arriving late, after data already anchored this
-        // stream mid-flight at exactly the byte that SYN would have produced.
+        // The handshake SYN arriving late, after data anchored this stream
+        // mid-flight at exactly the byte that SYN would have produced.
         if half.syn_seq.is_none() && half.baseline == Some(segment.seq.wrapping_add(1)) {
             return false;
         }
         true
     }
 
-    /// Drops the least-recently-active stream; called only when a new key
-    /// would exceed `MAX_STREAMS`.
+    /// Drops the least-recently-active stream, only when a new key would exceed
+    /// `MAX_STREAMS`.
     ///
-    /// Takes the budget because an eviction *is* an anchor loss, and every
-    /// other anchor loss in this file accounts for itself. This one used to
-    /// be silent, and the case it was silent about is not the hypothetical
-    /// one: capture is port-wide with no host filter, so any burst of foreign
-    /// flows past 64 keys evicts by staleness — and between two shop refreshes
-    /// the quietest flow on that port is the game's own. It loses `baseline`
-    /// and `next_off` mid-message, re-anchors on its next segment as if
-    /// nothing happened, and the missing snapshot appears in no counter and no
-    /// log line. `record_resync` is the same call
-    /// [`Self::push_budgeted`]'s pressure arm makes for the same loss, so a
-    /// crowded-out anchor and a quota-blown one now add up in one number.
+    /// An eviction *is* an anchor loss, hence the budget: capture is port-wide,
+    /// so foreign flows past 64 keys evict by staleness, and between two shop
+    /// refreshes the quietest flow on that port is the game's own. It re-anchors
+    /// silently, so without `record_resync` the missing snapshot appears in no
+    /// counter. Same call as [`Self::push_budgeted`]'s pressure arm, and no
+    /// `record_drop`, for the reason stated there.
     fn evict_stalest(&mut self, budget: &PipelineBudget) {
         let Some(&key) = self
             .streams
@@ -258,10 +233,9 @@ impl Reassembler {
             .streams
             .remove(&key)
             .expect("the key was just read out of this map");
-        // `clock` counts segments across *all* flows and was bumped for the
-        // arriving one before this call, so the difference is how many packets
-        // from other flows went by while this stream said nothing — the one
-        // number that separates "crowded out" from "went quiet".
+        // `clock` counts segments across *all* flows, so this is how many other
+        // packets went by while the stream said nothing: the one number that
+        // separates "crowded out" from "went quiet".
         let segments_since_active = self.clock.saturating_sub(evicted.last_active);
         budget.record_resync();
         warn_stream_evicted(budget, evicted, segments_since_active);
@@ -274,7 +248,7 @@ impl Reassembler {
     }
 }
 
-/// Reassembly state of the captured (server-to-client) half of a connection, in relative offsets.
+/// The captured (server-to-client) half of a connection, in relative offsets.
 #[derive(Default)]
 struct HalfStream {
     /// Last `Reassembler::clock` value this stream was active; eviction key.
@@ -291,30 +265,24 @@ struct HalfStream {
 
 impl HalfStream {
     fn push(&mut self, seq: u32, syn: bool, payload: BudgetedChunk) -> HalfOutcome {
-        // Recorded before `baseline` so `syn_starts_new_incarnation` can tell retransmission from a fresh incarnation.
+        // Before `baseline`: `syn_starts_new_incarnation` reads both to tell a
+        // retransmitted SYN from a fresh incarnation.
         if syn {
             self.syn_seq.get_or_insert(seq);
         }
         // SYN consumes a sequence number: data starts at seq + 1.
         let data_seq = if syn { seq.wrapping_add(1) } else { seq };
         self.baseline.get_or_insert(data_seq);
-        // Offset is measured from the currently expected byte, then shifted
-        // back to absolute. The distance stays within the TCP window, so the
-        // i32 span in `seq_diff` never overflows.
+        // Measured from the currently expected byte, then shifted back to
+        // absolute: the distance stays inside the TCP window, so `seq_diff`'s
+        // i32 span never overflows.
         let expected_seq = self.expected_seq();
         let offset = self.next_off + seq_diff(data_seq, expected_seq);
 
-        // `Vec::with_capacity(1)`, not `Vec::new()`, whose first `push` on a
-        // 48-byte element jumps to capacity 4 (192 bytes to hold 48). The
-        // common in-order case needs one chunk; only `drain` flushing a gap
-        // needs more. Nothing-delivering cases (retransmission, gap-buffered,
-        // bare SYN) now allocate one slot instead of none, but are rare —
-        // `capture::ip` drops empty non-SYN payloads upstream.
-        //
-        // `SmallVec<[BudgetedChunk; 1]>` was declined: it costs a dependency
-        // and inlines 48 bytes into `HalfOutcome`/`ReassemblyOutcome`, both
-        // returned by value twice per packet — an unmeasured malloc-for-memcpy
-        // trade. Nothing here is profiled, and `mem-smallvec` asks for one first.
+        // `with_capacity(1)`: `Vec::new()`'s first `push` of a 48-byte element
+        // jumps to capacity 4. `SmallVec` was declined — a dependency, plus 48
+        // bytes inlined into two by-value returns per packet, for a malloc
+        // nothing here has profiled.
         let mut out = Vec::with_capacity(1);
         if let Err(cause) = self.absorb(offset, payload, &mut out) {
             return HalfOutcome::Pressure(cause);
@@ -339,15 +307,13 @@ impl HalfStream {
             return self.buffer_future(offset, payload);
         }
 
-        // offset <= next_off: the distance is non-negative, bounded by the
-        // sequence window. `try_from`, not `as`: a negative difference would
-        // silently become ~1.8e19, fail the length check, and drop the
-        // segment — freezing this half-stream forever, silently.
+        // `try_from`, not `as`: a negative distance would silently become
+        // ~1.8e19, fail the length check below, and freeze this half-stream.
         let Ok(already) = usize::try_from(self.next_off - offset) else {
             report_absorb_invariant(self.next_off, offset);
-            // Deliver nothing, but don't report pressure: no quota refused
-            // anything here, and inventing one would throw away an anchor —
-            // this stream's at least — over an arithmetic bug in this function.
+            // Deliver nothing, but report no pressure: no quota refused
+            // anything, and inventing one would throw away an anchor over an
+            // arithmetic bug in this function.
             return Ok(());
         };
         if already < payload.as_slice().len() {
@@ -360,24 +326,18 @@ impl HalfStream {
         Ok(())
     }
 
-    /// Buffers a segment that sits past the gap, or reports which quota
-    /// refused it.
-    ///
-    /// The two refusals are checked in that order for a reason beyond
-    /// cheapness (`fits_pending` is arithmetic on a field; `try_retag_pending`
-    /// takes the shared budget mutex): the per-stream cap is the tighter of
-    /// the two by construction, so asking it first attributes an overflow to
-    /// the stream that caused it even when the shared pool happens to be
-    /// nearly full as well. Reversing them would blame the pool for a stream
-    /// that had already exhausted its own allowance.
+    /// Buffers a segment that sits past the gap, or reports which quota refused
+    /// it. The per-stream cap is checked first, being the tighter of the two by
+    /// construction: it attributes an overflow to the stream that caused it even
+    /// when the shared pool happens to be nearly full as well.
     fn buffer_future(
         &mut self,
         offset: i64,
         mut payload: BudgetedChunk,
     ) -> Result<(), PressureCause> {
         let capacity = payload.capacity();
-        // One `entry` probe, not `get`+`remove`+`insert`, saves two `O(log n)`
-        // walks and displaces a chunk only once the new one clears the quota.
+        // One `entry` probe: a held chunk is displaced only once the new one
+        // has cleared both quotas.
         match self.pending.entry(offset) {
             Entry::Occupied(mut slot) => {
                 // Keep only the largest segment seen at a given offset.
@@ -422,18 +382,18 @@ impl HalfStream {
         Ok(())
     }
 
-    /// Sequence number of the next expected byte: `baseline + next_off`, back
-    /// in the wrapping `u32` space (`baseline` is always set by the time this
-    /// runs — `push` inserts it first).
+    /// Sequence number of the next expected byte: `baseline + next_off`, back in
+    /// the wrapping `u32` space (`push` always sets `baseline` before this runs).
     fn expected_seq(&self) -> u32 {
-        // `next_off` is non-negative, mod 2^32: keeping the low 32 bits is the
-        // intended conversion, same as `wrapping_*` elsewhere. `u64` detour keeps truncation unsigned, avoiding sign extension.
+        // `next_off` is non-negative and read mod 2^32, so keeping the low 32
+        // bits is the intended conversion; the `u64` detour keeps that
+        // truncation unsigned, avoiding sign extension.
         let offset = (self.next_off as u64) as u32;
         self.baseline.unwrap_or(0).wrapping_add(offset)
     }
 }
 
-/// The rare branch of [`HalfStream::absorb`]'s offset invariant, kept off the hot path.
+/// The rare branch of [`HalfStream::absorb`], kept off the per-packet path.
 #[cold]
 #[inline(never)]
 fn report_absorb_invariant(next_off: i64, offset: i64) {
@@ -441,14 +401,14 @@ fn report_absorb_invariant(next_off: i64, offset: i64) {
     debug_assert!(offset <= next_off, "absorb offset exceeds next_off");
 }
 
-/// The rare branch of [`Reassembler::push_budgeted`]'s pressure arm: the budget mutex and seven fields belong off the per-packet path.
+/// The rare branch of the pressure arm: the budget mutex and seven fields
+/// belong off the per-packet path.
 #[cold]
 #[inline(never)]
 fn warn_reassembly_pressure(budget: &PipelineBudget, cause: PressureCause) {
     let stats = budget.snapshot();
-    // The scope is the first thing worth knowing from a log line like this:
-    // the same counters accompany a flood on some unrelated port and a genuine
-    // pool exhaustion, and only the second is a reason to revisit the quotas.
+    // The same counters accompany a flood on an unrelated port and a genuine
+    // pool exhaustion; only the second is a reason to revisit the quotas.
     let scope = match cause {
         PressureCause::Stream => "one stream's own pending cap; that flow re-anchors",
         PressureCause::Shared => "the shared reassembly quota; every flow re-anchors",
@@ -466,32 +426,20 @@ fn warn_reassembly_pressure(budget: &PipelineBudget, cause: PressureCause) {
     );
 }
 
-/// The rare branch of [`Reassembler::evict_stalest`], out of line for the same
-/// reason as [`warn_reassembly_pressure`] above.
+/// The rare branch of [`Reassembler::evict_stalest`], out of line like
+/// [`warn_reassembly_pressure`].
 ///
-/// Owns the evicted stream instead of borrowing it, deliberately: the gap
-/// buffer's leases release as it drops, and a line reporting the reassembly
-/// pool is only worth printing once the bytes this eviction just gave back are
-/// actually back. Borrowing would print a total that still counts them.
-///
-/// No `record_drop` accompanies the discarded gap buffer, which looks like an
-/// omission and is not. [`Reassembler::push_budgeted`] states the rule at its
-/// own reset — drop metrics identify the capture the pipeline *refused*, and
-/// chunks thrown away by a recovery are collateral, not extra captures — and
-/// nothing was refused here: the segment that triggered the eviction is
-/// admitted and delivered normally. Counting the collateral only on this path
-/// would make `dropped_segments` mean one thing under quota pressure and
-/// another under table pressure. The bytes are reported below instead, where a
-/// large number is diagnostic without redefining a counter two other paths
-/// share.
+/// Owns the evicted stream rather than borrowing it: its leases release as it
+/// drops, and the pool total is only worth printing once those bytes are back.
+/// The absent `record_drop` is not an omission — nothing was *refused* here,
+/// and [`Reassembler::push_budgeted`] states the rule; counting the discarded
+/// gap buffer would make `dropped_segments` mean one thing under quota pressure
+/// and another under table pressure, so its bytes go in the warning instead.
 #[cold]
 #[inline(never)]
 fn warn_stream_evicted(budget: &PipelineBudget, evicted: HalfStream, segments_since_active: u64) {
-    // What the evicted flow was in the middle of, in the spirit of
-    // `warn_reassembly_pressure`'s `scope`: in the counters an eviction that
-    // cost a shop refresh and one that discarded a flow which had never
-    // delivered a byte are the same event, and only the first is worth a
-    // player's attention.
+    // In the counters, an eviction that cost a shop refresh and one that
+    // discarded a flow which never delivered a byte are the same event.
     let loss = if evicted.pending_bytes > 0 {
         "a flow buffering behind a gap; its half-received message is gone"
     } else if evicted.next_off > 0 {
@@ -518,11 +466,10 @@ fn warn_stream_evicted(budget: &PipelineBudget, evicted: HalfStream, segments_si
 
 /// Which of the two independent quotas refused to buffer a segment.
 ///
-/// They are separate limits, not two readings of one: [`MAX_PENDING_BYTES`]
-/// bounds a single stream's gap buffer and is half the reassembly stage's
-/// share of the pool, so either can be reached with the other still slack.
-/// The distinction only exists so [`Reassembler::push_budgeted`] can size the
-/// recovery to the failure; nothing above this module sees it.
+/// Separate limits, not two readings of one: [`MAX_PENDING_BYTES`] bounds a
+/// single stream's gap buffer and is half the reassembly stage's share, so
+/// either can be reached with the other still slack. The distinction exists so
+/// [`Reassembler::push_budgeted`] can size the recovery to the failure.
 ///
 /// [`MAX_PENDING_BYTES`]: super::MAX_PENDING_BYTES
 #[derive(Clone, Copy)]
@@ -540,15 +487,13 @@ enum HalfOutcome {
 
 /// What [`Reassembler::push_budgeted`] did with a segment.
 pub(crate) enum ReassemblyOutcome {
-    /// The bytes that became contiguous, in order. Empty is normal: a
-    /// duplicate, a partial gap fill, or a segment still waiting on a predecessor.
+    /// The bytes that became contiguous, in order. Empty is normal: a duplicate,
+    /// a partial gap fill, or a segment still waiting on a predecessor.
     Chunks(Vec<BudgetedChunk>),
-    /// A pending-byte quota was exhausted and the segment's flow has lost its
-    /// place in the stream: its state is gone and the caller must re-anchor.
-    /// Not a "nothing yet". Whether the other tracked flows were cleared too
-    /// depends on which quota failed and is deliberately not reported here —
-    /// the caller re-arms one anchor window either way, and any flow that kept
-    /// its baseline simply carries on through it.
+    /// A pending-byte quota was exhausted and the segment's flow lost its place:
+    /// its state is gone and the caller must re-anchor, not wait. Whether the
+    /// other flows were cleared too is deliberately not reported — the caller
+    /// re-arms one anchor window either way.
     Pressure,
 }
 
@@ -608,12 +553,9 @@ mod tests {
         }
     }
 
-    /// The shared arm: 64 streams holding 16 pending bytes each, none of them
-    /// anywhere near its own 8 MiB cap, exhaust the reassembly stage between
-    /// them. That is the one case where every anchor deserves to go — the
-    /// bytes that have to come back are spread across all 64 buffers — so the
-    /// wide `clear()` is asserted here, by the reassembly total returning to
-    /// zero rather than to the 63 buffers a per-stream eviction would leave.
+    /// The shared arm: 64 streams, none near its own cap, exhaust the stage
+    /// between them, so every anchor deserves to go. The wide `clear()` shows up
+    /// as a reassembly total of zero, not the 63 buffers an eviction would leave.
     #[test]
     fn pending_bytes_are_global_across_sixty_four_streams() {
         let budget = test_budget(4096, 4096, 1024, 4096);
@@ -629,9 +571,8 @@ mod tests {
             assert!(budget.snapshot().current_total <= 4096);
         }
         assert_eq!(budget.snapshot().current_reassembly, 1024);
-        // Exactly the check the failing stream is about to run: its own cap
-        // still has room, so what refuses below is the shared quota and this
-        // stays a test of the shared arm even if the constants move.
+        // Exactly the check the failing stream is about to run: its own cap has
+        // room, so this stays a shared-arm test even if the constants move.
         assert!(
             fits_pending(16, 16).is_some(),
             "the per-stream cap must not be the limit under test here"
@@ -649,21 +590,13 @@ mod tests {
         assert_eq!(budget.snapshot().current_total, 0);
     }
 
-    /// The per-stream arm, and the reason the two are told apart at all.
+    /// The per-stream arm, and the reason the two are told apart at all: a
+    /// stranger on the port fills its own 8 MiB cap while the flow that matters
+    /// is mid-message, and losing the game flow's baseline there costs a shop
+    /// refresh, so the recovery must stop at the stream that overflowed.
     ///
-    /// Capture is port-wide, so a second flow on the game port is ordinary:
-    /// a connection left over from before a reconnect, or anyone else sending
-    /// from it. Give that flow a gap and it buffers up to its own 8 MiB cap —
-    /// reachable on its own, since the cap is half the reassembly stage's
-    /// share — while the flow that matters is mid-message. Losing the game
-    /// flow's baseline there costs a whole shop refresh, so the recovery must
-    /// stop at the stream that overflowed.
-    ///
-    /// Every shared quota is set to four times the per-stream cap, which is
-    /// what keeps this a test of `fits_pending` and not a second spelling of
-    /// the shared-arm test above: `try_retag_pending` cannot fail with that
-    /// much slack, and the snapshot below pins the slack that was actually
-    /// there at the moment of refusal.
+    /// Every shared quota is four times the per-stream cap, so `try_retag_pending`
+    /// cannot fail and this stays a test of `fits_pending`.
     #[test]
     fn a_stream_that_fills_its_own_pending_cap_leaves_every_other_anchor_alone() {
         const CHUNK: usize = 64 * 1024;
@@ -716,11 +649,9 @@ mod tests {
         let survivor = &reassembler.streams[&game];
         assert_eq!(survivor.baseline, Some(1000));
         assert_eq!(survivor.next_off, 2);
-        // The behavioural half of the same claim, and the assertion that goes
-        // red on the old `self.clear()`: a retransmission is recognisable as
-        // history only while the anchor holds. A cleared flow re-anchors on it
-        // and delivers "AB" a second time — two bytes of duplicate injected
-        // mid-message into a decoder that can resync but cannot un-see them.
+        // A retransmission is recognisable as history only while the anchor
+        // holds: a cleared flow re-anchors on it and delivers "AB" twice, a
+        // duplicate a decoder can resync from but cannot un-see.
         assert!(
             push(&mut reassembler, seg_on(game, 1000, b"AB")).is_empty(),
             "the surviving flow must still know 1000 is behind it"
@@ -846,7 +777,8 @@ mod tests {
         assert_eq!(collect_anchored(&overlap, [1, 2, 0]), b"ABCDEFGH");
     }
 
-    /// Sorting is per flow, but the *slots* are global: interleaved connections must come back each ordered, alternation intact.
+    /// Sorting is per flow but the *slots* are global: interleaved connections
+    /// come back each ordered, with the alternation intact.
     #[test]
     fn initial_anchor_burst_preserves_inter_flow_slots() {
         let first = flow();
@@ -894,12 +826,9 @@ mod tests {
     }
 
     /// The suffix rule for **every** arrival order of six segments, at four
-    /// origins — including two that straddle the `u32` wrap.
-    ///
-    /// Exhaustive (6! × 4 origins = 2 880 cases), not `proptest`-sampled: the
-    /// space is small enough to exhaust in milliseconds. Proves the two
-    /// properties from `docs/initial-stream-anchor.md` that the
-    /// six-permutation table above only covers for n = 3.
+    /// origins, two of which straddle the `u32` wrap. Exhaustive (2 880 cases)
+    /// rather than sampled: the space is small enough, and the table above
+    /// covers the two properties below only for n = 3.
     #[test]
     fn every_arrival_order_yields_the_immediate_suffix_of_the_stream() {
         for origin in [1_000_u32, u32::MAX - 5, u32::MAX - 11, 0] {
@@ -909,7 +838,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, bytes)| {
-                    // `wrapping_add`: near-`u32::MAX` origins wrap the sequence space under the segments.
+                    // Origins near `u32::MAX` wrap under the segments.
                     seg(origin.wrapping_add(index as u32 * 2), false, bytes)
                 })
                 .collect();
@@ -920,16 +849,15 @@ mod tests {
                 for index in order.iter().copied() {
                     delivered.extend(reassembler.push(&segments[index]));
                 }
-                // 1. What comes out is a *suffix* of the byte stream — never a
-                //    permutation, never a gap. The analysis server decodes
-                //    against this: it can resync from any point but not
+                // 1. A *suffix*, never a permutation and never a gap: the
+                //    analysis server resyncs from any point, but cannot
                 //    survive reordered or hole-punched bytes.
                 assert!(
                     whole.ends_with(&delivered),
                     "origin {origin}, order {order:?} delivered {delivered:?}, not a suffix"
                 );
-                // 2. The suffix starts at the first segment to arrive: that
-                //    arrival anchors the stream.
+                // 2. The suffix starts at the first segment to arrive, which
+                //    is the arrival that anchors the stream.
                 let anchor = order[0];
                 assert_eq!(
                     delivered.len(),
@@ -940,14 +868,10 @@ mod tests {
         }
     }
 
-    /// The three algebraic properties `seq_diff` is defined by, over a
-    /// lattice of bases including every wrap boundary.
-    ///
-    /// Dependency-free like the permutation sweep: interesting inputs are
-    /// exactly the boundaries — `0`, `u32::MAX`, `i32::MAX` (where signed
-    /// reading flips) — which a uniform generator reaches with probability
-    /// ~0. `seq_diff` is `const fn`, so this could be a `const _: () =
-    /// assert!(…)`; it's a test instead because the loop covers 1 000+ pairs.
+    /// The three algebraic properties `seq_diff` is defined by, over a lattice
+    /// of bases including every wrap boundary. The interesting inputs are
+    /// exactly those boundaries — `0`, `u32::MAX`, `i32::MAX`, where the signed
+    /// reading flips — which a uniform generator reaches with probability ~0.
     #[test]
     fn seq_diff_is_antisymmetric_and_wrap_relative() {
         let bases = [
@@ -966,12 +890,12 @@ mod tests {
             assert_eq!(seq_diff(base, base), 0, "base {base}");
             for delta in deltas {
                 let other = base.wrapping_add(delta as u32);
-                // 2. Relative distance: a wrap is invisible — `HalfStream::push`
-                //    tracks a stream past 2 GiB by measuring from the expected byte.
+                // 2. Relative distance: a wrap is invisible, which is how
+                //    `HalfStream::push` tracks a stream past 2 GiB.
                 assert_eq!(seq_diff(other, base), delta, "base {base}, delta {delta}");
-                // 3. Antisymmetric. No `delta` reaches `i32::MIN` (it can't
-                //    be negated): at exactly half the space apart, "ahead"
-                //    and "behind" are the same answer, a circle property.
+                // 3. Antisymmetric. No `delta` reaches `i32::MIN`, which
+                //    cannot be negated: half the space apart, "ahead" and
+                //    "behind" are the same answer.
                 assert_eq!(
                     seq_diff(base, other),
                     -delta,
@@ -979,14 +903,13 @@ mod tests {
                 );
             }
         }
-        // 2^31 apart reads as `i32::MIN` both ways — why `MAX_PENDING_BYTES`
-        // and the anchor logic bound how far out of order a segment may be.
+        // 2^31 apart reads as `i32::MIN` both ways: why `MAX_PENDING_BYTES` and
+        // the anchor logic bound how far out of order a segment may be.
         assert_eq!(seq_diff(0, 0x8000_0000), i64::from(i32::MIN));
         assert_eq!(seq_diff(0x8000_0000, 0), i64::from(i32::MIN));
     }
 
-    /// Every permutation of `0..n`, lexicographic, dependency-free — the
-    /// alternative was a random generator sampling a space this exhausts.
+    /// Every permutation of `0..n`, lexicographic and dependency-free.
     fn permutations(n: usize) -> Vec<Vec<usize>> {
         if n == 0 {
             return vec![Vec::new()];
@@ -994,8 +917,8 @@ mod tests {
         let mut out = Vec::new();
         for head in 0..n {
             for mut rest in permutations(n - 1) {
-                // Shift the tail indices that sit at or above `head` up by one,
-                // so `rest` becomes a permutation of `0..n` minus `head`.
+                // Shift tail indices at or above `head` up by one, so `rest`
+                // becomes a permutation of `0..n` minus `head`.
                 for index in &mut rest {
                     if *index >= head {
                         *index += 1;
@@ -1037,9 +960,8 @@ mod tests {
         assert_eq!(output, b"CDEFGH");
     }
 
-    /// Each flow anchors on its own first segment: the `1000` segment after
-    /// `1002` on `first` is history for that flow, while the same seq on
-    /// `second` is its origin.
+    /// Each flow anchors on its own first segment: `1000` after `1002` is
+    /// history on `first`, while the same seq is the origin on `second`.
     #[test]
     fn initial_anchor_is_isolated_by_flow() {
         let mut reassembler = Reassembler::new();
@@ -1102,7 +1024,7 @@ mod tests {
     fn reassembles_across_sequence_wrap() {
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(0xFFFF_FFFE, false, b"AB")), b"AB");
-        assert_eq!(r.push(&seg(0x0000_0000, false, b"CD")), b"CD"); // wraps, still contiguous.
+        assert_eq!(r.push(&seg(0x0000_0000, false, b"CD")), b"CD");
     }
 
     #[test]
@@ -1115,8 +1037,8 @@ mod tests {
 
     #[test]
     fn delivers_far_past_two_gigabytes() {
-        // A half-stream that already delivered 2^31 bytes: the next in-order
-        // segment must still be recognised — the old offset overflowed i32.
+        // A half-stream past 2^31 delivered bytes: the next in-order segment
+        // must still be recognised, where an origin-relative offset overflowed.
         let mut half = HalfStream {
             baseline: Some(0),
             next_off: (1i64 << 31) + 1000,
@@ -1153,7 +1075,6 @@ mod tests {
     fn eviction_keeps_the_active_flow() {
         let mut r = Reassembler::new();
         let hot = flow_from(1);
-        // `hot` stays active as newcomers fill the cap, so it survives eviction.
         r.push(&seg_on(hot, 1000, b"AB"));
         for port in 100..(100 + MAX_STREAMS as u32 * 2) {
             r.push(&seg_on(flow_from(port as u16), 1000, b"XY"));
@@ -1163,20 +1084,14 @@ mod tests {
         assert!(r.streams.contains_key(&hot));
     }
 
-    /// The scenario the eviction path was silent about, end to end.
+    /// The eviction path end to end: the game's flow goes quiet mid-message, as
+    /// it does between shop refreshes, while foreign flows on the same port fill
+    /// the table, so staleness picks the game's own stream. It re-anchors either
+    /// way; the point is that the loss is *counted*, on the same `resyncs`
+    /// number the pressure arm uses.
     ///
-    /// The game's flow anchors, delivers, and then goes quiet mid-message —
-    /// which is what it does between shop refreshes — while foreign flows on
-    /// the same port (capture is port-wide, no host filter) mint keys until
-    /// the table is full. Staleness then picks the game's own stream. It
-    /// re-anchors on its next segment either way; the point of this test is
-    /// that the loss is now *counted*, on the same `resyncs` number the
-    /// pending-byte pressure arm uses, instead of leaving a missing snapshot
-    /// with no trace anywhere.
-    ///
-    /// Uses `push_budgeted` against one shared budget rather than the `push`
-    /// helper, which mints a throwaway `PipelineBudget` per call and would
-    /// therefore read zero counters no matter what this path recorded.
+    /// Uses `push_budgeted` against one shared budget: the `push` helper mints a
+    /// throwaway `PipelineBudget` per call and would read zero counters.
     #[test]
     fn evicting_a_crowded_out_stream_counts_the_lost_anchor() {
         let budget = PipelineBudget::new();
@@ -1191,9 +1106,8 @@ mod tests {
         assert!(push(&mut reassembler, seg_on(game, 1004, b"EF")).is_empty());
         assert_eq!(budget.snapshot().resyncs, 0);
 
-        // 63 newcomers fill the table to the cap without evicting anyone; the
-        // 64th is the first key that has nowhere to go, and by then the game's
-        // stream is the least recently active of the 64.
+        // 63 newcomers fill the table; the 64th is the first key with nowhere
+        // to go, and the game's stream is by then the stalest.
         for port in 1..=(MAX_STREAMS as u16) {
             push(&mut reassembler, seg_on(flow_from(port), 1000, b"XY"));
         }
@@ -1208,16 +1122,14 @@ mod tests {
             1,
             "an evicted stream lost its anchor and must be counted like every other anchor loss"
         );
-        // The declined half of the same decision, pinned so it stays declined:
-        // nothing was *refused* here — the segment that triggered the eviction
-        // was admitted — and `push_budgeted` already rules that chunks a
-        // recovery throws away are collateral rather than extra captures. The
-        // discarded gap buffer is reported in the warning's bytes instead.
+        // Pinned so it stays declined: nothing was *refused* here — the segment
+        // that triggered the eviction was admitted — and `push_budgeted` rules
+        // that chunks a recovery throws away are collateral, not extra
+        // captures. The discarded gap buffer is in the warning's bytes instead.
         assert_eq!(budget.snapshot().dropped_segments, 0);
         // The evicted stream's buffered segment gave its lease back on the way out.
         assert_eq!(budget.snapshot().current_reassembly, 0);
 
-        // And it does re-anchor, silently as far as the byte stream goes.
         assert_eq!(push(&mut reassembler, seg_on(game, 9000, b"ZZ")), b"ZZ");
         drop(reassembler);
         assert_eq!(budget.snapshot().current_total, 0);

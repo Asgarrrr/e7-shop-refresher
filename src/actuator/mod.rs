@@ -20,24 +20,19 @@ use crate::watch::{HaltSource, WatchGate};
 
 use plan::{Epoch, Input, Job, ScreenError, Timings};
 
-/// The actuator's poison-tolerant lock: a panic on some other thread must not
-/// turn every later click into a fatal. The obligation [`crate::sync`] puts on
-/// its callers is discharged here by the shape of what is guarded — `Timings` is
-/// `Copy` and copied straight out, and the shield's slot is a plain handle, so
-/// neither can be caught half-written.
+/// The actuator's poison-tolerant lock: a panic on another thread must not turn
+/// every later click into a fatal. [`crate::sync`]'s obligation on its callers is
+/// discharged by what is guarded — `Timings` is `Copy` and copied straight out,
+/// the shield's slot is a plain handle — so neither can be caught half-written.
 use crate::sync::lock_ignoring_poison as lock;
 
 /// Generation counter of the shop state, bumped on every shop message. A job
-/// carries the epoch it was planned against and the executor refuses to act
-/// on any other: clicks aimed at a shop that no longer exists must die, not
-/// land.
+/// carries the epoch it was planned against and the executor refuses to act on
+/// any other: clicks aimed at a shop that no longer exists must die, not land.
 ///
-/// The ordering is `Relaxed` on purpose, and it is not a weakening: the epoch is
-/// only ever compared for equality, and nothing is published *through* it. The
-/// value reaches the executor baked into a `Job` travelling over an `mpsc`
-/// channel, whose `send`/`recv` is what creates the happens-before edge; the
-/// snapshot itself arrives under the controller's own mutex. A stronger load
-/// would not be a fresher one.
+/// `Relaxed` is not a weakening: the epoch is only compared for equality and
+/// nothing is published *through* it. It reaches the executor baked into a `Job`
+/// on an `mpsc` channel, whose `send`/`recv` makes the happens-before edge.
 #[derive(Clone, Default)]
 pub struct SnapshotEpoch(Arc<AtomicU64>);
 
@@ -46,9 +41,8 @@ impl SnapshotEpoch {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The generation to plan against, as an [`Epoch`] rather than a bare `u64`:
-    /// every job builder takes it beside a millisecond seed, and the two are not
-    /// interchangeable.
+    /// An [`Epoch`] rather than a bare `u64`: every job builder takes it beside
+    /// a millisecond seed, and the two are not interchangeable.
     #[must_use]
     pub fn current(&self) -> Epoch {
         Epoch(self.0.load(Ordering::Relaxed))
@@ -72,10 +66,8 @@ pub struct ActuatorHandle {
     pub mode: Mode,
     pub epoch: SnapshotEpoch,
     jobs: mpsc::Sender<Job>,
-    /// Shared with [`crate::app::setup`]'s live-edit path: the session thread swaps this
-    /// on a `SetTimings` command and reads it when building each job. Jobs
-    /// bake the resolved waits at submit time, so the executor never touches
-    /// it.
+    /// Shared with [`crate::app::setup`]'s live-edit path. Jobs bake the
+    /// resolved waits at submit time, so the executor never touches it.
     timings: Arc<Mutex<Timings>>,
 }
 
@@ -94,15 +86,14 @@ impl ActuatorHandle {
         }
     }
 
-    /// Queues a job for the executor, naming *why* it was lost when it was —
-    /// the caller journals the drop, a lost click must not be silent.
+    /// Queues a job for the executor, naming *why* it was lost when it was: the
+    /// caller journals the drop, a lost click must not be silent.
     ///
     /// # Errors
     ///
-    /// [`SubmitError::QueueFull`] when the executor is alive but behind, which
-    /// the next tick clears on its own, and [`SubmitError::ExecutorGone`] when
-    /// nobody is reading any more. The two need opposite advice, which is why
-    /// they are not one flag — see [`SubmitError`].
+    /// [`SubmitError::QueueFull`] when the executor is alive but behind, and
+    /// [`SubmitError::ExecutorGone`] when nobody is reading any more — two
+    /// variants because they need opposite advice, see [`SubmitError`].
     #[must_use = "a rejected job means a lost click — journal the drop"]
     pub fn submit(&self, job: Job) -> Result<(), SubmitError> {
         match self.jobs.try_send(job) {
@@ -112,12 +103,10 @@ impl ActuatorHandle {
         }
     }
 
-    /// The extra waits to bake into the next job, copied out from under the
-    /// lock (never held across a plan build).
-    ///
-    /// Poison-tolerant (see [`lock`]): this is called while building *every*
-    /// queued job, and panicking here would take the session down over an
-    /// unrelated fault.
+    /// The extra waits to bake into the next job, copied out from under the lock
+    /// (never held across a plan build). Poison-tolerant (see [`lock`]): this
+    /// runs while building *every* queued job, so panicking here would take the
+    /// session down over an unrelated fault.
     #[must_use]
     pub fn timings(&self) -> Timings {
         *lock(&self.timings)
@@ -130,38 +119,27 @@ impl ActuatorHandle {
     }
 }
 
-/// Why a job never reached the executor.
-///
-/// Both are lost clicks, but they need opposite advice, so they must not
-/// collapse back into one flag: a full queue is transient back-pressure the
-/// next tick clears on its own, while a closed channel means nobody is at the
-/// other end and no amount of waiting will help. Journaling the first when it
-/// is really the second sends the player looking for a slow actuator that does
-/// not exist.
-///
-/// The `Display` texts are the neutral one-liners a log or a crash chain wants.
-/// The journal deliberately says something longer and different at each of the
-/// two call sites, because there the *advice* is the point.
+/// Why a job never reached the executor. Do not collapse these back into one
+/// flag: a full queue is transient back-pressure the next tick clears, a closed
+/// channel means nobody is at the other end, and journaling the first when it is
+/// really the second sends the player after a slow actuator that does not exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitError {
     /// The executor is alive but behind: the bounded queue is at capacity.
     #[error("the actuator queue is full — the executor is behind")]
     QueueFull,
-    /// The receiving end is gone, so nothing will ever run this job. Since a
-    /// fatal no longer ends [`run_executor`], this is reachable only once the
-    /// session is tearing its workers down.
+    /// The receiving end is gone. Since a fatal no longer ends [`run_executor`],
+    /// this is reachable only once the session is tearing its workers down.
     #[error("the actuator executor is gone — nothing will run this job")]
     ExecutorGone,
 }
 
-/// How a surface failure must be handled. Classified at the error's birth
-/// site (the backend knows what broke), never blanket-mapped per trait
-/// method.
+/// How a surface failure must be handled. Classified at the error's birth site
+/// (the backend knows what broke), never blanket-mapped per trait method.
 ///
-/// Both payloads are already operator-facing text assembled so a human can read
-/// it, so `Display` is `{0}` verbatim: that is what lets an actuator failure
-/// appear in a `error = %err` field or a crash chain at all, instead of only as
-/// whatever prose one match arm happened to build.
+/// Both payloads are already operator-facing text, so `Display` is `{0}`
+/// verbatim: that is what lets an actuator failure appear in an `error = %err`
+/// field or a crash chain at all.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SurfaceError {
     /// The world moved under the job (window dragged, resized, minimized):
@@ -177,38 +155,21 @@ pub enum SurfaceError {
     Fatal(String),
 }
 
-/// The input backend the executor drives: real input on Windows, a recorder
-/// in tests.
+/// The input backend the executor drives: real input on Windows, a recorder in
+/// tests. Every method may park its thread for the length of an input, so the
+/// executor only ever calls them through `blocking`.
 ///
-/// Every method may park its thread for the length of an input (Win32
-/// syscalls plus the deliberate settle and hold beats), so the executor only
-/// ever calls them through `blocking`.
-///
-/// # Why the window is a parameter rather than a field
-///
-/// This invariant (`api-004`) used to be enforced at run time in three separate
-/// places: an `Option<Target>` field and a `target()` guard inside each Windows
-/// backend, plus an `.expect("active surface job guard")` in the executor's own
-/// guard — three chances to get the next backend wrong, and the backends' own
-/// copies duplicated state the executor already owned (it takes the
-/// [`plan::ClientRect`] out of `acquire` and carries it through the whole job
-/// anyway).
-///
-/// Instead `acquire` hands back a [`Window`](Surface::Window) — opaque,
-/// backend-owned, whatever the backend needs to act (the Win32 backends put the
-/// `HWND` and the measured client rect in it) — and every input method takes
-/// one. There is no state to forget to set, no guard to forget to write, and
-/// "input without an acquire" is not a value that can be built. What stays
-/// fail-closed is everything the *world* can break: the window died, moved, or
-/// refuses input. That is what [`SurfaceError`] is for, and the backends still
-/// re-verify on every single event.
+/// Do not move the window back into the backend as a field. `acquire` hands one
+/// out and every input method takes it, so "input without an acquire" is not a
+/// value that can be built; as a field (`api-004`) it took three run-time checks
+/// to say the same — an `Option<Target>` plus a `target()` guard in each Windows
+/// backend, and an `.expect` in the executor's guard. What stays fail-closed is
+/// only what the *world* can break, which is [`SurfaceError`]'s job.
 pub trait Surface {
     /// A backend's proof that it acquired the game window, and everything it
-    /// needs to act on it.
-    ///
-    /// Opaque on purpose: the executor only routes it from `acquire` to the
-    /// input calls and finally to `release`, and never looks inside. A backend
-    /// with nothing to carry uses `()`.
+    /// needs to act on it. Opaque: the executor only routes it from `acquire` to
+    /// the input calls and finally to `release`. A backend with nothing to carry
+    /// uses `()`.
     type Window;
 
     /// Locates the game window, returning its client area — whether it is
@@ -217,55 +178,42 @@ pub trait Surface {
     /// # Errors
     ///
     /// [`SurfaceError::Recoverable`] when the window is alive but not usable
-    /// right now, so the *next* `acquire` may well succeed: [`run_executor`]
-    /// drops this one job and the watchdog's retry heals it.
-    /// [`SurfaceError::Fatal`] when acting would be blind — no window carrying
-    /// the game's title, a client rect Windows refuses to read at all, a process
-    /// DPI awareness that would place every click at the wrong scale, or a window
-    /// at a higher integrity level than this process. There the executor halts
-    /// the watch and the payload is the line the player reads.
+    /// right now, so the *next* `acquire` may succeed. [`SurfaceError::Fatal`]
+    /// when acting would be blind — no window carrying the game's title, a
+    /// client rect Windows refuses to read, a process DPI awareness that would
+    /// place every click at the wrong scale, or a window at a higher integrity
+    /// level than this process — and the payload is the line the player reads.
     ///
     /// Either way nothing was engaged, so a failed `acquire` leaves no
-    /// [`release`](Surface::release) owing — which is why the executor only
-    /// builds its cleanup guard on the `Ok` path.
+    /// [`release`](Surface::release) owing: hence the cleanup guard being built
+    /// only on the `Ok` path.
     fn acquire(&mut self) -> Result<(Self::Window, plan::ClientRect), SurfaceError>;
 
     /// The same window and the same client area, for a job that will not send
     /// anything: [`Mode::DryRun`].
     ///
-    /// Required rather than defaulted to `acquire`, because a default is exactly
-    /// how this went wrong. The simulation path called `acquire`, and for the
-    /// `input` backend that means a real `SetForegroundWindow` — so turning on
-    /// the mode a cautious player turns on *first* yanked Epic Seven in front of
-    /// whatever they were doing, on every tick, while sending no input. A dry
-    /// run that reorders the desktop is not a dry run. Making this a decision
-    /// each backend has to write down is what stops the next one inheriting the
-    /// same surprise.
+    /// Do not default this to `acquire`: that default is how the simulation path
+    /// came to call a real `SetForegroundWindow` on the `input` backend, so the
+    /// mode a cautious player turns on *first* yanked Epic Seven in front of
+    /// them every tick while sending no input. Each backend writing the decision
+    /// down is what stops the next one inheriting the surprise.
     ///
-    /// Measuring is still allowed, and wanted. The rect is what resolves the
-    /// journal's screen coordinates, so without it the dry run stops answering
-    /// the question it exists for; a reachability preflight that provably
-    /// changes nothing (see `win::probe_window_reachable`) is likewise worth
-    /// keeping, since "the real run would be refused by UIPI" is the single most
-    /// useful thing a rehearsal can report. The line is *engaging*, not
-    /// *looking*.
+    /// Measuring is still wanted: the rect resolves the journal's screen
+    /// coordinates, and a preflight that provably changes nothing (see
+    /// `win::probe_window_reachable`) is the most useful thing a rehearsal can
+    /// report. The line is *engaging*, not *looking*.
     ///
     /// # Errors
     ///
-    /// The same classification as [`acquire`](Surface::acquire), and the same
-    /// consequences: a dry run reports the faults a live run would hit, which is
-    /// the point of rehearsing.
+    /// The same classification as [`acquire`](Surface::acquire): a dry run
+    /// reports the faults a live run would hit.
     fn measure(&mut self) -> Result<(Self::Window, plan::ClientRect), SurfaceError>;
 
     /// One left click at a screen point, held `press_ms`.
     ///
-    /// `window` is what [`acquire`](Surface::acquire) handed back, so the
-    /// precondition the point depends on — that a client rect was measured and
-    /// this is the window it was measured on — is carried by the argument rather
-    /// than asserted. Implementations must still answer everything the world can
-    /// break with a [`SurfaceError`], never a panic: the executor runs inside a
-    /// supervised task, so a panic ends the whole session while `Fatal` halts the
-    /// watch with a reason the player can read.
+    /// Implementations must answer everything the world can break with a
+    /// [`SurfaceError`], never a panic: the executor runs in a supervised task,
+    /// so a panic ends the session while `Fatal` halts the watch with a reason.
     fn click(
         &mut self,
         window: &Self::Window,
@@ -281,13 +229,10 @@ pub trait Surface {
         notches: i32,
     ) -> Result<(), SurfaceError>;
     /// Job over, completed or aborted: undo whatever the inputs set up for
-    /// `window`. Implementations must make this idempotent and non-panicking
-    /// because it runs from a destructor.
-    ///
-    /// The window is borrowed rather than consumed so the executor's guard can
-    /// own it outright instead of behind an `Option` — an `Option` there is what
-    /// made the guard's own `expect` necessary, and this trait is meant to delete
-    /// that kind of check, not relocate it.
+    /// `window`. Must be idempotent and non-panicking — it runs from a
+    /// destructor — and the window is borrowed rather than consumed so the
+    /// executor's guard can own it outright instead of behind the `Option` that
+    /// made its `expect` necessary.
     fn release(&mut self, window: &Self::Window) {
         let _ = window;
     }
@@ -295,22 +240,17 @@ pub trait Surface {
 
 /// Runs one blocking [`Surface`] call without starving the runtime.
 ///
-/// Every surface method parks its thread: the Win32 backends sleep through
-/// the cursor-settle, button-hold, focus-settle and shield-drain beats, wait
-/// on the shield thread's setup handshake, and call `SetForegroundWindow` /
-/// `SendInput` / `FindWindowW` synchronously — 120-170 ms for a single click,
-/// and a multi-slot buy is a dozen of them back to back. Left plain on a
-/// runtime worker that stalls the reassembly task long enough for the capture
-/// channels to overflow, and the stream re-anchors in the middle of a
-/// purchase — precisely when the `purchase` echo is due. It also outlasts
-/// shutdown's grace deadline, because `JoinHandle::abort` cannot interrupt a
-/// thread sitting in `std::thread::sleep`.
+/// Every surface method parks its thread — 120-170 ms for a single click, a
+/// dozen of those back to back for a multi-slot buy. Left plain on a runtime
+/// worker, that stalls the reassembly task until the capture channels overflow
+/// and the stream re-anchors mid-purchase, precisely when the `purchase` echo is
+/// due; it also outlasts shutdown's grace deadline, since `JoinHandle::abort`
+/// cannot interrupt a thread sitting in `std::thread::sleep`.
 ///
-/// `block_in_place` hands the worker's other tasks to a sibling thread for the
-/// duration. It panics anywhere but the multi-thread runtime, hence the
-/// flavor probe: the executor's own tests drive it on the current-thread
-/// runtime with the clock paused (`start_paused` and `multi_thread` are
-/// mutually exclusive), and the guard tests call it with no runtime at all.
+/// `block_in_place` panics anywhere but the multi-thread runtime, hence the
+/// flavor probe: the executor's own tests drive it on the current-thread runtime
+/// with the clock paused (`start_paused` and `multi_thread` are mutually
+/// exclusive), and the guard tests call it with no runtime at all.
 fn blocking<T>(call: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(call),
@@ -318,14 +258,11 @@ fn blocking<T>(call: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Owns cleanup for one successfully acquired job, and the window that job
-/// acquired.
+/// Owns cleanup for one successfully acquired job, and that job's window.
 ///
-/// Both fields are plain values rather than `Option`s: the guard is built only on
-/// `acquire`'s `Ok` path, so an inactive guard is not a state it has (see
-/// [`Surface`]'s "why the window is a parameter" for the `api-004` invariant
-/// this removes the last runtime check of). Idempotence of the release is a
-/// `bool`, which is the only thing the `Option` was actually tracking.
+/// Plain values rather than `Option`s: the guard is built only on `acquire`'s
+/// `Ok` path, so an inactive guard is not a state it has. Release idempotence is
+/// the `bool`, which is all the `Option` was really tracking.
 struct SurfaceJobGuard<'a, S: Surface> {
     surface: &'a mut S,
     window: S::Window,
@@ -363,8 +300,8 @@ impl<'a, S: Surface> SurfaceJobGuard<'a, S> {
         let Self {
             surface, window, ..
         } = self;
-        // Cleanup posts and hides too: blocking all the same, and this
-        // also runs from `Drop` on the runtime worker.
+        // Cleanup posts and hides too: blocking all the same, and it also runs
+        // from `Drop` on the runtime worker.
         blocking(|| surface.release(window));
     }
 }
@@ -380,27 +317,19 @@ impl<S: Surface> Drop for SurfaceJobGuard<'_, S> {
 /// never click blind. With `dry_run` the resolved screen input is journaled
 /// instead of sent.
 ///
-/// A fatal fault ends the job, never the task, and that is not a weakening of
-/// "an actuator that cannot act safely stops acting":
+/// A fatal fault ends the job, never the task, and that still stops the actuator
+/// acting: [`fail`] disables the gate *synchronously* and latches the cause, and
+/// [`drop_reason`] re-reads it at the top of every job and before every step, so
+/// from the fatal onwards jobs are dropped before `acquire` is even called —
+/// which also keeps `fail` from spamming.
 ///
-/// - [`fail`] calls `WatchGate::request_halt`, which disables the gate
-///   *synchronously* and latches the cause so nothing can re-arm behind the
-///   player's back.
-/// - [`drop_reason`] re-reads that gate at the top of every job and again
-///   before every step, and answers `"the watch is off"` while it is down.
-/// - So from the fatal onwards every job is dropped before `acquire` is even
-///   called: not one input can be delivered. The loop stops acting; only the
-///   task survives. It also means `fail` cannot spam — nothing reaches a
-///   surface call again until the player re-arms.
-///
-/// The task has to survive because it is spawned exactly once per session and
-/// nothing respawns it. Returning would drop the job receiver, and every later
-/// submit would then fail against a channel nobody reads, even though `Start`
-/// from `Status::Stopped` re-arms the gate and the session looks alive. Staying
-/// in the loop is what lets the player act on the halt: fix the cause, press
-/// Start, the next job re-runs `acquire`, and the actuator recovers with no
-/// process restart. (The UIPI halt is the one exception whose fix *is*
-/// restarting this app, since the integrity level is fixed at process start.)
+/// The task must survive because it is spawned once per session and nothing
+/// respawns it: returning would drop the job receiver, and every later submit
+/// would fail against a channel nobody reads, even though `Start` from
+/// `Status::Stopped` re-arms the gate and the session looks alive. Staying in
+/// the loop is what lets the player fix the cause, press Start, and recover with
+/// no process restart. (The UIPI halt is the one exception whose fix *is*
+/// restarting this app: the integrity level is fixed at process start.)
 pub async fn run_executor(
     mut surface: impl Surface,
     mut jobs: mpsc::Receiver<Job>,
@@ -416,11 +345,9 @@ pub async fn run_executor(
             journal.emit(&[format!(">> actuator: {reason} — dropped planned clicks")]);
             continue;
         }
-        // `acquire` finds the window, may steal the foreground and sleeps out
-        // the focus settle: blocking like every other surface call. A dry run
-        // takes the door that only looks — the whole mode is a promise not to
-        // touch the game, and `acquire` was breaking it before any click was
-        // even planned.
+        // A dry run takes the door that only looks: the mode is a promise not to
+        // touch the game, and `acquire` — which may steal the foreground — was
+        // breaking it before any click was even planned.
         let (window, rect) = match blocking(|| {
             if dry_run {
                 surface.measure()
@@ -436,36 +363,29 @@ pub async fn run_executor(
                 continue;
             }
             Err(SurfaceError::Fatal(reason)) => {
-                // Nothing was acquired, so there is nothing to release. The
-                // gate is down now: every job behind this one is dropped at
-                // the top of the loop until the player re-arms.
+                // Nothing was acquired, so nothing is owed a release. The gate is
+                // down now, so every job behind this one is dropped at the top
+                // of the loop until the player re-arms.
                 fail(&journal, &gate, &reason);
                 continue;
             }
         };
         let mut surface = SurfaceJobGuard::new(&mut surface, window);
-        // Built here, between the guard and the first sleep, because both of its
-        // refusals are properties of the rect `acquire` just measured — nothing
-        // in the loop re-reads it, so asking per step asked an unchanging
-        // question after having already waited out a step delay. A minimized
-        // window used to burn 1.18 s, or up to 61 s with a configured range,
-        // before abandoning a job that could never land a click. After the
-        // guard, not before it: a successful `acquire` owes a `release` whatever
-        // the rect turns out to be.
+        // Between the guard and the first sleep: both refusals are properties of
+        // the rect `acquire` just measured, so asking per step waited out a step
+        // delay (1.18 s by default, up to 61 s with a configured range) to
+        // answer an unchanging question. After the guard, though: a successful
+        // `acquire` owes a `release` whatever the rect turns out to be.
         let viewport = match plan::Viewport::of(rect) {
             Ok(viewport) => viewport,
             // A minimized window acquires with an empty client area, and the
-            // next `acquire` reads a fresh one: recoverable, so drop this job
-            // and let the watchdog's retry heal it. The classification is the
-            // converter's `ScreenError`, not a `rect.width <= 0` test spelled
-            // out again here.
+            // next `acquire` reads a fresh one. Classified by the converter's
+            // `ScreenError`, not by a `rect.width <= 0` test repeated here.
             Err(error @ ScreenError::DegenerateRect { .. }) => {
                 abort(&journal, &error.to_string());
                 continue;
             }
             // Nothing the loop can heal: the player has to widen the window.
-            // Abandon the job, keep the task — the guard releases as this
-            // iteration unwinds.
             Err(error @ ScreenError::TooNarrow { .. }) => {
                 fail(&journal, &gate, &error.to_string());
                 continue;
@@ -513,8 +433,6 @@ pub async fn run_executor(
                         abort(&journal, &reason);
                     }
                     SurfaceError::Fatal(reason) => {
-                        // Same as above: landed inputs stay landed, the rest
-                        // of the job dies with the gate, the task lives on.
                         fail(&journal, &gate, &reason);
                     }
                 }
@@ -540,9 +458,8 @@ fn drop_reason(job: &Job, epoch: &SnapshotEpoch, gate: &WatchGate) -> Option<&'s
 /// A recoverable fault ends the job, never the loop: journaled, then the
 /// watchdog turns the silence into a retry.
 fn abort(journal: &EventLog, reason: &str) {
-    // `warn`, not `info`, for the same reason as a link-down: the job did not
-    // do what the journal already promised it would, and the watchdog's retry
-    // only makes sense to a reader who can still see this line.
+    // `warn`, not `info`: the job did not do what the journal already promised,
+    // and the watchdog's retry only makes sense to a reader who saw this line.
     journal.emit_at(
         tracing::Level::WARN,
         &[format!(">> actuator: {reason} — aborted remaining clicks")],
@@ -554,15 +471,14 @@ fn abort(journal: &EventLog, reason: &str) {
 ///
 /// `request_halt` disables the gate synchronously and latches the cause, so
 /// every job after this one is refused by [`drop_reason`] before `acquire` is
-/// reached: the loop is inert from here even though its task keeps running
-/// (see [`run_executor`] for why the task must not die). That also makes this
-/// self-limiting — no surface call happens again until the player
-/// acknowledges the halt and re-arms, so a standing fault cannot flood the
-/// journal with repeats.
+/// reached: the loop is inert from here even though its task keeps running (see
+/// [`run_executor`] for why it must not die). That also makes this
+/// self-limiting — no surface call happens again until the player acknowledges
+/// the halt and re-arms — so a standing fault cannot flood the journal.
 fn fail(journal: &EventLog, gate: &WatchGate, reason: &str) {
-    // `error`, matching a session abort: this is one of the two lines that say
-    // the product stopped doing its job. It is also self-limiting (see above),
-    // so it cannot flood the file at this level.
+    // `error`, matching a session abort: one of the two lines that say the
+    // product stopped doing its job, and self-limiting (see above), so it cannot
+    // flood the file at this level.
     journal.emit_at(
         tracing::Level::ERROR,
         &[format!(">> actuator: {reason} — stopping the loop")],
@@ -591,9 +507,9 @@ mod tests {
         );
     }
 
-    /// `apply()` reaches `actuator.timings()` while holding the controller guard,
-    /// so without [`lock`]'s poison tolerance a panic under the timings lock
-    /// would poison that one too and every later dispatch would panic.
+    /// `apply()` reaches `actuator.timings()` while holding the controller
+    /// guard, so without [`lock`]'s poison tolerance a panic under the timings
+    /// lock would poison that one too and every later dispatch would panic.
     #[test]
     fn a_poisoned_timings_mutex_still_serves_reads_and_writes() {
         let timings = Arc::new(Mutex::new(Timings::default()));
@@ -612,7 +528,6 @@ mod tests {
             job_tx,
             Arc::clone(&timings),
         );
-        // Neither of these may panic, and the write must still be observable.
         assert_eq!(handle.timings(), Timings::default());
         let retuned = plan::TimingPreset::Cautious.timings();
         handle.set_timings(retuned);
@@ -642,9 +557,8 @@ mod tests {
         Scroll((i32, i32), i32),
     }
 
-    /// A distinguishable stand-in for a real backend's window handle: one is
-    /// minted per `acquire`, so a test can prove that every input and the release
-    /// were handed *this job's* window and not a stale one.
+    /// One is minted per `acquire`, so a test can prove that every input and the
+    /// release were handed *this job's* window and not a stale one.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct FakeWindow(u32);
 
@@ -659,12 +573,10 @@ mod tests {
         releases: Arc<Mutex<usize>>,
         /// Handed out by either door, incrementing, so two jobs never share one.
         acquires: u32,
-        /// Set by `acquire` and never by `measure`: the real `input` backend's
-        /// `acquire` steals the foreground, so a test can ask whether a job took
-        /// the door that acts on the desktop.
+        /// Set by `acquire` and never by `measure`, so a test can ask whether a
+        /// job took the door that acts on the desktop.
         engaged: Arc<Mutex<bool>>,
-        /// Every window this surface was *given* back, in call order: one entry
-        /// per `click`/`scroll`/`release`.
+        /// Every window this surface was *given* back, in call order.
         windows: Arc<Mutex<Vec<FakeWindow>>>,
     }
 
@@ -695,8 +607,8 @@ mod tests {
             Ok(())
         }
 
-        /// Records which window the caller handed back. Deliberately *before*
-        /// `deny`, so a refused input still proves it was aimed at the right one.
+        /// Called *before* `deny`, so a refused input still proves it was aimed
+        /// at the right window.
         fn saw(&mut self, window: &FakeWindow) {
             self.windows.lock().unwrap().push(*window);
         }
@@ -796,12 +708,8 @@ mod tests {
 
     /// Proves the `api-004` fix (see [`Surface`]): the window travels from
     /// `acquire` through every input to the release, and the executor cannot
-    /// route a stale one because it does not keep one.
-    ///
-    /// Two jobs run back to back against one surface, each minting its own
-    /// window. Job 1 is aborted by a recoverable refusal on its second input, so
-    /// it is also the case where the old shape had a half-cleared
-    /// `Option<Target>` to get wrong.
+    /// route a stale one because it keeps none. Job 1 aborts on its second
+    /// input — the case where the old shape had a half-cleared `Option<Target>`.
     #[tokio::test(start_paused = true)]
     async fn every_input_and_the_release_see_the_window_that_job_acquired() {
         let rig = rig();
@@ -830,9 +738,8 @@ mod tests {
         // release. Job 2: both clicks and its own release.
         assert_eq!(events.lock().unwrap().len(), 3);
         assert_eq!(*releases.lock().unwrap(), 2);
-        // Every call was handed *that* job's window, in order. A stale one would
-        // show up here as a `1` after the first `2` — which is exactly what a
-        // surface-held `Option<Target>` could produce and nothing checked.
+        // A stale window would show up here as a `1` after the first `2` —
+        // exactly what a surface-held `Option<Target>` could produce.
         assert_eq!(
             *windows.lock().unwrap(),
             vec![
@@ -940,8 +847,7 @@ mod tests {
         drop(rig.job_tx);
         let journal = rig.journal.clone();
         run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
-        // Two steps planned, only the first landed — and the abort is
-        // journaled.
+        // Two steps planned, only the first landed.
         assert_eq!(events.lock().unwrap().len(), 1);
         assert_eq!(*releases.lock().unwrap(), 1);
         assert!(
@@ -995,8 +901,8 @@ mod tests {
             .await
             .unwrap();
         // The fatal no longer ends the task, so the producer has to close the
-        // channel for the loop to finish; the timeout still fails the test if
-        // the fatal ever stops consuming.
+        // channel for the loop to finish; the timeout fails the test if the
+        // fatal ever stops consuming.
         drop(rig.job_tx);
         let journal = rig.journal.clone();
         let gate = rig.gate.clone();
@@ -1016,14 +922,11 @@ mod tests {
         }));
     }
 
-    /// The sibling arm of the one above, three lines apart in the source and
-    /// the opposite verdict: an `acquire` that fails *recoverably* — the window
-    /// vanished between two jobs — must drop the job and leave the watch armed
-    /// so the watchdog's retry can heal it. Delete this and a mis-edit that
-    /// routes it through `fail` turns a transient blip into a stopped hunt that
-    /// blames the actuator; nothing else executes that arm
-    /// (`executor_aborts_without_halt_on_a_minimized_acquire` acquires *fine*
-    /// and is classified later, by `ScreenError::DegenerateRect`).
+    /// The sibling arm of the one above, three lines apart in the source and the
+    /// opposite verdict. Nothing else executes it —
+    /// `executor_aborts_without_halt_on_a_minimized_acquire` acquires *fine* and
+    /// is classified later by `ScreenError::DegenerateRect` — so without this, a
+    /// mis-edit routing it through `fail` turns a blip into a stopped hunt.
     #[tokio::test(start_paused = true)]
     async fn executor_aborts_without_halt_when_acquire_fails_recoverably() {
         let rig = rig();
@@ -1061,14 +964,10 @@ mod tests {
         }));
     }
 
-    /// The preflight's verdict has to *reach the player*, not just exist.
-    ///
-    /// `win::preflight_refusal` is what `Surface::acquire` answers when the game
-    /// window is out of this process's reach; this is the rest of the trip —
-    /// through `fail`, into the journal the window renders, at acquire time and
-    /// before a single click is planned. Built from the real classifier rather
-    /// than from a copy of its text, so a reworded diagnosis cannot pass here
-    /// while shipping something else.
+    /// The preflight's verdict has to *reach the player*: this is the rest of
+    /// the trip, through `fail` into the journal the window renders. Built from
+    /// the real classifier, not a copy of its text, so a reworded diagnosis
+    /// cannot pass here while shipping something else.
     #[cfg(all(windows, feature = "actuator"))]
     #[tokio::test(start_paused = true)]
     async fn a_refused_preflight_reaches_the_journal_naming_the_integrity_level() {
@@ -1110,8 +1009,8 @@ mod tests {
             "{}",
             line.text
         );
-        // The cause the player reads must be the real one (STOVE elevates the
-        // game) and the action must be one they can perform on their side.
+        // The cause must be the real one (STOVE elevates the game) and the
+        // action one the player can perform on their side.
         assert!(line.text.contains("STOVE launcher"), "{}", line.text);
         assert!(
             line.text.contains("restart it as administrator"),
@@ -1122,9 +1021,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_stops_the_loop_when_an_input_fails() {
-        // A fatal input failure (e.g. the shield refused to raise) halts
-        // with the actuator's own label — never a blind click or a silent
-        // skip.
         let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         surface.deny_after = Some((
@@ -1162,13 +1058,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_keeps_landed_inputs_and_stops_once_on_a_mid_job_failure() {
-        // Three inputs land, the fourth fails fatally: landed inputs stay
-        // recorded, exactly one halt goes out, the surface is still
-        // released.
-        //
-        // The job queued behind it is the point of the second submit: the
-        // executor now lives long enough to pick it up, and must drop it on
-        // the downed gate rather than act on it.
+        // The second submit is the point: the executor lives long enough to pick
+        // that job up, and must drop it on the downed gate rather than act on
+        // it.
         let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         surface.deny_after = Some((
@@ -1227,12 +1119,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_re_armed_watch_acts_again_after_a_fatal_without_a_process_restart() {
-        // Proves [`run_executor`]'s task-survives-a-fatal invariant end to end:
-        // re-arm, then a second job must still be served with no restart.
+        // [`run_executor`]'s task-survives-a-fatal invariant, end to end.
         let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
-        // One-shot, like the shield refusing to raise against an elevated
-        // window: it fails the first input and never again, standing in for
+        // One-shot: it fails the first input and never again, standing in for
         // the player fixing the cause between the two jobs.
         surface.deny_after = Some((
             0,
@@ -1269,8 +1159,7 @@ mod tests {
             "the fatal must deliver nothing"
         );
 
-        // What the session does once it has dispatched the halt and the player
-        // presses Start again.
+        // What the session does once the player presses Start again.
         gate.acknowledge_halt(HaltSource::ActuatorFailed);
         gate.set(true);
         assert!(
@@ -1293,8 +1182,6 @@ mod tests {
             .expect("the executor must still be running to serve the second job")
             .expect("the executor task must not panic");
 
-        // Both of the second job's steps landed, on a rect it re-acquired
-        // itself, and nothing halted again.
         assert_eq!(events.lock().unwrap().len(), 2);
         assert_eq!(
             *releases.lock().unwrap(),
@@ -1314,9 +1201,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_aborts_without_halt_on_a_recoverable_input_failure() {
-        // The window moved mid-job: landed inputs stay, the remainder is
-        // aborted without stopping the loop — the watchdog's retry
-        // re-acquires a fresh rect.
         let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         surface.deny_after = Some((
@@ -1349,8 +1233,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_serves_the_next_job_after_a_recoverable_abort() {
-        // A recoverable abort ends one job, not the loop: the next job runs
-        // against a freshly acquired rect.
         let rig = rig();
         let (mut surface, events) = FakeSurface::new(design_rect());
         surface.deny_after = Some((
@@ -1387,15 +1269,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_aborts_without_halt_on_a_minimized_acquire() {
-        // A minimized window acquires with an empty client area: same fault
-        // as minimized mid-job, same recoverable abort — the loop halts only
-        // if the watchdog's retries stay broken.
-        //
-        // The classification now comes from `ScreenError::DegenerateRect`, not
-        // from a duplicate `rect.width <= 0` test the executor used to run
-        // before the step loop. That is what this test guards: with a `String`
-        // error, deleting the duplicate turned a transient minimize into a hard
-        // halt with no compiler complaint.
+        // Classified by `ScreenError::DegenerateRect`, not by a duplicate
+        // `rect.width <= 0` test before the step loop: with a `String` error,
+        // deleting that duplicate turned a transient minimize into a hard halt
+        // with no compiler complaint.
         let rig = rig();
         let (surface, events) = FakeSurface::new(Ok(ClientRect {
             left: 0,
@@ -1428,15 +1305,10 @@ mod tests {
 
     /// What the two verdict tests around this one do not pin: *when* the refusal
     /// lands. Both `ScreenError`s are properties of the rect `acquire` measured,
-    /// so the answer is knowable before the job's first delay — but the only
-    /// place the conversion ran was inside the step loop, one
-    /// `sleep(step.wait_ms)` in. A minimized window paid that delay in full
-    /// (1.18 s on the default timings, up to 61 s with a configured range) to
-    /// reach a conclusion that was already true when the rect was read.
-    ///
-    /// Virtual time makes the cost exact rather than approximate: paused, the
-    /// runtime auto-advances only over an awaited `sleep`, so a zero elapsed is
-    /// proof that no step delay was waited out at all.
+    /// so the answer is knowable before the job's first delay — yet the
+    /// conversion used to run inside the step loop, one `sleep(step.wait_ms)`
+    /// in. Paused, the runtime auto-advances only over an awaited `sleep`, so a
+    /// zero elapsed proves no step delay was waited out at all.
     #[tokio::test(start_paused = true)]
     async fn an_unmappable_window_is_refused_before_the_first_step_delay() {
         for rect in [
@@ -1482,8 +1354,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn executor_releases_the_surface_after_every_acquired_job() {
-        // Every acquired job releases; a job dropped before acquire never
-        // engaged anything.
+        // The second job is dropped on the downed gate, so it never engages
+        // anything and never releases.
         let rig = rig();
         let (mut surface, _events) = FakeSurface::new(design_rect());
         let releases = surface.releases.clone();
@@ -1512,10 +1384,9 @@ mod tests {
         assert_eq!(*releases.lock().unwrap(), 1);
     }
 
-    /// The other half of the classification: the same converter, the opposite
-    /// verdict. A window narrower than 16:9 is not something the loop can heal,
-    /// so it halts the watch — and the two arms are now told apart by
-    /// `ScreenError`'s variant rather than by which check ran first.
+    /// The other half of the classification: a window narrower than 16:9 is not
+    /// something the loop can heal, so it halts the watch. The two arms are told
+    /// apart by `ScreenError`'s variant, not by which check ran first.
     #[tokio::test(start_paused = true)]
     async fn executor_stops_the_loop_on_a_narrow_window() {
         let rig = rig();
@@ -1585,13 +1456,10 @@ mod tests {
         );
     }
 
-    /// The half of "dry run must not touch the game" the two tests around this
-    /// one cannot see: they prove no *input* is sent, and `acquire` is not an
-    /// input. On the `input` backend it is a real `SetForegroundWindow`, so the
-    /// mode a cautious player enables first was reordering their desktop on every
-    /// tick while sending nothing — and a `SetWindowPos` preflight had since been
-    /// added to that same path. `Surface` now has two doors and the live job is
-    /// what proves the engaging one still exists.
+    /// The half of "dry run must not touch the game" the tests around this one
+    /// cannot see: they prove no *input* is sent, and `acquire` is not an input
+    /// — on the `input` backend it is a real `SetForegroundWindow`. The
+    /// `dry_run == false` pass is what proves the engaging door still exists.
     #[tokio::test(start_paused = true)]
     async fn a_dry_run_takes_the_door_that_does_not_engage_the_window() {
         for dry_run in [true, false] {
@@ -1625,11 +1493,9 @@ mod tests {
         }
     }
 
-    /// The other half of "dry run must not touch the game": the test above
-    /// submits a `refresh_job`, which is two clicks and no scroll, so the
-    /// `Input::Scroll` arm of the dry-run branch was proved by nothing. A
-    /// bottom-group row is what plans scrolls — one to the top, one to the
-    /// bottom — and dry run is what a cautious player turns on first.
+    /// The test above submits a `refresh_job`, which is two clicks and no
+    /// scroll, so the `Input::Scroll` arm of the dry-run branch was proved by
+    /// nothing. A bottom-group row is what plans scrolls.
     #[tokio::test(start_paused = true)]
     async fn executor_dry_run_journals_a_scroll_without_touching_the_surface() {
         let rig = rig();

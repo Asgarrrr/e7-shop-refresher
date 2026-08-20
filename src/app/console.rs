@@ -1,8 +1,5 @@
-//! Console input: stdin lines in, [`Command`]s out.
-//!
-//! Touches only `mpsc::Sender<Command>` and `watch::Receiver<bool>` — it knows
-//! nothing about capture, reassembly or session state, and only the
-//! `workers.spawn("stdin", …)` call in the root knows about it.
+//! Console input: stdin lines in, [`Command`]s out. Knows nothing about
+//! capture, reassembly or session state.
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, watch};
@@ -11,8 +8,7 @@ use crate::journal::EventLog;
 
 use super::Command;
 
-/// Reads stdin lines and forwards them as [`Command`]s; the session loop never
-/// touches stdin.
+/// The session loop never touches stdin: it only ever sees [`Command`]s.
 pub(super) async fn stdin_loop(
     commands: mpsc::Sender<Command>,
     shutdown: watch::Receiver<bool>,
@@ -27,12 +23,9 @@ pub(super) async fn stdin_loop(
     .await;
 }
 
-/// Input-independent select core, injectable in tests so a pending read can be
-/// cancelled without touching process stdin.
-///
-/// Unknown input goes through `journal`, not `println!`: stdout is inert in the
-/// windowed build, so a bare print would reach nobody there while the log file
-/// still would.
+/// Injectable in tests so a pending read can be cancelled without touching
+/// process stdin. Unknown input goes through `journal`, not `println!`: stdout
+/// is inert in the windowed build, where the log file still is not.
 async fn input_loop(
     input: impl AsyncBufRead + Unpin,
     commands: mpsc::Sender<Command>,

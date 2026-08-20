@@ -1,17 +1,12 @@
 //! Byte accounting for every owned payload after packet parsing.
 //!
-//! Nothing in this file knows what TCP is. It owns the shared `Mutex<Usage>`
-//! pool, runtime enforcement of the per-stage quotas, the per-stream pending
-//! counter's arithmetic, and the move-only
-//! [`BudgetedChunk`]/[`PayloadLease`] pair whose whole point is that a
-//! `Vec<u8>` and its lease are never separated except through
-//! [`BudgetedChunk::into_parts`].
+//! Nothing here knows what TCP is. The move-only
+//! [`BudgetedChunk`]/[`PayloadLease`] pair exists so a `Vec<u8>` and its lease
+//! are never separated except through [`BudgetedChunk::into_parts`].
 //!
-//! This is a seam because the two halves of the `stream` layer fail
-//! differently: [`PipelineBudget::release`] runs from a `Drop` that may
-//! execute while a worker unwinds, so it saturates and reports rather than
-//! asserting, while [`PipelineBudget::try_retag`] keeps a hard assert in
-//! every profile because no `Drop` ever reaches it.
+//! [`PipelineBudget::release`] runs from a `Drop` that may execute while a
+//! worker unwinds, so it saturates and reports; [`PipelineBudget::try_retag`]
+//! keeps a hard assert in every profile because no `Drop` reaches it.
 
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,7 +46,6 @@ struct BudgetInner {
     resyncs: AtomicU64,
 }
 
-/// Shared accounting for every owned payload after packet parsing.
 #[derive(Clone)]
 pub(crate) struct PipelineBudget(Arc<BudgetInner>);
 
@@ -77,14 +71,11 @@ impl PipelineBudget {
         })
     }
 
-    /// Builds a budget from explicit per-stage quotas.
-    ///
     /// # Panics
     ///
-    /// Panics if any stage quota exceeds the global one: a stage that can
-    /// never fill is a silent hole in the memory guard. The production
-    /// constants are proved at compile time in the parent module; this
-    /// catches the `with_test_limits` path, which passes arbitrary values.
+    /// Panics if any stage quota exceeds the global one: a stage that can never
+    /// fill is a silent hole in the memory guard. Only reachable through
+    /// `with_test_limits`; the parent module proves the shipped constants.
     fn with_limits(limits: BudgetLimits) -> Self {
         assert!(limits.capture <= limits.global);
         assert!(limits.reassembly <= limits.global);
@@ -99,48 +90,31 @@ impl PipelineBudget {
         }))
     }
 
-    /// Test-only escape from the production constants.
-    ///
-    /// Takes the named struct, not four positional `usize`s: these seams pin
-    /// the byte-budget guarantees, and four same-typed arguments in a row
-    /// mean a silently swapped pair reads as a passing test of a budget
-    /// nobody meant to describe.
+    /// Test-only escape from the production constants. Takes the named struct,
+    /// not four positional `usize`s, where a silently swapped pair would read
+    /// as a passing test of a budget nobody meant to describe.
     #[cfg(test)]
     pub(crate) fn with_test_limits(limits: BudgetLimits) -> Self {
         Self::with_limits(limits)
     }
 
-    /// Reserves capture-stage bytes for `segment`'s payload and takes ownership
-    /// of it, pairing the buffer with the lease that will give the bytes back.
+    /// Takes ownership of `segment`'s payload, pairing the buffer with the
+    /// lease that will give its bytes back.
     ///
-    /// Charges `capacity()`, not `len()`: since `parse_segment` trims the
-    /// frame in place rather than copying the payload out, that capacity is
-    /// the whole frame's — payload plus IP/TCP headers plus any Ethernet
-    /// padding, roughly 40–60 bytes more per admitted packet. That's the
-    /// memory actually retained. It's also self-consistent: [`PayloadLease`]
-    /// records the bytes charged and [`BudgetedChunk::capacity`] returns
-    /// them, never a fresh `Vec::capacity()`, so a later `truncate` cannot
-    /// make a release disagree with its reservation.
-    ///
-    /// [`CAPTURE_STAGE_BYTES`] was deliberately not re-baselined for this:
-    /// overhead is at worst ~50% on a minimum-size segment and ~4% on a
-    /// full-MTU one, so the quota holds proportionally fewer packets — but
-    /// it's a memory bound, and 8 MiB is the memory it was chosen to bound.
-    /// Nothing in this crate has been profiled (see `Cargo.toml`'s
-    /// `[profile.release]` on why `lto = "thin"`), so a new number here would
-    /// replace a measured byte count with an unmeasured claim. The one
-    /// relation that could have broken is checked at compile time:
-    /// [`INITIAL_ANCHOR_MAX_BYTES`] (256 KiB) still fits with three orders of
-    /// magnitude to spare.
+    /// Charges `capacity()`, not `len()`: `parse_segment` trims the frame in
+    /// place, so that capacity is the whole frame's (~40–60 bytes of headers
+    /// and padding on top) and is the memory actually retained. The lease
+    /// records what was charged and [`BudgetedChunk::capacity`] replays it,
+    /// never a fresh `Vec::capacity()`, so a later `truncate` cannot make a
+    /// release disagree with its reservation. [`CAPTURE_STAGE_BYTES`] was
+    /// deliberately not re-baselined for that overhead: it bounds memory, not
+    /// packet count, and nothing here is profiled.
     ///
     /// # Errors
     ///
-    /// The `Err` payload is `segment` itself, handed back unmodified, because
-    /// the global or capture-stage quota is full. The caller decides what
-    /// happens next — drop it and record the drop, or retry once a lease
-    /// elsewhere releases.
-    ///
-    /// [`INITIAL_ANCHOR_MAX_BYTES`]: super::INITIAL_ANCHOR_MAX_BYTES
+    /// The `Err` payload is `segment` itself, unmodified, because a quota is
+    /// full; the caller drops it and records the drop, or retries after a
+    /// release elsewhere.
     pub(crate) fn admit_capture(&self, segment: Segment) -> Result<BudgetedSegment, Segment> {
         let bytes = segment.payload.capacity();
         if !self.reserve_new(Stage::Capture, bytes) {
@@ -199,14 +173,11 @@ impl PipelineBudget {
 
     /// Gives a lease's bytes back to the pool.
     ///
-    /// Runs from [`PayloadLease::drop`], which the workers execute *while
-    /// unwinding* whenever a `catch_unwind` boundary tears down live
-    /// `BudgetedChunk`/`BudgetedSegment` values. A panic raised from a `Drop`
-    /// during an unwind aborts the process immediately — no banner, and no
-    /// `crash.log`, which is exactly the failure mode `crash.rs` exists to
-    /// prevent. So an accounting bug saturates and is reported here instead of
-    /// asserting; `debug_assert!` keeps the fail-fast in debug and test builds,
-    /// where the abort costs a developer a stack trace, not a player a session.
+    /// Runs from [`PayloadLease::drop`], which workers execute while unwinding,
+    /// and a panic from a `Drop` during an unwind aborts the process with no
+    /// `crash.log` — the failure `crash.rs` exists to prevent. So an accounting
+    /// bug saturates and is reported here; `debug_assert!` keeps the fail-fast
+    /// where the cost is a developer's stack trace, not a player's session.
     fn release(&self, stage: Stage, bytes: usize) {
         let mut usage = self.0.usage.lock().unwrap_or_else(|err| err.into_inner());
         let current = stage_bytes(&usage, stage);
@@ -227,8 +198,7 @@ impl PipelineBudget {
         }
     }
 
-    // The discarded `fetch_update` results below are not swallowed errors: the
-    // closures always return `Some`, so the call can only report `Ok`.
+    // Not swallowed errors: the closures always return `Some`, so only `Ok`.
     pub(crate) fn record_drop(&self, bytes: usize) {
         let _ =
             self.0
@@ -285,9 +255,8 @@ impl PipelineBudget {
     }
 }
 
-/// The rare branch of [`PipelineBudget::release`], kept out of a body that runs
-/// once per released payload. See `release`'s comment for why this reports and
-/// saturates instead of asserting in shipped builds.
+/// The rare branch of [`PipelineBudget::release`], out of a body that runs once
+/// per released payload; see `release` on why it saturates instead of asserting.
 #[cold]
 #[inline(never)]
 fn report_release_underflow(stage: Stage, bytes: usize, total: usize, current: usize) {
@@ -302,18 +271,9 @@ fn report_release_underflow(stage: Stage, bytes: usize, total: usize, current: u
     debug_assert!(current >= bytes, "pipeline stage accounting underflow");
 }
 
-// --- the per-stream pending counter ----------------------------------------
-//
-// `pending_after_release` is `release`'s twin, kept beside it deliberately —
-// the argument for why neither may be a bare subtraction is spelled out once
-// above and once below. The counter itself is a `HalfStream` field in
-// `super::reassembly`; only its arithmetic is here.
-
 /// Whether `bytes` more pending bytes still fit `held`, and the new total if so.
-///
-/// The `None` arm folds overflow and over-quota together: both mean "do not
-/// buffer this," and neither may be a wrapping add on a counter fed by
-/// wire-supplied payload lengths.
+/// `None` folds overflow into over-quota: both mean "do not buffer this", and
+/// neither may be a wrapping add on a counter fed by wire-supplied lengths.
 pub(super) fn fits_pending(held: usize, bytes: usize) -> Option<usize> {
     held.checked_add(bytes)
         .filter(|total| *total <= MAX_PENDING_BYTES)
@@ -321,18 +281,11 @@ pub(super) fn fits_pending(held: usize, bytes: usize) -> Option<usize> {
 
 /// Takes a displaced chunk's charge back off a stream's pending total.
 ///
-/// The per-stream twin of [`PipelineBudget::release`], defensive for the
-/// same reason: every caller holds the invariant today (a chunk's charge is
-/// `lease.bytes`, which never drifts when `absorb` trims the buffer, and
-/// both call sites have just taken the entry out of `pending`), but a bare
-/// subtraction fails badly in both profiles if that ever stops being true.
-/// It wraps to ~1.8e19 wherever overflow checks are off, which makes
-/// [`fits_pending`] refuse every out-of-order segment forever — permanent
-/// silent resync churn, visible to the player only as a shop that stops
-/// updating — and panics inside the reassembly task wherever they are on,
-/// which `catch_unwind` turns into a dead session. Saturating plus a named
-/// log is diagnosable; `debug_assert!` keeps the fail-fast where an abort
-/// costs a developer a stack trace, not a player a session.
+/// The per-stream twin of [`PipelineBudget::release`], defensive for the same
+/// reason: a bare subtraction wrapped to ~1.8e19 makes [`fits_pending`] refuse
+/// every out-of-order segment forever — silent resync churn a player sees only
+/// as a shop that stops updating — and with overflow checks on it panics in the
+/// reassembly task, which `catch_unwind` turns into a dead session.
 pub(super) fn pending_after_release(pending_bytes: usize, released: usize) -> usize {
     if pending_bytes < released {
         report_pending_underflow(pending_bytes, released);
@@ -407,12 +360,9 @@ impl BudgetedChunk {
         self.lease.bytes
     }
 
-    /// Discards the first `n` bytes of the buffer.
-    ///
-    /// Only the buffer shrinks — the lease keeps charging what it reserved,
-    /// so [`Self::capacity`] is unchanged and a later release still matches
-    /// its reservation. That asymmetry is why trimming is a method here, not
-    /// a `pub(super) bytes` field: the buffer and its lease never separate.
+    /// Discards the first `n` bytes of the buffer. Only the buffer shrinks: the
+    /// lease keeps charging what it reserved, so [`Self::capacity`] is unchanged
+    /// and a later release still matches its reservation.
     pub(super) fn drain_front(&mut self, n: usize) {
         self.bytes.drain(..n);
     }
@@ -432,11 +382,10 @@ impl BudgetedChunk {
     ///
     /// # Errors
     ///
-    /// The `Err` payload is this chunk, handed back untouched, only because
-    /// it's larger than the entire outbound quota — a wait that could never
-    /// succeed. Every transient shortage is awaited instead, so `Err` means
-    /// "never," not "not yet"; the caller owns the chunk again and must drop
-    /// it (recording the drop) rather than retry.
+    /// Returns this chunk untouched only when it is larger than the entire
+    /// outbound quota — a wait that could never succeed. Transient shortages
+    /// are awaited, so `Err` means "never", not "not yet": drop it (recording
+    /// the drop) rather than retry.
     pub(crate) async fn retag_outbound(mut self) -> Result<Self, Self> {
         if self.capacity() > self.lease.budget.stage_limit(Stage::Outbound) {
             return Err(self);
@@ -497,40 +446,29 @@ impl BudgetedSegment {
         self.payload.capacity()
     }
 
-    /// The budget this segment's payload is charged against.
-    ///
-    /// A [`PipelineBudget`] is an `Arc` handle, so the clone is a refcount
-    /// bump. The reassembler needs an owned one because it records the drop
-    /// and resync after the payload has moved on into a half-stream.
+    /// The budget this payload is charged against, cloned (an `Arc` bump)
+    /// because the reassembler records the drop and resync after the payload
+    /// has moved on into a half-stream.
     pub(super) fn budget(&self) -> PipelineBudget {
         self.payload.lease.budget.clone()
     }
 
-    /// Unwraps the segment down to its budgeted payload, dropping the TCP
-    /// framing the reassembler has already read off it.
-    ///
-    /// A `HalfStream` is below the level that knows about flows: it takes a
-    /// [`BudgetedChunk`], so the segment ends here. The chunk carries its
-    /// lease onward and the segment cannot be used again.
+    /// Drops the TCP framing the reassembler has already read off the segment.
+    /// A `HalfStream` is below the level that knows about flows, so the segment
+    /// ends here and the chunk carries its lease onward.
     pub(super) fn into_payload(self) -> BudgetedChunk {
         self.payload
     }
 }
 
-// No `Deref<Target = [u8]>` here, unlike `BudgetedChunk` above: a segment is
-// a captured TCP record (flow, seq, syn, payload), not a transparent wrapper
-// around bytes, and surfacing `len()`/`is_empty()`/`first()` would read as
-// properties of the segment. Payload reads go through `payload()`. Also a
-// trap worth not building: `BudgetedChunk::capacity()` reports the lease
-// size while `len()` reports the current buffer length, and
-// `HalfStream::absorb` shrinks the latter without the former.
+// No `Deref<Target = [u8]>` here, unlike `BudgetedChunk`: it was declined
+// because `capacity()` reports the lease size while `len()` reports the buffer
+// length, and `HalfStream::absorb` shrinks the latter without the former.
 
-// Size canaries for the per-packet types: every captured packet becomes one
-// of these, and a `CaptureEvent` holding a `BudgetedSegment` is stored by
-// value in a 512-slot channel, so one extra field in `FlowKey` or
-// `PayloadLease` silently inflates tens of KiB of queue. Not ABI contracts —
-// `repr(Rust)` layout is unspecified — so a failure means re-measure and
-// update the number, not work around it.
+// Size canaries: a `CaptureEvent` holding a `BudgetedSegment` is stored by value
+// in a 512-slot channel, so one extra field silently inflates tens of KiB of
+// queue. Not ABI contracts — `repr(Rust)` layout is unspecified — so a failure
+// means re-measure, not work around.
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     // 24 (Vec) + 24 (PayloadLease: Arc + usize + Stage) = 48.
@@ -583,9 +521,8 @@ mod tests {
         assert_eq!(budget.snapshot().high_water_total, 64);
     }
 
-    /// `release` runs from `PayloadLease::drop`, possibly while a worker
-    /// unwinds: in a shipped build an accounting bug must degrade to a
-    /// saturating subtraction plus a log, never to a panic that would turn the
+    /// In a shipped build an accounting bug must degrade to a saturating
+    /// subtraction plus a log, never a panic that turns a `Drop` during an
     /// unwind into an `abort()` with no crash log.
     #[test]
     #[cfg(not(debug_assertions))]
@@ -601,8 +538,7 @@ mod tests {
         assert_eq!(budget.snapshot().current_total, 0);
     }
 
-    /// The same bug in a debug or test build still fails fast, where an abort
-    /// costs a developer a stack trace rather than a player a session.
+    /// The same bug in a debug or test build still fails fast.
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "pipeline total accounting underflow")]
@@ -610,8 +546,7 @@ mod tests {
         test_budget(128, 128, 128, 128).release(Stage::Capture, 64);
     }
 
-    /// `try_retag` is never reached from a `Drop`, so it keeps a hard assert in
-    /// every profile.
+    /// `try_retag` is never reached from a `Drop`, so its assert is hard.
     #[test]
     #[should_panic(expected = "pipeline stage accounting underflow")]
     fn retag_underflow_panics_in_every_profile() {

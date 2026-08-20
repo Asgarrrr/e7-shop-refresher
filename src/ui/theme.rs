@@ -1,23 +1,19 @@
 //! Crystal-blue dark theme: the palette, the visual style, and the status →
 //! color mapping. Widgets take colors from here, never hand-picked hex.
-//! Typography is egui's stock font: hierarchy comes from size and color
-//! only, with a single saturated element (the primary button) per screen.
+//! Hierarchy comes from size and color alone, with a single saturated element
+//! (the primary button) per screen.
 
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle};
 
 use crate::domain::control::{Status, StopReason};
 
-/// Page background, behind the panels.
 const PAGE: Color32 = Color32::from_rgb(0x0d, 0x0d, 0x0d);
-/// Panel background.
 const PANEL: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x19);
 /// Row hover, one step above the panel. (Also egui's `faint_bg_color`.)
 pub(super) const STRIPE: Color32 = Color32::from_rgb(0x22, 0x22, 0x21);
 /// Accent: selection, links, the active tab's underline, the primary button.
 pub(super) const ACCENT: Color32 = Color32::from_rgb(0x39, 0x87, 0xe5);
-/// Accent under the pointer.
 const ACCENT_HOVER: Color32 = Color32::from_rgb(0x4f, 0x95, 0xea);
-/// Accent while pressed.
 const ACCENT_PRESSED: Color32 = Color32::from_rgb(0x2f, 0x74, 0xc9);
 /// Primary ink.
 pub(super) const INK: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
@@ -29,38 +25,34 @@ pub(super) const INK_FAINT: Color32 = Color32::from_rgb(0x89, 0x87, 0x81);
 pub(super) const HAIRLINE: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2a);
 /// Watching: the loop is doing its job.
 const GREEN: Color32 = Color32::from_rgb(0x0c, 0xa3, 0x0c);
-/// Paused, and stops the player planned (limits). Also the rail the Setup
-/// tab's Stop section paints beside an armed limit (see `status_color`).
+/// Paused, and stops the player planned (limits).
 pub(super) const AMBER: Color32 = Color32::from_rgb(0xfa, 0xb2, 0x19);
 /// Stops the player did not plan (machine faults).
 const RED: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
 /// Matched rows in the shop table: brighter than the status green, to stay
 /// legible as body text on the panel.
 pub(super) const WANTED: Color32 = Color32::from_rgb(0x90, 0xee, 0x90);
-/// The tuned-baseline fill of a timing meter: a muted steel blue, so the
-/// bright `ACCENT` slack painted past it stands out as the player-controlled
-/// part.
+/// A timing meter's tuned baseline, muted so the `ACCENT` slack past it reads
+/// as the player-controlled part.
 pub(super) const METER_BASE: Color32 = Color32::from_rgb(0x2c, 0x42, 0x60);
 
-/// Spacing scale (4px grid). Every gap the layout inserts comes from here,
-/// named by size, applied by role at the call site.
+/// Spacing scale (4px grid). Every gap the layout inserts comes from here.
 pub(super) const SP_XS: f32 = 4.0;
 pub(super) const SP_SM: f32 = 8.0;
-/// The one step between `SP_SM` and `SP_XL`: horizontal button padding, which is
-/// wider than the vertical rhythm on purpose (the Linear-style pill).
+/// Horizontal button padding, wider than the vertical rhythm on purpose.
 pub(super) const SP_MD: f32 = 12.0;
 pub(super) const SP_XL: f32 = 24.0;
 
-/// Horizontal inset for tab content: full-width rules and row-hover fills
-/// bleed to the window edges, text sits this far in. Matches the chrome's
-/// 16px side margin, so the table text lines up under the status bar.
+/// Horizontal inset for tab content, while rules and hover fills bleed to the
+/// window edges. Matches the chrome's side margin, so the table text lines up
+/// under the status bar.
 pub(super) const EDGE: i8 = 16;
 
-/// Installs the theme on the context: visuals and text styles. Called once
-/// per window, before the first frame.
+/// Installs the theme on the context. Called once per window, before the first
+/// frame.
 pub(super) fn apply(ctx: &egui::Context) {
-    // The palette is dark by design: pin the theme so an OS in light mode
-    // does not swap in egui's light visuals under it.
+    // Pinned, so an OS in light mode does not swap egui's light visuals under
+    // a palette that is dark by design.
     ctx.set_theme(egui::Theme::Dark);
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = PANEL;
@@ -119,9 +111,8 @@ pub(super) fn apply(ctx: &egui::Context) {
     });
 }
 
-/// Section header: small grey capitals, the quiet divider of the layout.
-/// `.small()`/`.weak()` so a retune of the Small style or the weak grey in
-/// `apply` carries over.
+/// Section header: small grey capitals. `.small()`/`.weak()` rather than fixed
+/// values, so a retune in [`apply`] carries over.
 pub(super) fn section(text: &str) -> egui::RichText {
     egui::RichText::new(text.to_uppercase()).small().weak()
 }
@@ -131,10 +122,9 @@ pub(super) fn emphasis(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text.into()).size(15.0)
 }
 
-/// The one saturated element on screen: accent fill. Text color comes from
-/// the themed `fg_stroke` (INK when enabled), so a disabled button still
-/// mutes properly. `active.bg_stroke` is kept: keyboard focus renders with
-/// the Active state, and that stroke is the focus ring.
+/// The one saturated element on screen. Text color comes from the themed
+/// `fg_stroke` so a disabled button still mutes, and `active.bg_stroke` is left
+/// alone because keyboard focus renders Active and that stroke is its ring.
 pub(super) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.scope(|ui| {
         let widgets = &mut ui.style_mut().visuals.widgets;
@@ -147,11 +137,9 @@ pub(super) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     .inner
 }
 
-/// A bare (label-less) checkbox whose checked box fills the accent, matching
-/// the primary button, selection, and tab underline. Squared to a 2px radius:
-/// the global 6px radius rounds the ~16px checkbox icon into a circle that
-/// reads as a radio button. The caller owns the row's label (the Stop limits
-/// set the unit in their own column).
+/// A bare (label-less) checkbox filling the accent when checked. Squared to a
+/// 2px radius because the global 6px radius rounds the ~16px checkbox icon into
+/// a circle that reads as a radio button. The caller owns the row's label.
 pub(super) fn accent_checkbox(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     ui.scope(|ui| {
         let visuals = &mut ui.style_mut().visuals;
@@ -172,15 +160,11 @@ pub(super) fn accent_checkbox(ui: &mut egui::Ui, on: &mut bool) -> egui::Respons
     .inner
 }
 
-/// A full-width collapsible section header: a painted disclosure caret
-/// (right = closed, down = open) beside the small-caps title, the whole bar
-/// lighting up on hover and bleeding to the window edges. Text stays inset at
-/// the bar's left. Painted, not nested widgets, so nothing steals hover over
-/// the bar. Returns true on click.
+/// A full-width collapsible section header. Painted, not nested widgets, so
+/// nothing steals hover over the bar. Returns true on click.
 ///
-/// While collapsed, `summary` trails right-aligned in muted ink, and rides in
-/// the accessible name too (`title · summary`), so a folded section still
-/// shows what it holds.
+/// While collapsed, `summary` trails right-aligned and rides in the accessible
+/// name too (`title · summary`), so a folded section still shows what it holds.
 pub(super) fn collapsing_section(
     ui: &mut egui::Ui,
     title: &str,
@@ -189,11 +173,9 @@ pub(super) fn collapsing_section(
 ) -> bool {
     let (bar, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
-    // Bleed the fill + hit target to the clip rect (the full column past the
-    // content inset). Grow the y-range by half the item spacing so consecutive
-    // bars tile at the seam: without it the fill is only 28px while egui
-    // hit-tests a wider area, so hovering the gap lights the wrong bar. The
-    // growth is symmetric, so the label stays centred.
+    // Grown by half the item spacing so consecutive bars tile at the seam:
+    // egui hit-tests wider than the 28px fill, so hovering the gap would light
+    // the wrong bar. Symmetric, so the label stays centred.
     let pad = ui.spacing().item_spacing.y * 0.5;
     let full = egui::Rect::from_x_y_ranges(
         ui.clip_rect().x_range(),
@@ -203,9 +185,8 @@ pub(super) fn collapsing_section(
     let enabled = ui.is_enabled();
     let peek = (!open).then_some(()).and(summary);
     // Built inside the closure: `widget_info` only calls it when AccessKit is
-    // live, a test harness is reading, or the widget was just clicked/focused.
-    // Building the string outside would pay the `format!` every frame for
-    // nothing. Only `Copy` inputs are captured.
+    // live, a harness is reading, or the widget was just clicked. Outside, the
+    // `format!` would be paid every frame for nothing.
     response.widget_info(|| {
         let name = match peek {
             Some(summary) => format!("{title} · {summary}"),
@@ -214,9 +195,8 @@ pub(super) fn collapsing_section(
         egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &name)
     });
 
-    // Setup section headers: a heading-sized uppercase label in bright ink, so
-    // they read as titles. The caret trails one step down so the word leads;
-    // hover lifts both to full ink over the fill.
+    // The caret trails one step down so the word leads; hover lifts both to
+    // full ink over the fill.
     let hovered = response.hovered();
     let (title_color, caret_color) = if hovered {
         (INK, INK)
@@ -235,8 +215,7 @@ pub(super) fn collapsing_section(
         FontId::new(13.0, FontFamily::Proportional),
         title_color,
     );
-    // The collapsed peek: right-aligned at the content edge, clipped left of the
-    // title so a long summary never crosses it.
+    // Clipped left of the title, so a long summary never crosses it.
     if let Some(summary) = peek {
         let region = egui::Rect::from_min_max(
             egui::pos2(title_rect.right() + SP_SM, bar.top()),
@@ -250,9 +229,9 @@ pub(super) fn collapsing_section(
             INK_FAINT,
         );
     }
-    // A full-bleed rule at the tiled seam (not the inner bar), so the hover
-    // fill stops exactly at the divider instead of spilling into the next row.
-    // Drawn with the unclipped painter so the seam-edge line is not cut.
+    // At the tiled seam, not the inner bar, so the hover fill stops exactly at
+    // the divider instead of spilling into the next row. Drawn with the
+    // unclipped painter so the seam-edge line is not cut.
     ui.painter()
         .hline(full.x_range(), full.bottom(), Stroke::new(1.0, HAIRLINE));
     response.clicked()
@@ -260,7 +239,7 @@ pub(super) fn collapsing_section(
 
 /// A small painted disclosure caret at the left of `row` (right = closed,
 /// down = open), not a `▸` glyph, so it never depends on the stock font
-/// carrying the symbol. Shared by the journal bar and the Setup sections.
+/// carrying the symbol.
 pub(super) fn caret(painter: &egui::Painter, row: egui::Rect, open: bool, color: Color32) {
     let c = egui::pos2(row.left() + 6.0, row.center().y);
     let r = 3.5;
@@ -280,9 +259,8 @@ pub(super) fn caret(painter: &egui::Painter, row: egui::Rect, open: bool, color:
     painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
 }
 
-/// The status dot's color. One reading: green = working, amber = waiting on
-/// the player or a limit they set, red = the machine gave up, faint = nothing
-/// running.
+/// The status dot's color: green = working, amber = waiting on the player or a
+/// limit they set, red = the machine gave up, faint = nothing running.
 pub(super) fn status_color(status: Status) -> Color32 {
     match status {
         Status::Idle => INK_FAINT,

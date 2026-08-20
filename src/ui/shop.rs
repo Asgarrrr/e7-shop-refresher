@@ -6,10 +6,8 @@ use eframe::egui;
 use super::theme;
 use super::view::{SlotRow, ViewState};
 
-/// `rows` is borrowed from the shell's cache, re-derived only when the shop
-/// moves — see `view::SlotRows`. `detail` is a callback rather than a
-/// `SlotRow` field, since egui only asks for the hovered row — see
-/// `view::slot_detail`.
+/// `detail` is a callback rather than a `SlotRow` field, since egui only asks
+/// for the hovered row — see `view::slot_detail`.
 pub(super) fn render_shop_tab(
     ui: &mut egui::Ui,
     view: &ViewState,
@@ -24,15 +22,11 @@ pub(super) fn render_shop_tab(
     }
     if rows.is_empty() {
         super::content_inset(ui, |ui| {
-            // Names no cause, because this line no longer has one. It used to be
-            // reachable only from a genuinely slotless shop, so "re-open it in
-            // game" was sound advice; since `domain::shop::lenient_slots` began
-            // degrading an unusable `slots` to empty rather than failing the
-            // whole message, the same line is also what a *server* fault looks
-            // like — and sending the player to act on the game for a payload
-            // problem is the same misattribution the tolerance was filed
-            // against. The log has the `warn!` that tells the two apart, which
-            // is why the advice is to send it.
+            // Names no cause on purpose: since `lenient_slots` began degrading
+            // an unusable `slots` to empty, this line is reachable from a
+            // slotless shop *and* from a server fault, and the old "re-open it
+            // in game" blamed the player for a payload problem. The log carries
+            // the `warn!` that tells the two apart.
             ui.weak(
                 "the last shop message carried no usable slots — if this repeats, send the log",
             );
@@ -42,12 +36,12 @@ pub(super) fn render_shop_tab(
     shop_table(ui, rows, detail);
 }
 
-/// The slot table: uppercase header over a hairline rule, no zebra fill —
-/// rows light up on hover, with the full item detail as the tooltip.
+/// The slot table: uppercase header over a hairline rule, no zebra fill — rows
+/// light up on hover, with the full item detail as the tooltip.
 fn shop_table(ui: &mut egui::Ui, rows: &[SlotRow], detail: &dyn Fn(usize) -> String) {
     let width = ui.available_width();
-    // Text columns sit inside this inset; the row band the columns are laid in
-    // spans the full width, so the hover fill and header rule reach the edges.
+    // Text columns sit inside this inset while the row band spans full width,
+    // so the hover fill and header rule reach the edges.
     let edge = egui::vec2(f32::from(theme::EDGE), 0.0);
 
     let (header, _) = ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::hover());
@@ -55,7 +49,7 @@ fn shop_table(ui: &mut egui::Ui, rows: &[SlotRow], detail: &dyn Fn(usize) -> Str
     cell(ui, h_slot, false, theme::section("Slot"));
     cell(ui, h_kind, false, theme::section("Kind"));
     cell(ui, h_name, false, theme::section("Name"));
-    // The unit rides in the header so the value cells stay bare, right-aligned numbers.
+    // The unit rides in the header so the value cells stay bare numbers.
     cell(ui, h_price, true, theme::section("Price (gold)"));
     ui.painter().hline(
         header.x_range(),
@@ -64,14 +58,14 @@ fn shop_table(ui: &mut egui::Ui, rows: &[SlotRow], detail: &dyn Fn(usize) -> Str
     );
     ui.add_space(theme::SP_XS);
 
-    // Grow the hover fill into half the inter-row gap on each side to cover the full row band.
+    // Half the inter-row gap on each side, so the hover fill covers the full
+    // row band.
     let pad = ui.spacing().item_spacing.y / 2.0;
     for (index, row) in rows.iter().enumerate() {
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
         // `contains_pointer`, not `hovered`: a truncating cell label senses
-        // hover for its own tooltip, which would otherwise steal the row's
-        // `hovered` while the pointer is over the text.
+        // hover for its own tooltip and would steal the row's.
         if response.contains_pointer() {
             ui.painter().rect_filled(
                 rect.expand2(egui::vec2(0.0, pad)),
@@ -90,29 +84,22 @@ fn shop_table(ui: &mut egui::Ui, rows: &[SlotRow], detail: &dyn Fn(usize) -> Str
         );
         let price = crate::render::amount_or_dash(row.price);
         cell(ui, c_price, true, styled(row, price));
-        // `on_hover_ui`, not `on_hover_text`: egui runs the closure only for
-        // the hovered widget, so the item line is formatted for one row, not all six, per frame.
+        // `on_hover_ui`, not `on_hover_text`: egui runs the closure only for the
+        // hovered widget, so the item line is formatted once per frame rather
+        // than for every row.
         response.on_hover_ui(|ui| {
-            // A tooltip `Area` is sized on its first pass and caches that
-            // size (egui's own note on `Area::default_width`, filed as
-            // emilk/egui#5167). Each row's tooltip has its own id, so a slot
-            // first hovered with a short line ("slot 3 · Equipment") would
-            // keep that width on a later roll with a longer one, wrapping or
-            // squeezing it. Setting the max width per hover restores egui's
-            // own bound.
+            // A tooltip `Area` caches the size of its first pass (egui's note
+            // on `Area::default_width`, emilk/egui#5167), and each row's
+            // tooltip has its own id — so a slot first hovered with a short
+            // line would keep that width on a later, longer roll.
             ui.set_max_width(ui.spacing().tooltip_width);
             ui.label(detail(index));
         });
     }
 }
 
-/// One cell's text in its row's ink: matched-and-unbought rows read in the
-/// wanted green, sold-out rows mute and strike through — both survive the
-/// hover fill since the text paints on top of it.
-///
-/// Takes `impl Into<String>` to match `RichText::new`, so a caller may pass
-/// an owned value or a borrow without pre-allocating either. A free function
-/// rather than a closure because a closure cannot be generic over its argument.
+/// One cell's text in its row's ink. A free function rather than a closure,
+/// because a closure cannot be generic over its argument.
 fn styled(row: &SlotRow, text: impl Into<String>) -> egui::RichText {
     let mut text = egui::RichText::new(text);
     if row.wanted {
@@ -145,8 +132,7 @@ fn column_rects(row: egui::Rect) -> [egui::Rect; 4] {
     ]
 }
 
-/// One table cell: a truncating label placed in its column rect, left- or
-/// right-aligned (Price sits right).
+/// One table cell: a truncating label placed in its column rect.
 fn cell(ui: &mut egui::Ui, rect: egui::Rect, align_right: bool, text: egui::RichText) {
     let layout = if align_right {
         egui::Layout::right_to_left(egui::Align::Center)
@@ -158,8 +144,7 @@ fn cell(ui: &mut egui::Ui, rect: egui::Rect, align_right: bool, text: egui::Rich
     });
 }
 
-/// Welcome screen until the first snapshot lands: what the tool is, and the
-/// three steps that make it go.
+/// Welcome screen until the first snapshot lands.
 fn render_quick_start(ui: &mut egui::Ui) {
     ui.add_space(theme::SP_XL);
     ui.vertical_centered(|ui| {
@@ -221,7 +206,7 @@ mod tests {
         (ctrl, view, rows)
     }
 
-    /// The tooltip source the live shell builds; no test here hovers a row, so it only needs to exist.
+    /// No test here hovers a row, so this only needs to exist.
     fn details(ctrl: &Controller) -> impl Fn(usize) -> String + '_ {
         |index| slot_detail(ctrl, index)
     }
@@ -245,11 +230,8 @@ mod tests {
         harness.get_by_label("SLOT");
     }
 
-    /// Two claims, and the second is the one that moved: the placeholder must
-    /// not resurrect onboarding, and it must not blame the player for a payload
-    /// only the server could have sent. An empty `rows` reaches here from a
-    /// slotless shop *and* from a `slots` the decoder degraded, and the text
-    /// cannot tell which — so it must not pretend to.
+    /// An empty `rows` reaches here from a slotless shop *and* from a degraded
+    /// one, and the text cannot tell which — so it must not pretend to.
     #[test]
     fn slotless_snapshot_shows_a_hint_that_blames_nobody_not_quick_start() {
         let (ctrl, view, rows) = captured(vec![]);

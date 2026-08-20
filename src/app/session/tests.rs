@@ -1,22 +1,9 @@
 //! Tests for the session loop and its handlers, in the order the module
-//! declares them.
+//! declares them: the loop's exit paths, commands, server messages, `apply`,
+//! then watchdog recovery.
 //!
-//! 1. **The loop itself** — how each `break` path leaves the controller and the
-//!    gate, the safety-halt latch against a saturated command queue, the
-//!    post-loop grace drain that keeps a worker panic from reading as a clean
-//!    end, and the cooperative shutdown signal.
-//! 2. **Commands** (`handle_command`) — every `Command` variant, including the
-//!    `Toggle` resolution and the retune confirmations.
-//! 3. **Server messages** (`on_message`, `handle_purchase`) — shop snapshots,
-//!    purchase echoes and the lines each renders.
-//! 4. **`apply`** — the gate transitions, the advice wording, and the job
-//!    submissions (refresh, buy, confirm re-click) per actuator mode.
-//! 5. **Watchdog recovery** — each `Recovery` rung and what it queues.
-//!
-//! The shared fixtures (`never_shutdown`, `timings`, `off`, `recording`,
-//! `dud_shop`) open the file; the narrower ones (`one_item_shop`,
-//! `controller_with_named_item`, `armed`, `armed_recovering`) sit immediately
-//! above the group that uses them.
+//! The shared fixtures open the file; the narrower ones sit immediately above
+//! the group that uses them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,9 +14,8 @@ use crate::domain::control::{Limits, StopReason, past_rung};
 use crate::domain::filter::Filter;
 use crate::domain::shop::{CatalogId, Gold, ItemKind, PurchaseLimit, ShopItem, ShopSnapshot};
 
-/// A shutdown signal nobody ever raises: the loop must exit through its own
-/// paths. The sender drops immediately, which the loop reads as "no stop
-/// can ever arrive" and disables the branch — not as a stop.
+/// The sender drops immediately, which the loop reads as "no stop can ever
+/// arrive" and disables the branch — not as a stop.
 fn never_shutdown() -> watch::Receiver<bool> {
     watch::channel(false).1
 }
@@ -39,8 +25,7 @@ fn timings() -> Arc<Mutex<plan::Timings>> {
     Arc::new(Mutex::new(plan::Timings::default()))
 }
 
-/// Off-mode actuator: decisions keep the advice wording, nothing is
-/// ever submitted.
+/// Off-mode actuator: decisions keep the advice wording, nothing is submitted.
 fn off() -> ActuatorHandle {
     ActuatorHandle::new(
         Mode::Off,
@@ -59,8 +44,8 @@ fn recording(mode: Mode) -> (ActuatorHandle, mpsc::Receiver<plan::Job>) {
     )
 }
 
-/// A fixture catalog id; panics on `0`. [`CatalogId`] treats the wire's "no
-/// id" as `None`, not a magic number a test could pass by accident.
+/// Panics on `0`: [`CatalogId`] treats the wire's "no id" as `None`, not a
+/// magic number a test could pass by accident.
 fn cid(id: u32) -> CatalogId {
     CatalogId::new(id).expect("a fixture catalog id is never zero")
 }
@@ -127,9 +112,8 @@ async fn a_worker_panic_is_reported_when_the_uplink_channel_closes() {
     let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
     let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
     let (error_tx, error_rx) = mpsc::channel::<String>(1);
-    // The message sender drops, so the loop takes the uplink-closed break.
-    // The supervisor delivers the panic report a beat LATER — during the
-    // grace window — so only the post-loop grace-drain can surface it.
+    // The panic report lands a beat LATER than the uplink-closed break, so
+    // only the post-loop grace-drain can surface it.
     drop(message_tx);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -151,16 +135,11 @@ async fn a_worker_panic_is_reported_when_the_uplink_channel_closes() {
     assert_eq!(failure, Some("uplink task panicked".to_owned()));
 }
 
-/// A `biased` select is a priority list, and `messages` is the one branch a
-/// remote party can keep permanently ready: the uplink fills 256 slots, and a
-/// server sending faster than `on_message` runs means `recv()` is ready on every
-/// poll. While `fatal_errors` sat below it, "break immediately" — the fatal
-/// arm's own instruction — meant "after the flood drains", and a worker death
-/// went unreported while the window still claimed a healthy watch.
-///
-/// *When* is the assertion, not the exit: the old order reached `Exit::Fatal`
-/// too, just after handling every queued message first. So the test reads the
-/// journal — one shop snapshot handled before the abort line is one too many.
+/// `messages` is the one branch a remote party can keep permanently ready, and
+/// while `fatal_errors` sat below it "break immediately" meant "after the flood
+/// drains". *When* is the assertion, not the exit — the old order reached
+/// `Exit::Fatal` too, just last — so the test reads the journal: one shop
+/// handled before the abort line is one too many.
 #[tokio::test]
 async fn a_flood_of_messages_cannot_delay_a_fatal() {
     const QUEUED: usize = 8;
@@ -172,9 +151,8 @@ async fn a_flood_of_messages_cannot_delay_a_fatal() {
         Limits::default(),
     ));
 
-    // Armed, so a snapshot the filter does not match produces a journal line:
-    // an idle controller ignores shop messages, and a test where the flood is
-    // silent cannot tell the two orders apart.
+    // Armed, so the flood is not silent: an idle controller ignores shop
+    // messages, and a silent flood cannot tell the two orders apart.
     on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
     let armed_lines = journal.to_entries().len();
 
@@ -213,8 +191,7 @@ async fn a_flood_of_messages_cannot_delay_a_fatal() {
         Some("network capture: the adapter died".to_owned())
     );
     // The journal, not `Sender::capacity`: dropping the receiver discards the
-    // buffered messages too, so the free-slot count reads full either way.
-    // What separates the orders is whether anything was *processed*.
+    // buffered messages too, so only the journal shows what was *processed*.
     let said: Vec<Arc<str>> = journal
         .to_entries()
         .into_iter()
@@ -229,43 +206,24 @@ async fn a_flood_of_messages_cannot_delay_a_fatal() {
     drop(message_tx);
 }
 
-/// The sibling of the test above, on the other half of the same hazard.
-/// `Event::Tick` is the only check-point that enforces `Limits`, and the only
-/// thing that steps the watchdog's rungs — so a tick that never fires is a
-/// safety limit that never fires, with Buy and Refresh still going out.
-///
-/// While the tick was a `biased` branch *below* `messages`, "the branch it is
-/// cheapest to be late for" meant "the branch that is never serviced": a
-/// server that refills the 256 slots faster than `on_message` drains them
-/// keeps `recv()` ready on every poll. Tokio's cooperative budget does not
-/// break the tie — when the budget runs out *every* branch returns pending
-/// together and the next poll restarts at the top of the same priority list.
-///
-/// The assertion is behavioural, not structural: under a sustained flood the
-/// session must still stop itself on its own time limit. The watchdog rides
-/// this same `Event::Tick`; its rungs are 10 s apart, too slow to spell out
-/// here, but they are delivered by exactly what this proves.
-///
-/// `ServerMessage::Unknown` is deliberate — it is the cheapest message there
-/// is (`on_message` ignores it outright), so the flood does nothing but hold
-/// the branch ready. That is the worst case, not a contrived one.
+/// The other half of the same hazard: a tick that never fires is a `Limits`
+/// check and a watchdog rung that never fire, with Buy and Refresh still going
+/// out. The assertion is behavioural — under a sustained flood the session must
+/// still stop itself on its own time limit. `ServerMessage::Unknown` is the
+/// cheapest message there is, so the flood does nothing but hold the branch
+/// ready: the worst case, not a contrived one.
 #[tokio::test]
 async fn a_flood_of_messages_cannot_starve_the_tick() {
-    /// The uplink's own queue depth, mirrored so the flood is the shipped
-    /// shape.
+    /// The uplink's own depth, so the flood is the shipped shape.
     const UPLINK_SLOTS: usize = 256;
-    /// One sender's cooperative budget matches the loop's drain rate exactly,
-    /// and this test must not turn on which of two equal rates wins the round.
-    /// Several senders pin the queue at capacity instead.
+    /// One sender's cooperative budget matches the loop's drain rate exactly;
+    /// several pin the queue at capacity instead of racing it.
     const FLOODERS: usize = 4;
-    /// Long enough that the loop's *immediate* first tick does not already
-    /// trip it — the flood would then never be under way when the halt lands —
-    /// and short enough to be crossed by the next tick, one `TICK_PERIOD`
-    /// later.
+    /// Long enough that the loop's *immediate* first tick does not already trip
+    /// it, short enough to be crossed by the next tick one `TICK_PERIOD` later.
     const TIME_LIMIT_MS: u64 = 500;
-    /// The flood's own dead man's switch. The halt is what normally ends it
-    /// (see below), so this is only ever reached when the tick is starved —
-    /// that is, when this test is failing, and a failure must not be a hang.
+    /// The flood's own dead man's switch, reached only when the tick is starved
+    /// — that is, when this test is failing, and a failure must not be a hang.
     const GIVE_UP: Duration = Duration::from_secs(5);
 
     let gate = WatchGate::new(false);
@@ -294,9 +252,8 @@ async fn a_flood_of_messages_cannot_starve_the_tick() {
     }
     assert_eq!(message_tx.capacity(), 0, "the flood is queued and ready");
 
-    // The gate is the flood's stop signal: the halt this test is about closes
-    // it, the senders drop, and the loop then ends on a closed uplink instead
-    // of running for ever. Nothing here waits on wall-clock guesswork.
+    // The gate is the flood's stop signal, so nothing here waits on wall-clock
+    // guesswork: the halt closes it, the senders drop, the loop ends.
     let sent = Arc::new(AtomicU64::new(0));
     let floods: Vec<_> = (0..FLOODERS)
         .map(|_| {
@@ -336,9 +293,8 @@ async fn a_flood_of_messages_cannot_starve_the_tick() {
     }
 
     assert_eq!(failure, None);
-    // The stop reason, not merely "stopped": the teardown stops the controller
-    // too, and a test that only checked for a halt would pass on a loop that
-    // ticked exactly never.
+    // The stop reason, not merely "stopped": teardown stops the controller too,
+    // so a halt alone would pass on a loop that ticked exactly never.
     assert_eq!(
         controller.lock().unwrap().status(),
         Status::Stopped(StopReason::Timeout),
@@ -350,10 +306,8 @@ async fn a_flood_of_messages_cannot_starve_the_tick() {
             .iter()
             .any(|line| line.text.contains("session time limit reached"))
     );
-    // 08d62ba's lesson, applied to this test: a flood nobody measured is a
-    // flood that may not have happened. Refilling the queue many times over is
-    // what makes the loop's other branches unreachable through `biased`; the
-    // real figure is orders of magnitude above this floor.
+    // A flood nobody measured may not have happened; refilling the queue many
+    // times over is what makes the other branches unreachable.
     assert!(
         sent.load(Ordering::Relaxed) >= (UPLINK_SLOTS * 8) as u64,
         "the flood must have been sustained, not a single fill: {} messages",
@@ -606,9 +560,8 @@ async fn session_loop_exit_leaves_never_armed_controller_idle() {
     );
 }
 
-/// Closing the window must unwind the pipeline: without this branch the loop
-/// keeps running on a detached task and the process dies with a live capture
-/// session still open in the driver.
+/// Without this branch the loop keeps running on a detached task and the
+/// process dies with a live capture session still open in the driver.
 #[tokio::test(start_paused = true)]
 async fn shutdown_signal_ends_the_loop_and_stops_the_watch() {
     let gate = WatchGate::new(false);
@@ -644,8 +597,7 @@ async fn shutdown_signal_ends_the_loop_and_stops_the_watch() {
     .await;
 
     let _sender = signal.await.unwrap();
-    // A requested shutdown is a clean end, not a failure — and the player's
-    // own stop, so the controller must not report "session ended".
+    // A clean end, and the player's own: not "session ended".
     assert_eq!(failure, None);
     assert!(!gate.is_enabled());
     assert_eq!(
@@ -915,8 +867,7 @@ fn purchase_message_auto_resumes_controller() {
     assert!(gate.is_enabled());
 }
 
-/// A controller that stored a one-item shop whose slot carries id 42 and
-/// a name.
+/// Stores a one-item shop whose slot carries id 42 and a name.
 fn controller_with_named_item() -> Controller {
     let mut controller = Controller::new(Filter::default(), Limits::default());
     let mut snapshot = one_item_shop();
@@ -929,11 +880,9 @@ fn controller_with_named_item() -> Controller {
     controller
 }
 
-/// The balance is thousands-grouped here: this line used to interpolate a
-/// bare `u32` and print `250000` while the slot table two panes over showed
-/// `250,000` for the same purse. A gold amount now groups itself
-/// (`impl Display for Gold`), so the journal cannot opt out by forgetting to
-/// call a formatter.
+/// The balance is thousands-grouped by `impl Display for Gold`, so the journal
+/// cannot opt out by forgetting to call a formatter — this line used to print
+/// `250000` while the slot table two panes over showed `250,000`.
 #[test]
 fn purchase_line_names_item_from_snapshot_and_groups_the_balance() {
     let notice = PurchaseNotice {
@@ -976,8 +925,7 @@ fn match_hint_warns_when_some_matches_untracked() {
     let gate = WatchGate::new(false);
     let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
     let _ = ctrl.handle(Event::Start { now_ms: 0 });
-    // Two matches, only one trackable: the first slot keeps the id-0
-    // sentinel, so auto-resume would refresh over it.
+    // Two matches, only one trackable: the id-0 slot would be refreshed over.
     let snapshot = ShopSnapshot {
         merchant: None,
         slots: vec![
@@ -1219,9 +1167,8 @@ fn buy_job_names_the_slot_it_cannot_click_and_still_clicks_the_rest() {
     let journal = EventLog::default();
     let (actuator, mut jobs) = recording(Mode::Live);
     let controller = armed();
-    // Seven slots: the first and last match and are trackable, the five
-    // between do not match. Slot 7 sits past the six clickable rows, so the
-    // batch is mixed — one row to click, one refusal to report.
+    // Two trackable matches, but slot 7 sits past the six clickable rows: one
+    // row to click, one refusal to report.
     let mut slots = vec![ShopItem {
         id: Some(cid(42)),
         ..ShopItem::default()
@@ -1402,9 +1349,8 @@ fn full_job_queue_journals_the_drop() {
     );
 }
 
-/// A closed channel is not a full one. Collapsing the submit result to a
-/// bool would merge them one `false` apart, sending the player hunting a
-/// slow actuator when nobody is at the other end.
+/// Collapsing the submit result to a bool would merge these one `false` apart,
+/// sending the player hunting a slow actuator when nobody is at the other end.
 #[test]
 fn a_gone_executor_is_journaled_as_gone_not_as_a_full_queue() {
     let gate = WatchGate::new(true);
@@ -1608,9 +1554,8 @@ fn watchdog_buy_reissue_without_clickable_rows_journals_the_gap() {
     let journal = EventLog::default();
     let (actuator, mut jobs) = recording(Mode::Live);
     let controller = armed_recovering();
-    // Seven slots, only the last one matches: trackable (id 42) so the
-    // purchase ladder arms, but position 7 sits beyond the six clickable
-    // rows — no buy job can target it.
+    // The only match is trackable, so the purchase ladder arms, but position 7
+    // is beyond the six clickable rows: no buy job can target it.
     let mut slots: Vec<ShopItem> = (0..6)
         .map(|_| ShopItem {
             kind: ItemKind::Equipment,
@@ -1646,8 +1591,8 @@ fn watchdog_buy_reissue_without_clickable_rows_journals_the_gap() {
         past_rung(1),
     );
     jobs.try_recv().expect("confirm retry job");
-    // The re-issue rung finds nothing clickable: no job, but the journal
-    // must say so instead of ending on the announcement.
+    // Nothing clickable: no job, but the journal must say so rather than end
+    // on the announcement.
     dispatch(
         &controller,
         &gate,

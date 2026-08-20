@@ -1,11 +1,6 @@
 //! Where a click goes: the 1280×720 design space, the clickable zones, the two
 //! row/slot representations, and the transform into physical screen pixels.
-//!
-//! The bottom layer of `plan` — it answers *where*, never *when*, and depends on
-//! nothing else in the module. `MAX_ROW`, `LAST_TOP_ROW`, [`buy_zone`] and the
-//! test that couples them live here together on purpose: "six rows, the first
-//! four reachable at scroll-top" is a statement about *this* geometry, and the
-//! guard test reads the row count off `buy_zone` and `DESIGN_H` to prove it.
+//! Answers *where*, never *when*, and depends on nothing else in `plan`.
 
 const DESIGN_W: f32 = 1280.0;
 const DESIGN_H: f32 = 720.0;
@@ -16,19 +11,11 @@ pub const MAX_ASPECT: f32 = 2.194;
 
 /// Highest 0-based clickable row: the Secret Shop shows six display slots.
 const MAX_ROW: u8 = 5;
-/// Highest row reachable at scroll-top; anything above it is only clickable
-/// once the list has been scrolled to the bottom.
-///
-/// `pub(super)` for [`buy_job`](super::jobs::buy_job), the one reader outside
-/// this file — the split of the rows into two groups is its whole scrolling
-/// strategy.
+/// Highest row reachable at scroll-top; the rest need a scroll to the bottom.
 pub(super) const LAST_TOP_ROW: u8 = 3;
-/// `MAX_ROW` and `LAST_TOP_ROW` are two halves of one fact ("six rows, the
-/// first four reachable at scroll-top"). Do not let them drift back into bare
-/// `<= 5` / `> 3` literals at separate sites: a shop row count changed in one
-/// place only would plan a scroll-to-bottom for a row still at the top, i.e. a
-/// click on the wrong item with real gold behind it. Editing either alone now
-/// stops the build here.
+/// Two halves of one fact. As bare `<= 5` / `> 3` literals at separate sites, a
+/// row count changed in one place planned a scroll-to-bottom for a row still at
+/// the top — a click on the wrong item's Buy button, with real gold on it.
 const _: () = assert!(LAST_TOP_ROW < MAX_ROW);
 
 /// How an element rides a non-16:9 window: HUD elements anchor to a content
@@ -75,10 +62,6 @@ pub const CONFIRM_BUY: Zone = Zone {
 };
 
 /// Anywhere over the item column: only the wheel routing matters.
-///
-/// `pub(super)` for `jobs::scroll`, which is the only thing that ever aims at
-/// it; it stays here with the other three zones because the four together are
-/// the design-space map.
 pub(super) const SCROLL_ZONE: Zone = Zone {
     cx: 1154.0,
     cy: 420.0,
@@ -87,35 +70,30 @@ pub(super) const SCROLL_ZONE: Zone = Zone {
     anchor: Anchor::Right,
 };
 
-/// A 1-based display slot, exactly as the shop numbers its items — the shape
-/// the domain's `BuyTarget::slot` and `ShopItem::effective_slot` speak.
-///
-/// Distinct from [`Row`] because the two differ by one and used to be the same
-/// `u8`: `buy_job(trigger, timings, epoch, &slots, now_ms)` type-checked, and an
-/// off-by-one row clicks the *wrong item's* Buy button, spends the player's gold
-/// on an item the filter rejected, and then wedges the pause — the purchase echo
-/// for the unexpected id is not on the checklist, so nothing ever clears it.
-/// [`Slot::row`] is the one place the two representations meet.
+/// A 1-based display slot, as the shop numbers its items — the shape the
+/// domain's `BuyTarget::slot` and `ShopItem::effective_slot` speak. Distinct
+/// from [`Row`], which differs by one: as one `u8` type, passing slots where
+/// rows were meant compiled, and an off-by-one row buys the wrong item and then
+/// wedges the pause — the echo for the unexpected id is not on the checklist.
+/// [`Slot::row`] is where the two representations meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Slot(u8);
 
 impl Slot {
-    /// Wraps a display slot number as the shop reported it. Any value is
-    /// accepted — a degraded shop can report 0 or a clamped `u8::MAX`, and
-    /// [`Slot::row`] is what refuses those.
+    /// Any value is accepted — a degraded shop can report 0 or a clamped
+    /// `u8::MAX`, and [`Slot::row`] is what refuses those.
     #[must_use]
     pub const fn new(slot: u8) -> Self {
         Self(slot)
     }
 
-    /// The display number, for the player-facing line.
     #[must_use]
     pub const fn get(self) -> u8 {
         self.0
     }
 
-    /// The clickable 0-based row of this display slot; `None` for anything
-    /// a degraded shop put outside the six rows — never a click.
+    /// `None` for anything a degraded shop put outside the six rows — never a
+    /// click.
     ///
     /// # Examples
     ///
@@ -126,8 +104,8 @@ impl Slot {
     /// assert_eq!(Slot::new(1).row(), Row::new(0));
     /// assert_eq!(Slot::new(6).row(), Row::new(5));
     ///
-    /// // What a degraded shop can report: the `0` sentinel, a seventh slot,
-    /// // and the clamped `effective_slot` fallback. None of them is a click.
+    /// // What a degraded shop can report — the `0` sentinel, a seventh slot,
+    /// // the clamped `effective_slot` fallback. None of them is a click.
     /// assert_eq!(Slot::new(0).row(), None);
     /// assert_eq!(Slot::new(7).row(), None);
     /// assert_eq!(Slot::new(u8::MAX).row(), None);
@@ -142,18 +120,14 @@ impl Slot {
 }
 
 /// A 0-based clickable row, `0..=MAX_ROW` **by construction**: the only thing
-/// [`buy_zone`] and [`buy_job`](super::jobs::buy_job) accept.
-///
-/// `buy_job` used to filter `row <= MAX_ROW` itself and silently lose anything
-/// above it, so a slot-numbered `&[1, …, 6]` dropped row 6 rather than erring.
-/// There is nothing left to filter: an out-of-range row cannot be built, and the
-/// refusal happens once, at [`Slot::row`], where the caller still has a slot to
-/// name in the journal.
+/// [`buy_zone`] and [`buy_job`](super::jobs::buy_job) accept. Do not reinstate
+/// `buy_job`'s `row <= MAX_ROW` filter — it dropped a slot-numbered `&[1, …, 6]`
+/// row 6 silently instead of erring. The refusal belongs at [`Slot::row`], where
+/// the caller still has a slot to name in the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Row(u8);
 
 impl Row {
-    /// A row from a raw 0-based index, or `None` past [`MAX_ROW`].
     #[must_use]
     pub const fn new(row: u8) -> Option<Self> {
         if row <= MAX_ROW {
@@ -163,14 +137,12 @@ impl Row {
         }
     }
 
-    /// The 0-based index, for the coordinate arithmetic.
     #[must_use]
     pub const fn get(self) -> u8 {
         self.0
     }
 
-    /// The display slot this row is: the one definition of the `row + 1` the
-    /// journal line used to spell by hand. Cannot overflow — a `Row` is at most
+    /// The one definition of `row + 1`. Cannot overflow — a `Row` is at most
     /// `MAX_ROW`.
     #[must_use]
     pub const fn slot(self) -> Slot {
@@ -185,9 +157,8 @@ const BUY_ROW_PITCH: f32 = 145.0;
 /// How far the whole list rides up once scrolled to the bottom, design px.
 const SCROLL_BOTTOM_SHIFT: f32 = 217.0;
 
-/// The Buy button of a 0-based row. Rows `0..=LAST_TOP_ROW` are clickable at
-/// scroll-top; the rest only at scroll-bottom, where the whole list sits
-/// `SCROLL_BOTTOM_SHIFT` design px higher.
+/// The Buy button of a 0-based row: rows `0..=LAST_TOP_ROW` at scroll-top, the
+/// rest only at scroll-bottom, where the list sits `SCROLL_BOTTOM_SHIFT` higher.
 ///
 /// # Examples
 ///
@@ -197,8 +168,7 @@ const SCROLL_BOTTOM_SHIFT: f32 = 217.0;
 ///
 /// // Row 0's Buy button is on the 720 px-tall screen at scroll-top…
 /// assert_eq!(buy_zone(row(0), false).cy, 166.5);
-/// // …while row 4's is not: it only exists once the list has been scrolled
-/// // to the bottom, which lifts the whole list by the same 217 px.
+/// // …row 4's only once the scroll to the bottom lifts the list by 217 px.
 /// assert_eq!(buy_zone(row(4), false).cy, 746.5);
 /// assert_eq!(buy_zone(row(4), true).cy, 529.5);
 /// ```
@@ -233,13 +203,10 @@ pub struct ClientRect {
 }
 
 impl ClientRect {
-    /// No usable client area at all — which on Windows is what a *minimized*
-    /// window reads back as, so it is the recoverable case everywhere: the next
-    /// `acquire()` re-reads a fresh rect and the watchdog's retry self-heals it.
-    ///
-    /// The single definition matters: do not re-spell this test at a call
-    /// site — every caller (the executor's post-`acquire` guard, each Win32
-    /// backend) must agree on it, or a transient minimize can halt the watch.
+    /// No usable client area — which on Windows is what a *minimized* window
+    /// reads back as, so it is the recoverable case: the next `acquire()`
+    /// re-reads a fresh rect. Do not re-spell this test at a call site; every
+    /// caller must agree on it or a transient minimize halts the watch.
     #[must_use]
     pub const fn is_degenerate(self) -> bool {
         self.width <= 0 || self.height <= 0
@@ -248,16 +215,13 @@ impl ClientRect {
 
 /// Why a design point has no screen coordinate.
 ///
-/// Two variants rather than one string because the two want *opposite* verdicts
-/// from the executor — a minimized window aborts one job, an unsupported window
-/// shape halts the watch — and a caller that cannot match on the cause has to
-/// re-derive one of them itself.
-/// `PartialEq` but not `Eq`: `TooNarrow` carries the measured aspect, and the
-/// point of keeping it is the message, not equality.
+/// Two variants rather than one string because they want *opposite* verdicts
+/// from the executor: a minimized window aborts one job, an unsupported window
+/// shape halts the watch. `PartialEq` and not `Eq` — `TooNarrow` carries an
+/// `f32`, kept for the message rather than for equality.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScreenError {
-    /// The client area has no extent: minimized, or a window that just died.
-    /// Recoverable — the next `acquire()` reads a fresh rect.
+    /// No extent: minimized, or a window that just died. Recoverable.
     DegenerateRect { width: i32, height: i32 },
     /// Narrower than 16:9, so the game caps the view *vertically* and no
     /// design-space mapping exists. Only the player can fix it.
@@ -279,15 +243,12 @@ impl std::fmt::Display for ScreenError {
 }
 
 /// Design → physical screen pixels, for any window at least 16:9 wide. A
-/// narrower window caps the view vertically instead: unsupported, refused —
-/// the caller must never guess a coordinate.
+/// narrower window caps the view vertically instead: refused, never guessed.
 ///
 /// # Errors
 ///
-/// [`ScreenError::DegenerateRect`] when `rect` has no extent (a minimized or
-/// just-closed window), and [`ScreenError::TooNarrow`] when the window is
-/// narrower than the 16:9 design aspect. The distinction is the whole point of
-/// the type: the first is transient, the second is not.
+/// [`ScreenError::DegenerateRect`] for a rect with no extent (transient),
+/// [`ScreenError::TooNarrow`] below the 16:9 design aspect (not).
 ///
 /// # Examples
 ///
@@ -298,8 +259,7 @@ impl std::fmt::Display for ScreenError {
 ///
 /// let left = DesignPoint { x: 100.0, y: 100.0, anchor: Anchor::Left };
 ///
-/// // At the 1280×720 design resolution the transform is the identity, and the
-/// // three anchors coincide.
+/// // At 1280×720 the transform is the identity and the three anchors coincide.
 /// let design = ClientRect { left: 0, top: 0, width: 1280, height: 720 };
 /// assert_eq!(to_screen(design, left)?, (100, 100));
 ///
@@ -307,8 +267,8 @@ impl std::fmt::Display for ScreenError {
 /// let scaled = ClientRect { left: 100, top: 50, width: 1920, height: 1080 };
 /// assert_eq!(to_screen(scaled, left)?, (250, 200));
 ///
-/// // Narrower than 16:9 has no design-space mapping at all: the game caps the
-/// // view vertically instead, so the point is refused rather than guessed.
+/// // Narrower than 16:9 has no design-space mapping: the game caps the view
+/// // vertically instead, so the point is refused rather than guessed.
 /// let narrow = ClientRect { left: 0, top: 0, width: 1280, height: 800 };
 /// assert!(matches!(
 ///     to_screen(narrow, left),
@@ -320,24 +280,14 @@ pub fn to_screen(rect: ClientRect, point: DesignPoint) -> Result<(i32, i32), Scr
     Ok(Viewport::of(rect)?.place(point))
 }
 
-/// A window that has been proved mappable, and the three numbers that proof
-/// produced. Every term in [`to_screen`] that depends on the *window* rather
-/// than on the point resolves here, once.
+/// A window proved mappable, and the three numbers that proof produced: every
+/// term of [`to_screen`] that depends on the *window* resolves here, once.
 ///
-/// The split exists for the executor, not for arithmetic. Both [`ScreenError`]s
-/// are properties of the rect alone, so asking them per step asked the same
-/// question of the same unchanging value up to eight times per job — and the
-/// only place the executor could ask was inside its step loop, *after* the first
-/// `sleep(step.wait_ms)`. A minimized window therefore paid a full step delay,
-/// up to 61 s with a configured range, before abandoning a job that could never
-/// have landed a click. Resolved once at `acquire` time, the refusal is
-/// immediate and the per-step map cannot fail at all.
-///
-/// This does not weaken the mid-job case the executor used to be credited with
-/// catching here: the rect is measured once by `acquire` and never re-read by
-/// the loop, so a window minimized *during* a job was never visible to this
-/// conversion. That is the backends' `validate_target`, which re-reads the rect
-/// before every input and answers `Recoverable`.
+/// Resolved at `acquire` time rather than per step because both [`ScreenError`]s
+/// are properties of the rect alone, and the step loop could only ask *after*
+/// its first `sleep(step.wait_ms)`: a minimized window paid a full step delay,
+/// up to 61 s, before abandoning a job that could never land a click. A mid-job
+/// minimize is the backends' `validate_target`, not this.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Viewport {
     /// Client-area origin in screen pixels, straight off the rect.
@@ -345,20 +295,16 @@ pub struct Viewport {
     top: i32,
     /// Design pixels → physical pixels.
     scale: f32,
-    /// Width of the 16:9-or-wider view in design pixels, which is what the
-    /// `Right` and `Center` anchors measure against.
+    /// The view in design px, what `Right` and `Center` measure against.
     view_w: f32,
     /// Pillarbox: half the client width the view does not cover.
     off_x: f32,
 }
 
 impl Viewport {
-    /// Resolves the window-dependent half of the design → screen transform.
-    ///
     /// # Errors
     ///
-    /// The same two verdicts, for the same reasons, as [`to_screen`] — which is
-    /// now a thin wrapper over this and [`place`](Viewport::place).
+    /// The same two verdicts, for the same reasons, as [`to_screen`].
     pub fn of(rect: ClientRect) -> Result<Self, ScreenError> {
         if rect.is_degenerate() {
             return Err(ScreenError::DegenerateRect {
@@ -382,10 +328,8 @@ impl Viewport {
         })
     }
 
-    /// One design point in the resolved window. Infallible by construction:
-    /// the only two ways this transform has no answer are refused by
-    /// [`of`](Viewport::of), and nothing between the two calls can reintroduce
-    /// them — `self` carries no borrow of the world.
+    /// Infallible by construction: the two ways this transform has no answer are
+    /// refused by [`of`](Viewport::of), and `self` borrows nothing of the world.
     #[must_use]
     pub fn place(self, point: DesignPoint) -> (i32, i32) {
         let Self {
@@ -400,17 +344,12 @@ impl Viewport {
             Anchor::Right => view_w - (DESIGN_W - point.x),
             Anchor::Center => view_w / 2.0 + (point.x - DESIGN_W / 2.0),
         };
-        // `as` from float to int saturates at the bounds but maps `NaN` to 0 —
-        // which here would be a click at the top-left corner of the *screen*,
-        // outside the game window, silently. It cannot happen: `of`'s
-        // `is_degenerate` rejects `height <= 0`, so `ch >= 1.0` and neither `s`
-        // nor `aspect` can be a `0.0 / 0.0`, and every other term is a finite
-        // design constant or a rect field. That argument is why the refusal has
-        // to stay in the constructor: it is what makes this function total. The
-        // saturation itself is the wanted behaviour for the remaining extreme —
-        // an absurd rect clamps to `i32` bounds, and `pack_point` then refuses
-        // the coordinate rather than masking it back inside the window. The same
-        // reasoning is written out at `win::move_cursor`'s clamp.
+        // `as` from float to int saturates, but maps `NaN` to 0 — a silent click
+        // at the top-left of the *screen*. Unreachable only because `of` rejects
+        // `height <= 0`, so `ch >= 1.0` and neither `s` nor `aspect` is
+        // `0.0 / 0.0`; that is what keeps the refusal in the constructor. The
+        // saturation is wanted for the rest: an absurd rect clamps to `i32`
+        // bounds and `pack_point` refuses it rather than masking it back inside.
         let px = (left as f32 + off_x + x * s).round() as i32;
         let py = (top as f32 + point.y * s).round() as i32;
         (px, py)
@@ -420,9 +359,6 @@ impl Viewport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The guard test below plans a real job: the coupling it pins runs from the
-    // row count through `buy_zone` into `buy_job`, so it has to reach the
-    // sibling module that builds one.
     use crate::actuator::plan::fixtures::row;
     use crate::actuator::plan::{Epoch, Input, Timings, Trigger, buy_job};
 
@@ -456,34 +392,21 @@ mod tests {
         );
     }
 
-    /// The `Center` arm's offset term, on a point that is not the centre.
-    ///
-    /// Every other `Anchor::Center` assertion in this module passes `x = 640.0`,
-    /// which is exactly `DESIGN_W / 2.0` — so `(point.x - DESIGN_W / 2.0)` is
-    /// `0.0` at all of them and the whole offset term is unobservable. Mutation
-    /// proved it: flipping the `+` to `-` and to `/` in
-    /// `view_w / 2.0 + (point.x - DESIGN_W / 2.0)` leaves the entire suite green
-    /// on the shipped feature lane. Neither zone that actually uses this anchor
-    /// sits at the centre — `CONFIRM_REFRESH` is at 747.5 and `CONFIRM_BUY` at
-    /// 750.0 — so under the sign flip the buy confirmation is aimed 220 design
-    /// pixels left of its button, on a modal the executor clicks with the
-    /// player's gold already committed.
-    ///
-    /// This is `const-003`'s failure mode with a different constant: a test that
-    /// covers the line, asserts a true thing, and cannot fail. Both real zone
-    /// abscissae are used below so the pin is on the values that ship, and a
-    /// mirrored point on the other side of the centre catches an `abs` as well
-    /// as a sign.
+    /// The `Center` arm's offset term, on a point that is not the centre. Every
+    /// other `Center` assertion here passes `x = 640.0` — exactly
+    /// `DESIGN_W / 2.0`, so the term is `0.0` and unobservable, and mutating its
+    /// `+` to `-` or `/` left the whole suite green. Both zones that use this
+    /// anchor are off centre (`CONFIRM_REFRESH` 747.5, `CONFIRM_BUY` 750.0), so
+    /// a sign flip aims the buy confirmation 220 design px off its button, with
+    /// the player's gold already committed.
     #[test]
     fn to_screen_places_an_off_centre_center_anchor() {
-        // Design resolution: the transform is the identity, so the expected
-        // value is the design abscissa itself and any change to the offset
-        // term's sign, operator or operand order moves it.
+        // At design resolution the transform is the identity.
         let design = rect(0, 0, 1280, 720);
-        // Genuinely pillarboxed, so the view centre and the window centre are
-        // different points and the offset must ride the former. 1800×720 is
-        // aspect 2.5, past the 2.194 cap, so `view_w` is 1579.68 with a 110.16
-        // bar each side: 1579.68 / 2 + (750 - 640) + 110.16 = 1010.
+        // Pillarboxed, so the view centre and the window centre differ and the
+        // offset must ride the former. 1800×720 is aspect 2.5, past the 2.194
+        // cap: `view_w` 1579.68, a 110.16 bar each side, and
+        // 1579.68 / 2 + (750 - 640) + 110.16 = 1010.
         let wide = rect(0, 0, 1800, 720);
         assert_eq!(
             to_screen(
@@ -499,9 +422,8 @@ mod tests {
             ),
             Ok((748, 462))
         );
-        // Mirrored about the centre: 640 - 110 must land 110 left of it, not
-        // right of it, which an `abs` or a swapped subtraction would get wrong
-        // while still passing the two above.
+        // Mirrored about the centre: 640 - 110 must land 110 left of it, which
+        // an `abs` or a swapped subtraction gets wrong while passing the above.
         assert_eq!(
             to_screen(design, point(530.0, 360.0, Anchor::Center)),
             Ok((530, 360))
@@ -533,8 +455,7 @@ mod tests {
     #[test]
     fn to_screen_anchors_follow_the_view_edges_when_wide() {
         // 1440×720 (aspect 2.0, under the cap): the view fills the window, so
-        // Left sticks to the left edge, Right to the right edge, Center stays
-        // centered.
+        // each anchor sticks to its window edge.
         let rect = rect(0, 0, 1440, 720);
         assert_eq!(
             to_screen(rect, point(100.0, 100.0, Anchor::Left)),
@@ -553,8 +474,8 @@ mod tests {
 
     #[test]
     fn to_screen_pillarboxes_past_the_aspect_cap() {
-        // 3440×1440 (aspect 2.389 > cap): symmetric side bars appear and the
-        // anchors follow the content edges, not the screen edges.
+        // 3440×1440 (aspect 2.389 > cap): symmetric side bars, and the anchors
+        // follow the content edges rather than the screen edges.
         let rect = rect(0, 0, 3440, 1440);
         let (left_edge, _) = to_screen(rect, point(0.0, 0.0, Anchor::Left)).unwrap();
         let (right_edge, _) = to_screen(rect, point(1280.0, 0.0, Anchor::Right)).unwrap();
@@ -580,8 +501,8 @@ mod tests {
         let Err(error) = to_screen(rect(0, 0, 0, 0), point(0.0, 0.0, Anchor::Left)) else {
             panic!("a minimized window has no client area to map into");
         };
-        // Told apart from `TooNarrow` by the *type*, not by its text: this one
-        // aborts a job, the other one halts the watch.
+        // Told apart from `TooNarrow` by the *type*, not the text: this one
+        // aborts a job, the other halts the watch.
         assert_eq!(
             error,
             ScreenError::DegenerateRect {
@@ -592,23 +513,16 @@ mod tests {
         assert_eq!(error.to_string(), "degenerate client area 0×0");
     }
 
-    /// The three properties `to_screen` is *defined* by, over a deliberate
-    /// lattice of window shapes rather than five hand-picked resolutions.
-    ///
-    /// Do not replace this with `proptest` (asked for by `20-test.md`'s
-    /// `test-007`): `to_screen` is piecewise linear, so all its interesting
-    /// behaviour is at the boundaries — exactly 16:9, exactly the aspect cap,
-    /// the anchor extremes, the design-space edges — and a lattice hits every
-    /// one of those deliberately where random rects would hit them by luck, for
-    /// the cost of test-only crates on every `--locked` lane. A generator would
-    /// also have to construct at-least-16:9 rects with the same arithmetic the
-    /// function under test uses. Coverage here is 1 152 cases against the five
-    /// resolutions above, and the properties are stated rather than sampled.
+    /// The three properties `to_screen` is *defined* by, over a lattice of
+    /// window shapes. Do not replace it with `proptest` (`20-test.md`'s
+    /// `test-007`): the function is piecewise linear, so its behaviour is all at
+    /// boundaries — exactly 16:9, the aspect cap, the anchor and design-space
+    /// edges — which a lattice hits deliberately and random rects hit by luck,
+    /// and a generator would build its rects with the arithmetic under test.
     #[test]
     fn to_screen_maps_every_shape_inside_the_client_area() {
-        // Heights across the range a real window takes, plus the extremes; extra
-        // width walks the three regimes — exactly 16:9, wider, and past the
-        // `MAX_ASPECT` cap where the view pillarboxes.
+        // Heights a real window takes, plus the extremes; extra width walks the
+        // three regimes — 16:9, wider, and past the cap where it pillarboxes.
         let heights = [1, 200, 719, 720, 721, 1080, 1440, 2160];
         let extras = [0, 1, 7, 400, 1920, 8000];
         let points = [
@@ -619,8 +533,8 @@ mod tests {
         ];
         let mut cases = 0_u32;
         for height in heights {
-            // The narrowest width that is still at least 16:9, so every rect in
-            // the sweep is one `to_screen` must accept.
+            // The narrowest width still at least 16:9, so every rect in the
+            // sweep is one `to_screen` must accept.
             let min_width = (f64::from(height) * f64::from(DESIGN_W) / f64::from(DESIGN_H)).ceil();
             for extra in extras {
                 let width = min_width as i32 + extra;
@@ -630,10 +544,8 @@ mod tests {
                         let (px, py) = to_screen(r, p).unwrap_or_else(|err| {
                             panic!("{width}×{height} is 16:9 or wider: {err}")
                         });
-                        // 1. Inside the client area. This is the property the
-                        //    executor relies on and no example test stated: a
-                        //    coordinate outside the window clicks another
-                        //    application, or nothing, with real gold behind it.
+                        // 1. Inside the client area: outside it, the click lands
+                        //    on another application, with real gold behind it.
                         assert!(
                             (r.left..=r.left + r.width).contains(&px),
                             "x {px} outside {}..={} for {width}×{height}",
@@ -648,10 +560,8 @@ mod tests {
                         );
                         cases += 1;
                     }
-                    // 2. The pillarbox bars are symmetric: the design-space left
-                    //    and right edges sit the same distance from their window
-                    //    edges. An asymmetric offset is how a centred modal's
-                    //    confirm button drifts off it on an ultrawide.
+                    // 2. Symmetric pillarbox bars: an asymmetric offset drifts a
+                    //    centred modal's confirm button off it on an ultrawide.
                     let (left_edge, _) = to_screen(r, point(0.0, 0.0, Anchor::Left)).expect("edge");
                     let (right_edge, _) =
                         to_screen(r, point(DESIGN_W, 0.0, Anchor::Right)).expect("edge");
@@ -660,10 +570,8 @@ mod tests {
                         (bar_left - bar_right).abs() <= 1,
                         "bars {bar_left}/{bar_right} differ by more than rounding at {width}×{height}"
                     );
-                    // 3. Monotone in the design x within one anchor: a larger
-                    //    design x never maps to a smaller pixel. `Anchor::Left`
-                    //    alone, because the three anchors measure from different
-                    //    edges and are not comparable to each other.
+                    // 3. Monotone in the design x. `Anchor::Left` alone: the
+                    //    three anchors measure from different edges.
                     let mut last = i32::MIN;
                     for x in [0.0, 1.0, 320.0, 640.0, 1279.0, DESIGN_W] {
                         let (px, _) = to_screen(r, point(x, 0.0, Anchor::Left)).expect("in range");
@@ -673,8 +581,7 @@ mod tests {
                 }
             }
         }
-        // The sweep is worth what it covers; a refactor that silently shrinks it
-        // should fail here rather than pass quietly.
+        // A refactor that silently shrinks the sweep fails here.
         assert_eq!(cases, 8 * 6 * 5 * 4);
     }
 
@@ -688,31 +595,19 @@ mod tests {
 
     #[test]
     fn the_row_count_and_the_scroll_split_stay_one_fact() {
-        // The guard that was missing: `MAX_ROW` and `LAST_TOP_ROW` used to be
-        // bare `<= 5` / `> 3` literals at three sites, and editing one alone
-        // planned a scroll-to-bottom for a row still at the top — a click on the
-        // wrong item's Buy button with real gold behind it.
-        //
-        // Every clause below is a *literal*, deliberately. The first version of
-        // this test derived all six of its assertions from the two constants,
-        // which made every one of them a tautology: `Slot::new(MAX_ROW + 1).row()
-        // == Row::new(MAX_ROW)` holds for any `MAX_ROW < 255` by `Slot::row`'s own
-        // definition, and the two `buy_job` clauses restated `row.get() >
-        // LAST_TOP_ROW`. `LAST_TOP_ROW = 2` or `= 4` passed the whole suite —
-        // i.e. the guard reintroduced exactly the hazard it was filed against.
+        // Every clause below is a *literal*, deliberately: derived from the two
+        // constants they were tautologies, and `LAST_TOP_ROW = 2` or `= 4`
+        // passed the whole suite — the guard admitting the hazard it exists for.
         assert_eq!(MAX_ROW, 5, "the Secret Shop shows six display slots");
         assert_eq!(LAST_TOP_ROW, 3, "four of them are reachable at scroll-top");
         assert_eq!(Slot::new(6).row(), Row::new(5));
         assert_eq!(Slot::new(7).row(), None);
         assert_eq!(Row::new(6), None);
 
-        // The clause that actually couples the row count to the geometry, which
-        // is the coupling the two constants exist to state: a top-group row is
-        // one whose Buy button is on screen *without* scrolling, and a
-        // bottom-group row is one whose Buy button is on screen only *with* it.
-        // Read straight off `buy_zone`, so a row count changed without moving the
-        // split — or a pitch or shift changed without moving either — fails here
-        // and not in the shop.
+        // The coupling the two constants exist to state, read straight off
+        // `buy_zone`: a top-group row is on screen *without* scrolling, a
+        // bottom-group row only *with* it. A row count, pitch or shift changed
+        // without the split moving fails here and not in the shop.
         let on_screen = |cy: f32| (0.0..=DESIGN_H).contains(&cy);
         for index in 0..=LAST_TOP_ROW {
             assert!(
@@ -731,8 +626,7 @@ mod tests {
             );
         }
 
-        // The last top-group row is bought without a second scroll; the first
-        // bottom-group row is reached by one, and only one.
+        // The first bottom-group row costs one extra scroll, and only one.
         let scrolls = |index: u8| {
             buy_job(
                 Trigger::ShopOpened,
@@ -748,7 +642,6 @@ mod tests {
         };
         assert_eq!(scrolls(3), 1);
         assert_eq!(scrolls(4), 2);
-        // And the row the extra scroll exists for really does move by the shift.
         assert_eq!(
             buy_zone(row(4), false).cy - buy_zone(row(4), true).cy,
             SCROLL_BOTTOM_SHIFT
@@ -763,8 +656,7 @@ mod tests {
         assert_eq!(Slot::new(7).row(), None);
     }
 
-    /// The two representations round-trip, in the one place each direction
-    /// lives: the journal line reads `Row::slot`, the planner reads `Slot::row`.
+    /// The journal reads `Row::slot`, the planner `Slot::row`: they round-trip.
     #[test]
     fn every_row_names_the_slot_it_came_from() {
         for index in 0..=MAX_ROW {

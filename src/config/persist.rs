@@ -1,11 +1,10 @@
 //! Format-preserving persistence of the GUI-editable config sections back to
-//! config.toml. Only `[filter]`, `[limits]`, and `[actuator.timings]` are
-//! rewritten; every other section is left exactly as the player wrote it.
-//! Whole-section replacement drops a section's inner commented-out example
-//! lines on first save, but keeps the comments above each header.
+//! config.toml. Only `[filter]`, `[limits]` and `[actuator.timings]` are
+//! rewritten; every other section is left as the player wrote it. Whole-section
+//! replacement drops a section's inner commented-out example lines on first
+//! save, but keeps the comments above each header.
 //!
-//! The one exception is [`strip_retired_keys`], which deletes the retired
-//! `[capture]` / `[forward]` keys once — see its docs for why.
+//! [`strip_retired_keys`] is the one exception — see its docs.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -34,19 +33,16 @@ pub enum Section {
 ///
 /// # Errors
 ///
-/// - [`Error::ConfigRead`] — the existing file could not be read (locked by an
-///   antivirus, permission denied, a directory in its place). A *missing* file
-///   is not an error: it is treated as an empty document and created.
+/// - [`Error::ConfigRead`] — the existing file could not be read. A *missing*
+///   file is not an error: it is an empty document, and gets created.
 /// - [`Error::ConfigReparse`] — the existing file is not valid TOML. Rewriting
-///   is format-preserving, so it has to parse what the player wrote first; the
-///   error carries the offending span.
+///   is format-preserving, so it must parse what the player wrote first.
 /// - [`Error::ConfigSerialize`] — a section could not be rendered back to TOML.
-///   Unreachable for the three concrete section types today, and kept typed so
-///   it stays distinguishable from the parse failure above.
-/// - [`Error::ConfigWrite`] — creating the parent directory, writing the
-///   sibling temp file, or renaming it over the target failed. The path is in
-///   the message: this is the read-only / OneDrive-locked `config.toml` case,
-///   where every Setup change is otherwise lost without explanation.
+///   Unreachable for the three section types today, kept typed to stay
+///   distinguishable from the parse failure above.
+/// - [`Error::ConfigWrite`] — the parent directory, the sibling temp file, or
+///   the rename failed. The path is in the message: this is the read-only /
+///   OneDrive-locked case, where Setup changes are otherwise lost in silence.
 ///
 /// The original file is left untouched whenever this returns `Err`.
 pub fn save(path: impl AsRef<Path>, edits: &[Section]) -> Result<()> {
@@ -65,22 +61,18 @@ pub fn save(path: impl AsRef<Path>, edits: &[Section]) -> Result<()> {
     replace_file(path, &updated)
 }
 
-/// Put `contents` at `path`, atomically, creating the parent directory
-/// first.
+/// Put `contents` at `path`, atomically, creating the parent directory first.
 ///
-/// Shared by [`save`] and [`strip_retired_keys`] so there is exactly one
-/// write path for `config.toml`: a second one is how it ends up non-atomic,
-/// truncating the file the player hand-wrote.
+/// Shared by [`save`] and [`strip_retired_keys`] so `config.toml` has exactly
+/// one write path: a second one is how it ends up non-atomic.
 ///
 /// # Errors
 ///
-/// [`Error::ConfigWrite`] — creating the parent directory, writing the
-/// sibling temp file, or renaming it over the target failed. The target is
-/// left untouched in every case.
+/// [`Error::ConfigWrite`] — the parent directory, the temp write or the rename
+/// failed. The target is left untouched in every case.
 fn replace_file(path: &Path, contents: &str) -> Result<()> {
-    // The config lives in a per-user app-data subdir that may not exist yet on
-    // first run (nothing created it before this first Apply); make it so the
-    // sibling-temp write below has a directory to land in.
+    // The per-user app-data subdir may not exist yet on first run, and the
+    // sibling-temp write below needs somewhere to land.
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|source| Error::ConfigWrite {
             path: path.to_path_buf(),
@@ -91,17 +83,11 @@ fn replace_file(path: &Path, contents: &str) -> Result<()> {
     // never truncates the hand-authored config. On any failure, remove the temp
     // so a read-only or locked target doesn't accrete a stale `config.toml.tmp`.
     let tmp = path.with_extension("toml.tmp");
-    // `sync_all` before the rename, and that is what makes the sentence above
-    // true rather than nearly true. `fs::write` returns once the bytes are in
-    // the page cache; the rename that follows is metadata, and NTFS can commit
-    // it durably while the data behind it is still unwritten. Lose power in
-    // that window and the next launch finds a zero-length `config.toml` —
-    // which is not an error anywhere downstream, because `Config` is
-    // `#[serde(default)]`, so it parses as an all-default config and
-    // `seed_config_if_missing` declines to restore it (the file exists). Every
-    // filter, limit, timing and hand-written comment would be gone with
-    // nothing logged: exactly the loss this function promises to prevent, on
-    // the one failure it had not covered.
+    // `sync_all` before the rename, or the sentence above is only nearly true:
+    // NTFS can commit the rename durably while the data is still in page cache,
+    // the next launch then finds a zero-length `config.toml`, `#[serde(default)]`
+    // parses it as an all-default `Config`, and `seed_config_if_missing`
+    // declines to restore it because the file exists. Silent total loss.
     let durable_write = || -> std::io::Result<()> {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(contents.as_bytes())?;
@@ -121,9 +107,8 @@ fn replace_file(path: &Path, contents: &str) -> Result<()> {
 
 /// The retired-but-still-parsed keys, grouped by the table that holds them.
 ///
-/// Mirrors [`CaptureConfig::retired_keys`] / [`ForwardConfig::retired_keys`]:
-/// those name what a loaded config *sets*, this names what can be taken out.
-/// The two lists must stay in step, or a key warns forever or gets silently
+/// Must stay in step with [`CaptureConfig::retired_keys`] /
+/// [`ForwardConfig::retired_keys`], or a key warns forever or gets silently
 /// deleted with nothing logged.
 ///
 /// [`CaptureConfig::retired_keys`]: super::CaptureConfig::retired_keys
@@ -138,33 +123,25 @@ const RETIRED_KEYS: &[(&str, &[&str])] = &[
 /// Returns the keys it removed (`"capture.filter, forward.client_to_server"`),
 /// or `None` when the file held none and was therefore not written at all.
 ///
-/// The keys are `deny_unknown_fields`, kept parsed-and-ignored because
-/// deleting them outright would turn every existing installation's next
-/// launch into "Invalid configuration". [`save`] only ever rewrites
-/// `[filter]`, `[limits]` and `[actuator.timings]`, so without this the
-/// startup warning would never stop firing. `CaptureConfig` and
-/// `ForwardConfig` hold *only* retired keys, so stripping always empties —
-/// and removes — the header too, and never a table this pass did not touch
-/// (`config.example.toml` ships both headers with every key commented out).
+/// [`save`] rewrites only `[filter]`, `[limits]` and `[actuator.timings]`, so
+/// without this the startup warning never stops firing. Both structs hold
+/// *only* retired keys, so stripping always empties — and removes — the header
+/// too, but never a table this pass did not touch.
 ///
-/// It does remove commented-out *assignments* of those keys, wherever in the
-/// file they sit, including ones the player typed — see [`tidy`] for why that
-/// is the narrowest correct scope rather than an overreach. What it never
-/// touches is prose, or a commented assignment of any key that still exists.
+/// Commented-out *assignments* of those keys go as well, wherever they sit and
+/// including ones the player typed — see [`tidy`]. Prose never does, nor a
+/// commented assignment of a key that still exists.
 ///
 /// # Errors
 ///
-/// - [`Error::ConfigRead`] — the file could not be read. A *missing* file
-///   yields `None`, not an error.
-/// - [`Error::ConfigReparse`] — the file is not valid TOML. Unreachable from
-///   the startup path (`Config::load` already parsed the same bytes), kept
-///   typed rather than silently skipped.
-/// - [`Error::ConfigWrite`] — the rewrite failed (read-only file, antivirus
-///   lock). The file is left as-is, retired keys included, so the caller
-///   must keep warning about them.
+/// - [`Error::ConfigRead`] — unreadable. A *missing* file yields `None`.
+/// - [`Error::ConfigReparse`] — not valid TOML. Unreachable from the startup
+///   path (`Config::load` parsed the same bytes), kept typed rather than
+///   silently skipped.
+/// - [`Error::ConfigWrite`] — the rewrite failed. The file keeps its retired
+///   keys, so the caller must keep warning about them.
 ///
-/// All non-fatal for callers: the keys are inert, so a failed delete costs a
-/// log line, not a startup.
+/// All non-fatal: the keys are inert, so a failed delete costs a log line.
 pub fn strip_retired_keys(path: impl AsRef<Path>) -> Result<Option<String>> {
     let path = path.as_ref();
     let text = match std::fs::read_to_string(path) {
@@ -185,8 +162,7 @@ pub fn strip_retired_keys(path: impl AsRef<Path>) -> Result<Option<String>> {
 }
 
 /// What one strip pass changed: the rewritten document, and the keys it took
-/// out in `capture.buffer_size` form — ready to name in the log, so a player
-/// reading it later sees which lines left their file.
+/// out in `capture.buffer_size` form — ready to name in the log.
 #[derive(Debug)]
 struct Stripped {
     text: String,
@@ -194,15 +170,14 @@ struct Stripped {
 }
 
 /// Pure core: drop the retired keys from the document text. `None` when the
-/// text sets none of them, which is the whole point — no rewrite, no log line,
-/// and no mtime change on the file of every install from here on.
+/// text sets none of them — no rewrite, no log line, and no mtime change on the
+/// file of every install from here on.
 fn strip_sections(text: &str) -> Result<Option<Stripped>> {
     let mut doc: DocumentMut = text.parse()?;
     let root = doc.as_table_mut();
     let mut removed = Vec::new();
-    // Headers this pass emptied, and the retired keys of every table it
-    // edited — both finished off by `tidy` on the rendered text (see there
-    // for why the tree cannot do it).
+    // Headers this pass emptied, and the retired keys of every table it edited
+    // — both finished off by `tidy` on the rendered text.
     let mut headers = Vec::new();
     let mut orphaned = Vec::new();
     for (table, keys) in RETIRED_KEYS {
@@ -223,20 +198,18 @@ fn strip_sections(text: &str) -> Result<Option<Stripped>> {
     }))
 }
 
-/// Remove `keys` from `root[table]`, appending each removal to `removed` as
-/// a dotted name. Returns true when the table is now empty *and* this pass
+/// Remove `keys` from `root[table]`, appending each removal to `removed` as a
+/// dotted name. Returns true when the table is now empty *and* this pass
 /// emptied it — the caller drops its header line in [`tidy`].
 ///
-/// Handles every spelling a player's file can use: the header table
-/// (`[capture]`), the inline one (`capture = { .. }`), and the dotted
-/// `capture.filter = ".."` (`toml_edit` models the last as a table too,
-/// told apart by `is_dotted`). Inline/dotted forms are removed immediately;
-/// the header table is left for [`tidy`], which drops the header without
-/// its leading comments.
+/// Handles all three spellings: header (`[capture]`), inline
+/// (`capture = { .. }`) and dotted (`capture.filter = ".."`, which `toml_edit`
+/// also models as a table, told apart by `is_dotted`). The first two are
+/// removed here; the header is left for [`tidy`], which drops it without its
+/// leading comments.
 ///
-/// Gated on having removed something: an untouched empty table is a
-/// commented-out section (the shape `config.example.toml` seeds), not our
-/// leftover.
+/// Gated on having removed something: an untouched empty table is the player's
+/// commented-out section, the shape `config.example.toml` seeds, not a leftover.
 fn strip_table(root: &mut Table, table: &str, keys: &[&str], removed: &mut Vec<String>) -> bool {
     let before = removed.len();
     let (empty, has_header) = match root.get_mut(table) {
@@ -272,8 +245,8 @@ fn strip_table(root: &mut Table, table: &str, keys: &[&str], removed: &mut Vec<S
 /// A text pass, because neither line is reachable from the tree: `toml_edit`
 /// attaches a comment to whatever *follows* it, so a section's leading
 /// comments are the header's decor, and its trailing commented-out lines
-/// belong to the *next* header. `Table::remove` on `[capture]` does both
-/// halves of the wrong thing at once — observed on the live `%APPDATA%`
+/// belong to the *next* header. `Table::remove` on `[capture]` therefore does
+/// both halves of the wrong thing at once — observed on the live `%APPDATA%`
 /// file:
 ///
 /// - deletes the player's own commented-out
@@ -286,37 +259,18 @@ fn strip_table(root: &mut Table, table: &str, keys: &[&str], removed: &mut Vec<S
 /// So the emptied table is rendered before being removed, leaving every
 /// comment where its author put it.
 ///
-/// The commented-key match is narrow — `#`, key, `=` — so prose survives
-/// even when it names a retired key, and it runs only for the keys of a
-/// table this pass edited. A comment *inside* a removed section outlives it:
-/// the accepted cost of never touching a comment we are not sure about.
-///
-/// # Why the commented-key sweep is whole-document
-///
-/// It looks like the one unscoped thing here, and the scope is deliberate.
-/// [`RETIRED_KEYS`] names four keys, and none of them is a live key of *any*
-/// table in the schema — `buffer_size`, `server_to_client` and
-/// `client_to_server` exist nowhere else, and `filter` is a table header
-/// (`[filter]`), never an assignment. So a `# <one of the four> = …` line can
-/// only ever be a commented-out spelling of a retired key, whichever section it
-/// was written under, and removing it is this pass's whole purpose.
-///
-/// Scoping it to the edited section would be worse, not safer: the tables being
-/// stripped are removed *wholesale* (both structs hold only retired keys), so a
-/// commented sibling left behind is a comment `toml_edit` re-homes under the
-/// next header — `# filter = "tcp and tcp.SrcPort == 3333"` reading as
-/// `reconnect.filter`, which is the exact defect the paragraphs above describe
-/// and the reason this text pass exists.
-///
-/// Two narrowings already bound it: this runs only for the keys of a table the
-/// tree pass edited, and that pass runs only on a file that actually *set* a
-/// retired key. A file seeded from `config.example.toml` — which ships all four
-/// commented out and none of them set — is never rewritten at all.
+/// The commented-key sweep is whole-document on purpose: none of
+/// [`RETIRED_KEYS`]' four names is a live key of *any* table in the schema, so
+/// such a line can only be a commented-out retired key whichever section it
+/// sits under — and a commented sibling left behind is the re-homing defect
+/// above. The match is narrow (`#`, key, `=`) so prose survives. A comment
+/// *inside* a removed section outlives it: the accepted cost of never touching
+/// a comment we are not sure about.
 fn tidy(text: &str, headers: &[&str], keys: &[&str]) -> String {
     let mut out = String::with_capacity(text.len());
-    // A dropped header leaves the blank line before it *and* the one before
-    // the next section; swallow one, but only when both existed, so the
-    // pass never invents or removes spacing elsewhere.
+    // A dropped header leaves the blank line before it *and* the one before the
+    // next section; swallow one, but only when both existed, so the pass never
+    // invents or removes spacing elsewhere.
     let mut header_dropped = false;
     let mut previous_blank = true;
     for line in text.split_inclusive('\n') {
@@ -372,12 +326,9 @@ fn write_sections(text: &str, edits: &[Section]) -> Result<String> {
             Section::Filter(filter) => set_table(root, "filter", section_table(filter)?),
             Section::Limits(limits) => set_table(root, "limits", section_table(limits)?),
             Section::Timings(timings) => {
-                // The write boundary the loader's `validate` never sees: the
-                // Setup tab hands `Timings` here directly, with no `Config` in
-                // the path. It used to call `config::validate_timings` for
-                // that reason; no longer needed, since `plan::DelayRange`
-                // carries `min_ms <= max_ms <= MAX_TIMING_MS` by construction
-                // — any `Timings` reaching here is one `Config::load` accepts.
+                // The write boundary the loader's `validate` never sees. No
+                // clamp needed: `plan::DelayRange` is bounded by construction,
+                // so any `Timings` here is one `Config::load` accepts.
                 let mut table = section_table(timings)?;
                 inline_ranges(&mut table);
                 set_nested_table(root, "actuator", "timings", table);
@@ -403,11 +354,10 @@ fn set_table(parent: &mut Table, key: &str, mut new: Table) {
 }
 
 /// Replace `parent[outer][inner]`, ensuring `outer` is a header table first.
-/// Absent → a fresh implicit table (so a new file grows only
-/// `[actuator.timings]`, no bare `[actuator]` header). Authored inline
-/// (`actuator = { .. }`) → promoted to a header table in place so its other
-/// keys (`dry_run`/`backend`) survive the splice. Already a header table → left as
-/// is, its keys preserved.
+/// Absent → a fresh implicit table, so a new file grows only
+/// `[actuator.timings]` and no bare `[actuator]` header. Inline
+/// (`actuator = { .. }`) → promoted in place, so `dry_run`/`backend` survive the
+/// splice. Already a header table → left as is.
 fn set_nested_table(parent: &mut Table, outer: &str, inner: &str, new: Table) {
     if let Some(inline) = parent.get(outer).and_then(Item::as_inline_table).cloned() {
         parent.insert(outer, Item::Table(inline.into_table()));
@@ -446,8 +396,7 @@ mod tests {
         }
     }
 
-    /// A range the type accepts — the only kind that can reach this module, now
-    /// that `DelayRange` carries `min_ms <= max_ms <= MAX_TIMING_MS`.
+    /// A range the type accepts — the only kind that can reach this module.
     fn range(min_ms: u64, max_ms: u64) -> crate::actuator::plan::DelayRange {
         crate::actuator::plan::DelayRange::try_new(min_ms, max_ms)
             .expect("the fixture range must be valid")
@@ -565,11 +514,9 @@ backend = \"input\"
             ..Timings::default()
         };
         let out = write_sections(text, &[Section::Timings(timings)]).expect("write");
-        // Promoted to a header table; mode keys survive; timings spliced in.
         assert!(out.contains("dry_run = true"), "dry_run kept");
         assert!(out.contains("backend = \"input\""), "backend kept");
         assert!(out.contains("[actuator.timings]"));
-        // The whole thing still loads and the mode is intact.
         let config: crate::config::Config = toml::from_str(&out).expect("reload");
         assert!(config.actuator.dry_run);
         assert_eq!(
@@ -580,10 +527,9 @@ backend = \"input\"
 
     #[test]
     fn inert_timing_ranges_are_not_written() {
-        // Whole-section replacement means every field of `Timings` lands in the
-        // file. Without the skips, the first Apply after touching one knob
-        // wrote all eight ranges — seven of them `{ min_ms = 0, max_ms = 0 }`
-        // no-ops — into a file this module exists to leave alone.
+        // Whole-section replacement puts every field of `Timings` in the file:
+        // without the skips, one knob touched wrote all eight ranges, seven of
+        // them `{ min_ms = 0, max_ms = 0 }` no-ops.
         let timings = Timings {
             refreshed: range(200, 800),
             ..Timings::default()
@@ -608,11 +554,9 @@ backend = \"input\"
 
     #[test]
     fn inert_filter_keys_are_not_written() {
-        // The `Timings` twin, at the layer that writes the file: four of
-        // `Filter`'s five never-`None` fields would otherwise write
+        // The `Timings` twin: one item name typed would otherwise write
         // `kinds = []`, `sets = []`, `required_substats = []` and
-        // `include_sold_out = false` on the first Apply after typing one
-        // item name.
+        // `include_sold_out = false` too.
         let out = write_sections("", &[Section::Filter(hunt_filter())]).expect("write");
         assert!(out.contains("names = [\"ticketrare_name\"]"));
         for inert in ["kinds", "sets", "required_substats", "include_sold_out"] {
@@ -625,12 +569,10 @@ backend = \"input\"
 
     #[test]
     fn a_persisted_substat_requirement_reloads() {
-        // The one `Filter` field that is not a scalar or a string list.
-        // `toml_edit` renders it as the inline `required_substats = [{ name =
+        // `toml_edit` renders this as the inline `required_substats = [{ name =
         // "speed", min = 8.0 }]`, not the `[[filter.required_substats]]`
-        // array-of-tables `config.example.toml` documents — both are the same
-        // document to any parser, so this is a cosmetic house-style
-        // divergence, not a defect.
+        // array-of-tables `config.example.toml` documents. Both are the same
+        // document to any parser: a house-style divergence, not a defect.
         let filter = Filter {
             required_substats: vec![crate::domain::filter::SubstatReq {
                 name: "speed".to_owned(),
@@ -646,13 +588,9 @@ backend = \"input\"
 
     #[test]
     fn the_widest_writable_timings_reload_through_the_loader() {
-        // The second write boundary, pinned from the writing side:
-        // `Config::load` guards the loader, but the Setup tab reaches this
-        // module with no `Config` in the path, so an unclamped `Timings`
-        // used to land on disk and break the *next* launch. That is no
-        // longer constructible, so what is left to prove is the other
-        // direction: the extreme a `Timings` *can* hold still survives the
-        // round trip through the file this module writes.
+        // An unclamped `Timings` used to reach disk here and break the *next*
+        // launch. No longer constructible, so what is left to prove is that the
+        // widest a `Timings` *can* hold still round-trips.
         let widest = Timings {
             refreshed: range(0, crate::actuator::plan::MAX_TIMING_MS),
             shop_opened: range(
@@ -671,9 +609,8 @@ backend = \"input\"
 
     #[test]
     fn all_default_timings_write_no_range_and_still_round_trip() {
-        // The degenerate case of the skips: every range inert leaves the
-        // header alone. It must still reload as the calibrated default rather
-        // than fail to parse.
+        // Every range inert leaves the header alone; it must still reload as
+        // the calibrated default rather than fail to parse.
         let out = write_sections("", &[Section::Timings(Timings::default())]).expect("write");
         assert!(!out.contains("min_ms"), "no no-op range written: {out:?}");
         let config: crate::config::Config = toml::from_str(&out).expect("reload");
@@ -682,9 +619,8 @@ backend = \"input\"
 
     #[test]
     fn a_malformed_existing_file_reports_the_parse_error_not_a_write_error() {
-        // The two failure modes used to funnel through one `String` variant:
-        // "the file you wrote is broken" and "we failed to serialize" read
-        // identically in the banner. They must not.
+        // "your file is broken" and "we failed to serialize" used to funnel
+        // through one `String` variant and read identically in the banner.
         let err = write_sections(
             "game_port = = 3333\n",
             &[Section::Limits(Limits::default())],
@@ -700,8 +636,7 @@ backend = \"input\"
 
     /// The user's live `%APPDATA%` file, in miniature: `config.example.toml`
     /// once shipped both blocks uncommented, so this is what is on disk for
-    /// every player who launched an early build. Two warnings every startup,
-    /// forever, until something removes the keys.
+    /// every player who launched an early build.
     #[test]
     fn a_config_with_both_retired_blocks_comes_back_without_them() {
         let text = "\
@@ -731,13 +666,11 @@ filter = \"tcp and tcp.SrcPort == 3333\"
             );
         }
         assert!(stripped.text.contains("game_port = 3333"), "live key kept");
-        // The log line names every key that left the file, in a fixed order.
         assert_eq!(
             stripped.removed,
             "capture.buffer_size, capture.filter, forward.server_to_client, forward.client_to_server"
         );
-        // And what is left still loads: stripping must not produce a file the
-        // next launch refuses.
+        // Stripping must not produce a file the next launch refuses.
         let config: crate::config::Config = toml::from_str(&stripped.text).expect("reload");
         assert_eq!(config.game_port.get(), 3333);
         assert_eq!(config.capture.retired_keys(), None);
@@ -746,9 +679,8 @@ filter = \"tcp and tcp.SrcPort == 3333\"
 
     #[test]
     fn stripping_keeps_untouched_sections_and_their_header_comments() {
-        // The same guarantee `untouched_sections_and_header_comments_survive`
-        // pins for `save`, extended to this second write path: it is the reason
-        // both go through `toml_edit` instead of a regex.
+        // The reason this second write path goes through `toml_edit` and not a
+        // regex, same as `untouched_sections_and_header_comments_survive`.
         let text = "\
 # top of file
 game_port = 3333
@@ -774,9 +706,8 @@ buffer_size = 65535
 
     #[test]
     fn an_emptied_retired_table_leaves_no_bare_header() {
-        // Both structs hold only retired keys, so stripping always empties
-        // the table; a leftover `[capture]` header would be worse than the
-        // key it used to hold.
+        // Both structs hold only retired keys, so stripping always empties the
+        // table.
         let text = "\
 [capture]
 buffer_size = 65575
@@ -796,8 +727,7 @@ max_spend = 300
 
     #[test]
     fn a_config_without_retired_keys_is_left_byte_identical() {
-        // The normal case for every install from here on: no rewrite means no
-        // log line and no mtime change on the player's file.
+        // No rewrite means no log line and no mtime change on the player's file.
         let text = "\
 # top of file
 game_port = 3333
@@ -806,9 +736,9 @@ game_port = 3333
 names = [\"ticketrare_name\"]
 ";
         assert!(strip_sections(text).expect("valid TOML").is_none());
-        // Including the shape `config.example.toml` seeds: both headers
-        // present, every key commented out. An untouched empty table is the
-        // player's commented section, not our leftover.
+        // Including the shape `config.example.toml` seeds — both headers
+        // present, every key commented out — which is the player's commented
+        // section, not our leftover.
         let seeded = "\
 [forward]
 # server_to_client = true
@@ -821,11 +751,9 @@ names = [\"ticketrare_name\"]
 
     #[test]
     fn a_retired_table_that_still_holds_another_key_keeps_that_key_and_its_header() {
-        // Defensive: no such case exists today (both structs hold only
-        // retired keys, and `deny_unknown_fields` refuses anything else) —
-        // this pins "remove the table when empty" rather than "remove the
-        // retired table", so a later release adding a live `[capture]` key
-        // is not silently deleted by this pass.
+        // Defensive: no such case exists today, but this pins "remove the table
+        // when empty" rather than "remove the retired table", so a later
+        // release adding a live `[capture]` key is not silently deleted here.
         let text = "[capture]\nbuffer_size = 65575\nsomething_live = 7\n";
         let stripped = strip_sections(text).expect("valid TOML").expect("rewrites");
         assert!(
@@ -842,10 +770,9 @@ names = [\"ticketrare_name\"]
 
     #[test]
     fn a_retired_key_written_inline_is_stripped_too() {
-        // `capture = { buffer_size = .. }` and `capture.filter = ".."` are both
-        // legal TOML for the same document, and both are what a hand-editing
-        // player may leave behind. Missing them would keep the warning going
-        // with no way out but the header form.
+        // `capture = { buffer_size = .. }` and `capture.filter = ".."` are the
+        // same document to `toml`. Missing them would keep the warning going
+        // with no way out but rewriting the file in the header form.
         let stripped = strip_sections("capture = { buffer_size = 65575 }\ngame_port = 3333\n")
             .expect("valid TOML")
             .expect("rewrites");
@@ -866,7 +793,7 @@ names = [\"ticketrare_name\"]
     #[test]
     fn only_the_retired_keys_that_are_present_are_named() {
         // The list goes straight into the startup log; naming a key the player
-        // never wrote would send them looking for a line that is not there.
+        // never wrote sends them looking for a line that is not there.
         let stripped = strip_sections("[capture]\nfilter = \"tcp\"\n")
             .expect("valid TOML")
             .expect("rewrites");
@@ -874,11 +801,9 @@ names = [\"ticketrare_name\"]
     }
 
     /// **The regression that made this a text pass.** `Table::remove` on the
-    /// emptied `[forward]` takes its decor with it — a table's decor is every
-    /// comment line above the header, not its contents. In the live
-    /// `%APPDATA%` file that decor is the player's own commented-out
-    /// loopback `server_url`: deleted by a pass whose whole promise is that
-    /// it changes no setting.
+    /// emptied `[forward]` takes its decor with it, and a table's decor is
+    /// every comment line above the header. In the live `%APPDATA%` file that
+    /// decor is the player's own commented-out loopback `server_url`.
     #[test]
     fn a_comment_above_a_removed_header_belongs_to_the_line_before_it() {
         let text = "\
@@ -892,9 +817,9 @@ server_to_client = true
 initial_ms = 1000
 ";
         let stripped = strip_sections(text).expect("valid TOML").expect("rewrites");
-        // Exact text, because the guarantee is the *layout*: the player's
-        // commented alternative kept, in place, and the blank line the dropped
-        // header used to need not left behind as a second one.
+        // Exact text, because the guarantee is the *layout*: the commented
+        // alternative kept in place, and the blank line the dropped header
+        // used to need not left behind as a second one.
         assert_eq!(
             stripped.text,
             "\
@@ -909,10 +834,10 @@ initial_ms = 1000
 
     #[test]
     fn a_commented_out_retired_key_does_not_outlive_its_section() {
-        // The other half: a commented example line at the end of `[capture]`
-        // is `toml_edit`-attached to the *next* header, so removing the
-        // section re-homes it — `# filter = ..` would resurface under
-        // `[reconnect]`, reading as a commented `reconnect.filter`.
+        // A commented example line at the end of `[capture]` is
+        // `toml_edit`-attached to the *next* header, so removing the section
+        // re-homes it — `# filter = ..` resurfacing under `[reconnect]`, where
+        // it reads as a commented `reconnect.filter`.
         let text = "\
 [reconnect]
 initial_ms = 1000
@@ -949,8 +874,8 @@ names = [\"ticketrare_name\"]
     #[test]
     fn a_malformed_file_is_reported_not_stripped() {
         // Unreachable from the startup path (`Config::load` parsed the same
-        // bytes first), and still typed rather than swallowed: a rewrite that
-        // guessed at broken TOML would be a rewrite of the player's file.
+        // bytes first), and still typed rather than swallowed: guessing at
+        // broken TOML would be a rewrite of the player's file.
         let err = strip_sections("game_port = = 3333\n").expect_err("malformed TOML");
         assert!(
             matches!(err, Error::ConfigReparse(_)),

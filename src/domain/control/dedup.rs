@@ -6,11 +6,10 @@ use std::sync::Arc;
 use crate::domain::shop::{CatalogId, Gold, ShopSnapshot, Substat};
 
 /// One slot's contribution to a snapshot's identity: the catalog id plus the
-/// per-roll fields the filter can match on — a re-roll redrawing the same
-/// catalog ids is improbable but possible, and must read as a new shop.
-/// `limit` is deliberately excluded: re-opening the shop after a buy
-/// re-delivers the same roll with `remaining` decremented, and that must
-/// still count as the same shop.
+/// per-roll fields the filter matches on, since a re-roll can redraw the same
+/// ids and must read as a new shop. `limit` is deliberately excluded —
+/// re-opening after a buy re-delivers the roll with `remaining` decremented,
+/// which is still the same shop.
 #[derive(Clone, PartialEq)]
 pub(super) struct SlotIdentity {
     id: CatalogId,
@@ -20,17 +19,14 @@ pub(super) struct SlotIdentity {
     substats: Vec<Substat>,
 }
 
-/// A snapshot's dedup identity: the ordered [`SlotIdentity`]s, behind an `Arc`.
-///
-/// Shared rather than owned because `Controller` holds two of these at once (the
-/// last roll evaluated and the roll `bought` is scoped to) and they are the same
-/// value whenever both are set. The contents are never mutated in place — only
-/// compared and replaced wholesale — so the second holder wants a refcount, not
-/// a second deep copy of every slot's `set` and `substats` strings.
+/// A snapshot's dedup identity: the ordered [`SlotIdentity`]s, behind an `Arc`
+/// because `Controller` holds two at once (the last roll evaluated and the roll
+/// `bought` is scoped to) and they are the same value whenever both are set.
+/// Never mutated in place, so the second holder wants a refcount, not a copy.
 pub(super) type Fingerprint = Arc<Vec<SlotIdentity>>;
 
-/// Snapshot identity for dedup: the ordered [`SlotIdentity`]s. `None` when
-/// any id is the 0 sentinel — omitted ids make shops indistinguishable.
+/// `None` when any id is the 0 sentinel — omitted ids make shops
+/// indistinguishable, so dedup must fail open rather than guess.
 pub(super) fn fingerprint(snapshot: &ShopSnapshot) -> Option<Fingerprint> {
     let slots: Option<Vec<SlotIdentity>> = snapshot
         .slots

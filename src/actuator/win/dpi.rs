@@ -1,10 +1,6 @@
 //! The one *per-process* precondition both backends establish before they touch
-//! the game window: that this process is per-monitor DPI aware.
-//!
-//! Its own file because it is the only thing under `win` that is about the
-//! process rather than about the window. The verdict is a pure function of an
-//! awareness value, so wording and classification are tested with no Win32
-//! anywhere. [`ensure_dpi_awareness`] is what both `acquire`s call first.
+//! the game window: that this process is per-monitor DPI aware. Its own file
+//! because it is the only thing under `win` about the process, not the window.
 
 use std::sync::OnceLock;
 
@@ -17,7 +13,6 @@ use windows_sys::Win32::UI::HiDpi::{
 
 use crate::actuator::SurfaceError;
 
-/// Names an awareness value for the log line and the refusal.
 fn awareness_name(awareness: DPI_AWARENESS) -> &'static str {
     match awareness {
         DPI_AWARENESS_UNAWARE => "unaware",
@@ -28,10 +23,8 @@ fn awareness_name(awareness: DPI_AWARENESS) -> &'static str {
     }
 }
 
-/// The verdict on an awareness value: `Ok(())` only for per-monitor awareness.
-///
-/// Pure, so the wording and the classification can be tested without any Win32
-/// — the same split `preflight_refusal` uses.
+/// `Ok(())` only for per-monitor awareness. Pure, so wording and classification
+/// are testable with no Win32 — the same split `preflight_refusal` uses.
 fn awareness_verdict(awareness: DPI_AWARENESS) -> Result<(), SurfaceError> {
     if awareness == DPI_AWARENESS_PER_MONITOR_AWARE {
         return Ok(());
@@ -45,42 +38,24 @@ fn awareness_verdict(awareness: DPI_AWARENESS) -> Result<(), SurfaceError> {
     )))
 }
 
-/// Establishes — once per process — that this process is *per-monitor* DPI aware,
-/// which is what makes every client rect below come back in physical pixels.
+/// Establishes, once per process, the *per-monitor* DPI awareness that makes
+/// every client rect below come back in physical pixels.
 ///
-/// # Why this is checked rather than assumed
-///
-/// The whole coordinate chain is physical-pixel arithmetic: `client_rect` reads
-/// `GetClientRect` + `ClientToScreen`, `plan::to_screen` scales design-space
-/// points against that rect, and `move_cursor` normalizes the result against
-/// `SM_CXVIRTUALSCREEN`, which is always physical. A DPI-unaware or system-aware
-/// process gets *virtualized* rects on a scaled display, so every planned point
-/// is off by the scale factor and clicks land on the wrong buttons — and nothing
-/// reports it: `SendInput` is documented not to signal that kind of failure at
-/// all (see [`sendinput_result`]), and `PostMessageW` cheerfully posts a
-/// well-formed message to a wrong coordinate.
+/// A DPI-unaware or system-aware process gets *virtualized* client rects on a
+/// scaled display, so every planned point is off by the scale factor — and
+/// nothing reports it: `SendInput` cannot signal that kind of failure at all
+/// (see [`sendinput_result`]) and `PostMessageW` posts a well-formed message to
+/// the wrong coordinate. A mis-aimed click being worse than none, anything but
+/// per-monitor awareness refuses the acquire with a `Fatal`.
 ///
 /// Do not drop `SetProcessDpiAwarenessContext`'s return value on the assumption
-/// that a failure means "already set to what we want" — it answers `FALSE` for
-/// **any** already-set awareness, `UNAWARE` and `SYSTEM_AWARE` included, so that
-/// assumption would leave the click chain resting on an unverified choice made
-/// elsewhere.
-///
-/// `build.rs` declares `dpiAwareness = permonitorv2, permonitor` in the embedded
-/// application manifest, which the loader applies before any code runs. Measured
-/// on the built exe: awareness is already per-monitor at process entry, and
-/// every later setter — ours, winit's v2 attempt and its v1 fallback — fails
-/// with `ERROR_ACCESS_DENIED` without changing it, so the setter below always
-/// fails in the GUI build, now because we got there first rather than winit.
-/// A `__COMPAT_LAYER` shim can still outrank the manifest:
-/// `__COMPAT_LAYER=DPIUNAWARE` on a manifested build was measured landing at
-/// `unaware`, the case the refusal below names.
-///
-/// The answer therefore comes from reading the context back, not from the
-/// setter's return — that is the only way to learn *whose* value won. A
-/// mis-aimed click is worse than no click, so anything but per-monitor
-/// awareness refuses the acquire with a `Fatal`, in the same voice as the UIPI
-/// preflight.
+/// that a failure means "already set to what we want": it answers `FALSE` for
+/// **any** already-set awareness, `UNAWARE` included, so only reading the
+/// context back says *whose* value won. `build.rs` puts `dpiAwareness =
+/// permonitorv2, permonitor` in the manifest and the loader applies it before
+/// any code runs, so the setter always fails (`ERROR_ACCESS_DENIED`, measured) —
+/// but `__COMPAT_LAYER=DPIUNAWARE` outranks the manifest, measured landing at
+/// `unaware`.
 ///
 /// # Errors
 ///
@@ -91,41 +66,24 @@ fn awareness_verdict(awareness: DPI_AWARENESS) -> Result<(), SurfaceError> {
 pub(super) fn ensure_dpi_awareness() -> Result<(), SurfaceError> {
     static DPI: OnceLock<Result<(), SurfaceError>> = OnceLock::new();
     DPI.get_or_init(|| {
-        // SAFETY: the argument is a well-known Win32 constant and the call only
-        // flips process-global DPI state — it borrows nothing and hands back
-        // nothing to keep alive. A zero answer means *some* awareness was
-        // already set, which is why the value is read back below rather than
-        // inferred from this return.
+        // SAFETY: the argument is a well-known Win32 constant, and the call
+        // flips process-global state without borrowing anything.
         let set =
             unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-        // Read before the two getters below: `GetLastError` is per-thread and
-        // any later call may overwrite it, and neither getter is documented to
-        // leave it alone. The manifest has already set the awareness on every
-        // build of this exe, so this branch fires on every launch — this value
-        // is the difference between a reproducible bug report and "the clicks
-        // miss sometimes".
+        // Read before the two getters below: `GetLastError` is per-thread, and
+        // neither getter is documented to leave it alone.
         let set_error = (set == 0).then(std::io::Error::last_os_error);
-        // One Win32 call per block, so each `// SAFETY:` answers for exactly the
-        // call above it.
-        //
         // SAFETY: takes no argument, returns an opaque process-global token, and
         // borrows nothing.
         let context = unsafe { GetThreadDpiAwarenessContext() };
         // SAFETY: `context` is the token the previous call just produced, and
-        // this is its only documented consumer; it takes no pointer and no
-        // handle, and answers `DPI_AWARENESS_INVALID` for anything it does not
-        // recognize.
+        // this call answers `DPI_AWARENESS_INVALID` for anything it does not
+        // recognize rather than faulting.
         let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(context) };
         let verdict = awareness_verdict(awareness);
-        // `Some` exactly when the setter refused, with the error it named
-        // captured back when it still belonged to that call.
         if let Some(error) = set_error {
-            // Expected on every launch: the manifest sets the awareness before
-            // any code runs, so this setter is always refused
-            // (`ERROR_ACCESS_DENIED`, measured). `accepted=false` is the one
-            // case that matters — it means something outranked the manifest: a
-            // `__COMPAT_LAYER` shim, or the "Override high DPI scaling
-            // behavior" checkbox.
+            // `info`, not `warn`: this fires on every launch. `accepted=false`
+            // is the one case that matters.
             tracing::info!(
                 awareness = awareness_name(awareness),
                 accepted = verdict.is_ok(),
@@ -143,8 +101,6 @@ pub(super) fn ensure_dpi_awareness() -> Result<(), SurfaceError> {
 mod tests {
     use super::*;
 
-    /// Only per-monitor awareness gives physical-pixel client rects (see
-    /// [`ensure_dpi_awareness`] for why the other values are refused).
     #[test]
     fn only_per_monitor_awareness_is_accepted_for_the_coordinate_maths() {
         assert_eq!(awareness_verdict(DPI_AWARENESS_PER_MONITOR_AWARE), Ok(()));
@@ -159,7 +115,7 @@ mod tests {
                 panic!("{name} awareness must refuse: a mis-aimed click is worse than none");
             };
             assert!(reason.contains(name), "{reason}");
-            // The player is pointed at something they can actually change.
+            // Pointing at something the player can actually change.
             assert!(reason.contains("compatibility setting"), "{reason}");
             assert!(reason.contains("__COMPAT_LAYER"), "{reason}");
         }

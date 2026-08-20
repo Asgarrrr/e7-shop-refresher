@@ -1,9 +1,6 @@
 //! Hunt: the item-interest criteria — the section's summary and its leaf
-//! widgets (id lists, substat rows, the checkbox-gated numeric cell). Works on
-//! a `Filter` field or a scratch buffer handed in by the caller, needing no
-//! `EditorState`. `hunt_body` stays in the shell because it reaches four draft
-//! fields at once — see `_HANDOFF.md` for the draft-grouping prerequisite that
-//! would let it move here too.
+//! widgets. Works on a `Filter` field or a scratch buffer handed in by the
+//! caller; `hunt_body` stays in the shell because it reaches four drafts.
 
 use eframe::egui;
 
@@ -12,30 +9,21 @@ use crate::domain::filter::{Filter, SubstatReq};
 use crate::render::kind_label;
 
 /// The gear grades the game ships, and so the only floors `[filter] min_grade`
-/// accepts. Spelled here because `domain::filter`'s pair is private and
-/// `src/domain/` stays clear of GUI code; that module's parse-time check is the
-/// authority, and `the_grade_field_is_bounded_by_what_the_config_accepts` runs
-/// this range through it so the two cannot drift apart unnoticed.
+/// accepts. A copy of a domain `domain::filter` owns privately;
+/// `the_grade_field_is_bounded_by_what_the_config_accepts` holds the two in
+/// step.
 const GRADE_MIN: u8 = 2;
 const GRADE_MAX: u8 = 4;
 
-/// One-line recap of the hunt draft for the folded Hunt bar: the labels of what
-/// the loop would buy (haul-headliner names, then kinds, then the finer
-/// criteria).
-///
-/// Every field [`Filter::is_unrestricted`] counts as a criterion is listed
-/// here, and that is not decoration. "nothing selected" is the only thing this
-/// tab says about an empty hunt, so a criterion that restricts without
-/// appearing reads as an empty filter that nonetheless arms — and the loop then
-/// refreshes forever, buys nothing, and the bar gives no clue why.
-/// `min_grade` was exactly that; `max_price` and `min_substats` had editors in
-/// the body but no part here, so a config setting only one of them told the
-/// same lie from the folded bar.
+/// One-line recap of the hunt draft for the folded Hunt bar. If a filter
+/// restricts, the summary must say so: every field [`Filter::is_unrestricted`]
+/// counts has to appear, or the bar reads "nothing selected" over a hunt that
+/// arms, refreshes forever and buys nothing.
 pub(super) fn hunt_summary(filter: &Filter) -> String {
     let mut parts: Vec<String> = Vec::new();
     for name in &filter.names {
-        // Reuse the haul's wire→label map so a hunted token reads "Covenant"
-        // rather than "ticketrare_name"; an unknown id shows verbatim.
+        // The haul's wire→label map, so a token reads "Covenant" and not
+        // "ticketrare_name"; an unknown id shows verbatim.
         let label = crate::render::HAUL_HEADLINERS
             .iter()
             .find(|(wire, _)| name == wire)
@@ -55,10 +43,8 @@ pub(super) fn hunt_summary(filter: &Filter) -> String {
             "substats",
         ));
     }
-    // `Some(0)` is skipped rather than shown as "0+ substats": it constrains
-    // nothing, `is_unrestricted` refuses to count it, and Apply stays dark
-    // over it — a part here would be the mirror-image lie, a bar naming a
-    // criterion for a filter the loop calls empty.
+    // `Some(0)` constrains nothing and `is_unrestricted` refuses to count it,
+    // so naming it would be the mirror-image lie.
     if let Some(min) = filter.min_substats.filter(|min| *min > 0) {
         parts.push(format!("{min}+ substats"));
     }
@@ -82,9 +68,8 @@ pub(super) fn hunt_summary(filter: &Filter) -> String {
     }
 }
 
-/// One-click add for the two tokens ~90% of players hunt (covenant bookmark,
-/// mystic medal), spelling their internal ids so the player never types a
-/// `ticketrare_name`. Reuses the haul's headliner table.
+/// One-click add for the two tokens ~90% of players hunt, spelling their
+/// internal ids so the player never types a `ticketrare_name`.
 pub(super) fn quick_add_names(ui: &mut egui::Ui, names: &mut Vec<String>) {
     ui.horizontal(|ui| {
         ui.weak("quick add");
@@ -116,17 +101,10 @@ pub(super) fn string_list(
     ui.label(label);
     let mut removed = None;
     for (index, value) in values.iter().enumerate() {
-        // Content-keyed row ids (duplicates rejected on add), so focus/edit
-        // state survive a removal above the row.
-        //
-        // Keyed on `(label, value)` and not on `value` alone: `push_id` salts
-        // the *parent* `Ui`'s id, and `hunt_body` calls this twice — "names"
-        // and "sets" — on the same `Ui`, so the content alone gave the two
-        // lists' rows one id (measured: the two child `ui.id()` values compare
-        // equal). That is egui's "Double ID" case — the overlay, and two
-        // widgets sharing one registration for focus and interaction state.
-        // The two fields are adjacent and both ask for "exact internal ids",
-        // so the same string landing in both is the ordinary way in.
+        // Content-keyed so focus survives a removal above the row, and salted
+        // with `label` because `push_id` salts the *parent* `Ui`: `hunt_body`
+        // calls this twice on one `Ui`, so content alone gave both lists' rows
+        // a single id — egui's "Double ID" case.
         ui.push_id(egui::Id::new((label, value)), |ui| {
             ui.horizontal(|ui| {
                 ui.monospace(value);
@@ -156,9 +134,8 @@ pub(super) fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input:
     ui.label("required substats");
     let mut removed = None;
     for (index, req) in reqs.iter_mut().enumerate() {
-        // Salted like `string_list`'s rows and for the same reason: this list
-        // shares a parent `Ui` with the two string lists, so a substat named
-        // the same as a set or a name entry would collide with it.
+        // Salted like `string_list`'s rows: this list shares a parent `Ui` with
+        // them, so a substat named like a set entry would collide.
         let row_id = egui::Id::new(("required substats", &req.name));
         ui.push_id(row_id, |ui| {
             ui.horizontal(|ui| {
@@ -168,13 +145,11 @@ pub(super) fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input:
                 if has_min {
                     let min = req.min.get_or_insert(1.0);
                     ui.add(egui::DragValue::new(min).speed(0.5));
-                    // egui parses typed text with `f64::from_str`, which accepts
-                    // "nan" and "inf". Either would satisfy no `value >= min`
-                    // threshold, light Apply forever (`NaN != NaN` in `Filter`'s
-                    // derived `PartialEq`), and be refused by `Config::validate`
-                    // on the next launch — so it is snapped back here. No range
-                    // is set instead of clamped, to avoid silently rewriting a
-                    // config-seeded value (see `clamp_existing_to_range(false)`).
+                    // egui parses typed text with `f64::from_str`, which takes
+                    // "nan"/"inf": either matches nothing, lights Apply forever
+                    // (`NaN != NaN`), and is refused on the next launch.
+                    // Snapped back, not range-clamped, which would rewrite a
+                    // config-seeded value (see `clamp_existing_to_range`).
                     if !min.is_finite() {
                         *min = 1.0;
                     }
@@ -206,8 +181,7 @@ pub(super) fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input:
 }
 
 /// Checkbox-gated numeric criterion, laid as two grid cells (label, value).
-/// Unchecked means "no constraint" — never a 0. Arming is [`arm_optional`]'s;
-/// the field is [`optional_field`]'s, shared with the Stop rails.
+/// Unchecked means "no constraint" — never a 0.
 pub(super) fn optional_value<T: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     label: &str,
@@ -223,18 +197,10 @@ pub(super) fn optional_value<T: egui::emath::Numeric>(
 }
 
 /// The gear-grade floor: [`optional_value`]'s cell over the closed domain the
-/// game actually ships. A twin rather than one more call to it — the way
-/// [`super::duration_row`] is [`super::limit_row`]'s twin — because the bound
-/// *is* the point. `optional_field` is open above, so a 5 dragged in here would
-/// be a criterion no item satisfies, written to config.toml by Apply and then
-/// refused outright by `domain::filter`'s `grade_floor` at the next launch:
-/// one drag, and the app no longer starts. [`bounded_field`] clamps what the
-/// player drags while still leaving a seeded value exactly as the file spelled
-/// it, so both halves hold.
-///
-/// Seeded at [`GRADE_MAX`]: the epic floor is what `config.example.toml`
-/// documents and what a player reaching for this criterion is after — the same
-/// "seed the useful value, not the range's floor" call `max_price`'s seed makes.
+/// game ships. A twin rather than another call to it because the bound *is* the
+/// point — `optional_field` is open above, and a 5 dragged in here would be
+/// written to config.toml by Apply and refused by `grade_floor` at the next
+/// launch, so the app would stop starting. Seeded at [`GRADE_MAX`].
 pub(super) fn grade_value(ui: &mut egui::Ui, value: &mut Option<u8>) {
     let mut on = value.is_some();
     ui.checkbox(&mut on, "min grade");
@@ -251,7 +217,6 @@ mod tests {
 
     #[test]
     fn hunt_summary_names_the_hunted_tokens() {
-        // The folded Hunt bar reads the covenant token by its haul label.
         let named = Filter {
             names: vec!["ticketrare_name".to_owned()],
             ..Filter::default()
@@ -262,11 +227,8 @@ mod tests {
 
     #[test]
     fn a_restricting_filter_is_never_summarized_as_nothing_selected() {
-        // The bar's contract, in the terms the loop uses: `is_unrestricted` is
-        // what decides whether the hunt can arm, so anything it counts has to
-        // show. A `min_grade`-only config used to fold up as "nothing
-        // selected" while `matches` dropped every gradeless item — an armed
-        // loop refreshing forever with an empty-looking Hunt bar.
+        // A `min_grade`-only config used to fold up as "nothing selected" while
+        // `matches` dropped every gradeless item.
         for filter in [
             Filter {
                 min_grade: Some(4),
@@ -302,8 +264,8 @@ mod tests {
             hunt_summary(&filter),
             "3+ substats, ≤300,000 gold, grade 4+"
         );
-        // And the converse of the test above: `min_substats = 0` restricts
-        // nothing, so the bar must keep calling it an empty hunt.
+        // The converse: `min_substats = 0` restricts nothing, so the bar must
+        // keep calling it an empty hunt.
         let inert = Filter {
             min_substats: Some(0),
             ..Filter::default()
@@ -314,11 +276,9 @@ mod tests {
 
     #[test]
     fn the_grade_field_is_bounded_by_what_the_config_accepts() {
-        // The drag range is a copy of a domain the loader owns, so hold the two
-        // in step here rather than trusting the comment on `GRADE_MIN`. Widen
-        // the domain without widening this range and the tab silently refuses a
-        // legal floor; narrow it without narrowing the range and the tab
-        // authors a config.toml the next launch will not load.
+        // Widen the loader's domain without widening this range and the tab
+        // refuses a legal floor; narrow it without narrowing the range and the
+        // tab authors a config.toml the next launch will not load.
         for grade in GRADE_MIN..=GRADE_MAX {
             let filter: Filter = toml::from_str(&format!("min_grade = {grade}"))
                 .expect("the field must not offer a grade the loader refuses");

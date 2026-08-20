@@ -6,10 +6,9 @@ use crate::domain::control::Haul;
 use crate::domain::control::{Controller, RefusalReason, Status, StopReason};
 use crate::domain::shop::{ItemKind, ShopItem, ShopSnapshot};
 
-/// The hunt tokens worth naming in the haul readout — the covenant bookmark
-/// and mystic medal 90% of players chase. Wire name → display label, in
-/// headline order; every other bought item is bucketed into "+N other". Only
-/// the window renders the haul, so this is gated with it.
+/// The hunt tokens worth naming in the haul readout — the covenant bookmark and
+/// mystic medal most players chase. Wire name → display label, in headline
+/// order; every other bought item is bucketed into "+N other".
 #[cfg(feature = "gui")]
 pub(crate) const HAUL_HEADLINERS: [(&str, &str); 2] = [
     ("ticketrare_name", "Covenant"),
@@ -37,21 +36,16 @@ pub(crate) fn kind_label(kind: ItemKind) -> &'static str {
 /// Thousands-grouped decimal (`1234567` -> `1,234,567`); the stdlib has no
 /// locale-free grouping to lean on.
 ///
-/// Reached only through `Display for Gold` and `Display for Crystals`, never
-/// at a print site: it used to be called by hand at each of four places that
-/// show an amount, and one of them — the journal's `>> bought: … 250000 gold
-/// left` — forgot, so a run showed `250000` next to `250,000` in the same
-/// window.
-///
-/// Stays a free `u32` function rather than moving onto the currencies: the
-/// grouping rule is a display concern this module owns, so both currencies
-/// share one copy of it.
+/// Reached only through `Display for Gold` and `Display for Crystals`, never at
+/// a print site: called by hand at each place that shows an amount, one of them
+/// forgets, and a run shows `250000` next to `250,000` in the same window. Stays
+/// a free function because the grouping rule is a display concern this module
+/// owns.
 pub(crate) fn grouped(n: u32) -> String {
-    // Digits are extracted least-significant-first into a fixed buffer
-    // (`u32::MAX` is ten digits, so it always fits), rather than through
-    // `n.to_string()`, which allocated a second `String` purely to iterate its
-    // characters. Called on the repaint path by every price cell and balance
-    // tile.
+    // Digits into a fixed buffer (`u32::MAX` is ten digits, so it always fits)
+    // rather than through `n.to_string()`, which allocates a second `String`
+    // purely to iterate it. Every price cell and balance tile hits this on the
+    // repaint path.
     let mut digits = ['0'; 10];
     let mut len = 0;
     let mut rest = n;
@@ -76,24 +70,18 @@ pub(crate) fn grouped(n: u32) -> String {
 /// An amount, or an em-dash while it is unknown. The one absent-value policy
 /// shared by the status-bar balance tiles and the slot table's price column.
 ///
-/// Generic over `Display`, not `u32` specifically: grouping is now the
-/// currency's own rendering (`impl Display for Gold`/`Crystals`), so this
-/// function's only job is the em-dash. Renamed from `grouped_or_dash` to say
-/// so.
-///
-/// A sealed `Amount` trait implemented only for the two currencies was
-/// considered, to block other types. Rejected: every call site already reads
-/// a typed field straight out of the domain, so the trait would add no check
-/// beyond what call sites already have.
+/// Generic over `Display`, not `u32`: grouping is the currency's own rendering
+/// (`impl Display for Gold`/`Crystals`), so this function's only job is the
+/// em-dash. A sealed `Amount` trait to block other types was considered and
+/// rejected — every call site already reads a typed field out of the domain.
 #[cfg(feature = "gui")]
 pub(crate) fn amount_or_dash(value: Option<impl std::fmt::Display>) -> String {
     value.map_or_else(|| "—".to_owned(), |amount| amount.to_string())
 }
 
-/// The state word (title-cased) and an optional clause, split so the window
-/// can weight them — word in the severity color, clause muted — while the
-/// console joins them via `status_label`. For `Stopped` the clause is the
-/// stop reason. The hint only offers "start" where the domain would actually
+/// The state word and an optional clause, split so the window can weight them —
+/// word in the severity color, clause muted — while the console joins them via
+/// `status_label`. The hint only offers "start" where the domain would actually
 /// arm: an unrestricted filter reads "define a filter first".
 pub(crate) fn status_summary(controller: &Controller) -> (&'static str, Option<&'static str>) {
     let unrestricted = controller.filter().is_unrestricted();
@@ -118,10 +106,9 @@ pub(crate) fn status_label(controller: &Controller) -> String {
     }
 }
 
-/// Why the domain refused to arm, in the player's words. Named for what it
-/// returns, like its `*_label` siblings: imported bare into `session/mod.rs`,
-/// where a lone `refusal` would also read as `Action::Refused`'s payload or
-/// as `pcap`'s unrelated `Refusal`.
+/// Why the domain refused to arm, in the player's words. Named `*_label` like
+/// its siblings because it is imported bare into `session/mod.rs`, where a lone
+/// `refusal` would read as `Action::Refused`'s payload or `pcap`'s `Refusal`.
 pub(crate) fn refusal_label(reason: RefusalReason) -> &'static str {
     match reason {
         RefusalReason::UnrestrictedFilter => {
@@ -162,12 +149,10 @@ pub(crate) fn render_shop(snapshot: &ShopSnapshot) {
 /// `index` is the item's 0-based position, needed for the player-facing slot
 /// number when the wire slot is omitted (`effective_slot`).
 ///
-/// Appended with `write!` rather than `push_str(&format!(..))`: this backs the
-/// shop table's hover tooltip too, and each `format!` used to allocate a
-/// throwaway `String` per present field just to copy it in and drop it (the
-/// substat clause added one more per substat plus a `join`). Writing into a
-/// `String` is infallible, so the `Result`s are discarded rather than
-/// unwrapped.
+/// `write!` rather than `push_str(&format!(..))`: this also backs the shop
+/// table's hover tooltip, and each `format!` would allocate a throwaway `String`
+/// per present field plus one per substat. Writing into a `String` is
+/// infallible, so the `Result`s are discarded rather than unwrapped.
 pub(crate) fn format_item(item: &ShopItem, index: usize) -> String {
     use std::fmt::Write as _;
 
@@ -185,8 +170,6 @@ pub(crate) fn format_item(item: &ShopItem, index: usize) -> String {
         let _ = write!(line, " · grade {grade}");
     }
     if let Some(price) = item.price {
-        // A gold amount groups itself now, so this line cannot drift from the
-        // table's price column the way the journal's "bought" line once did.
         let _ = write!(line, " · {price} gold");
     }
     if !item.substats.is_empty() {
@@ -210,14 +193,13 @@ pub(crate) fn format_item(item: &ShopItem, index: usize) -> String {
     line
 }
 
-/// The stdin key for the console lane. Silent in the windowed build: that
-/// build carries `windows_subsystem = "windows"`, so it has no console to
-/// print into and stdin is inert — `journal.rs` holds the invariant that
-/// player-facing text has one sink. The `#[cfg]` sits on the body, not the
-/// item, so the one caller ([`Session::run`](crate::app::Session::run)) stays
-/// feature-independent — gating the *call* instead was tried and reverted: it
-/// leaves this `pub(crate)` item with no caller in a `gui` build, i.e.
-/// `dead_code` under `-D warnings`.
+/// The stdin key for the console lane. Silent in the windowed build, which has
+/// no console to print into and an inert stdin.
+///
+/// The `#[cfg]` sits on the body, not the item, so the one caller
+/// ([`Session::run`](crate::app::Session::run)) stays feature-independent.
+/// Gating the *call* instead leaves this `pub(crate)` item with no caller in a
+/// `gui` build, i.e. `dead_code` under `-D warnings`.
 pub(crate) fn print_controls() {
     #[cfg(not(feature = "gui"))]
     println!("Commands: start, stop, [Enter] toggle, Ctrl+C to quit");

@@ -1,15 +1,10 @@
 //! Tests for the config schema, its validation rules and the retired keys.
 //!
 //! A sibling file rather than an inline `mod tests`, matching
-//! `app/session/tests.rs` and `domain/control/tests.rs`: the schema module was
-//! 1591 lines of which 989 were these, so a reader changing a validation rule
-//! scrolled past the tests to reach the code. `ServerUrl`'s own tests live with
-//! the type in `server_url.rs`.
+//! `app/session/tests.rs`. `ServerUrl`'s own tests live in `server_url.rs`.
 
 use super::*;
 
-// Only the tests name a kind now: the `[filter] kinds` rule moved into
-// `filter::hunt_kinds`, at the boundary where the ambiguity actually is.
 use crate::domain::shop::ItemKind;
 use crate::domain::shop::{Crystals, Gold};
 
@@ -19,13 +14,11 @@ fn parse_and_validate(text: &str) -> Result<Config> {
     Ok(config)
 }
 
-/// **The regression this whole compatibility shim exists to prevent.**
-///
-/// `config.example.toml` shipped `buffer_size = 65575` uncommented, and
-/// `main::seed_config_if_missing` writes it to `%APPDATA%` on every first
-/// run, so this text is on disk for every player who has launched the app.
-/// `deny_unknown_fields` means deleting the keys outright would turn their
-/// next launch into "Invalid configuration" and an app that will not start.
+/// **The regression this compatibility shim exists to prevent.**
+/// `config.example.toml` shipped `buffer_size = 65575` uncommented and
+/// `main::seed_config_if_missing` wrote it to every `%APPDATA%`, so under
+/// `deny_unknown_fields` deleting the keys is "Invalid configuration" and an
+/// app that will not start, for every player who has launched it.
 #[test]
 fn a_config_written_before_the_capture_keys_were_retired_still_loads() {
     let config = parse_and_validate(
@@ -41,10 +34,9 @@ fn a_config_written_before_the_capture_keys_were_retired_still_loads() {
 
 #[test]
 fn a_retired_filter_naming_another_port_is_no_longer_a_startup_failure() {
-    // Used to be refused: a filter on another port delivered traffic
-    // nothing could classify. The backend builds its own filter from
-    // `game_port` now, so the value is inert, and refusing it would lock an
-    // upgrading player out over a setting with no effect.
+    // Used to be refused, back when a filter on another port delivered traffic
+    // nothing could classify. The backend builds its own now, so refusing this
+    // would lock an upgrading player out over a setting with no effect.
     let config = parse_and_validate("[capture]\nfilter = \"tcp and tcp.SrcPort == 4444\"")
         .expect("an inert setting must not stop the app from starting");
     assert!(config.capture.filter.is_some());
@@ -52,8 +44,7 @@ fn a_retired_filter_naming_another_port_is_no_longer_a_startup_failure() {
 
 #[test]
 fn the_retired_capture_keys_are_named_only_when_they_are_actually_set() {
-    // This list is what the startup warning prints; an empty file must not
-    // produce a warning about keys the player never wrote.
+    // This list is what the startup warning prints.
     assert_eq!(Config::default().capture.retired_keys(), None);
     assert_eq!(
         parse_and_validate("[capture]\nbuffer_size = 65575")
@@ -81,10 +72,8 @@ fn the_retired_capture_keys_are_named_only_when_they_are_actually_set() {
     );
 }
 
-/// **The same regression, for the `[forward]` block.** `config.example.toml`
-/// shipped this text uncommented too, so it is on disk for every player who
-/// has launched the app — the user's live
-/// `%APPDATA%\arkyve-refresh-shop\config.toml` included.
+/// **The same regression, for the `[forward]` block**, shipped uncommented in
+/// `config.example.toml` too.
 #[test]
 fn a_config_written_before_the_forward_keys_were_retired_still_loads() {
     let config = parse_and_validate("[forward]\nserver_to_client = true\nclient_to_server = false")
@@ -95,15 +84,13 @@ fn a_config_written_before_the_forward_keys_were_retired_still_loads() {
 
 #[test]
 fn a_retired_forward_combination_is_no_longer_a_startup_failure() {
-    // Both directions off used to be refused (it described a relay
-    // forwarding nothing). There is one direction now and neither key
-    // reaches the pipeline, so refusing any combination would lock an
-    // upgrading player out over a setting with no effect.
+    // Both directions off used to be refused, describing a relay forwarding
+    // nothing. Neither key reaches the pipeline now, so refusing any
+    // combination would lock an upgrading player out over a dead setting.
     assert!(
         parse_and_validate("[forward]\nserver_to_client = false\nclient_to_server = false").is_ok()
     );
-    // The client -> server stream is inert, not fatal: never captured, so
-    // simply not forwarded.
+    // The client -> server stream is never captured, so this is inert.
     let config = parse_and_validate("[forward]\nclient_to_server = true")
         .expect("an inert setting must not stop the app from starting");
     assert_eq!(config.forward.client_to_server, Some(true));
@@ -111,8 +98,6 @@ fn a_retired_forward_combination_is_no_longer_a_startup_failure() {
 
 #[test]
 fn the_retired_forward_keys_are_named_only_when_they_are_actually_set() {
-    // This list is what the startup warning prints; an empty file must not
-    // produce a warning about keys the player never wrote.
     assert_eq!(Config::default().forward.retired_keys(), None);
     assert_eq!(
         parse_and_validate("[forward]\nserver_to_client = true")
@@ -142,17 +127,15 @@ fn the_retired_forward_keys_are_named_only_when_they_are_actually_set() {
 
 #[test]
 fn a_misspelled_forward_key_is_still_rejected() {
-    // The section is vestigial, not untyped: `deny_unknown_fields` still
-    // catches a typo, which is the only way a player learns the key they
-    // meant does not exist.
+    // The section is vestigial, not untyped: `deny_unknown_fields` is the only
+    // way a player learns the key they meant does not exist.
     assert!(toml::from_str::<Config>("[forward]\nserver_to_clients = true").is_err());
 }
 
 #[test]
 fn capture_buffer_overflow_is_still_rejected_during_deserialization() {
-    // The key is ignored, not untyped: a value that cannot be a `usize` is
-    // still a malformed file, and reporting it as a parse error is more
-    // useful than silently reading it as "unset".
+    // The key is ignored, not untyped: a value that cannot be a `usize` is a
+    // malformed file, better reported than silently read as "unset".
     let error = parse_and_validate("[capture]\nbuffer_size = 18446744073709551616")
         .expect_err("integer overflow must fail deserialization");
     assert!(matches!(error, crate::Error::ConfigParse(_)));
@@ -185,12 +168,10 @@ fn reconnect_durations_enforce_floor_and_order() {
 
 #[test]
 fn misspelled_kind_value_is_rejected() {
-    // Used to *parse* — `ItemKind`'s `serde(other)` folded the typo into
-    // `Unknown`, and `validate()` caught it afterwards. `Filter::kinds`
-    // holds `HuntKind` now, with no catch-all, so refusal is serde's,
-    // naming the three legal values at the offending line — a typo would
-    // otherwise match nothing while `is_unrestricted` counts it as a
-    // criterion, and the loop burns crystals forever.
+    // `ItemKind`'s `serde(other)` folds a typo into `Unknown`, which matches
+    // nothing while `is_unrestricted` counts it as a criterion — the loop then
+    // burns crystals forever. `Filter::kinds` holds `HuntKind`, no catch-all,
+    // so the refusal is serde's and names the three legal values.
     let error = parse_and_validate("[filter]\nkinds = [\"equipement\"]")
         .expect_err("a misspelled kind must not silently match nothing");
     assert!(matches!(error, crate::Error::ConfigParse(_)), "{error:?}");
@@ -255,13 +236,9 @@ fn full_filter_and_limits_sections_parse() {
 
 #[test]
 fn a_zero_game_port_is_rejected_by_the_type() {
-    // `game_port = 0` used to be a clause in `Config::validate`, untested.
-    // It's `NonZeroU16` now, so the refusal is serde's, landing as a parse
-    // error with the offending line quoted — and the two consumers with no
-    // `Config` in scope (the BPF filter string, `parse_segment`'s
-    // server-side test) can no longer be handed the zero, which would have
-    // built a filter matching nothing while classifying every packet as
-    // client-sent.
+    // `NonZeroU16`, so the refusal is serde's — and the BPF filter string and
+    // `parse_segment`, which read it with no `Config` in scope, can no longer
+    // be handed a zero that matches nothing and calls every packet client-sent.
     let error = parse_and_validate("game_port = 0").expect_err("port 0 is not a port");
     assert!(matches!(error, crate::Error::ConfigParse(_)), "{error:?}");
     assert!(error.report().contains("game_port"), "{}", error.report());
@@ -325,8 +302,7 @@ fn actuator_backend_parses_and_defaults_to_message() {
     let config: Config =
         toml::from_str("[actuator]\nbackend = \"input\"").expect("config should parse");
     assert_eq!(config.actuator.backend, ActuatorBackend::Input);
-    // Absent key: the live-validated message backend — the player keeps
-    // the mouse.
+    // Absent key: the message backend, so the player keeps the mouse.
     let config: Config = toml::from_str("[actuator]").expect("config should parse");
     assert_eq!(config.actuator.backend, ActuatorBackend::Message);
     assert_eq!(Config::default().actuator.backend, ActuatorBackend::Message);
@@ -352,23 +328,15 @@ fn actuator_timings_parse_and_default_to_zero() {
 
 #[test]
 fn reversed_timing_range_is_rejected_and_names_both_values() {
-    // `{ min_ms = 800, max_ms = 200 }` is a plausible typo in this inline
-    // form; accepted, it would silently reread as a fixed 800 ms delay.
-    // Refused by `DelayRange`'s `try_from`, so it is a *parse* error — `toml`
-    // quotes the offending line and points a caret at the value.
-    //
-    // `toml::from_str` directly, not `Config::load`: the refusal is the
-    // deserializer's and this is what pins it. The loader deliberately does
-    // *not* die on this any more (see `a_players_reversed_timing_range_no…`
-    // below, and `drop_unreadable_timing_ranges` for the argument) — the
-    // refused value still never reaches the loop, which is what this test is
-    // about; what changed is that it costs the player a warning instead of a
-    // startup.
+    // Accepted, `{ min_ms = 800, max_ms = 200 }` would silently reread as a
+    // fixed 800 ms delay. `DelayRange`'s `try_from` refuses it, so it is a
+    // *parse* error with the line quoted. Not through `Config::load`, which
+    // deliberately no longer dies on this (see `drop_unreadable_timing_ranges`)
+    // — what this pins is that the deserializer refuses the value either way.
     let error =
         parse_and_validate("[actuator.timings]\nrefreshed = { min_ms = 800, max_ms = 200 }")
             .expect_err("a reversed range must not be silently reinterpreted");
-    // `report()`, not `to_string()`: the chain walk is what the two report
-    // sites actually print.
+    // `report()`, not `to_string()`: the chain walk is what gets printed.
     let message = error.report();
     assert!(matches!(error, crate::Error::ConfigParse(_)), "{error:?}");
     assert!(message.contains("refreshed"), "{message}");
@@ -402,11 +370,8 @@ fn an_oversized_timing_range_is_rejected() {
 
 #[test]
 fn every_timing_range_is_checked_not_just_the_first() {
-    // A per-field guard that only walked one range would leave the other
-    // seven exactly as unvalidated as before. `DelayRange`'s `try_from`
-    // cannot have that bug by construction — every field is the same type —
-    // but the eight keys must still each *be* a `DelayRange`, which is what
-    // this walks.
+    // `DelayRange`'s `try_from` cannot miss a field by construction, but the
+    // eight keys must still each *be* a `DelayRange`.
     for name in Timings::default().named_ranges().map(|(name, _)| name) {
         let text = format!("[actuator.timings]\n{name} = {{ min_ms = 9, max_ms = 1 }}");
         match parse_and_validate(&text) {
@@ -418,8 +383,7 @@ fn every_timing_range_is_checked_not_just_the_first() {
 
 #[test]
 fn a_timing_range_at_the_ceiling_is_accepted() {
-    // The bound is inclusive, and a wide-but-sane range must stay usable:
-    // the ceiling exists to stop a frozen loop, not to narrow the knob.
+    // The ceiling stops a frozen loop; it is not meant to narrow the knob.
     let ceiling = crate::actuator::plan::MAX_TIMING_MS;
     let config = parse_and_validate(&format!(
         "[actuator.timings]\nrefreshed = {{ min_ms = 0, max_ms = {ceiling} }}"
@@ -455,23 +419,18 @@ fn every_timing_preset_survives_validation() {
     }
 }
 
-/// **The regression this salvage pass exists to prevent**, and the twin of
-/// `a_config_written_before_the_capture_keys_were_retired_still_loads` one
-/// release later.
-///
-/// `DelayRange::draw` read a reversed pair as a point at `min_ms` for the
-/// whole life of the setting, so this file was a *working* config; the day the
-/// type started refusing it, `Config::load` started failing and `main` turned
-/// that into `fatal()` — an error window instead of the app, curable only by
-/// hand-editing a file under `%APPDATA%` that the Setup tab otherwise owns.
+/// **The regression this salvage pass exists to prevent.** `DelayRange::draw`
+/// read a reversed pair as a point at `min_ms`, so this file was a *working*
+/// config until the type started refusing it — at which point `Config::load`
+/// failed, `main` turned that into `fatal()`, and the only cure was
+/// hand-editing a `%APPDATA%` file the Setup tab otherwise owns.
 #[test]
 fn a_players_reversed_timing_range_no_longer_bricks_the_app() {
     let dir = TempDir::new("unreadable-timings");
     std::fs::create_dir_all(dir.path()).expect("fixture dir");
     let path = dir.join("config.toml");
-    // Both shapes the finding names: the transposed inline pair (an ordinary
-    // typo in this form) and the over-ceiling `{ max_ms = 120000 }` shorthand,
-    // whose omitted `min_ms` must be read as the 0 `serde` would have used.
+    // Both shapes: the transposed pair, and the over-ceiling shorthand whose
+    // omitted `min_ms` must read as the 0 `serde` would have used.
     let text = "\
 # hand-written
 game_port = 3333
@@ -488,8 +447,8 @@ between_buys = { max_ms = 120000 }
 
     let (config, dropped) =
         Config::load_reporting(&path).expect("an existing config must still open the app");
-    // The half the log file cannot deliver in a windowed build. Both keys in one
-    // line, naming both, because the advice is the same for either.
+    // The half the log file cannot deliver in a windowed build. One line for
+    // both keys, because the advice is the same for either.
     let lines = dropped.journal_lines();
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("actuator.timings.refreshed"), "{lines:?}");
@@ -498,32 +457,26 @@ between_buys = { max_ms = 120000 }
         "{lines:?}"
     );
     assert!(lines[0].contains("they are not in force"), "{lines:?}");
-    // The unreadable ranges are *not in force*: each action falls back to its
-    // calibrated baseline, which is exactly what an absent key means.
+    // Dropped to the default, which is exactly what an absent key means.
     assert_eq!(config.actuator.timings.refreshed, DelayRange::default());
     assert_eq!(config.actuator.timings.between_buys, DelayRange::default());
-    // Its readable neighbour in the same table is untouched — the pass drops
-    // the key it cannot read, never the section.
+    // The pass drops the key it cannot read, never the section.
     assert_eq!(config.actuator.timings.shop_opened.min_ms(), 100);
     assert_eq!(config.actuator.timings.shop_opened.max_ms(), 900);
-    // And nothing outside `[actuator.timings]` was affected.
     assert_eq!(config.game_port.get(), 3333);
     assert_eq!(config.filter.names, vec!["ticketrare_name".to_owned()]);
     config.validate().expect("and the result must validate");
 
-    // The file is left alone, comment and typo included. Swapping the pair for
-    // the player would be guessing which of their two numbers was the wrong
-    // one and writing the guess into their file; the warning names the key so
-    // they can decide.
+    // The file is left alone, comment and typo included: swapping the pair
+    // would be writing a guess at which number was wrong into their file.
     assert_eq!(
         std::fs::read_to_string(&path).expect("still readable"),
         text,
         "the loader must not rewrite the player's config"
     );
 
-    // The other side of the pair, on the same fixture minus the two bad ranges:
-    // a file the app wrote itself is every launch after the first, and it must
-    // put nothing in the journal at all.
+    // The same fixture minus the two bad ranges — every launch after the first
+    // — must put nothing in the journal at all.
     std::fs::write(
         &path,
         "game_port = 3333\n\n[filter]\nnames = [\"ticketrare_name\"]\n\n[actuator.timings]\nshop_opened = { min_ms = 100, max_ms = 900 }\n",
@@ -538,9 +491,8 @@ between_buys = { max_ms = 120000 }
 
 #[test]
 fn an_unreadable_range_is_dropped_whichever_way_the_table_is_spelled() {
-    // `[actuator.timings]`, the dotted key and the inline table are the same
-    // document to `toml`, so a player bricked by any of the four must be
-    // unbricked by all of them.
+    // All four spellings are the same document to `toml`, so a player bricked
+    // by any of them must be unbricked by all of them.
     for text in [
         "[actuator.timings]\nrefreshed = { min_ms = 800, max_ms = 200 }\n",
         "actuator.timings.refreshed = { min_ms = 800, max_ms = 200 }\n",
@@ -554,8 +506,7 @@ fn an_unreadable_range_is_dropped_whichever_way_the_table_is_spelled() {
             DelayRange::default(),
             "{text:?}"
         );
-        // The value the window needs, on all four spellings: a salvage the GUI
-        // cannot name is a setting silently not in force.
+        // A salvage the GUI cannot name is a setting silently not in force.
         assert_eq!(
             dropped.journal_lines().len(),
             1,
@@ -571,9 +522,8 @@ fn an_unreadable_range_is_dropped_whichever_way_the_table_is_spelled() {
 
 #[test]
 fn the_salvage_pass_rules_on_nothing_but_the_ranges_it_can_read() {
-    // It removes candidates and lets the strict parse decide; anything it
-    // does not understand must survive to be refused properly, or a real
-    // mistake would load as "range dropped, carry on".
+    // Anything the pass does not understand must survive to be refused
+    // properly, or a real mistake loads as "range dropped, carry on".
     for text in [
         // A misspelled key beside the reversed one: still `deny_unknown_fields`.
         "[actuator.timings]\nrefreshed = { min_ms = 800, max_ms = 200 }\nrefesh = { max_ms = 5 }\n",
@@ -589,9 +539,8 @@ fn the_salvage_pass_rules_on_nothing_but_the_ranges_it_can_read() {
             "{text:?} must still be refused outright"
         );
     }
-    // The misspelling is what the player is told about, not the range this
-    // pass already dropped — repeating the stale one would point at a line
-    // that is no longer the problem.
+    // The misspelling is what the player is told about, not the range already
+    // dropped: the stale error points at a line that is no longer there.
     let error = parse(
         "[actuator.timings]\nrefreshed = { min_ms = 800, max_ms = 200 }\nrefesh = { max_ms = 5 }\n",
     )
@@ -601,9 +550,7 @@ fn the_salvage_pass_rules_on_nothing_but_the_ranges_it_can_read() {
 
 #[test]
 fn a_valid_file_never_reaches_the_salvage_pass() {
-    // The normal path stays a single strict parse: the pass finds nothing to
-    // drop in a file whose ranges are all readable, so a well-formed config
-    // pays no second parse and no rewrite.
+    // A well-formed config must pay no second parse and no rewrite.
     assert!(
         drop_unreadable_timing_ranges(
             "[actuator.timings]\nrefreshed = { min_ms = 200, max_ms = 800 }\n\
@@ -620,8 +567,7 @@ fn a_valid_file_never_reaches_the_salvage_pass() {
         ))
         .is_none()
     );
-    // And a file with no `[actuator]` section at all — the common case — is
-    // declined at the first hop rather than walked.
+    // No `[actuator]` section — the common case — declines at the first hop.
     assert!(drop_unreadable_timing_ranges("game_port = 3333\n").is_none());
     assert!(drop_unreadable_timing_ranges("[actuator]\ndry_run = true\n").is_none());
 }
@@ -637,8 +583,7 @@ fn misspelled_timings_key_is_rejected() {
 
 #[test]
 fn unknown_actuator_backend_is_rejected() {
-    // A silently defaulted typo would steal the mouse the player asked
-    // to keep.
+    // A silently defaulted typo would steal the mouse the player kept.
     assert!(toml::from_str::<Config>("[actuator]\nbackend = \"postmessage\"").is_err());
 }
 
@@ -662,11 +607,10 @@ fn required_substat_without_name_is_rejected() {
 
 #[test]
 fn bundled_example_config_parses_validates_and_is_restrictive() {
-    // `main::seed_config_if_missing` writes this exact text to %APPDATA% on
-    // every player's first launch. Nothing else deserializes it, so it can
-    // rot silently (a renamed field, a retired key, a typo) while CI stays
-    // green — and the shipped exe then hands every new player an "Invalid
-    // configuration" window before they see the app.
+    // `main::seed_config_if_missing` writes this text to every player's
+    // %APPDATA% and nothing else deserializes it, so without this it rots
+    // silently while CI stays green and the shipped exe greets a new player
+    // with "Invalid configuration".
     let text = include_str!("../../config.example.toml");
     let config: Config = toml::from_str(text).expect("the bundled example must parse");
     config
@@ -678,22 +622,17 @@ fn bundled_example_config_parses_validates_and_is_restrictive() {
         !config.filter.is_unrestricted(),
         "the example must carry a hunt criterion"
     );
-    // And it must not re-plant the retired keys it warns about: uncommenting
-    // either line here would hand every *new* player a first launch that
-    // warns about the example the app just seeded, then rewrites it.
+    // Uncommenting either retired line here would hand every *new* player a
+    // first launch that warns about the example the app just seeded.
     assert_eq!(config.capture.retired_keys(), None);
     assert_eq!(config.forward.retired_keys(), None);
 
-    // The same thing proved on disk, through the real entry point: seeded
-    // and offered to the stripper, the example comes back untouched — no
-    // rewrite, no log line, headers still there. An untouched empty table is
-    // a commented section, not a leftover.
+    // The same on disk: offered to the stripper, the example must come back
+    // untouched — an empty table is a commented section, not a leftover.
     let dir = TempDir::new("example-strip");
     let path = dir.join("config.toml");
-    // Through `seed_config_if_missing`, not a hand-rolled `fs::write`: that
-    // is what every player's first launch actually runs (it also creates
-    // the parent directory), so a change to the real seeder cannot leave
-    // this test passing against a stale copy of what it used to do.
+    // Through the real seeder, not a hand-rolled `fs::write`, so changing it
+    // cannot leave this passing against a stale copy of what it used to do.
     crate::seed_config_if_missing(&path);
     assert_eq!(
         std::fs::read_to_string(&path).expect("the seeder created it"),
@@ -712,16 +651,14 @@ fn bundled_example_config_parses_validates_and_is_restrictive() {
     );
 }
 
-/// Scratch directory removed on drop, including when an assertion panics
-/// (unlike the hand-rolled cleanup in `crash.rs`, which leaks on failure).
-/// The name mixes the pid with a process-local counter so two test binaries
-/// or two parallel tests in one binary cannot collide.
+/// Scratch directory removed on drop, including when an assertion panics. The
+/// name mixes the pid with a process-local counter so two test binaries, or two
+/// parallel tests in one binary, cannot collide.
 struct TempDir(std::path::PathBuf);
 
 impl TempDir {
-    /// Note: the directory is deliberately **not** created. The save test
-    /// needs it absent to prove `persist::save` builds it (the first-Apply
-    /// case on a machine whose %APPDATA% subdir does not exist yet).
+    /// The directory is deliberately **not** created: the save test needs it
+    /// absent to prove `persist::save` builds it.
     fn new(tag: &str) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -795,9 +732,7 @@ fn save_then_load_round_trips_the_edited_sections_through_disk() {
 
 #[test]
 fn stripping_a_players_config_clears_the_retired_warning_for_good() {
-    // The whole point, end to end: a file that warns on this launch must
-    // not warn on the next one. Load -> the keys are set -> strip -> load
-    // again -> nothing set, and everything else the player wrote is intact.
+    // End to end, with everything else the player wrote intact.
     let dir = TempDir::new("strip-retired");
     std::fs::create_dir_all(dir.path()).expect("fixture dir");
     let path = dir.join("config.toml");
@@ -829,7 +764,6 @@ fn stripping_a_players_config_clears_the_retired_warning_for_good() {
     let text = std::fs::read_to_string(&path).expect("readable");
     assert!(text.contains("# hand-written"), "comments survive: {text}");
 
-    // Idempotent: the second launch finds nothing and writes nothing.
     assert_eq!(
         persist::strip_retired_keys(&path).expect("must not fail"),
         None
@@ -843,9 +777,8 @@ fn stripping_a_players_config_clears_the_retired_warning_for_good() {
 
 #[test]
 fn a_failed_strip_leaves_the_retired_keys_in_place_to_warn_about() {
-    // The best-effort path: the strip is not allowed to be fatal, and when
-    // it fails the keys really are still on disk — which is why `main` keeps
-    // the present-tense warning for this branch.
+    // The strip is not allowed to be fatal, and when it fails the keys really
+    // are still on disk — which is why `main` still warns on this branch.
     let dir = TempDir::new("failed-strip");
     std::fs::create_dir_all(dir.path()).expect("fixture dir");
     let path = dir.join("config.toml");
@@ -875,10 +808,8 @@ fn a_failed_strip_leaves_the_retired_keys_in_place_to_warn_about() {
 
 #[test]
 fn stripping_a_missing_config_is_not_an_error() {
-    // `seed_config_if_missing` can fail (unwritable %APPDATA%), leaving
-    // `Config::load` on the in-memory defaults. Those set no retired key so
-    // `main` never calls this — but a missing file must be "nothing to do",
-    // not a startup-time error report.
+    // `seed_config_if_missing` can fail on an unwritable %APPDATA%, so a
+    // missing file must be "nothing to do", not a startup error report.
     let dir = TempDir::new("strip-missing");
     assert_eq!(
         persist::strip_retired_keys(dir.join("config.toml"))
@@ -889,8 +820,8 @@ fn stripping_a_missing_config_is_not_an_error() {
 
 #[test]
 fn load_on_a_missing_file_yields_the_defaults() {
-    // The `NotFound` branch is what every machine without a config.toml
-    // takes at startup; turning it into an error would be invisible in CI.
+    // The `NotFound` branch is what every machine without a config.toml takes
+    // at startup; turning it into an error would be invisible in CI.
     let dir = TempDir::new("missing");
     let path = dir.join("config.toml");
     assert!(!path.exists());
@@ -903,10 +834,9 @@ fn load_on_a_missing_file_yields_the_defaults() {
 
 #[test]
 fn a_failed_save_leaves_the_original_config_intact() {
-    // The atomicity guarantee, pinned: `save` writes a sibling temp and
-    // renames. Squatting the temp path with a directory makes that write
-    // fail — and a "simplification" to a direct `fs::write(path, ..)` would
-    // instead succeed here, having already truncated the player's file.
+    // Squatting the temp path with a directory fails the sibling write. A
+    // "simplification" to `fs::write(path, ..)` would succeed here instead,
+    // having already truncated the player's file.
     use crate::config::persist::{self, Section};
 
     let dir = TempDir::new("failed-save");
@@ -943,9 +873,8 @@ fn a_failed_save_leaves_the_original_config_intact() {
 #[test]
 fn an_unreadable_config_reports_the_path_not_a_bare_os_error() {
     // A directory where the file should be: not `NotFound`, so it takes the
-    // read-error branch. Before this carried a path, the player saw
-    // "i/o: Access is denied. (os error 5)" and nothing else — while the
-    // file sits somewhere under %APPDATA% they never navigate to.
+    // read-error branch. Without a path the player sees only "i/o: Access is
+    // denied. (os error 5)" about a %APPDATA% file they never navigate to.
     let dir = TempDir::new("unreadable");
     std::fs::create_dir_all(dir.join("config.toml")).expect("fixture dir");
 
@@ -962,13 +891,11 @@ fn an_unreadable_config_reports_the_path_not_a_bare_os_error() {
 
 #[test]
 fn a_non_finite_substat_threshold_is_rejected() {
-    // `nan`/`inf` are legal TOML 1.0 float literals. Accepted, `value >=
-    // min` is false for every value, so the filter matches nothing while
-    // `is_unrestricted()` still counts it as a criterion — the loop arms
-    // and refreshes forever, debiting crystals. `nan` adds a second
-    // symptom: `Filter`'s derived `PartialEq` recurses into the
-    // `Option<f64>`, so the Setup tab's dirty check never clears and every
-    // Apply rewrites `config.toml`.
+    // `nan`/`inf` are legal TOML 1.0 float literals. Accepted, `value >= min`
+    // is false for every value, so the filter matches nothing while
+    // `is_unrestricted()` counts it as a criterion — the loop arms and
+    // refreshes forever, debiting crystals. `nan` also breaks `Filter`'s
+    // derived `PartialEq`, so the Setup tab's dirty check never clears.
     for literal in ["nan", "inf", "-inf", "-nan"] {
         let text = format!("[[filter.required_substats]]\nname = \"speed\"\nmin = {literal}\n");
         let error = parse_and_validate(&text)
@@ -984,8 +911,8 @@ fn a_non_finite_substat_threshold_is_rejected() {
 
 #[test]
 fn a_finite_substat_threshold_including_zero_and_negative_is_accepted() {
-    // Only *non-finite* is refused. A zero or negative floor is meaningful
-    // (some substats are stored as deltas) and must stay reachable.
+    // A zero or negative floor is meaningful (some substats are stored as
+    // deltas) and must stay reachable.
     let config = parse_and_validate(
         "[[filter.required_substats]]\nname = \"speed\"\nmin = 0.0\n\n\
              [[filter.required_substats]]\nname = \"cri\"\nmin = -1.5\n\n\
@@ -999,9 +926,7 @@ fn a_finite_substat_threshold_including_zero_and_negative_is_accepted() {
 #[test]
 fn a_configs_debug_redacts_the_server_url() {
     // `Config` is exactly the kind of value that ends up in a startup line.
-    // `Debug` is a plain derive again now that the field is a `ServerUrl`;
-    // this pins that the derive stays safe — redaction reached through the
-    // field, not reimplemented.
+    // `Debug` is a plain derive, safe only because the field is a `ServerUrl`.
     let rendered = format!(
         "{:?}",
         Config {

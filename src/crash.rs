@@ -31,9 +31,9 @@ pub fn install() {
         let entry = crash_entry(epoch, &thread, &location, &message, &backtrace);
         let candidates = crash_log_paths();
         let written = write_first_writable(&candidates, &entry);
-        // Safe pre-`install_logging`: the writer is a non-blocking channel
-        // send that's a no-op with no subscriber yet. `epoch_s` repeats the
-        // file entry's epoch, joining this line to `crash.log` without dates.
+        // Safe pre-`install_logging`: with no subscriber yet this is a no-op.
+        // `epoch_s` repeats the file entry's epoch, joining this line to
+        // `crash.log` without dates.
         match &written {
             Some(path) => tracing::error!(
                 thread = %thread,
@@ -90,8 +90,7 @@ fn crash_log_paths() -> Vec<PathBuf> {
     crash_log_paths_from(local.as_deref(), &std::env::temp_dir())
 }
 
-/// Pure version of [`crash_log_paths`] taking borrowed paths — lets callers,
-/// including the tests this split exists for, hand over a literal.
+/// Pure version of [`crash_log_paths`], so a test can hand over a literal.
 fn crash_log_paths_from(local_appdata: Option<&Path>, temp: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(local) = local_appdata {
@@ -137,9 +136,9 @@ fn append(path: &Path, entry: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// RAII scratch file: removed on drop, including on an assertion panic.
-    /// Named by test and pid so parallel tests and `cargo test` runs don't
-    /// collide; a leaked stale file previously let a broken run pass silently.
+    /// RAII scratch file: removed on drop, including on an assertion panic, and
+    /// named by test and pid so parallel runs cannot collide — a leaked stale
+    /// file lets a broken run pass silently.
     struct TempFile(PathBuf);
 
     impl TempFile {
