@@ -129,12 +129,8 @@ fn main() -> eframe::Result {
     ]);
 
     let (commands, mut receiver) = mpsc::channel::<Command>(16);
-    let handles = SessionHandles {
-        controller: controller.clone(),
-        commands,
-        gate: gate.clone(),
-        journal: journal.clone(),
-    };
+    let handles =
+        SessionHandles::for_preview(controller.clone(), commands, gate.clone(), journal.clone());
 
     // Make the buttons real: drain the command channel and apply each command
     // to the seeded controller, exactly as the session loop would (minus the

@@ -5,6 +5,7 @@
 //! Layout: a status bar on top, a collapsible journal at the bottom, and a
 //! tabbed center. This file is the shell and the tab strip.
 
+mod capture_health;
 mod editor;
 mod journal;
 mod shop;
@@ -21,9 +22,11 @@ use eframe::egui;
 use crate::actuator::plan::Timings;
 use crate::app::{Command, SessionHandles};
 use crate::config;
+use crate::domain::control::Status;
 use crate::journal::LogLine;
 use crate::watch::HaltSource;
 
+use capture_health::{CaptureHealthView, render_capture_health};
 use editor::EditorState;
 use view::{SlotRow, SlotRows, ViewState, merchant_heading, slot_detail, view_state};
 
@@ -144,6 +147,20 @@ impl eframe::App for ShopApp {
             self.slots.sync(&ctrl);
             (view_state(&ctrl), merchant_heading(&ctrl))
         };
+        // Two atomic loads and one short-lived-lock snapshot, neither held
+        // past this block: the same "no lock across a frame" rule the
+        // controller read above follows.
+        let capture = {
+            let counters = self.handles.capture_health.snapshot();
+            let pipeline = self.handles.budget.snapshot();
+            CaptureHealthView {
+                delivered: counters.delivered,
+                unparsed: counters.unparsed,
+                admitted: counters.admitted,
+                dropped_segments: pipeline.dropped_segments,
+                resyncs: pipeline.resyncs,
+            }
+        };
         let generation = self.handles.journal.generation();
         if generation != self.journal_generation {
             self.journal_cache = self.handles.journal.to_entries();
@@ -160,13 +177,22 @@ impl eframe::App for ShopApp {
         let clicked = egui::Panel::top("status_bar")
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
             .show(ui, |ui| {
-                statusbar::render_status_bar(
+                let clicked = statusbar::render_status_bar(
                     ui,
                     &view,
                     outcome.as_deref(),
                     session_alive,
                     &self.fetcher,
-                )
+                );
+                // New content appended after the status bar's own, not a
+                // redesign of it: gated on the same "a run exists" condition
+                // its stat tiles already use, since every counter reads as a
+                // meaningless zero before `Start`.
+                if !matches!(view.status_kind, Status::Idle) {
+                    ui.add_space(theme::SP_SM);
+                    render_capture_health(ui, &capture);
+                }
+                clicked
             })
             .inner;
         let open = self.journal_open;

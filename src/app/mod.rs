@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::info;
 
 use crate::actuator::{ActuatorHandle, Mode, SnapshotEpoch, plan};
-use crate::capture::CaptureSource;
+use crate::capture::{CaptureHealth, CaptureSource};
 use crate::domain::control::{Controller, Limits};
 use crate::domain::filter::Filter;
 use crate::journal::EventLog;
@@ -79,6 +79,44 @@ pub struct SessionHandles {
     pub commands: mpsc::Sender<Command>,
     pub gate: WatchGate,
     pub journal: EventLog,
+    /// Byte accounting for the pipeline: `budget.snapshot()` takes a short
+    /// lock that never crosses a frame boundary, the same rule `controller`
+    /// above already follows.
+    pub(crate) budget: PipelineBudget,
+    /// Live capture counters — see [`CaptureHealth`] for why a clone of this
+    /// is safe to read from the egui thread while [`Session::run`]'s capture
+    /// pump increments the same atomics on its own thread. Constructed here,
+    /// before the backend that will increment it exists, precisely so a
+    /// clone can ride in this struct from the very first frame.
+    pub(crate) capture_health: CaptureHealth,
+}
+
+impl SessionHandles {
+    /// Builds handles for a caller outside this crate that drives the window
+    /// over its own controller, gate, journal and command channel instead of
+    /// a real [`Session`] — today, only `examples/ui_preview.rs`.
+    ///
+    /// `budget` and `capture_health` are not parameters: both are
+    /// `pub(crate)`-constructed types, unreachable from outside this crate,
+    /// and a preview runs no real capture pipeline to feed them anyway — they
+    /// start fresh and empty, which reads as "no traffic yet" rather than a
+    /// fault. See `CaptureCounters` and `ui::capture_health::diagnosis` for
+    /// why that default is the honest one.
+    pub fn for_preview(
+        controller: Arc<Mutex<Controller>>,
+        commands: mpsc::Sender<Command>,
+        gate: WatchGate,
+        journal: EventLog,
+    ) -> Self {
+        Self {
+            controller,
+            commands,
+            gate,
+            journal,
+            budget: PipelineBudget::new(),
+            capture_health: CaptureHealth::default(),
+        }
+    }
 }
 
 /// Cooperative stop for a session running on a detached task. The GUI closes
@@ -127,11 +165,19 @@ pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
         controller.enable_recovery();
     }
     let controller = Arc::new(Mutex::new(controller));
+    // Both created here, ahead of `Session::run`, so a clone can ride in
+    // `SessionHandles` from the window's first frame — `run` hands the
+    // originals to the pipeline instead of making fresh ones, exactly as
+    // `controller` above already does.
+    let budget = PipelineBudget::new();
+    let capture_health = CaptureHealth::default();
     let handles = SessionHandles {
         controller,
         commands: command_tx,
         gate,
         journal,
+        budget,
+        capture_health,
     };
     let (job_tx, job_rx) = mpsc::channel::<plan::Job>(JOB_QUEUE);
     let timings = Arc::new(Mutex::new(config.actuator.timings));
@@ -212,8 +258,9 @@ impl Session {
             commands,
             gate,
             journal,
+            budget,
+            capture_health,
         } = handles;
-        let budget = PipelineBudget::new();
         let pressure_resync = PressureResync::default();
         let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(CAPTURE_EVENT_QUEUE);
         let (raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(PIPELINE_QUEUE);
@@ -226,7 +273,7 @@ impl Session {
 
         // Wrapped in catch_unwind so a panic surfaces as a fatal message rather
         // than a dropped sender, which reads as a clean "session ended".
-        let source = build_source(&config)?;
+        let source = build_source(&config, capture_health)?;
         let capture = spawn_capture_with_budget(
             source,
             segment_tx,
@@ -424,19 +471,24 @@ impl std::str::FromStr for Command {
 /// adapter's link framing, so it keeps working on Wi-Fi, where a raw NIC tap
 /// would deliver 802.11 frames this crate does not decode. Blocking, but quick
 /// — nothing in it waits on a human.
+///
+/// `health` rides along rather than being constructed here: `setup` made it
+/// before either arm below could run, so a clone already sits in
+/// `SessionHandles` for the window by the time this returns — the no-backend
+/// arm still takes it, unused, so both signatures match.
 #[cfg(all(windows, feature = "pcap-backend"))]
-fn build_source(config: &Config) -> Result<CaptureSource> {
+fn build_source(config: &Config, health: CaptureHealth) -> Result<CaptureSource> {
     use crate::capture::PcapSource;
     info!(
         port = config.game_port,
         "opening the Npcap tap on every adapter (the tap itself needs no privilege)"
     );
-    let (source, stop) = PcapSource::open(config.game_port)?;
+    let (source, stop) = PcapSource::open(config.game_port, health)?;
     Ok(CaptureSource::new(source, stop))
 }
 
 #[cfg(not(all(windows, feature = "pcap-backend")))]
-fn build_source(_config: &Config) -> Result<CaptureSource> {
+fn build_source(_config: &Config, _health: CaptureHealth) -> Result<CaptureSource> {
     Err(crate::Error::Capture(
         "no capture backend compiled — enable `pcap-backend` (the default) on Windows".to_owned(),
     ))

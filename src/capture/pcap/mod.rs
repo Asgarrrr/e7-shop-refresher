@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-use super::{CaptureStop, PacketSource, Segment, parse_segment};
+use super::{CaptureCounters, CaptureHealth, CaptureStop, PacketSource, Segment, parse_segment};
 use crate::error::{Error, Result};
 use sys::{INSTALL_HINT, READ_TIMEOUT_MS, SNAPLEN, Wpcap, capture_loop, enumerate, open_device};
 
@@ -64,31 +64,34 @@ const FRAME_QUEUE_DEPTH: usize = 16;
 /// `parse_segment` can drop one here, so `unparsed` alone explains a
 /// healthy-looking session that yields nothing, while `delivered` at zero means
 /// the adapters are open but the kernel filter matches no traffic.
-#[derive(Default)]
-struct Funnel {
-    delivered: u64,
-    unparsed: u64,
-    admitted: u64,
-}
+///
+/// A thin wrapper over [`CaptureHealth`], not a fresh set of counters: the
+/// atomics it increments are the exact ones [`PcapSource::counters`] hands to
+/// the window, so `report`'s `debug!` line and the player's readout can never
+/// drift apart — both read [`CaptureHealth::snapshot`], nothing else.
+struct Funnel(CaptureHealth);
 
 impl Funnel {
-    fn report(&self) {
-        if self.delivered != 1 && !self.delivered.is_multiple_of(FUNNEL_LOG_EVERY) {
+    /// `delivered` is the argument, not a fresh load, because every caller
+    /// already has it from [`CaptureHealth::record_delivered`]'s return —
+    /// the modulus check this guards costs nothing extra to feed.
+    fn report(&self, delivered: u64) {
+        if delivered != 1 && !delivered.is_multiple_of(FUNNEL_LOG_EVERY) {
             return;
         }
-        log_funnel(self);
+        log_funnel(self.0.snapshot());
     }
 }
 
-/// The rare half of [`Funnel::report`], kept out of line: `report` runs twice
-/// per delivered packet, so it should carry only the modulus test.
+/// The rare half of [`Funnel::report`], kept out of line: `report` runs on
+/// every delivered packet, so it should carry only the modulus test.
 #[cold]
 #[inline(never)]
-fn log_funnel(funnel: &Funnel) {
+fn log_funnel(counters: CaptureCounters) {
     debug!(
-        delivered = funnel.delivered,
-        admitted = funnel.admitted,
-        unparsed = funnel.unparsed,
+        delivered = counters.delivered,
+        admitted = counters.admitted,
+        unparsed = counters.unparsed,
         "capture funnel"
     );
 }
@@ -175,6 +178,8 @@ pub struct PcapSource {
     /// Shared with [`PcapStop`], and with every capture thread.
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    /// Wraps the [`CaptureHealth`] this source shares with the window; see
+    /// [`PacketSource::counters`].
     funnel: Funnel,
 }
 
@@ -221,7 +226,13 @@ impl PcapSource {
     /// - a capture thread failed to spawn. [`start_capture_threads`] stops and
     ///   joins the ones that did start, because the `Self` whose [`Drop`] would
     ///   do it is never constructed on this path.
-    pub(crate) fn open(game_port: NonZeroU16) -> Result<(Self, PcapStop)> {
+    ///
+    /// `health` is not created here: it is handed in already shared with the
+    /// window (`app::setup` constructs it before this backend, or any
+    /// backend, exists), so the counters this source increments are the same
+    /// atomics the player reads — see [`CaptureHealth`] for the rest of that
+    /// argument.
+    pub(crate) fn open(game_port: NonZeroU16, health: CaptureHealth) -> Result<(Self, PcapStop)> {
         let (wpcap, loaded_from) = Wpcap::load()?;
         // The path names the install mode: `System32\wpcap.dll` rather than
         // `System32\Npcap\wpcap.dll` is the WinPcap-compatible one.
@@ -305,7 +316,7 @@ impl PcapSource {
                 capture_loss,
                 stop: Arc::clone(&stop),
                 threads,
-                funnel: Funnel::default(),
+                funnel: Funnel(health),
             },
             PcapStop { stop },
         ))
@@ -494,18 +505,18 @@ impl PacketSource for PcapSource {
                 }
             };
 
-            self.funnel.delivered += 1;
+            let delivered = self.funnel.0.record_delivered();
             // The link header is already gone: its length depends on the
             // adapter, and nothing down here knows which one a packet came
             // from. By value, so the buffer becomes the payload uncopied.
             let Some(segment) = parse_segment(packet, self.game_port) else {
-                self.funnel.unparsed += 1;
-                self.funnel.report();
+                self.funnel.0.record_unparsed();
+                self.funnel.report(delivered);
                 continue;
             };
 
-            self.funnel.admitted += 1;
-            if self.funnel.admitted == 1 {
+            let admitted = self.funnel.0.record_admitted();
+            if admitted == 1 {
                 // `parse_segment` admits nothing but the game server, so this
                 // proves filter, port, adapter choice and strip all agree; its
                 // absence means capture is open but sees nothing. The client's
@@ -519,7 +530,7 @@ impl PacketSource for PcapSource {
                     "first server-to-client segment admitted"
                 );
             }
-            self.funnel.report();
+            self.funnel.report(delivered);
             return Ok(segment);
         }
     }
@@ -529,6 +540,13 @@ impl PacketSource for PcapSource {
         // against a capture thread setting it again. `Relaxed` for the reason
         // given at `PcapStop` — there is no payload behind the flag.
         self.capture_loss.swap(false, Ordering::Relaxed)
+    }
+
+    /// The live counters the window reads: the exact atomics [`PcapSource::open`]
+    /// was handed, read through [`CaptureHealth::snapshot`] — the same call
+    /// [`Funnel::report`]'s `debug!` line uses, so the two can never disagree.
+    fn counters(&self) -> CaptureCounters {
+        self.funnel.0.snapshot()
     }
 }
 
@@ -626,6 +644,7 @@ impl PcapSource {
         failures: Receiver<AdapterFailure>,
         game_port: NonZeroU16,
         pacing: Pacing,
+        health: CaptureHealth,
     ) -> Self {
         Self {
             packets,
@@ -637,7 +656,7 @@ impl PcapSource {
             capture_loss: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
-            funnel: Funnel::default(),
+            funnel: Funnel(health),
         }
     }
 }
@@ -676,7 +695,13 @@ mod tests {
         // kernel filter matches nothing on their adapters. The receiver's only
         // `Err` is the all-senders-gone disconnect, and these two never go.
         let siblings = (frames.clone(), frames);
-        let mut source = PcapSource::from_channels(packets, failures, game_port(), immediate());
+        let mut source = PcapSource::from_channels(
+            packets,
+            failures,
+            game_port(),
+            immediate(),
+            CaptureHealth::default(),
+        );
         report
             .send(AdapterFailure {
                 device: r"\Device\NPF_{THE-ONE-THAT-MATTERED}".to_owned(),
@@ -711,7 +736,13 @@ mod tests {
         let (frames, packets) = sync_channel(FRAME_QUEUE_DEPTH);
         let (report, failures) = channel();
         let sibling = frames.clone();
-        let mut source = PcapSource::from_channels(packets, failures, game_port(), immediate());
+        let mut source = PcapSource::from_channels(
+            packets,
+            failures,
+            game_port(),
+            immediate(),
+            CaptureHealth::default(),
+        );
         // Delivered nothing, so it was never on the game's path: most of the
         // devices this backend opens are idle by design.
         report
@@ -795,8 +826,11 @@ mod tests {
     #[test]
     #[ignore = "needs Npcap and a real adapter"]
     fn the_tap_opens_on_this_machine_without_elevation() {
-        let (source, mut stop) = PcapSource::open(NonZeroU16::new(3333).expect("3333 is not zero"))
-            .expect("open the Npcap tap");
+        let (source, mut stop) = PcapSource::open(
+            NonZeroU16::new(3333).expect("3333 is not zero"),
+            CaptureHealth::default(),
+        )
+        .expect("open the Npcap tap");
         assert!(!source.threads.is_empty(), "at least one adapter must open");
         println!("adapters capturing: {}", source.threads.len());
         stop.stop();
@@ -878,5 +912,64 @@ mod tests {
             "NPF_{A1B2-C3D4}"
         );
         assert_eq!(short_device_name("lo0"), "lo0");
+    }
+
+    /// A minimal admissible IPv4 TCP packet, IP layer down (no Ethernet
+    /// framing) — exactly the shape the funnel channel carries, already
+    /// stripped by `link`. Rebuilt here rather than imported from
+    /// `capture::ip::tests::ipv4_tcp`: that helper is private to its own test
+    /// module.
+    fn ipv4_tcp_from_game_port(payload: &[u8]) -> Vec<u8> {
+        let server = ([104, 116, 20, 111], game_port().get());
+        let client = ([192, 168, 1, 10], 51000);
+        let builder = etherparse::PacketBuilder::ipv4(server.0, client.0, 64)
+            .tcp(server.1, client.1, 1000, 64_240);
+        let mut out = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut out, payload).expect("write packet");
+        out
+    }
+
+    /// The trait boundary [`PacketSource::counters`] adds: what it reports
+    /// must equal what [`PcapSource::next_segment`] actually dequeued and
+    /// classified, not a second count that could drift from it.
+    ///
+    /// This covers the consumer side of the funnel channel; the producer side
+    /// — that `capture_loop`'s own `LoopCounters.delivered` equals the number
+    /// of frames it pushed through `forward` into this same channel — is
+    /// already pinned by plan 028's tests in `sys::tests`. Together the two
+    /// prove there is no seam between "a capture thread sent a frame" and
+    /// "the window's counters saw it".
+    #[test]
+    fn published_counters_report_exactly_what_next_segment_processed() {
+        let (frames, packets) = sync_channel(FRAME_QUEUE_DEPTH);
+        let (_report, failures) = channel();
+        let health = CaptureHealth::default();
+        let mut source =
+            PcapSource::from_channels(packets, failures, game_port(), immediate(), health.clone());
+
+        frames
+            .send(ipv4_tcp_from_game_port(b"AB"))
+            .expect("receiver alive");
+        frames
+            .send(ipv4_tcp_from_game_port(b"CD"))
+            .expect("receiver alive");
+        frames
+            .send(b"not an ip packet at all".to_vec())
+            .expect("receiver alive");
+        drop(frames);
+
+        assert!(source.next_segment().is_ok(), "first admitted segment");
+        assert!(source.next_segment().is_ok(), "second admitted segment");
+        // The third frame cannot parse; `next_segment` loops past it and then
+        // finds the channel disconnected — the funnel's only other exit.
+        assert!(source.next_segment().is_err());
+
+        let counters = source.counters();
+        assert_eq!(counters.delivered, 3, "every dequeued frame is delivered");
+        assert_eq!(counters.admitted, 2);
+        assert_eq!(counters.unparsed, 1);
+        // The handle `open` would have shared with the window is the exact
+        // one these increments landed on — not a copy that could disagree.
+        assert_eq!(health.snapshot(), counters);
     }
 }

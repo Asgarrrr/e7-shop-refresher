@@ -81,7 +81,9 @@ impl LinkStrip {
 /// ⚠ **Untested.** The measured machine has `VlanSupport=0`, so no tagged frame
 /// was ever observed; this exists so a player who does run tagged VLANs doesn't
 /// see a silent parse failure. Symptom if broken: `unparsed` climbing in
-/// lockstep with `delivered`.
+/// lockstep with `delivered` — visible in the window's capture-health row
+/// (`ui::capture_health`) as "traffic is being captured, but none of it looks
+/// like the game's", without anyone needing a debug build to see it.
 fn ethernet_payload_offset(frame: &[u8]) -> Option<usize> {
     let mut at = ETHERTYPE_OFFSET;
     // `<=` so `MAX_VLAN_TAGS` tags are accepted and the (MAX+1)-th falls
