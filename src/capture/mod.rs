@@ -1,6 +1,12 @@
 //! Passive traffic capture and the packet-source abstraction.
 
 mod ip;
+// Not under the backend's gate, though `capture::pcap` is its only consumer
+// today. It holds no `unsafe`, no raw pointer and no FFI, so the gate bought
+// nothing and cost it four of the six verification lanes — including both
+// `just verify` test lanes, which is where its ⚠ Untested VLAN cases most
+// needed to run. See its module doc.
+mod link;
 
 // The one capture backend. Without `pcap-backend` the crate has no way to
 // capture at all, and says so (see `app::build_source`).

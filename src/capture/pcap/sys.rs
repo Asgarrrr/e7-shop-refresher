@@ -8,8 +8,9 @@
 //! `Handle` retains the `*mut PcapT` — auditable only because that field, and
 //! every `*mut PcapT` in the crate, is private to this file. Splitting
 //! `open_device` from `capture_loop` would make it `pub(super)` and spread
-//! the check over three files. [`super::link`] carries no pointer; it is the
-//! one that left.
+//! the check over three files. [`crate::capture::link`] carries no pointer; it
+//! is the one that left — and it left this directory entirely, so its tests run
+//! in lanes that never build a backend.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;
@@ -19,8 +20,8 @@ use std::sync::mpsc::{Sender, SyncSender, TrySendError};
 
 use tracing::{debug, info_span, warn};
 
-use super::link::{LinkStrip, UnsupportedDatalink};
 use super::{AdapterFailure, short_device_name};
+use crate::capture::link::{LinkStrip, UnsupportedDatalink};
 use crate::error::{Error, Result};
 
 /// Size libpcap requires of every error buffer: it writes up to this many
@@ -1220,8 +1221,10 @@ mod tests {
 
     /// A minimal untagged Ethernet frame carrying an IPv4 `EtherType`, for
     /// `LinkStrip::Ethernet` to strip. Rebuilt here rather than reused from
-    /// `link::tests::ethernet_frame` because that helper is private to link's
-    /// own test module (`PLAN.md` keeps `link.rs` out of this plan's scope).
+    /// `crate::capture::link`'s `tests::ethernet_frame`, because that helper is
+    /// private to that module's own `#[cfg(test)]` block — and should stay
+    /// there. What this file needs is a frame shaped enough to reach the funnel;
+    /// what that one builds is a frame shaped to exercise the strip itself.
     fn ethernet_frame_with_ip_payload(payload: &[u8]) -> Vec<u8> {
         let mut frame = vec![0xAAu8; 12]; // dst + src MAC, unread by the strip
         frame.extend_from_slice(&0x0800u16.to_be_bytes()); // EtherType: IPv4

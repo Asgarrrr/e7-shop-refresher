@@ -42,7 +42,7 @@ pub(super) fn diagnosis(view: &CaptureHealthView) -> &'static str {
          but nothing has matched the capture filter"
     } else if view.admitted == 0 {
         // `unparsed` is climbing in lockstep with `delivered` here — the
-        // same symptom `capture::pcap::link`'s untested VLAN strip names for
+        // same symptom `capture::link`'s untested VLAN strip names for
         // its own failure mode, now visible without a debug build.
         "traffic is being captured, but none of it looks like the game's"
     } else if view.dropped_segments > 0 || view.resyncs > 0 {

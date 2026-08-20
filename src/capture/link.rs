@@ -1,10 +1,37 @@
 //! Link-layer stripping: a captured frame in, the IP packet inside it out.
 //!
-//! No `wpcap.dll` symbol and no raw pointer, so this is the seam that can be
-//! cut without touching the soundness argument in [`super::sys`]. It is also
-//! where the next bug will land: the VLAN path below is `⚠ Untested`, and a
-//! wrong strip length doesn't fail loudly — it hands `parse_segment` bytes off
-//! by a few. Most of this backend's tests live here for that reason.
+//! No `wpcap.dll` symbol and no raw pointer, so this is the seam that could be
+//! cut without touching the soundness argument in `capture::pcap::sys` — and it
+//! has been. This module sits outside the `pcap-backend` gate its only consumer
+//! lives under, which is what lets its tests run in all six verification lanes
+//! rather than the two that build a backend.
+//!
+//! That matters more here than anywhere else in the capture path, because this
+//! is where the next bug will land: the VLAN path below is `⚠ Untested` against
+//! real hardware, and a wrong strip length doesn't fail loudly — it hands
+//! [`parse_segment`](crate::capture::parse_segment) bytes off by a few.
+//!
+//! The cost of being un-gated is the `dead_code` allow below: in a lane with no
+//! `pcap-backend`, nothing outside this file's own tests refers to any of it.
+//! The allow is written to apply only in those lanes, so an item that really
+//! did go unused in the shipped build would still be caught.
+
+// Measured, not assumed: without this, `cargo clippy --no-default-features
+// --all-targets` reports twelve `never used` warnings here — every constant,
+// both types, `ip_bytes` and `ethernet_payload_offset` — because the lib target
+// compiles without `#[cfg(test)]`, and `capture::pcap` is the only non-test
+// caller any of them has.
+//
+// `cfg_attr` rather than a bare `#![allow]` so the silence is scoped to exactly
+// the lanes where the gap is real. In a build that *does* enable the backend,
+// dead code in this file means a genuine mistake and still fails the lane.
+#![cfg_attr(
+    not(all(windows, feature = "pcap-backend")),
+    allow(
+        dead_code,
+        reason = "capture::pcap is the only consumer and it is feature-gated; this module deliberately is not"
+    )
+)]
 
 use std::ffi::c_int;
 
