@@ -419,17 +419,35 @@ fn drop_unreadable_timing_ranges(text: &str) -> Option<(String, Vec<(&'static st
     (!dropped.is_empty()).then(|| (doc.to_string(), dropped))
 }
 
-/// The `(min_ms, max_ms)` pair an authored range spells out. An omitted key
-/// reads 0, matching `RawDelayRange`'s `serde(default)`, so the
-/// `{ max_ms = 120000 }` shorthand is judged on `serde`'s numbers.
+/// The `(min_ms, max_ms)` pair `RawDelayRange`'s own `TryFrom` (in
+/// `actuator::plan::timings`) would build from this table, so the salvage
+/// pass judges an authored range exactly as `serde` does. An absent `min_ms`
+/// reads `0`; an absent `max_ms` reads the *resolved* `min_ms`, not `0` —
+/// `refreshed = { min_ms = 200 }` is the fixed delay `200..=200`, and judging
+/// it as `(200, 0)` is the defect this function exists to not repeat.
+/// `RawDelayRange` is the specification; keep this in agreement with it.
 ///
-/// `None` for anything that is not two non-negative integers: a string, float
-/// or negative is a different complaint, reported better by the strict parse.
+/// `None` for anything that is not two non-negative integers written: a
+/// string, float or negative is a different complaint, reported better by the
+/// strict parse. An absent key is not that case — it resolves per the rule
+/// above, exactly as `#[serde(default)]` would.
 fn written_range(item: &Item) -> Option<(u64, u64)> {
     let table = item.as_table_like()?;
-    let field = |name: &str| match table.get(name) {
-        None => Some(0),
-        Some(written) => written.as_integer().and_then(|ms| u64::try_from(ms).ok()),
+    // `Ok(None)` for a key that is simply absent, `Ok(Some(ms))` for one that
+    // reads as a non-negative integer, `Err(())` for anything else — kept
+    // distinct from "absent" so an unreadable key still fails the read below
+    // and defers to the strict parse, rather than being treated as unwritten.
+    let field = |name: &str| -> std::result::Result<Option<u64>, ()> {
+        match table.get(name) {
+            None => Ok(None),
+            Some(written) => written
+                .as_integer()
+                .and_then(|ms| u64::try_from(ms).ok())
+                .map(Some)
+                .ok_or(()),
+        }
     };
-    Some((field("min_ms")?, field("max_ms")?))
+    let min_ms = field("min_ms").ok()?.unwrap_or(0);
+    let max_ms = field("max_ms").ok()?.unwrap_or(min_ms);
+    Some((min_ms, max_ms))
 }

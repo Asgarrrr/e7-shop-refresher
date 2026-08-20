@@ -489,6 +489,99 @@ between_buys = { max_ms = 120000 }
     );
 }
 
+/// **The bug this test pins.** `written_range` used to resolve an omitted
+/// `max_ms` to `0`, not to the resolved `min_ms` the way `RawDelayRange` does.
+/// A floor-only range like `shop_opened = { min_ms = 200 }` is the fixed delay
+/// `200..=200` to `serde` — legal — but the salvage pass judged it as
+/// `(200, 0)`, saw `DelayRangeError::Reversed`, and deleted a range the player
+/// wrote correctly. `refreshed` is the genuinely invalid pair that must be
+/// present for the salvage pass to run at all.
+#[test]
+fn a_floor_only_range_survives_the_salvage_of_a_neighbouring_bad_one() {
+    let dir = TempDir::new("floor-only-timings");
+    std::fs::create_dir_all(dir.path()).expect("fixture dir");
+    let path = dir.join("config.toml");
+    let text = "\
+# hand-written
+game_port = 3333
+
+[filter]
+names = [\"ticketrare_name\"]
+
+[actuator.timings]
+shop_opened = { min_ms = 200 }
+refreshed = { min_ms = 800, max_ms = 200 }
+";
+    std::fs::write(&path, text).expect("seed a pre-refusal config");
+
+    let (config, dropped) =
+        Config::load_reporting(&path).expect("an existing config must still open the app");
+    let lines = dropped.journal_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("actuator.timings.refreshed"), "{lines:?}");
+    assert!(
+        !lines[0].contains("actuator.timings.shop_opened"),
+        "a floor-only range is legal and must not be reported as dropped: {lines:?}"
+    );
+    // The fixed-delay semantics `RawDelayRange` defines: an omitted `max_ms`
+    // resolves to the resolved `min_ms`, not to 0.
+    assert_eq!(config.actuator.timings.shop_opened.min_ms(), 200);
+    assert_eq!(config.actuator.timings.shop_opened.max_ms(), 200);
+    config.validate().expect("and the result must validate");
+
+    // The file is left alone: the salvage pass only removes candidates it
+    // cannot read, never rewrites the ones it can.
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("still readable"),
+        text,
+        "the loader must not rewrite the player's config"
+    );
+}
+
+/// **Guards the invariant the floor-only bug broke.** `written_range` and
+/// `RawDelayRange`'s `TryFrom` (`actuator::plan::timings`) are two
+/// implementations of one rule, in two files, and they drifted once already —
+/// this pins them together directly instead of only covering the one
+/// spelling that surfaced the drift, so the next disagreement between the two
+/// fails here rather than shipping.
+///
+/// Lives in `config::tests`, not `plan::timings`, because `written_range` is
+/// private to `config` and this file reaches it through `use super::*`;
+/// `plan::timings` has no way to see it at all.
+#[test]
+fn written_range_agrees_with_what_serde_actually_builds() {
+    for spelling in [
+        "{ min_ms = 200 }",
+        "{ max_ms = 900 }",
+        "{ min_ms = 100, max_ms = 900 }",
+        "{}",
+    ] {
+        let text = format!("[actuator.timings]\nshop_opened = {spelling}\n");
+
+        let doc: DocumentMut = text.parse().expect("valid toml");
+        let item = doc
+            .as_table()
+            .get("actuator")
+            .and_then(Item::as_table_like)
+            .and_then(|table| table.get("timings"))
+            .and_then(Item::as_table_like)
+            .and_then(|table| table.get("shop_opened"))
+            .expect("the fixture always writes shop_opened");
+        let from_written_range = written_range(item).expect("every spelling here is readable");
+
+        let config: Config = toml::from_str(&text).expect("serde must accept the same text");
+        let from_serde = (
+            config.actuator.timings.shop_opened.min_ms(),
+            config.actuator.timings.shop_opened.max_ms(),
+        );
+
+        assert_eq!(
+            from_written_range, from_serde,
+            "{spelling:?}: written_range and serde disagree on the pair"
+        );
+    }
+}
+
 #[test]
 fn an_unreadable_range_is_dropped_whichever_way_the_table_is_spelled() {
     // All four spellings are the same document to `toml`, so a player bricked
