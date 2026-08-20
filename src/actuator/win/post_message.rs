@@ -18,8 +18,8 @@ use crate::actuator::{Surface, SurfaceError, shield};
 
 use super::dpi::ensure_dpi_awareness;
 use super::{
-    Hwnd, MOVE_SETTLE_MS, Target, WHEEL_DELTA, client_rect, find_game_window, preflight_refusal,
-    probe_window_reachable, release_twice, verify_identity,
+    Hwnd, MOVE_SETTLE_MS, Target, WHEEL_DELTA, client_rect, find_game_window, owning_pid,
+    preflight_refusal, probe_window_reachable, release_twice, verify_identity,
 };
 
 /// Posted messages are retrieved before queued hardware input: a freshly
@@ -56,6 +56,10 @@ trait MessageDriver: Send {
     /// which tests drive with a synthetic `ERROR_ACCESS_DENIED`.
     fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()>;
     fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError>;
+    /// [`owning_pid`], read once at `acquire` and re-read by every later
+    /// [`verify`](MessageSurface::verify) — see [`Target`]'s doc comment for
+    /// why.
+    fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError>;
     fn post(
         &mut self,
         hwnd: Hwnd,
@@ -84,6 +88,10 @@ impl MessageDriver for SystemMessageDriver {
 
     fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError> {
         client_rect(hwnd.raw())
+    }
+
+    fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError> {
+        owning_pid(hwnd.raw())
     }
 
     fn post(
@@ -170,14 +178,18 @@ impl MessageSurface {
         Ok(())
     }
 
-    /// Re-resolves the title before comparing the rect, matching
-    /// `send_input.rs`'s `verify_placement` exactly (both funnel through
-    /// [`verify_identity`]): the two backends must refuse the same
+    /// Re-resolves the title before comparing the owning pid and the rect,
+    /// matching `send_input.rs`'s `verify_placement` exactly (both funnel
+    /// through [`verify_identity`]): the two backends must refuse the same
     /// changed-identity target the same way, not merely a moved one.
     fn verify(&mut self, target: Target) -> Result<(), SurfaceError> {
         let titled = self.driver.find_game_window()?;
         let driver = &mut self.driver;
-        verify_identity(titled, target, move || driver.client_rect(target.hwnd))
+        verify_identity(titled, target, move || {
+            let pid = driver.owning_pid(target.hwnd)?;
+            let rect = driver.client_rect(target.hwnd)?;
+            Ok((pid, rect))
+        })
     }
 }
 
@@ -192,7 +204,8 @@ impl Surface for MessageSurface {
             .probe_reachable(hwnd)
             .map_err(|error| preflight_refusal(&error))?;
         let rect = self.driver.client_rect(hwnd)?;
-        let target = Target { hwnd, rect };
+        let pid = self.driver.owning_pid(hwnd)?;
+        let target = Target { hwnd, rect, pid };
         Ok((target, rect))
     }
 
@@ -318,7 +331,7 @@ mod tests {
     use windows_sys::Win32::Foundation::HWND;
 
     use crate::actuator::win::tests::{
-        GAME_HWND, OTHER_HWND, dead_handle, game_rect, uipi_refusal,
+        GAME_HWND, GAME_PID, OTHER_HWND, OTHER_PID, dead_handle, game_rect, uipi_refusal,
     };
 
     // The specification the order tests below assert — read off the live
@@ -356,6 +369,7 @@ mod tests {
         FindWindow,
         Probe(Hwnd),
         ClientRect(Hwnd),
+        OwningPid(Hwnd),
         Post(Hwnd, u32, usize, isize),
         ShieldRaise(Hwnd, ClientRect),
         ShieldHide,
@@ -366,9 +380,11 @@ mod tests {
         calls: Vec<MessageCall>,
         window: Hwnd,
         rect: ClientRect,
+        pid: u32,
         find_results: VecDeque<Result<Hwnd, SurfaceError>>,
         probe_results: VecDeque<std::io::Result<()>>,
         rect_results: VecDeque<Result<ClientRect, SurfaceError>>,
+        pid_results: VecDeque<Result<u32, SurfaceError>>,
         post_results: VecDeque<Result<(), SurfaceError>>,
         shield_raise_results: VecDeque<Result<bool, String>>,
     }
@@ -379,9 +395,11 @@ mod tests {
                 calls: Vec::new(),
                 window: GAME_HWND,
                 rect: game_rect(),
+                pid: GAME_PID,
                 find_results: VecDeque::new(),
                 probe_results: VecDeque::new(),
                 rect_results: VecDeque::new(),
+                pid_results: VecDeque::new(),
                 post_results: VecDeque::new(),
                 shield_raise_results: VecDeque::new(),
             }
@@ -416,6 +434,16 @@ mod tests {
                 result
             } else {
                 Ok(state.rect)
+            }
+        }
+
+        fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(MessageCall::OwningPid(hwnd));
+            if let Some(result) = state.pid_results.pop_front() {
+                result
+            } else {
+                Ok(state.pid)
             }
         }
 
@@ -500,6 +528,7 @@ mod tests {
         let target = Target {
             hwnd: GAME_HWND,
             rect: game_rect(),
+            pid: GAME_PID,
         };
 
         surface.release(&target);
@@ -533,6 +562,7 @@ mod tests {
             calls(&state),
             vec![
                 MessageCall::FindWindow,
+                MessageCall::OwningPid(GAME_HWND),
                 MessageCall::ClientRect(GAME_HWND),
                 MessageCall::ShieldRaise(GAME_HWND, game_rect()),
                 MessageCall::Sleep(SHIELD_DRAIN_MS),
@@ -636,7 +666,11 @@ mod tests {
         ));
         assert_eq!(
             calls(&state),
-            vec![MessageCall::FindWindow, MessageCall::ClientRect(GAME_HWND)],
+            vec![
+                MessageCall::FindWindow,
+                MessageCall::OwningPid(GAME_HWND),
+                MessageCall::ClientRect(GAME_HWND),
+            ],
             "a moved window must be refused before the shield is touched or anything is posted"
         );
     }
@@ -662,9 +696,38 @@ mod tests {
         );
     }
 
-    /// The negative control for the check above: an unchanged target must
-    /// still click end to end, so the new title re-resolution cannot pass by
-    /// refusing everything.
+    /// Parity with `send_input.rs`'s equivalent: a recycled `HWND` value now
+    /// owned by a different process must be refused exactly like a changed
+    /// title, even though the title and the `HWND` integer both still match.
+    #[test]
+    fn a_changed_owning_process_is_fatal() {
+        let (mut surface, state) = fake_surface();
+        let target = acquire_and_clear(&mut surface, &state);
+        state.lock().unwrap().pid_results.push_back(Ok(OTHER_PID));
+
+        assert!(matches!(
+            surface.click(&target, (30, 40), 5),
+            Err(SurfaceError::Fatal(reason)) if reason.contains("different process")
+        ));
+        assert_eq!(
+            calls(&state),
+            vec![
+                MessageCall::FindWindow,
+                // `verify_identity` reads the pid and the rect together, in one
+                // round trip, once the title has matched — see its doc comment
+                // for why that is not a correctness gap: both are cheap reads,
+                // unlike the desktop-affecting calls the title check guards.
+                MessageCall::OwningPid(GAME_HWND),
+                MessageCall::ClientRect(GAME_HWND),
+            ],
+            "a window now owned by a different process must be refused before the shield is \
+             touched or anything is posted"
+        );
+    }
+
+    /// The negative control for the two checks above: an unchanged target
+    /// must still click end to end, so the new title and pid re-resolution
+    /// cannot pass by refusing everything.
     #[test]
     fn an_unchanged_target_still_clicks() {
         let (mut surface, state) = fake_surface();
@@ -677,6 +740,7 @@ mod tests {
             calls(&state),
             vec![
                 MessageCall::FindWindow,
+                MessageCall::OwningPid(GAME_HWND),
                 MessageCall::ClientRect(GAME_HWND),
                 MessageCall::ShieldRaise(GAME_HWND, game_rect()),
                 MessageCall::Post(GAME_HWND, WM_MOUSEMOVE, 0, lparam),
@@ -739,6 +803,7 @@ mod tests {
             calls(&state),
             vec![
                 MessageCall::FindWindow,
+                MessageCall::OwningPid(GAME_HWND),
                 MessageCall::ClientRect(GAME_HWND),
                 MessageCall::ShieldRaise(GAME_HWND, game_rect()),
                 MessageCall::Post(GAME_HWND, WM_MOUSEMOVE, 0, client_lparam),
