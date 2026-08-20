@@ -47,20 +47,94 @@ pub(super) fn post_refusal(error: &std::io::Error) -> SurfaceError {
     }
 }
 
+/// The process-global calls used by [`MessageSurface`] (see the module docs
+/// for why this trait exists).
+trait MessageDriver: Send {
+    fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError>;
+    /// [`probe_window_reachable`], handing back the thread's last-error
+    /// untouched so the classification stays in the pure [`preflight_refusal`],
+    /// which tests drive with a synthetic `ERROR_ACCESS_DENIED`.
+    fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()>;
+    fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError>;
+    fn post(
+        &mut self,
+        hwnd: Hwnd,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> Result<(), SurfaceError>;
+    /// [`shield::raise`]: `Ok(true)` means the shield was (re)placed by this
+    /// call, so the caller owes it the drain beat.
+    fn shield_raise(&mut self, hwnd: Hwnd, rect: ClientRect) -> Result<bool, String>;
+    fn shield_hide(&mut self);
+    fn sleep(&mut self, duration: Duration);
+}
+
+struct SystemMessageDriver;
+
+impl MessageDriver for SystemMessageDriver {
+    fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError> {
+        ensure_dpi_awareness()?;
+        find_game_window().map(Hwnd::new)
+    }
+
+    fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()> {
+        probe_window_reachable(hwnd.raw())
+    }
+
+    fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError> {
+        client_rect(hwnd.raw())
+    }
+
+    fn post(
+        &mut self,
+        hwnd: Hwnd,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> Result<(), SurfaceError> {
+        post(hwnd, msg, wparam, lparam)
+    }
+
+    fn shield_raise(&mut self, hwnd: Hwnd, rect: ClientRect) -> Result<bool, String> {
+        shield::raise(hwnd, rect)
+    }
+
+    fn shield_hide(&mut self) {
+        shield::hide();
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
 /// `PostMessageW` backend (the default). The engine tracks its cursor through
 /// move messages, so every input re-asserts the [`shield`] over the game until
 /// [`release`](Surface::release).
 ///
-/// Braced-empty rather than a unit struct so `MessageSurface::default()` — how
-/// `src/app/mod.rs` spawns it — does not become a
-/// `clippy::default_constructed_unit_structs` diagnostic in a file this type
-/// does not own.
-#[derive(Default)]
-pub struct MessageSurface {}
+/// The driver stays erased behind `Box<dyn MessageDriver>` even though
+/// production only ever holds the one ZST, for the same reason as
+/// `WinSurface`'s (`send_input.rs:117-121`): `MessageDriver`/
+/// `SystemMessageDriver` are private to this module, so a generic parameter
+/// such as `MessageSurface<D: MessageDriver = SystemMessageDriver>` would leak
+/// a private type in a public API (`private_bounds`, `private_interfaces` —
+/// red under `-D warnings`).
+pub struct MessageSurface {
+    driver: Box<dyn MessageDriver>,
+}
+
+impl Default for MessageSurface {
+    fn default() -> Self {
+        Self {
+            driver: Box::new(SystemMessageDriver),
+        }
+    }
+}
 
 impl Drop for MessageSurface {
     fn drop(&mut self) {
-        shield::hide();
+        self.driver.shield_hide();
     }
 }
 
@@ -71,21 +145,34 @@ impl Target {
     fn to_client(self, at: (i32, i32)) -> (i32, i32) {
         (at.0 - self.rect.left, at.1 - self.rect.top)
     }
+}
+
+impl MessageSurface {
+    #[cfg(test)]
+    fn with_driver(driver: impl MessageDriver + 'static) -> Self {
+        Self {
+            driver: Box::new(driver),
+        }
+    }
 
     /// Before every input: the window must be where the job planned it and
     /// the shield seated above it; a (re)placed shield gets the drain beat.
     /// A shield failure is fatal — never click shieldless.
-    fn engage(self) -> Result<(), SurfaceError> {
-        self.verify()?;
-        if shield::raise(self.hwnd, self.rect).map_err(SurfaceError::Fatal)? {
-            std::thread::sleep(Duration::from_millis(SHIELD_DRAIN_MS));
+    fn engage(&mut self, target: Target) -> Result<(), SurfaceError> {
+        self.verify(target)?;
+        if self
+            .driver
+            .shield_raise(target.hwnd, target.rect)
+            .map_err(SurfaceError::Fatal)?
+        {
+            self.driver.sleep(Duration::from_millis(SHIELD_DRAIN_MS));
         }
         Ok(())
     }
 
-    fn verify(self) -> Result<(), SurfaceError> {
-        let rect = client_rect(self.hwnd.raw())?;
-        if rect == self.rect {
+    fn verify(&mut self, target: Target) -> Result<(), SurfaceError> {
+        let rect = self.driver.client_rect(target.hwnd)?;
+        if rect == target.rect {
             return Ok(());
         }
         Err(rect_change_error(rect))
@@ -96,16 +183,14 @@ impl Surface for MessageSurface {
     type Window = Target;
 
     fn acquire(&mut self) -> Result<(Target, ClientRect), SurfaceError> {
-        ensure_dpi_awareness()?;
-        let hwnd = find_game_window()?;
+        let hwnd = self.driver.find_game_window()?;
         // One probe per job: the alternative is `shield::raise` failing on the
         // first click of every job with a message naming the wrong cause.
-        probe_window_reachable(hwnd).map_err(|error| preflight_refusal(&error))?;
-        let rect = client_rect(hwnd)?;
-        let target = Target {
-            hwnd: Hwnd::new(hwnd),
-            rect,
-        };
+        self.driver
+            .probe_reachable(hwnd)
+            .map_err(|error| preflight_refusal(&error))?;
+        let rect = self.driver.client_rect(hwnd)?;
+        let target = Target { hwnd, rect };
         Ok((target, rect))
     }
 
@@ -124,17 +209,19 @@ impl Surface for MessageSurface {
         press_ms: u64,
     ) -> Result<(), SurfaceError> {
         let target = *target;
-        target.engage()?;
+        self.engage(target)?;
         let lparam = pack_point(target.to_client(at))?;
-        post(target.hwnd, WM_MOUSEMOVE, 0, lparam)?;
-        std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
-        post(target.hwnd, WM_LBUTTONDOWN, MK_LBUTTON as usize, lparam)?;
-        std::thread::sleep(Duration::from_millis(press_ms));
+        self.driver.post(target.hwnd, WM_MOUSEMOVE, 0, lparam)?;
+        self.driver.sleep(Duration::from_millis(MOVE_SETTLE_MS));
+        self.driver
+            .post(target.hwnd, WM_LBUTTONDOWN, MK_LBUTTON as usize, lparam)?;
+        self.driver.sleep(Duration::from_millis(press_ms));
         // This backend re-verifies per post rather than up front, so there is
         // nothing to revalidate before the release.
+        let driver = &mut self.driver;
         release_twice(
             || Ok(()),
-            || post(target.hwnd, WM_LBUTTONUP, 0, lparam),
+            || driver.post(target.hwnd, WM_LBUTTONUP, 0, lparam),
             "WM_LBUTTONUP",
         )
     }
@@ -146,16 +233,16 @@ impl Surface for MessageSurface {
         notches: i32,
     ) -> Result<(), SurfaceError> {
         let target = *target;
-        target.engage()?;
-        post(
+        self.engage(target)?;
+        self.driver.post(
             target.hwnd,
             WM_MOUSEMOVE,
             0,
             pack_point(target.to_client(at))?,
         )?;
-        std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
+        self.driver.sleep(Duration::from_millis(MOVE_SETTLE_MS));
         // `WM_MOUSEWHEEL` takes screen coordinates; the delta rides wParam.
-        post(
+        self.driver.post(
             target.hwnd,
             WM_MOUSEWHEEL,
             wheel_wparam(notches)?,
@@ -167,7 +254,7 @@ impl Surface for MessageSurface {
     /// Lowers the shield the inputs raised. `shield::hide` tolerates there being
     /// nothing up, which it must: this runs from the guard *and* from `Drop`.
     fn release(&mut self, _target: &Target) {
-        shield::hide();
+        self.driver.shield_hide();
     }
 }
 
