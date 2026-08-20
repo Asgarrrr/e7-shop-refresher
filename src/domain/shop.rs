@@ -323,14 +323,23 @@ where
 /// a lever the server can pull to evict a player's real diagnostic history.
 const MAX_WIRE_TEXT: usize = 120;
 
-/// Strips control characters (replacing each with a single space) and caps the
-/// result at [`MAX_WIRE_TEXT`] **characters**. Shared by [`sanitized_text`] and
-/// [`sanitized_required_text`]; returns whether anything changed, so the
-/// callers can decide whether to log.
+/// Strips control characters (replacing each with a single space), caps the
+/// result at [`MAX_WIRE_TEXT`] **characters**, then trims. Shared by
+/// [`sanitized_text`] and [`sanitized_required_text`]; returns whether
+/// anything changed, so the callers can decide whether to log.
 ///
 /// Replacing rather than deleting a control character keeps `"a\nb"` from
 /// becoming `"ab"` — two words the server kept apart should not collide just
 /// because the separator was hostile.
+///
+/// Trimmed because `ui::editor::hunt` trims the player's side of the same
+/// comparison (`input.trim()` before a criterion is stored) and
+/// `Filter::matches` compares both sides by exact equality — an untrimmed
+/// wire value would silently stop matching a criterion the player typed
+/// correctly. Trimming happens *after* the cap, not before: truncating at
+/// exactly [`MAX_WIRE_TEXT`] characters can itself land on a space (an
+/// overlong value cut mid-word), so trimming first could leave that
+/// truncation-made space behind untouched.
 fn sanitize_wire_text(raw: String) -> (String, bool) {
     let mut changed = false;
     let stripped: String = raw
@@ -344,11 +353,17 @@ fn sanitize_wire_text(raw: String) -> (String, bool) {
             }
         })
         .collect();
-    if stripped.chars().count() > MAX_WIRE_TEXT {
+    let capped: String = if stripped.chars().count() > MAX_WIRE_TEXT {
         changed = true;
-        return (stripped.chars().take(MAX_WIRE_TEXT).collect(), changed);
+        stripped.chars().take(MAX_WIRE_TEXT).collect()
+    } else {
+        stripped
+    };
+    let trimmed = capped.trim();
+    if trimmed.len() != capped.len() {
+        changed = true;
     }
-    (stripped, changed)
+    (trimmed.to_owned(), changed)
 }
 
 /// Server-supplied display text, with control characters removed and the
@@ -718,5 +733,18 @@ mod tests {
         let snapshot = parse(r#"{"slots":[{"name":"Ancient Coin","set":"set_speed"}]}"#);
         assert_eq!(snapshot.slots[0].name.as_deref(), Some("Ancient Coin"));
         assert_eq!(snapshot.slots[0].set.as_deref(), Some("set_speed"));
+    }
+
+    /// `ui::editor::hunt` trims a criterion before storing it (`input.trim()`),
+    /// but replacing a control character with a space, as the sanitizer does,
+    /// can itself leave a trailing space the wire value never had — a "\n" at
+    /// the end of a name becomes a `" "` at the end of a name. Left untrimmed,
+    /// that space is the only difference between the sanitized wire value and
+    /// the player's trimmed criterion, and `Filter::matches` is exact equality:
+    /// the item silently stops matching.
+    #[test]
+    fn a_trailing_control_character_does_not_leave_a_space_behind() {
+        let snapshot = parse(r#"{"slots":[{"name":"Covenant Bookmark\n"}]}"#);
+        assert_eq!(snapshot.slots[0].name.as_deref(), Some("Covenant Bookmark"));
     }
 }
