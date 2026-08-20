@@ -7,13 +7,30 @@
 
 use eframe::egui;
 
-use super::{arm_optional, count_label, optional_field};
+use super::{arm_optional, bounded_field, count_label, optional_field};
 use crate::domain::filter::{Filter, SubstatReq};
 use crate::render::kind_label;
 
+/// The gear grades the game ships, and so the only floors `[filter] min_grade`
+/// accepts. Spelled here because `domain::filter`'s pair is private and
+/// `src/domain/` stays clear of GUI code; that module's parse-time check is the
+/// authority, and `the_grade_field_is_bounded_by_what_the_config_accepts` runs
+/// this range through it so the two cannot drift apart unnoticed.
+const GRADE_MIN: u8 = 2;
+const GRADE_MAX: u8 = 4;
+
 /// One-line recap of the hunt draft for the folded Hunt bar: the labels of what
-/// the loop would buy (haul-headliner names, then kinds, then a count of the
-/// finer criteria).
+/// the loop would buy (haul-headliner names, then kinds, then the finer
+/// criteria).
+///
+/// Every field [`Filter::is_unrestricted`] counts as a criterion is listed
+/// here, and that is not decoration. "nothing selected" is the only thing this
+/// tab says about an empty hunt, so a criterion that restricts without
+/// appearing reads as an empty filter that nonetheless arms — and the loop then
+/// refreshes forever, buys nothing, and the bar gives no clue why.
+/// `min_grade` was exactly that; `max_price` and `min_substats` had editors in
+/// the body but no part here, so a config setting only one of them told the
+/// same lie from the folded bar.
 pub(super) fn hunt_summary(filter: &Filter) -> String {
     let mut parts: Vec<String> = Vec::new();
     for name in &filter.names {
@@ -37,6 +54,21 @@ pub(super) fn hunt_summary(filter: &Filter) -> String {
             "substat",
             "substats",
         ));
+    }
+    // `Some(0)` is skipped rather than shown as "0+ substats": it constrains
+    // nothing, `is_unrestricted` refuses to count it, and Apply stays dark
+    // over it — a part here would be the mirror-image lie, a bar naming a
+    // criterion for a filter the loop calls empty.
+    if let Some(min) = filter.min_substats.filter(|min| *min > 0) {
+        parts.push(format!("{min}+ substats"));
+    }
+    if let Some(max) = filter.max_price {
+        // `Gold` groups itself, so this reads like the shop table's price
+        // column rather than a bare seven-digit number.
+        parts.push(format!("≤{max} gold"));
+    }
+    if let Some(min) = filter.min_grade {
+        parts.push(format!("grade {min}+"));
     }
     if parts.is_empty() {
         return "nothing selected".to_owned();
@@ -86,7 +118,16 @@ pub(super) fn string_list(
     for (index, value) in values.iter().enumerate() {
         // Content-keyed row ids (duplicates rejected on add), so focus/edit
         // state survive a removal above the row.
-        ui.push_id(egui::Id::new(value), |ui| {
+        //
+        // Keyed on `(label, value)` and not on `value` alone: `push_id` salts
+        // the *parent* `Ui`'s id, and `hunt_body` calls this twice — "names"
+        // and "sets" — on the same `Ui`, so the content alone gave the two
+        // lists' rows one id (measured: the two child `ui.id()` values compare
+        // equal). That is egui's "Double ID" case — the overlay, and two
+        // widgets sharing one registration for focus and interaction state.
+        // The two fields are adjacent and both ask for "exact internal ids",
+        // so the same string landing in both is the ordinary way in.
+        ui.push_id(egui::Id::new((label, value)), |ui| {
             ui.horizontal(|ui| {
                 ui.monospace(value);
                 if remove_button(ui).clicked() {
@@ -115,7 +156,10 @@ pub(super) fn substat_reqs(ui: &mut egui::Ui, reqs: &mut Vec<SubstatReq>, input:
     ui.label("required substats");
     let mut removed = None;
     for (index, req) in reqs.iter_mut().enumerate() {
-        let row_id = egui::Id::new(&req.name);
+        // Salted like `string_list`'s rows and for the same reason: this list
+        // shares a parent `Ui` with the two string lists, so a substat named
+        // the same as a set or a name entry would collide with it.
+        let row_id = egui::Id::new(("required substats", &req.name));
         ui.push_id(row_id, |ui| {
             ui.horizontal(|ui| {
                 ui.monospace(&req.name);
@@ -178,9 +222,32 @@ pub(super) fn optional_value<T: egui::emath::Numeric>(
     }
 }
 
+/// The gear-grade floor: [`optional_value`]'s cell over the closed domain the
+/// game actually ships. A twin rather than one more call to it — the way
+/// [`super::duration_row`] is [`super::limit_row`]'s twin — because the bound
+/// *is* the point. `optional_field` is open above, so a 5 dragged in here would
+/// be a criterion no item satisfies, written to config.toml by Apply and then
+/// refused outright by `domain::filter`'s `grade_floor` at the next launch:
+/// one drag, and the app no longer starts. [`bounded_field`] clamps what the
+/// player drags while still leaving a seeded value exactly as the file spelled
+/// it, so both halves hold.
+///
+/// Seeded at [`GRADE_MAX`]: the epic floor is what `config.example.toml`
+/// documents and what a player reaching for this criterion is after — the same
+/// "seed the useful value, not the range's floor" call `max_price`'s seed makes.
+pub(super) fn grade_value(ui: &mut egui::Ui, value: &mut Option<u8>) {
+    let mut on = value.is_some();
+    ui.checkbox(&mut on, "min grade");
+    arm_optional(on, value, GRADE_MAX);
+    if let Some(current) = value.as_mut() {
+        bounded_field(ui, current, GRADE_MIN..=GRADE_MAX);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::shop::Gold;
 
     #[test]
     fn hunt_summary_names_the_hunted_tokens() {
@@ -191,5 +258,77 @@ mod tests {
         };
         assert_eq!(hunt_summary(&named), "Covenant");
         assert_eq!(hunt_summary(&Filter::default()), "nothing selected");
+    }
+
+    #[test]
+    fn a_restricting_filter_is_never_summarized_as_nothing_selected() {
+        // The bar's contract, in the terms the loop uses: `is_unrestricted` is
+        // what decides whether the hunt can arm, so anything it counts has to
+        // show. A `min_grade`-only config used to fold up as "nothing
+        // selected" while `matches` dropped every gradeless item — an armed
+        // loop refreshing forever with an empty-looking Hunt bar.
+        for filter in [
+            Filter {
+                min_grade: Some(4),
+                ..Filter::default()
+            },
+            Filter {
+                max_price: Some(Gold::new(300_000)),
+                ..Filter::default()
+            },
+            Filter {
+                min_substats: Some(3),
+                ..Filter::default()
+            },
+        ] {
+            assert!(!filter.is_unrestricted());
+            assert_ne!(
+                hunt_summary(&filter),
+                "nothing selected",
+                "a filter the loop calls restricted must not fold up as empty: {filter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_numeric_criteria_read_in_the_shop_table_s_terms() {
+        let filter = Filter {
+            min_grade: Some(4),
+            max_price: Some(Gold::new(300_000)),
+            min_substats: Some(3),
+            ..Filter::default()
+        };
+        assert_eq!(
+            hunt_summary(&filter),
+            "3+ substats, ≤300,000 gold, grade 4+"
+        );
+        // And the converse of the test above: `min_substats = 0` restricts
+        // nothing, so the bar must keep calling it an empty hunt.
+        let inert = Filter {
+            min_substats: Some(0),
+            ..Filter::default()
+        };
+        assert!(inert.is_unrestricted());
+        assert_eq!(hunt_summary(&inert), "nothing selected");
+    }
+
+    #[test]
+    fn the_grade_field_is_bounded_by_what_the_config_accepts() {
+        // The drag range is a copy of a domain the loader owns, so hold the two
+        // in step here rather than trusting the comment on `GRADE_MIN`. Widen
+        // the domain without widening this range and the tab silently refuses a
+        // legal floor; narrow it without narrowing the range and the tab
+        // authors a config.toml the next launch will not load.
+        for grade in GRADE_MIN..=GRADE_MAX {
+            let filter: Filter = toml::from_str(&format!("min_grade = {grade}"))
+                .expect("the field must not offer a grade the loader refuses");
+            assert_eq!(filter.min_grade, Some(grade));
+        }
+        for outside in [GRADE_MIN - 1, GRADE_MAX + 1] {
+            assert!(
+                toml::from_str::<Filter>(&format!("min_grade = {outside}")).is_err(),
+                "the field must not refuse a grade the loader accepts: {outside}"
+            );
+        }
     }
 }

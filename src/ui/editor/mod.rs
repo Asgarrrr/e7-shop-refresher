@@ -15,7 +15,7 @@ mod stop;
 mod timing;
 mod timing_meter;
 
-use hunt::{hunt_summary, optional_value, quick_add_names, string_list, substat_reqs};
+use hunt::{grade_value, hunt_summary, optional_value, quick_add_names, string_list, substat_reqs};
 use stop::{duration_row, limit_row, stop_summary};
 use timing::{fine_tune_body, mode_hint, pass_estimate, timing_summary};
 
@@ -213,6 +213,13 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
         .show(ui, |ui| {
             optional_value(ui, "min substats", &mut editor.filter.min_substats, 1);
             ui.end_row();
+            // The grade floor belongs here and not in a row of its own: it is
+            // an optional numeric criterion like the two around it, and the
+            // whole reason it needed adding is that a player who set it in
+            // config.toml had nowhere to see it. See [`grade_value`] for why it
+            // is `optional_value`'s twin rather than another call to it.
+            grade_value(ui, &mut editor.filter.min_grade);
+            ui.end_row();
             // Seeded above the covenant-bookmark price so a fresh cap still
             // matches the default hunt targets.
             currency_row(&mut editor.filter.max_price, Gold::get, Gold::new, |cap| {
@@ -283,7 +290,14 @@ fn currency_row<T: Copy>(
     *value = raw.map(wrap);
 }
 
-/// The drag field for an armed optional criterion, floored at 1.
+/// The drag field for an armed optional criterion, floored at 1 and open
+/// above — the shape every criterion but the grade floor has.
+fn optional_field<T: egui::emath::Numeric>(ui: &mut egui::Ui, value: &mut T) -> egui::Response {
+    bounded_field(ui, value, T::from_f64(1.0)..=T::MAX)
+}
+
+/// The same field over an explicit range, for a criterion the game only
+/// defines on a closed set of values ([`hunt::grade_value`] is the one).
 ///
 /// `clamp_existing_to_range` is **off** deliberately: without it, a value
 /// already present — `max_refreshes = 0` seeded from config.toml — is
@@ -292,10 +306,19 @@ fn currency_row<T: Copy>(
 /// `seeded_zero_limit_is_not_silently_clamped`). Shared so the fix lives once.
 /// [`stop::duration_row`] can't use it: it drags whole minutes derived from
 /// stored ms, with its own range/write-back, sharing only [`arm_optional`].
-fn optional_field<T: egui::emath::Numeric>(ui: &mut egui::Ui, value: &mut T) -> egui::Response {
+///
+/// Note what the flag does *not* switch off: a value the player drags or types
+/// is still clamped to the range. That is the half a bounded criterion needs —
+/// a seeded value survives untouched, and the player cannot author one outside
+/// the domain.
+fn bounded_field<T: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    range: std::ops::RangeInclusive<T>,
+) -> egui::Response {
     ui.add(
         egui::DragValue::new(value)
-            .range(T::from_f64(1.0)..=T::MAX)
+            .range(range)
             .clamp_existing_to_range(false),
     )
 }
@@ -605,6 +628,57 @@ mod tests {
         harness.run();
         drop(harness);
         assert_eq!(editor.filter.names, vec!["ticketrare_name".to_owned()]);
+    }
+
+    #[test]
+    fn a_config_set_grade_floor_can_be_seen_and_cleared() {
+        // The half of the bug the summary can't cover: `min_grade = 4` in
+        // config.toml had no widget at all, so the one criterion actually
+        // restricting the hunt was invisible *and* uncorrectable — the player
+        // could only watch the loop refresh and buy nothing. The floor now
+        // renders at its seeded value (unclamped, like every other seeded
+        // criterion), and unticking it clears it back to `None`.
+        let filter = Filter {
+            min_grade: Some(2),
+            ..named_filter()
+        };
+        let mut editor = EditorState::new(filter, Limits::default(), Timings::default());
+        {
+            // Scoped so the assertion below can read the draft the harness
+            // borrows: a first render alone must not move the value.
+            let mut harness = Harness::new_ui(|ui| {
+                edit_setup(ui, &mut editor);
+            });
+            harness.run();
+        }
+        assert_eq!(editor.filter.min_grade, Some(2));
+        let mut harness = Harness::new_ui(|ui| {
+            edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("min grade").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.min_grade, None);
+    }
+
+    #[test]
+    fn arming_the_grade_floor_seeds_the_epic_grade() {
+        // Ticking the box must land on a floor the game has — the seed is
+        // `hunt::GRADE_MAX`, the value config.example.toml documents — and the
+        // change must be committable like any other criterion.
+        let mut editor = EditorState::new(named_filter(), Limits::default(), Timings::default());
+        let mut harness = Harness::new_ui(|ui| {
+            edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("min grade").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.min_grade, Some(4));
+        let expected = Filter {
+            min_grade: Some(4),
+            ..named_filter()
+        };
+        assert_eq!(run_setup(&mut editor), vec![Command::SetFilter(expected)]);
     }
 
     #[test]
