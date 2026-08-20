@@ -241,9 +241,27 @@ windows-sys = { version = "0.61", features = [
 # `glow` twenty lines up. The alternative considered and rejected was keeping it
 # for `tempfile`: `crash.rs`'s test module carries its own ~20-line RAII
 # `TempFile` guard, so nothing here needs `tempfile` compiled at all.
+# `wgpu` stays: `editor`'s `timing_meter_grip_moves_with_the_range` builds its
+# harness with `HarnessBuilder::wgpu()`, so the renderer is a real dependency
+# even though nothing snapshots.
 egui_kittest = { version = "0.35", default-features = false, features = ["wgpu"] }
 # Paused-clock tests (`start_paused`) for the uplink send timeout.
 tokio = { version = "1", features = ["test-util"] }
+
+# `test = false` because `build.rs` stamps `/MANIFESTUAC:requireAdministrator`
+# onto every *bin* target, and cargo builds `src/main.rs` a second time as a
+# test harness that inherits it. Windows then refuses to start that harness from
+# an ordinary shell — `cargo test` dies with "the requested operation requires
+# elevation" (os error 740) after the 666 lib tests have already passed, so the
+# whole suite reports failure on any developer machine that is not running
+# elevated. It costs nothing to switch off: `src/main.rs` contains no `#[test]`
+# and no `mod tests`, so the harness this suppresses was always empty. CI only
+# escaped because a GitHub Windows runner executes elevated with UAC filtering
+# off.
+[[bin]]
+name = "arkyve-refresh-shop"
+path = "src/main.rs"
+test = false
 
 # Dashboard preview with injected mock data — lets the egui UI be seen on a
 # machine with no capture backend (mac dev). Reuses the real `ShopApp`; needs
