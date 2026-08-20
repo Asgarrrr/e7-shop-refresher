@@ -19,6 +19,7 @@
 //! above the group that uses them.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
 use crate::actuator::SnapshotEpoch;
@@ -226,6 +227,138 @@ async fn a_flood_of_messages_cannot_delay_a_fatal() {
         "the fatal must be the first thing the loop says, not the {QUEUED}th: {said:?}"
     );
     drop(message_tx);
+}
+
+/// The sibling of the test above, on the other half of the same hazard.
+/// `Event::Tick` is the only check-point that enforces `Limits`, and the only
+/// thing that steps the watchdog's rungs — so a tick that never fires is a
+/// safety limit that never fires, with Buy and Refresh still going out.
+///
+/// While the tick was a `biased` branch *below* `messages`, "the branch it is
+/// cheapest to be late for" meant "the branch that is never serviced": a
+/// server that refills the 256 slots faster than `on_message` drains them
+/// keeps `recv()` ready on every poll. Tokio's cooperative budget does not
+/// break the tie — when the budget runs out *every* branch returns pending
+/// together and the next poll restarts at the top of the same priority list.
+///
+/// The assertion is behavioural, not structural: under a sustained flood the
+/// session must still stop itself on its own time limit. The watchdog rides
+/// this same `Event::Tick`; its rungs are 10 s apart, too slow to spell out
+/// here, but they are delivered by exactly what this proves.
+///
+/// `ServerMessage::Unknown` is deliberate — it is the cheapest message there
+/// is (`on_message` ignores it outright), so the flood does nothing but hold
+/// the branch ready. That is the worst case, not a contrived one.
+#[tokio::test]
+async fn a_flood_of_messages_cannot_starve_the_tick() {
+    /// The uplink's own queue depth, mirrored so the flood is the shipped
+    /// shape.
+    const UPLINK_SLOTS: usize = 256;
+    /// One sender's cooperative budget matches the loop's drain rate exactly,
+    /// and this test must not turn on which of two equal rates wins the round.
+    /// Several senders pin the queue at capacity instead.
+    const FLOODERS: usize = 4;
+    /// Long enough that the loop's *immediate* first tick does not already
+    /// trip it — the flood would then never be under way when the halt lands —
+    /// and short enough to be crossed by the next tick, one `TICK_PERIOD`
+    /// later.
+    const TIME_LIMIT_MS: u64 = 500;
+    /// The flood's own dead man's switch. The halt is what normally ends it
+    /// (see below), so this is only ever reached when the tick is starved —
+    /// that is, when this test is failing, and a failure must not be a hang.
+    const GIVE_UP: Duration = Duration::from_secs(5);
+
+    let gate = WatchGate::new(false);
+    let journal = EventLog::default();
+    let controller = Mutex::new(Controller::new(
+        Filter::matching_default_items(),
+        Limits {
+            max_duration_ms: Some(TIME_LIMIT_MS),
+            ..Limits::default()
+        },
+    ));
+    // Armed at 0 on the session clock the loop itself reads, so the elapsed
+    // time the limit is checked against is the loop's own running time.
+    on_command(&controller, &gate, &journal, &off(), Command::Start, 0);
+    assert!(gate.is_enabled());
+
+    let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
+    let (message_tx, message_rx) = mpsc::channel::<UplinkEvent>(UPLINK_SLOTS);
+    let (_error_tx, error_rx) = mpsc::channel::<String>(1);
+    // Full before the loop's first poll: the senders below only have to keep
+    // it that way, never to win a race to fill it.
+    for _ in 0..UPLINK_SLOTS {
+        message_tx
+            .try_send(UplinkEvent::Message(ServerMessage::Unknown))
+            .expect("fill the bounded uplink queue");
+    }
+    assert_eq!(message_tx.capacity(), 0, "the flood is queued and ready");
+
+    // The gate is the flood's stop signal: the halt this test is about closes
+    // it, the senders drop, and the loop then ends on a closed uplink instead
+    // of running for ever. Nothing here waits on wall-clock guesswork.
+    let sent = Arc::new(AtomicU64::new(0));
+    let floods: Vec<_> = (0..FLOODERS)
+        .map(|_| {
+            let gate = gate.clone();
+            let sent = Arc::clone(&sent);
+            let messages = message_tx.clone();
+            tokio::spawn(async move {
+                let until = std::time::Instant::now() + GIVE_UP;
+                while gate.is_enabled() && std::time::Instant::now() < until {
+                    if messages
+                        .send(UplinkEvent::Message(ServerMessage::Unknown))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    sent.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+    drop(message_tx); // only the senders above may keep the uplink open.
+
+    let failure = session_loop(
+        &controller,
+        &gate,
+        &journal,
+        &off(),
+        command_rx,
+        message_rx,
+        error_rx,
+        never_shutdown(),
+    )
+    .await;
+    for flood in floods {
+        flood.await.expect("a flood task never panics");
+    }
+
+    assert_eq!(failure, None);
+    // The stop reason, not merely "stopped": the teardown stops the controller
+    // too, and a test that only checked for a halt would pass on a loop that
+    // ticked exactly never.
+    assert_eq!(
+        controller.lock().unwrap().status(),
+        Status::Stopped(StopReason::Timeout),
+        "the time limit must fire while the uplink queue is saturated"
+    );
+    assert!(
+        journal
+            .to_entries()
+            .iter()
+            .any(|line| line.text.contains("session time limit reached"))
+    );
+    // 08d62ba's lesson, applied to this test: a flood nobody measured is a
+    // flood that may not have happened. Refilling the queue many times over is
+    // what makes the loop's other branches unreachable through `biased`; the
+    // real figure is orders of magnitude above this floor.
+    assert!(
+        sent.load(Ordering::Relaxed) >= (UPLINK_SLOTS * 8) as u64,
+        "the flood must have been sustained, not a single fill: {} messages",
+        sent.load(Ordering::Relaxed)
+    );
 }
 
 #[test]

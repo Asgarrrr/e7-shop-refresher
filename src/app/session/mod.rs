@@ -80,11 +80,22 @@ pub(super) async fn session_loop(
     mut shutdown: watch::Receiver<bool>,
 ) -> Option<String> {
     let now_ms = || journal.now_ms();
-    let mut ticker = tokio::time::interval(TICK_PERIOD);
-    // Burst would replay every tick missed during a CPU stall back to back,
-    // all carrying near-identical `now_ms`: pointless repeated dispatches
-    // (each taking and releasing the controller mutex) right after a hiccup.
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The tick deadline is owned here rather than by `tokio::time::interval`,
+    // because the tick is not serviced from the `select!` at all — see the note
+    // above it. Starting at `Instant::now()` reproduces `interval`'s immediate
+    // first tick: the loop takes a check-point as it starts.
+    //
+    // Re-arming from *now* rather than from the missed deadline is
+    // `MissedTickBehavior::Delay`, kept for the reason it was chosen: Burst
+    // would replay every tick missed during a CPU stall back to back, all
+    // carrying near-identical `now_ms` — pointless repeated dispatches, each
+    // taking and releasing the controller mutex, right after a hiccup.
+    let mut next_tick = tokio::time::Instant::now();
+    // Only ever *wakes* the loop at the deadline. Whether a tick is due is
+    // decided by `next_tick`, never by this future having been polled, which
+    // is the whole point: a future that is never polled cannot answer.
+    let tick_wakeup = tokio::time::sleep_until(next_tick);
+    tokio::pin!(tick_wakeup);
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     // Stdin EOF and the fatal channel draining are not shutdowns: their
@@ -105,6 +116,48 @@ pub(super) async fn session_loop(
             // The player's own stop, like Ctrl+C.
             break Exit::PlayerStopped;
         }
+        // `Event::Tick` is the only check-point that enforces `Limits` and
+        // steps the watchdog's rungs, and it is the one thing here that has to
+        // happen on a schedule rather than on an arrival. That is exactly what
+        // the `biased` select below cannot promise it: its branch list is a
+        // priority order, `messages` is ready on every poll while a server
+        // sends faster than `on_message` runs, and a tick under it is not
+        // "late" — it is never. Tokio's cooperative budget does not rescue it
+        // either: when the budget runs out *every* branch returns pending
+        // together, the task yields, and the next poll restarts at the top of
+        // the same list. Measured, not asserted: fed a run of
+        // `ServerMessage::Unknown` — the cheapest message there is — the loop
+        // ran five seconds past a 500 ms `max_duration_ms` without dispatching
+        // one tick, and stopped only when the test cut the flood off.
+        //
+        // So the tick is not a branch. It is serviced here, against a deadline
+        // this loop owns, before the select is entered: a flood can make a
+        // tick late by one `on_message` call and by nothing more.
+        //
+        // This does not walk back the ordering below (`08d62ba`). The exits
+        // still sit above the branch a remote party keeps ready — and what now
+        // sits above *them* is not a branch a remote party can hold open, it
+        // is a bounded synchronous dispatch that runs at most once per
+        // `TICK_PERIOD`. The fatal arm's "break immediately" pays one tick for
+        // this, where the tick used to pay everything.
+        let due = tokio::time::Instant::now();
+        if due >= next_tick {
+            next_tick = due + TICK_PERIOD;
+            tick_wakeup.as_mut().reset(next_tick);
+            let now = now_ms();
+            dispatch(
+                controller,
+                gate,
+                journal,
+                actuator,
+                Event::Tick { now_ms: now },
+                now,
+            );
+            ticks = ticks.wrapping_add(1);
+            if ticks.is_multiple_of(HEARTBEAT_EVERY_TICKS) {
+                heartbeat(controller, gate, now, last_shop_ms, unknown_messages);
+            }
+        }
         // `biased` polls in source order and takes the first ready branch, so
         // this list is a priority order and a branch that is *always* ready
         // starves everything below it. `messages` is the one branch that can be:
@@ -121,10 +174,11 @@ pub(super) async fn session_loop(
         //
         // The safety halt stays first of the four; that much was already argued
         // (`docs/tech-debt/06-async.md`, `async-cancel-safety`). Nothing below
-        // the exits can starve anything: `commands` is human-paced, and `ticker`
-        // is last because a tick is the branch it is cheapest to be late for —
-        // and while `messages` is flooding, the loop is being driven by the real
-        // shop rather than by a timer.
+        // the exits can starve anything: `commands` is human-paced, and
+        // `tick_wakeup` is last because a wakeup is the cheapest thing to be
+        // late for — the deadline it wakes for is absolute, so a wakeup that
+        // never comes loses no tick; the check above still fires on the next
+        // trip round the loop.
         tokio::select! {
             biased;
             source = gate.next_halt() => {
@@ -199,14 +253,9 @@ pub(super) async fn session_loop(
                 }
                 None => break Exit::UplinkClosed,
             },
-            _ = ticker.tick() => {
-                let now = now_ms();
-                dispatch(controller, gate, journal, actuator, Event::Tick { now_ms: now }, now);
-                ticks = ticks.wrapping_add(1);
-                if ticks.is_multiple_of(HEARTBEAT_EVERY_TICKS) {
-                    heartbeat(controller, gate, now, last_shop_ms, unknown_messages);
-                }
-            }
+            // Parks the loop until the next tick is due and nothing more: the
+            // tick is dispatched at the top, where no branch can outrank it.
+            _ = &mut tick_wakeup => {}
         }
     };
     // See [`FATAL_REPORT_GRACE`]: if the loop ended on a closed uplink with
