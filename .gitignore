@@ -33,6 +33,12 @@ Thumbs.db
 /plans
 /.claude
 
+# Documents de planification générés par agent. Même espèce que /plans
+# ci-dessus, et traités pareil désormais : les fichiers restent sur le disque,
+# git ne les suit plus. Rien dans src/, README.md, justfile ou .github/ ne les
+# cite — vérifié avant de les retirer du suivi.
+/docs
+
 # Runtime panic log (crash.log; app-data first, temp-dir fallback)
 crash.log
 
