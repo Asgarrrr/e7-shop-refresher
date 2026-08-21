@@ -385,14 +385,7 @@ where
     let Some(raw) = Option::<String>::deserialize(de)? else {
         return Ok(None);
     };
-    let (cleaned, changed) = sanitize_wire_text(raw);
-    if changed {
-        tracing::debug!(
-            field = "display text",
-            "tolerated a control character or an overlong value in a server-supplied string — sanitized"
-        );
-    }
-    Ok(Some(cleaned))
+    Ok(Some(sanitize_and_report(raw, "display text")))
 }
 
 /// [`sanitized_text`] for a field that is not optional on the Rust side
@@ -401,15 +394,29 @@ fn sanitized_required_text<'de, D>(de: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let raw = String::deserialize(de)?;
+    Ok(sanitize_and_report(
+        String::deserialize(de)?,
+        "substat name",
+    ))
+}
+
+/// [`sanitize_wire_text`] plus the `debug!` that reports a value it had to
+/// change — the whole body both `deserialize_with` hooks above used to carry.
+///
+/// `field` is what tells the two apart in the log. Both hooks passed
+/// `"display text"` while the body was written twice, so a mangled
+/// `Substat::name` reported itself as a display string; serde hands a
+/// `deserialize_with` no field name, so naming it per hook is as close as this
+/// can get.
+fn sanitize_and_report(raw: String, field: &'static str) -> String {
     let (cleaned, changed) = sanitize_wire_text(raw);
     if changed {
         tracing::debug!(
-            field = "display text",
+            field,
             "tolerated a control character or an overlong value in a server-supplied string — sanitized"
         );
     }
-    Ok(cleaned)
+    cleaned
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
