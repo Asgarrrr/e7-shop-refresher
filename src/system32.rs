@@ -23,9 +23,12 @@ use tracing::warn;
 /// plants a file under it gets their code run elevated. `GetSystemDirectoryW`
 /// cannot be redirected that way.
 ///
-/// `MAX_PATH` is documented as always sufficient here, so the truncation branch
-/// is unreachable in practice; it falls back rather than truncating, because
-/// half a path is a path that could resolve somewhere else.
+/// `MAX_PATH` is not documented as always sufficient here; the contract is only
+/// that a too-small buffer is reported, as the `SAFETY` note below spells out.
+/// A real system directory is short, so that branch is very unlikely to fire —
+/// it is kept because the call reports the case for free, and it falls back
+/// rather than truncating, because half a path is a path that could resolve
+/// somewhere else.
 #[must_use]
 pub fn directory() -> PathBuf {
     use std::os::windows::ffi::OsStringExt;

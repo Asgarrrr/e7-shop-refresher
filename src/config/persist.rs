@@ -63,7 +63,7 @@ pub enum Section {
 ///   is format-preserving, so it must parse what the player wrote first.
 /// - [`Error::ConfigSerialize`] — a section could not be rendered back to TOML.
 ///   Unreachable for every [`Section`] today — the three table variants
-///   serialize infallibly and the three key variants do not serialize at all —
+///   serialize infallibly and the two key variants do not serialize at all —
 ///   kept typed to stay distinguishable from the parse failure above.
 /// - [`Error::ConfigWrite`] — the parent directory, the sibling temp file, or
 ///   the rename failed. The path is in the message: this is the read-only /
@@ -148,11 +148,10 @@ const RETIRED_KEYS: &[(&str, &[&str])] = &[
 /// Returns the keys it removed (`"capture.filter, forward.client_to_server"`),
 /// or `None` when the file held none and was therefore not written at all.
 ///
-/// [`save`] never touches `[capture]` or `[forward]` — it writes only the six
+/// [`save`] never touches `[capture]` or `[forward]` — it writes only the five
 /// pieces [`Section`] names — so without this the startup warning never stops
-/// firing. Both structs hold
-/// *only* retired keys, so stripping always empties — and removes — the header
-/// too, but never a table this pass did not touch.
+/// firing. Both structs hold *only* retired keys, so stripping always empties
+/// — and removes — the header too, but never a table this pass did not touch.
 ///
 /// Commented-out *assignments* of those keys go as well, wherever they sit and
 /// including ones the player typed — see [`tidy`]. Prose never does, nor a

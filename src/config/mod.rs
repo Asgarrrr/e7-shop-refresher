@@ -96,7 +96,13 @@ pub struct Config {
 /// `deny_unknown_fields` deleting them fails `Config::load` on every existing
 /// installation; editing `config.example.toml` does nothing for files already
 /// written. [`persist::strip_retired_keys`] takes the keys out at the same
-/// startup that warns about them, so the warning fires once per install.
+/// startup that warns about them, so the warning fires once per install — but
+/// only when the rewrite lands. A read-only or OneDrive-locked file fails the
+/// strip, which [`RetiredKeys::NotRewritten`] reports without deleting
+/// anything: the keys are still there for the next [`Config::load`] to read, so
+/// the warning repeats every launch until the file is writable.
+///
+/// [`RetiredKeys::NotRewritten`]: crate::RetiredKeys::NotRewritten
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ForwardConfig {

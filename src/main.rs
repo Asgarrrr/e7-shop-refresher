@@ -79,10 +79,13 @@ fn main() -> ExitCode {
             // Structured for the file, prose for the player: the prose has
             // newlines that would break one-event-per-line in the log.
             // `?err` is safe here specifically because a config parse/reparse
-            // failure is redacted at the type: `Error::ConfigParse` and
-            // `Error::ConfigReparse` carry `error::TomlLocation`, not the raw
-            // `toml`/`toml_edit` error, so neither this line nor `report()`
-            // below can render the offending source line.
+            // failure is redacted at the type, by `error.rs`'s two `From`
+            // impls: `Error::ConfigParse` is the upstream `toml::de::Error`
+            // with `set_input(None)` called before boxing — the derived
+            // `Debug` prints every field, but `input`, the whole file, is now
+            // `None` — and `Error::ConfigReparse` carries a `ReparseMessage`,
+            // `toml_edit`'s `message()` and nothing else. Neither this line
+            // nor `report()` below can reach the offending source line.
             tracing::error!(
                 error = ?err,
                 config_path = %config_path.display(),

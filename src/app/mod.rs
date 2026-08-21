@@ -39,8 +39,15 @@ use reassembly::reassemble_loop_with_pressure;
 use session::session_loop;
 use workers::{SessionWorkers, spawn_capture_with_budget};
 
-/// Both stages are byte-capped by [`PipelineBudget`]; the slot count only
-/// bounds how far a producer runs ahead.
+/// Depth of both pipeline channels, which are backpressured differently.
+/// `raw_tx` carries [`BudgetedChunk`], whose [`PipelineBudget`] lease caps the
+/// bytes in flight whatever the depth, so there the slot count only bounds how
+/// far reassembly runs ahead of the uplink. `message_tx` carries
+/// [`UplinkEvent`], which holds no lease: these slots are its only
+/// backpressure, and each one can hold a whole decoded message. What bounds an
+/// inbound message is tungstenite's default 64 MiB ceiling — `connect_async` is
+/// called with no `WebSocketConfig` — not the 32 MiB pipeline budget. Raising
+/// this number raises that second worst case with it.
 const PIPELINE_QUEUE: usize = 256;
 
 /// First message wins; the depth exists so a racing second report cannot block

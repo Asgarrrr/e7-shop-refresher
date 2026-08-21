@@ -376,8 +376,14 @@ fn verify_identity_of<D: WindowDriver + ?Sized>(
 ///
 /// Epic Seven runs at *high* integrity (`STOVE.exe` declares
 /// `requireAdministrator`, the game inherits it) and UIPI refuses input from
-/// below that level without either backend naming the cause: the `Message`
-/// backend retries `shield::raise`'s `ERROR_ACCESS_DENIED` forever, and
+/// below that level. Without this preflight the `Message` backend meets that
+/// refusal as `shield::raise`'s `ERROR_ACCESS_DENIED`, on the first click of
+/// the job: `engage` classifies every shield failure `Fatal`, and
+/// `run_executor` answers a `Fatal` by halting the gate, so one refusal stops
+/// the watch until the player re-arms. The cause is not lost — `shield`'s
+/// `placement_refusal` names the integrity level — but the remedy is: it is
+/// left to [`preflight_refusal`], which runs once per job instead of once per
+/// click and can afford the whole paragraph.
 /// `SendInput` "will not indicate the failure was caused by UIPI blocking" — it
 /// reports one event injected while nothing moves. Only a preflight sees it.
 ///
