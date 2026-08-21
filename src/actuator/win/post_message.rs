@@ -16,10 +16,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::actuator::plan::ClientRect;
 use crate::actuator::{Surface, SurfaceError, shield};
 
-use super::dpi::ensure_dpi_awareness;
 use super::{
-    Hwnd, MOVE_SETTLE_MS, Target, WHEEL_DELTA, client_rect, find_game_window, owning_pid,
-    preflight_refusal, probe_window_reachable, release_twice, verify_identity,
+    Hwnd, MOVE_SETTLE_MS, SystemWindowDriver, Target, WHEEL_DELTA, WindowDriver, preflight_refusal,
+    release_twice, verify_identity_of,
 };
 
 /// Posted messages are retrieved before queued hardware input: a freshly
@@ -47,19 +46,11 @@ pub(super) fn post_refusal(error: &std::io::Error) -> SurfaceError {
     }
 }
 
-/// The process-global calls used by [`MessageSurface`] (see the module docs
-/// for why this trait exists).
-trait MessageDriver: Send {
-    fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError>;
-    /// [`probe_window_reachable`], handing back the thread's last-error
-    /// untouched so the classification stays in the pure [`preflight_refusal`],
-    /// which tests drive with a synthetic `ERROR_ACCESS_DENIED`.
-    fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()>;
-    fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError>;
-    /// [`owning_pid`], read once at `acquire` and re-read by every later
-    /// [`verify`](MessageSurface::verify) — see [`Target`]'s doc comment for
-    /// why.
-    fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError>;
+/// What this backend adds to [`WindowDriver`]: posting, and the shield.
+///
+/// The five window calls it shares with `send_input`'s `InputDriver` live on
+/// the supertrait — see [`WindowDriver`] for why they are not declared here.
+trait MessageDriver: WindowDriver {
     fn post(
         &mut self,
         hwnd: Hwnd,
@@ -71,29 +62,9 @@ trait MessageDriver: Send {
     /// call, so the caller owes it the drain beat.
     fn shield_raise(&mut self, hwnd: Hwnd, rect: ClientRect) -> Result<bool, String>;
     fn shield_hide(&mut self);
-    fn sleep(&mut self, duration: Duration);
 }
 
-struct SystemMessageDriver;
-
-impl MessageDriver for SystemMessageDriver {
-    fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError> {
-        ensure_dpi_awareness()?;
-        find_game_window().map(Hwnd::new)
-    }
-
-    fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()> {
-        probe_window_reachable(hwnd.raw())
-    }
-
-    fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError> {
-        client_rect(hwnd.raw())
-    }
-
-    fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError> {
-        owning_pid(hwnd.raw())
-    }
-
+impl MessageDriver for SystemWindowDriver {
     fn post(
         &mut self,
         hwnd: Hwnd,
@@ -111,10 +82,6 @@ impl MessageDriver for SystemMessageDriver {
     fn shield_hide(&mut self) {
         shield::hide();
     }
-
-    fn sleep(&mut self, duration: Duration) {
-        std::thread::sleep(duration);
-    }
 }
 
 /// `PostMessageW` backend (the default). The engine tracks its cursor through
@@ -123,11 +90,10 @@ impl MessageDriver for SystemMessageDriver {
 ///
 /// The driver stays erased behind `Box<dyn MessageDriver>` even though
 /// production only ever holds the one ZST, for the same reason as
-/// `WinSurface`'s (`send_input.rs:117-121`): `MessageDriver`/
-/// `SystemMessageDriver` are private to this module, so a generic parameter
-/// such as `MessageSurface<D: MessageDriver = SystemMessageDriver>` would leak
-/// a private type in a public API (`private_bounds`, `private_interfaces` —
-/// red under `-D warnings`).
+/// `WinSurface`'s: `MessageDriver` is private to this module, so a generic
+/// parameter such as `MessageSurface<D: MessageDriver = SystemWindowDriver>`
+/// would leak a private type in a public API (`private_bounds`,
+/// `private_interfaces` — red under `-D warnings`).
 pub struct MessageSurface {
     driver: Box<dyn MessageDriver>,
 }
@@ -135,7 +101,7 @@ pub struct MessageSurface {
 impl Default for MessageSurface {
     fn default() -> Self {
         Self {
-            driver: Box::new(SystemMessageDriver),
+            driver: Box::new(SystemWindowDriver),
         }
     }
 }
@@ -178,18 +144,14 @@ impl MessageSurface {
         Ok(())
     }
 
-    /// Re-resolves the title before comparing the owning pid and the rect,
-    /// matching `send_input.rs`'s `verify_placement` exactly (both funnel
-    /// through [`verify_identity`]): the two backends must refuse the same
-    /// changed-identity target the same way, not merely a moved one.
+    /// Re-resolves the title before comparing the owning pid and the rect.
+    ///
+    /// [`verify_identity_of`], the same function `send_input.rs`'s
+    /// `verify_placement` calls: the two backends must refuse a
+    /// changed-identity target the same way, not merely a moved one, and
+    /// sharing the call is what makes that so rather than saying it.
     fn verify(&mut self, target: Target) -> Result<(), SurfaceError> {
-        let titled = self.driver.find_game_window()?;
-        let driver = &mut self.driver;
-        verify_identity(titled, target, move || {
-            let pid = driver.owning_pid(target.hwnd)?;
-            let rect = driver.client_rect(target.hwnd)?;
-            Ok((pid, rect))
-        })
+        verify_identity_of(&mut *self.driver, target)
     }
 }
 
@@ -410,7 +372,7 @@ mod tests {
         state: Arc<Mutex<FakeState>>,
     }
 
-    impl MessageDriver for FakeMessageDriver {
+    impl WindowDriver for FakeMessageDriver {
         fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(MessageCall::FindWindow);
@@ -447,6 +409,16 @@ mod tests {
             }
         }
 
+        fn sleep(&mut self, duration: Duration) {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push(MessageCall::Sleep(duration.as_millis() as u64));
+        }
+    }
+
+    impl MessageDriver for FakeMessageDriver {
         fn post(
             &mut self,
             hwnd: Hwnd,
@@ -473,14 +445,6 @@ mod tests {
                 .unwrap()
                 .calls
                 .push(MessageCall::ShieldHide);
-        }
-
-        fn sleep(&mut self, duration: Duration) {
-            self.state
-                .lock()
-                .unwrap()
-                .calls
-                .push(MessageCall::Sleep(duration.as_millis() as u64));
         }
     }
 

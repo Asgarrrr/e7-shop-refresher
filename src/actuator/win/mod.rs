@@ -3,15 +3,17 @@
 //! (`SendInput`, real cursor, foreground — the fallback). No window is ever
 //! resized: `to_screen` covers any aspect from 16:9 up, refuses narrower.
 //!
-//! This root holds what neither backend owns: the window itself, and the two
+//! This root holds what neither backend owns: the window itself, the two
 //! verdicts both must reach identically ([`rect_change_error`],
-//! [`release_twice`]).
+//! [`release_twice`]), and the window calls they make identically
+//! ([`WindowDriver`], [`verify_identity_of`]).
 
 mod dpi;
 mod post_message;
 mod send_input;
 
 use std::fmt;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NOT_READY, HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
@@ -245,10 +247,11 @@ fn owning_pid(hwnd: HWND) -> Result<u32, SurfaceError> {
 /// the same process, at the rect the job read. A reviewer should reject any
 /// new input path that reaches an actual click without going through this.
 ///
-/// `titled` is gathered by the caller, not read here — the two backends
-/// resolve it through different driver seams ([`MessageDriver`](post_message)'s
-/// vs. [`InputDriver`](send_input)'s) — and a title mismatch returns before
-/// `owned` is ever called, matching the pre-existing `send_input.rs` behaviour
+/// `titled` and `owned` are supplied by the caller, not read here, so that this
+/// function is the *verdict* and nothing else — [`verify_identity_of`] is the
+/// one caller that gathers them, and it is shared. A title mismatch returns
+/// before `owned` is ever called, matching the pre-existing `send_input.rs`
+/// behaviour
 /// and the `..._before_input` tests that assert the call log ends at the
 /// title check. `owned` reads the pid and the rect together in one round trip
 /// once the title has matched: both are cheap synchronous reads (unlike
@@ -291,6 +294,81 @@ fn verify_identity(
         return Err(rect_change_error(rect));
     }
     Ok(())
+}
+
+/// The window calls both backends make identically — the reads that
+/// [`verify_identity`] judges, plus the wait between inputs.
+///
+/// A supertrait of `post_message`'s `MessageDriver` and `send_input`'s
+/// `InputDriver` rather than five declarations in each: while they were
+/// separate, the eight lines that feed [`verify_identity`] could only be
+/// written once per backend, and what kept the two copies in step was a comment
+/// on one of them saying it matched the other. Each backend trait now adds only
+/// what is genuinely its own — `post`/`shield_*` against `send`/`foreground_*`.
+///
+/// Dyn-compatible, which is not incidental: both surfaces hold their driver as
+/// `Box<dyn …Driver>` (see [`MessageSurface`] for why the type is erased rather
+/// than generic), and a trait object implements its supertraits, so
+/// [`verify_identity_of`] takes either without an upcast.
+pub(super) trait WindowDriver: Send {
+    fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError>;
+    /// [`probe_window_reachable`], handing back the thread's last-error
+    /// untouched so the classification stays in the pure [`preflight_refusal`],
+    /// which tests drive with a synthetic `ERROR_ACCESS_DENIED`.
+    fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()>;
+    fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError>;
+    /// [`owning_pid`], read once at `acquire` and re-read by every later
+    /// [`verify_identity_of`] — see [`Target`]'s doc comment for why.
+    fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError>;
+    fn sleep(&mut self, duration: Duration);
+}
+
+/// The real Windows calls behind [`WindowDriver`], for both backends.
+///
+/// One ZST where there were two: `SystemMessageDriver` and `SystemInputDriver`
+/// carried these five bodies each, character for character.
+pub(super) struct SystemWindowDriver;
+
+impl WindowDriver for SystemWindowDriver {
+    fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError> {
+        dpi::ensure_dpi_awareness()?;
+        find_game_window().map(Hwnd::new)
+    }
+
+    fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()> {
+        probe_window_reachable(hwnd.raw())
+    }
+
+    fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError> {
+        client_rect(hwnd.raw())
+    }
+
+    fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError> {
+        owning_pid(hwnd.raw())
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+/// [`verify_identity`] driven off a [`WindowDriver`]: re-resolve the title, then
+/// read the owning pid and the rect through the same seam.
+///
+/// The one place those three reads are ordered. Both backends called it
+/// `verify`/`verify_placement` and spelled it out identically; the requirement
+/// that they refuse a changed-identity target the same way is a fact about this
+/// function now, not a claim in a doc comment.
+fn verify_identity_of<D: WindowDriver + ?Sized>(
+    driver: &mut D,
+    target: Target,
+) -> Result<(), SurfaceError> {
+    let titled = driver.find_game_window()?;
+    verify_identity(titled, target, move || {
+        let pid = driver.owning_pid(target.hwnd)?;
+        let rect = driver.client_rect(target.hwnd)?;
+        Ok((pid, rect))
+    })
 }
 
 /// Asks Windows, once per acquire, whether this process may drive `hwnd` at

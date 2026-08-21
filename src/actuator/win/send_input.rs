@@ -24,10 +24,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::actuator::plan::ClientRect;
 use crate::actuator::{Surface, SurfaceError};
 
-use super::dpi::ensure_dpi_awareness;
 use super::{
-    Hwnd, MOVE_SETTLE_MS, Target, WHEEL_DELTA, client_rect, find_game_window, owning_pid,
-    preflight_refusal, probe_window_reachable, release_twice, verify_identity,
+    Hwnd, MOVE_SETTLE_MS, SystemWindowDriver, Target, WHEEL_DELTA, WindowDriver, preflight_refusal,
+    release_twice, verify_identity_of,
 };
 
 /// The foreground switch is asynchronous: give it a beat before verifying.
@@ -50,37 +49,18 @@ enum InputEvent {
     Wheel(i32),
 }
 
-/// The process-global input calls used by [`WinSurface`] (see the module docs
-/// for why this trait exists).
-trait InputDriver: Send {
-    fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError>;
-    /// [`probe_window_reachable`], handing back the thread's last-error
-    /// untouched so the classification stays in the pure [`preflight_refusal`],
-    /// which tests drive with a synthetic `ERROR_ACCESS_DENIED`.
-    fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()>;
+/// What this backend adds to [`WindowDriver`]: injecting input, and the
+/// foreground `SendInput` aims at.
+///
+/// The five window calls it shares with `post_message`'s `MessageDriver` live
+/// on the supertrait — see [`WindowDriver`] for why they are not declared here.
+trait InputDriver: WindowDriver {
     fn foreground_window(&mut self) -> Hwnd;
     fn request_foreground(&mut self, hwnd: Hwnd);
-    fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError>;
-    /// [`owning_pid`], read once at `acquire` and re-read by every later
-    /// [`verify_placement`](WinSurface::verify_placement) — see [`Target`]'s
-    /// doc comment for why.
-    fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError>;
     fn send(&mut self, event: InputEvent) -> Result<(), SurfaceError>;
-    fn sleep(&mut self, duration: Duration);
 }
 
-struct SystemInputDriver;
-
-impl InputDriver for SystemInputDriver {
-    fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError> {
-        ensure_dpi_awareness()?;
-        find_game_window().map(Hwnd::new)
-    }
-
-    fn probe_reachable(&mut self, hwnd: Hwnd) -> std::io::Result<()> {
-        probe_window_reachable(hwnd.raw())
-    }
-
+impl InputDriver for SystemWindowDriver {
     fn foreground_window(&mut self) -> Hwnd {
         // SAFETY: no arguments, no ownership — the returned HWND (possibly
         // NULL) is only ever compared here, never dereferenced.
@@ -96,14 +76,6 @@ impl InputDriver for SystemInputDriver {
         let _ = unsafe { SetForegroundWindow(hwnd.raw()) };
     }
 
-    fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError> {
-        client_rect(hwnd.raw())
-    }
-
-    fn owning_pid(&mut self, hwnd: Hwnd) -> Result<u32, SurfaceError> {
-        owning_pid(hwnd.raw())
-    }
-
     fn send(&mut self, event: InputEvent) -> Result<(), SurfaceError> {
         match event {
             InputEvent::Move(at) => move_cursor(at),
@@ -114,19 +86,15 @@ impl InputDriver for SystemInputDriver {
             }
         }
     }
-
-    fn sleep(&mut self, duration: Duration) {
-        std::thread::sleep(duration);
-    }
 }
 
 /// `SendInput` backend: real cursor, real foreground.
 ///
 /// The driver stays erased behind `Box<dyn InputDriver>` even though production
-/// only ever holds the one ZST: `InputDriver`/`SystemInputDriver` are private to
-/// this module, so `trait-002`'s `WinSurface<D: InputDriver = SystemInputDriver>`
-/// would leak a private type (`private_bounds`, `private_interfaces` — red under
-/// `-D warnings`). Measured, not assumed; the allocation is one per session.
+/// only ever holds the one ZST: `InputDriver` is private to this module, so
+/// `WinSurface<D: InputDriver = SystemWindowDriver>` would leak a private type
+/// (`private_bounds`, `private_interfaces` — red under `-D warnings`).
+/// Measured, not assumed; the allocation is one per session.
 pub struct WinSurface {
     driver: Box<dyn InputDriver>,
 }
@@ -134,7 +102,7 @@ pub struct WinSurface {
 impl Default for WinSurface {
     fn default() -> Self {
         Self {
-            driver: Box::new(SystemInputDriver),
+            driver: Box::new(SystemWindowDriver),
         }
     }
 }
@@ -150,7 +118,7 @@ impl WinSurface {
     /// The part of acquiring that both doors owe. The probe comes before the
     /// foreground is stolen and before any coordinate is planned — an
     /// unreachable window is not worth pulling forward, and `SendInput` will not
-    /// report the refusal later (see [`probe_window_reachable`]). A dry run
+    /// report the refusal later (see [`probe_window_reachable`](super::probe_window_reachable)). A dry run
     /// keeps it: it provably changes nothing, and "the real run would be
     /// refused" is the most useful sentence a rehearsal can print.
     fn locate(&mut self) -> Result<Hwnd, SurfaceError> {
@@ -181,15 +149,9 @@ impl WinSurface {
     /// and must not have the other. `FindWindowW`, `GetClientRect` and
     /// `ClientToScreen` are answered out of window-manager state and cannot wait
     /// on anything; `SetWindowPos` does enter Epic Seven's message loop, which is
-    /// why [`probe_window_reachable`] needed a hang check and this does not.
+    /// why [`probe_window_reachable`](super::probe_window_reachable) needed a hang check and this does not.
     fn verify_placement(&mut self, target: Target) -> Result<(), SurfaceError> {
-        let titled = self.driver.find_game_window()?;
-        let driver = &mut self.driver;
-        verify_identity(titled, target, move || {
-            let pid = driver.owning_pid(target.hwnd)?;
-            let rect = driver.client_rect(target.hwnd)?;
-            Ok((pid, rect))
-        })
+        verify_identity_of(&mut *self.driver, target)
     }
 
     /// The placement reads, plus the demand that the window own the foreground —
@@ -380,7 +342,7 @@ fn send_input(mi: MOUSEINPUT) -> Result<(), SurfaceError> {
 /// Note what is *not* in that list: UIPI. "Neither `GetLastError` nor the return
 /// value will indicate the failure was caused by UIPI blocking", so an
 /// out-of-reach window makes this answer `Ok(())` while nothing moves in the
-/// game — a blind spot only [`probe_window_reachable`] can cover.
+/// game — a blind spot only [`probe_window_reachable`](super::probe_window_reachable) can cover.
 pub(super) fn sendinput_result(inserted: u32) -> Result<(), SurfaceError> {
     if inserted == 1 {
         Ok(())
@@ -453,7 +415,7 @@ mod tests {
         state: Arc<Mutex<FakeState>>,
     }
 
-    impl InputDriver for FakeInputDriver {
+    impl WindowDriver for FakeInputDriver {
         fn find_game_window(&mut self) -> Result<Hwnd, SurfaceError> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(DriverCall::FindWindow);
@@ -468,24 +430,6 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.calls.push(DriverCall::Probe(hwnd));
             state.probe_results.pop_front().unwrap_or(Ok(()))
-        }
-
-        fn foreground_window(&mut self) -> Hwnd {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push(DriverCall::Foreground);
-            if let Some(hwnd) = state.foreground_results.pop_front() {
-                hwnd
-            } else {
-                state.foreground
-            }
-        }
-
-        fn request_foreground(&mut self, hwnd: Hwnd) {
-            self.state
-                .lock()
-                .unwrap()
-                .calls
-                .push(DriverCall::RequestForeground(hwnd));
         }
 
         fn client_rect(&mut self, hwnd: Hwnd) -> Result<ClientRect, SurfaceError> {
@@ -508,18 +452,38 @@ mod tests {
             }
         }
 
-        fn send(&mut self, event: InputEvent) -> Result<(), SurfaceError> {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push(DriverCall::Send(event));
-            state.send_results.pop_front().unwrap_or(Ok(()))
-        }
-
         fn sleep(&mut self, duration: Duration) {
             self.state
                 .lock()
                 .unwrap()
                 .calls
                 .push(DriverCall::Sleep(duration.as_millis() as u64));
+        }
+    }
+
+    impl InputDriver for FakeInputDriver {
+        fn foreground_window(&mut self) -> Hwnd {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(DriverCall::Foreground);
+            if let Some(hwnd) = state.foreground_results.pop_front() {
+                hwnd
+            } else {
+                state.foreground
+            }
+        }
+
+        fn request_foreground(&mut self, hwnd: Hwnd) {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push(DriverCall::RequestForeground(hwnd));
+        }
+
+        fn send(&mut self, event: InputEvent) -> Result<(), SurfaceError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(DriverCall::Send(event));
+            state.send_results.pop_front().unwrap_or(Ok(()))
         }
     }
 
