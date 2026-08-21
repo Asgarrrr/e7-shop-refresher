@@ -119,9 +119,9 @@ fn edit_setup(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
 /// The four collapsible sections — the Setup tab's scrolling body.
 ///
 /// No `session_alive` parameter, and its brief life is worth a sentence:
-/// `plans/042` added one so the restart-only settings could stay editable with
+/// `8d25453` added one so the restart-only settings could stay editable with
 /// no session running, since the file was the only place they landed.
-/// `plans/045` made them a live retune, so all four sections now need somewhere
+/// `08d67e9` made them a live retune, so all four sections now need somewhere
 /// to send a command and the caller gates them together again.
 pub(super) fn edit_sections(ui: &mut egui::Ui, editor: &mut EditorState) {
     // Summaries are built only while folded. No space between collapsed bars:
@@ -373,7 +373,7 @@ fn preset_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Option<TimingPrese
 /// of claiming a setting nobody received. Disabled while nothing changed, while
 /// a changed filter is too unrestricted to arm, and once the session is dead.
 ///
-/// `plans/045` collapsed this back to one return value. While the click mode
+/// `08d67e9` collapsed this back to one return value. While the click mode
 /// was restart-only it had no `Command`, so Apply had to hand the caller a
 /// second thing to persist and a second rule for when a draft counts as
 /// applied. It is a live retune now, so it rides the same channel and the same
@@ -544,7 +544,7 @@ mod tests {
     }
 
     /// It follows the same twin rule as the other three now, and that is the
-    /// whole point of `plans/045`: a command lost to a saturated queue leaves
+    /// whole point of `08d67e9`: a command lost to a saturated queue leaves
     /// Apply lit rather than claiming a mode the executor never heard about.
     #[test]
     fn the_click_mode_draft_clears_only_on_a_delivered_command() {
