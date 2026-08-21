@@ -229,7 +229,7 @@ file to regenerate the example on the next launch.
 | `capture.buffer_size` | — | **Retired.** Still parsed so older files keep loading, then removed from your `config.toml` at the next startup; ignored (the backend sizes its own buffer) |
 | `capture.filter` | — | **Retired.** Still parsed so older files keep loading, then removed from your `config.toml` at the next startup; ignored (the backend builds its own filter from `game_port`) |
 | `[filter]` | matches everything | Item interest criteria (kinds, sets, substats, price) |
-| `[limits]` | no limits | Session stop limits (refreshes, crystals, matches, duration) |
+| `[limits]` | no limits | Session stop limits (refreshes, crystals, matches, duration). **None of them caps gold**: `max_spend` is a crystal budget, and crystals pay for refreshes. A run's worst-case gold outlay is `max_matches` × `filter.max_price`, so leaving both unset — the default — means no gold ceiling at all |
 | `[actuator]` | live, posted clicks | `dry_run = true` journals planned clicks without sending input; `backend = "input"` drives the real cursor instead. Both editable in Setup → Clicking, and both take effect from the next clicks — no restart |
 
 ## Running

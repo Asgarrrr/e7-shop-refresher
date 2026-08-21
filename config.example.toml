@@ -67,6 +67,13 @@ names = ["ticketrare_name", "ticketspecial_name"]
 
 [limits]
 # Refresh-loop stop limits. Every key is optional; absent means no limit.
+#
+# None of these caps gold: max_spend is a crystal budget, and crystals are
+# what refreshes cost. Gold is what buys cost, and its ceiling comes from two
+# keys working together — filter.max_price rejects any item above it (so it is
+# never bought) and max_matches below bounds how many items a run buys. Worst
+# case for a session is therefore max_matches x filter.max_price. Leave both
+# unset, as they are by default, and there is no gold ceiling at all.
 # max_refreshes = 100        # paid refreshes per session
 # max_spend = 300            # crystal budget — hard ceiling, never crossed
 # max_matches = 5            # cumulative alerted items (not purchases)

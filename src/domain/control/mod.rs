@@ -51,6 +51,27 @@ pub enum Recovery {
 ///
 /// Deserialized from the config file's `[limits]` section; unknown keys are
 /// rejected because a misspelled limit is a limit that never triggers.
+///
+/// # There is no gold limit here, and that is deliberate
+///
+/// The currency this section bounds is crystals ([`Self::max_spend`]), which
+/// only refreshes spend. Gold is spent by *buys*, and a run's worst-case gold
+/// outlay is bounded from the other two knobs instead:
+/// `max_matches × Filter::max_price` — the per-item gold ceiling lives in
+/// `[filter]`, because an item above it never matches and so is never bought,
+/// and [`Self::max_matches`] bounds how many matches a run can make. **Both
+/// default to `None`, so a config setting neither has no gold ceiling at
+/// all.**
+///
+/// A `max_gold_spend` key would have to accumulate gold actually spent, and
+/// the only wire signal for it is `PurchaseNotice::gold` — the balance
+/// *after* the buy, not the price, optional and failing open when absent, and
+/// carrying `item: Option<CatalogId>` so the purchase is not always
+/// attributable to a priced item. A limit built on that would silently not
+/// limit, which is the exact failure this type's own `deny_unknown_fields`
+/// exists to prevent. The gap is that nothing tells a player the product
+/// above is their worst case — a sentence, which `config.example.toml` and
+/// the README now carry, not a field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
