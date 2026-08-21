@@ -13,7 +13,7 @@ mod timing;
 mod timing_meter;
 
 use hunt::{grade_value, hunt_summary, optional_value, quick_add_names, string_list, substat_reqs};
-use startup::{backend_row, dry_run_row, port_row, restart_notice, startup_summary};
+use startup::{backend_row, dry_run_row, restart_notice, startup_summary};
 use stop::{duration_row, limit_row, stop_summary};
 use timing::{fine_tune_body, mode_hint, pass_estimate, timing_summary};
 
@@ -130,8 +130,6 @@ impl EditorState {
     /// does not rewrite the backend line.
     pub(super) fn startup_edits(&self) -> StartupEdits {
         StartupEdits {
-            game_port: (self.startup.game_port != self.applied_startup.game_port)
-                .then_some(self.startup.game_port),
             dry_run: (self.startup.dry_run != self.applied_startup.dry_run)
                 .then_some(self.startup.dry_run),
             backend: (self.startup.backend != self.applied_startup.backend)
@@ -140,7 +138,7 @@ impl EditorState {
     }
 }
 
-/// Which of the three restart-only drafts moved, and to what. `None` means
+/// Which of the two restart-only drafts moved, and to what. `None` means
 /// unchanged and therefore not written.
 ///
 /// Plain values rather than `persist::Section`s: the Command-to-Section mapping
@@ -148,7 +146,6 @@ impl EditorState {
 /// of it — see `persisted_sections`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct StartupEdits {
-    pub(super) game_port: Option<std::num::NonZeroU16>,
     pub(super) dry_run: Option<bool>,
     pub(super) backend: Option<crate::config::ActuatorBackend>,
 }
@@ -156,7 +153,7 @@ pub(super) struct StartupEdits {
 impl StartupEdits {
     /// True when nothing moved, so the caller can skip the write entirely.
     pub(super) fn is_empty(self) -> bool {
-        self.game_port.is_none() && self.dry_run.is_none() && self.backend.is_none()
+        self.dry_run.is_none() && self.backend.is_none()
     }
 }
 
@@ -199,13 +196,8 @@ pub(super) fn edit_sections(ui: &mut egui::Ui, editor: &mut EditorState, session
             ui.add_space(theme::SP_SM);
         }
     });
-    let startup = (!editor.startup_open).then(|| {
-        startup_summary(
-            editor.startup.game_port,
-            editor.startup.dry_run,
-            editor.startup.backend,
-        )
-    });
+    let startup = (!editor.startup_open)
+        .then(|| startup_summary(editor.startup.dry_run, editor.startup.backend));
     section(ui, "Startup", startup.as_deref(), &mut editor.startup_open);
     if editor.startup_open {
         startup_body(ui, editor);
@@ -217,7 +209,6 @@ pub(super) fn edit_sections(ui: &mut egui::Ui, editor: &mut EditorState, session
 /// player never needs to open twice — and the notice closes it, so the last
 /// thing read before Apply is the sentence that says a restart is coming.
 fn startup_body(ui: &mut egui::Ui, editor: &mut EditorState) {
-    port_row(ui, &mut editor.startup.game_port);
     dry_run_row(ui, &mut editor.startup.dry_run);
     backend_row(ui, &mut editor.startup.backend);
     ui.add_space(theme::SP_SM);
@@ -446,12 +437,12 @@ pub(super) struct Committed {
 /// # Why a dead session does not always disable it
 ///
 /// It used to, and for the three live-editable drafts that is right: a retune
-/// nobody can take should not look taken. The restart-only three are the
-/// opposite case. A player whose capture never started has a dead session and
-/// a wrong `game_port` — that is the *only* state in which they would come
-/// looking for this field, and refusing the write there would be refusing it
-/// exactly when it is needed. So a dead session still commits those three, and
-/// still refuses the rest.
+/// nobody can take should not look taken. The restart-only pair is the opposite
+/// case. `config.example.toml` calls `backend = "input"` the fallback for when
+/// a game update stops honouring posted clicks — and an actuator fault of
+/// exactly that kind is what halts the watch and kills the session. Refusing
+/// the write there would refuse it in the state it exists for. So a dead
+/// session still commits those two, and still refuses the rest.
 #[must_use]
 pub(super) fn commit_row(
     ui: &mut egui::Ui,
@@ -578,11 +569,6 @@ mod tests {
             .build_ui(app)
     }
 
-    /// A port different from the seeded one, for the restart-only tests.
-    fn other_port() -> std::num::NonZeroU16 {
-        std::num::NonZeroU16::new(4001).expect("4001 is not zero")
-    }
-
     /// Drive `commit_row` once against a chosen session state, and report what
     /// Apply committed. `edit_setup` hard-codes a live session, which is the
     /// one thing these tests need to vary.
@@ -608,19 +594,20 @@ mod tests {
             Timings::default(),
             StartupSettings::default(),
         );
-        editor.startup.game_port = other_port();
+        editor.startup.backend = crate::config::ActuatorBackend::Input;
         let edits = editor.startup_edits();
-        assert_eq!(edits.game_port, Some(other_port()));
+        assert_eq!(edits.backend, Some(crate::config::ActuatorBackend::Input));
         assert_eq!(
-            (edits.dry_run, edits.backend),
-            (None, None),
+            edits.dry_run, None,
             "an untouched field must not be rewritten"
         );
     }
 
-    /// **The reason a dead session does not disable Apply.** A player whose
-    /// capture never started has no session and, possibly, a wrong port — the
-    /// one state in which this field exists to be used.
+    /// **The reason a dead session does not disable Apply.** The backend switch
+    /// is what `config.example.toml` calls the fallback for when a game update
+    /// stops honouring posted clicks — and an actuator fault of exactly that
+    /// kind is what halted the watch. Refusing the write on a dead session
+    /// would refuse it in the state it exists for.
     #[test]
     fn a_dead_session_still_commits_the_restart_only_settings() {
         let mut editor = EditorState::new(
@@ -629,9 +616,12 @@ mod tests {
             Timings::default(),
             StartupSettings::default(),
         );
-        editor.startup.game_port = other_port();
+        editor.startup.backend = crate::config::ActuatorBackend::Input;
         let committed = run_commit(&mut editor, false);
-        assert_eq!(committed.startup.game_port, Some(other_port()));
+        assert_eq!(
+            committed.startup.backend,
+            Some(crate::config::ActuatorBackend::Input)
+        );
         assert!(
             committed.commands.is_empty(),
             "a dead session takes no command, so none may be reported as delivered"

@@ -1,7 +1,7 @@
 //! Format-preserving persistence of the GUI-editable parts of config.toml.
 //! `[filter]`, `[limits]` and `[actuator.timings]` are rewritten as whole
-//! sections; `game_port`, `actuator.dry_run` and `actuator.backend` are
-//! rewritten as single keys. Everything else is left as the player wrote it.
+//! sections; `actuator.dry_run` and `actuator.backend` are rewritten as single
+//! keys. Everything else is left as the player wrote it.
 //! Whole-section replacement drops a section's inner commented-out example
 //! lines on first save, but keeps the comments above each header; a single-key
 //! write keeps even those.
@@ -9,7 +9,6 @@
 //! [`strip_retired_keys`] is the one exception — see its docs.
 
 use std::io::Write as _;
-use std::num::NonZeroU16;
 use std::path::Path;
 
 use serde::Serialize;
@@ -24,18 +23,22 @@ use crate::error::{Error, Result};
 /// One GUI-editable piece of config.toml to persist. Built per Apply from what
 /// actually changed, so a limits-only edit never rewrites `[filter]`.
 ///
-/// # Why the last three are keys and not sections
+/// # Why the last two are keys and not sections
 ///
 /// The first three each own a whole TOML table, so a write can replace them
-/// wholesale. The last three do not own anything. `game_port` is a scalar at
-/// the document root — there is no section to replace. `dry_run` and `backend`
-/// are two keys of `[actuator]`, a table that also holds `timings`, which
-/// [`Section::Timings`] owns: replacing `[actuator]` wholesale would delete the
+/// wholesale. The last two do not own anything: `dry_run` and `backend` are two
+/// keys of `[actuator]`, a table that also holds `timings`, which
+/// [`Section::Timings`] owns. Replacing `[actuator]` wholesale would delete the
 /// player's tuned click timings on any Apply that touched the backend switch.
 ///
-/// Splitting them into one variant per key rather than grouping them into a
-/// struct is the same rule the sentence above states, one level down — an Apply
-/// that moved only the port must not rewrite the backend line.
+/// One variant per key rather than one for the pair is the same rule the
+/// sentence above states, one level down — an Apply that moved only the
+/// rehearsal switch must not rewrite the backend line.
+///
+/// `game_port` is deliberately absent. It is a `config.toml` key with no widget
+/// (see `ui::editor::startup`), so nothing in the window can produce an edit to
+/// persist. A variant for it existed briefly in `8d25453` and left with the
+/// field.
 ///
 /// `Debug` because [`save`] is best-effort and journals its failure by name.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,8 +46,6 @@ pub enum Section {
     Filter(Filter),
     Limits(Limits),
     Timings(Timings),
-    /// `game_port`, a root key.
-    GamePort(NonZeroU16),
     /// `actuator.dry_run`.
     DryRun(bool),
     /// `actuator.backend`.
@@ -358,10 +359,6 @@ fn write_sections(text: &str, edits: &[Section]) -> Result<String> {
                 inline_ranges(&mut table);
                 set_nested_table(root, "actuator", "timings", table);
             }
-            // `NonZeroU16` is the loader's own domain, so there is nothing left
-            // to check here: a port this module can be handed is a port
-            // `Config::load` accepts.
-            Section::GamePort(port) => set_key(root, "game_port", i64::from(port.get()).into()),
             Section::DryRun(dry_run) => set_actuator_key(root, "dry_run", (*dry_run).into()),
             Section::Backend(backend) => {
                 set_actuator_key(root, "backend", backend_key(*backend).into());
@@ -971,28 +968,32 @@ names = [\"ticketrare_name\"]
         );
     }
 
-    /// A port is one line in the middle of a hand-written file. Replacing the
-    /// `Item` instead of the `Value` would take the note beside it with it.
+    /// A switch is one line in the middle of a hand-written file. Replacing the
+    /// `Item` instead of the `Value` would take the note beside it with it, and
+    /// the untouched keys around it must not move either.
     #[test]
-    fn writing_the_game_port_keeps_the_comments_wrapped_around_it() {
+    fn writing_one_actuator_key_keeps_the_comments_wrapped_around_it() {
         let text = "\
-# the port my client talks to
-game_port = 3333 # checked against the client 2026-08
-server_url = \"wss://ingest.arkyve.dev/refresh-shop\"
+game_port = 3333
+# the mode I rehearse in before a long run
+[actuator]
+dry_run = false # flipped 2026-08 after the geometry check
+backend = \"message\"
 ";
-        let port = NonZeroU16::new(4001).expect("4001 is not zero");
-        let out = write_sections(text, &[Section::GamePort(port)]).expect("write");
+        let out = write_sections(text, &[Section::DryRun(true)]).expect("write");
         assert_eq!(
             out,
             "\
-# the port my client talks to
-game_port = 4001 # checked against the client 2026-08
-server_url = \"wss://ingest.arkyve.dev/refresh-shop\"
+game_port = 3333
+# the mode I rehearse in before a long run
+[actuator]
+dry_run = true # flipped 2026-08 after the geometry check
+backend = \"message\"
 "
         );
     }
 
-    /// The reason these three are keys and not a section: `[actuator]` is
+    /// The reason these two are keys and not a section: `[actuator]` is
     /// shared with `Section::Timings`, so a backend switch must not be able to
     /// delete a tuned range.
     #[test]
@@ -1061,22 +1062,19 @@ refreshed = { min_ms = 200, max_ms = 800 }
         }
     }
 
-    /// The whole document, written from nothing and read back: the three keys
-    /// land in the two tables that own them and nowhere else.
+    /// The whole document, written from nothing and read back: both keys land
+    /// in the table that owns them and nowhere else.
     #[test]
-    fn the_three_startup_keys_round_trip_together() {
-        let port = NonZeroU16::new(65_535).expect("65535 is not zero");
+    fn the_two_startup_keys_round_trip_together() {
         let out = write_sections(
             "",
             &[
-                Section::GamePort(port),
                 Section::DryRun(true),
                 Section::Backend(ActuatorBackend::Input),
             ],
         )
         .expect("write");
         let config: crate::config::Config = toml::from_str(&out).expect("reload");
-        assert_eq!(config.game_port, port);
         assert!(config.actuator.dry_run);
         assert_eq!(config.actuator.backend, ActuatorBackend::Input);
         config.validate().expect("what we write must also validate");

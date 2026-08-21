@@ -188,11 +188,11 @@ fn run_mode(
     // editor, which has no controller home.
     let seed_timings = config.actuator.timings;
     // Same reason, one step stronger: nothing downstream of `setup` keeps these
-    // three at all — the port is baked into a kernel filter, the backend into a
-    // moved-in `Surface` — so this is the only moment the window can learn what
-    // a restart would currently do.
+    // two at all — the backend is baked into a `Surface` moved into the
+    // executor — so this is the only moment the window can learn what a restart
+    // would currently do. `game_port` is not among them on purpose: it has no
+    // widget, so the window has nothing to seed. See `ui::editor::startup`.
     let seed_startup = ui::StartupSettings {
-        game_port: config.game_port,
         dry_run: config.actuator.dry_run,
         backend: config.actuator.backend,
     };
