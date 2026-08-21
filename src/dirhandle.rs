@@ -98,3 +98,30 @@ pub fn open_directory_itself(dir: &Path) -> std::io::Result<File> {
 pub fn is_plain_directory(dir: &Path) -> bool {
     open_directory_itself(dir).is_ok()
 }
+
+/// A directory junction, which unlike a symlink an ordinary user can create.
+/// `mklink` is a `cmd` builtin, so it cannot be spawned directly.
+///
+/// The attack this module exists to refuse, built for the tests that prove it
+/// is refused. Here rather than in each test module that needs it — `crash`,
+/// `lib` and `migrate` carried three identical copies — for the reason the
+/// module header gives about the gate: a check and the thing it is checked
+/// against are worth exactly as much as their agreement, and three copies is
+/// three chances for one to drift into building a different attack from the one
+/// the gate is claimed to stop.
+///
+/// The `TempDir` fixtures around it stay per-module on purpose: their `Drop`
+/// unlinks a *different* set of junctions each (`migrate` nests one more), and
+/// a shared one would either recurse into an attacker's tree or leave a mount
+/// point behind.
+#[cfg(test)]
+pub(crate) fn junction(link: &Path, target: &Path) -> bool {
+    std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link)
+        .arg(target)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}

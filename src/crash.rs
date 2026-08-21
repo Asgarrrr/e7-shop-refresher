@@ -335,19 +335,8 @@ mod tests {
         }
     }
 
-    /// A directory junction, which unlike a symlink an ordinary user can
-    /// create. `mklink` is a `cmd` builtin, so it cannot be spawned directly.
     #[cfg(windows)]
-    fn junction(link: &Path, target: &Path) -> bool {
-        std::process::Command::new("cmd")
-            .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(link)
-            .arg(target)
-            .output()
-            .is_ok_and(|out| out.status.success())
-    }
+    use crate::dirhandle::junction;
 
     #[cfg(windows)]
     #[test]
