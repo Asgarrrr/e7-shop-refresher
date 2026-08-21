@@ -342,6 +342,7 @@ mod tests {
                 SnapshotEpoch::default(),
                 jobs,
                 Arc::new(Mutex::new(plan::Timings::default())),
+                Arc::new(Mutex::new(crate::actuator::ClickMode::default())),
             ),
             job_rx,
         )

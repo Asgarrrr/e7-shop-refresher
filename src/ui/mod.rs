@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
+use crate::actuator::ClickMode;
 use crate::actuator::plan::Timings;
 use crate::app::{Command, SessionHandles};
 use crate::config;
@@ -28,7 +29,6 @@ use crate::watch::HaltSource;
 
 use capture_health::{CaptureHealthView, render_capture_health};
 use editor::EditorState;
-pub use editor::StartupSettings;
 use view::{SlotRow, SlotRows, ViewState, merchant_heading, slot_detail, view_state};
 
 /// Where the session's terminal outcome lands (fatal error, crash, or clean
@@ -104,22 +104,21 @@ impl ShopApp {
         handles: SessionHandles,
         error: SessionErrorSlot,
         timings: Timings,
-        startup: StartupSettings,
+        click_mode: ClickMode,
         config_path: PathBuf,
     ) -> Self {
         theme::apply(&cc.egui_ctx);
-        // The drafts seed from the controller; `Timings` aren't domain state,
-        // so they seed from the startup config value instead — and neither are
-        // the three in `startup`, for a stronger reason: the session never
-        // holds them at all, so the config this process was launched with is
-        // the only place they exist.
+        // The drafts seed from the controller; neither `Timings` nor
+        // `ClickMode` is domain state, so both seed from the config value the
+        // process launched with. From there the session owns them, and Apply
+        // retunes it like any other draft.
         let (editor, slots) = {
             let ctrl = lock_ignoring_poison(&handles.controller);
             let mut slots = SlotRows::default();
             // Synced here so the first frame finds the cache already current.
             slots.sync(&ctrl);
             (
-                EditorState::new(ctrl.filter().clone(), *ctrl.limits(), timings, startup),
+                EditorState::new(ctrl.filter().clone(), *ctrl.limits(), timings, click_mode),
                 slots,
             )
         };
@@ -253,19 +252,15 @@ impl eframe::App for ShopApp {
         // Dispatch first, then record: "applied" state and persistence both key
         // off what the session actually took.
         let mut delivered = Vec::new();
-        for command in clicked.into_iter().chain(applied.commands) {
+        for command in clicked.into_iter().chain(applied) {
             if deliver_command(&self.handles, command.clone()) {
                 delivered.push(command);
             }
         }
         self.editor.mark_applied(&delivered);
-        // Best-effort for the retunes above — a write failure only costs the
-        // on-disk copy, because the session already took them. **Not** for the
-        // restart-only keys appended here: for those the file is the only place
-        // the change can land, so `mark_startup_saved` waits on the result
-        // below rather than running beside `mark_applied`.
-        let mut sections = persisted_sections(&delivered);
-        sections.extend(startup_sections(applied.startup));
+        // Best-effort: a write failure only costs the on-disk copy, so it is
+        // journaled and moved past.
+        let sections = persisted_sections(&delivered);
         if !sections.is_empty()
             && let Err(err) = config::persist::save(&self.config_path, &sections)
         {
@@ -284,10 +279,6 @@ impl eframe::App for ShopApp {
                 "config.toml not saved ({labels}): {}",
                 err.report()
             )]);
-        } else {
-            // Reached when there was nothing to write, too, which is correct:
-            // an empty `startup` re-seeds the twin with what it already holds.
-            self.editor.mark_startup_saved();
         }
     }
 }
@@ -352,33 +343,26 @@ fn render_tabs(ui: &mut egui::Ui, tab: &mut Tab) {
 /// `config.toml`, so a wildcard would let a new `Set*` retune the session and
 /// silently vanish on the next launch.
 fn persisted_sections(commands: &[Command]) -> Vec<config::persist::Section> {
+    use config::persist::Section;
     commands
         .iter()
-        .filter_map(|command| match command {
-            Command::SetFilter(filter) => Some(config::persist::Section::Filter(filter.clone())),
-            Command::SetLimits(limits) => Some(config::persist::Section::Limits(*limits)),
-            Command::SetTimings(timings) => Some(config::persist::Section::Timings(*timings)),
-            Command::Start | Command::Stop | Command::Toggle => None,
+        .flat_map(|command| match command {
+            Command::SetFilter(filter) => vec![Section::Filter(filter.clone())],
+            Command::SetLimits(limits) => vec![Section::Limits(*limits)],
+            Command::SetTimings(timings) => vec![Section::Timings(*timings)],
+            // The one command that becomes two keys — `flat_map` rather than
+            // `filter_map` exists for this arm alone. Both are written even
+            // when only one moved: the command carries the pair because a
+            // single Apply must not land in halves, and writing back an
+            // unchanged value through `set_key` reproduces its line byte for
+            // byte, comment included.
+            Command::SetClickMode(mode) => vec![
+                Section::DryRun(mode.dry_run),
+                Section::Backend(mode.backend),
+            ],
+            Command::Start | Command::Stop | Command::Toggle => Vec::new(),
         })
         .collect()
-}
-
-/// The restart-only half of the bridge above. Separate from
-/// [`persisted_sections`] because these two reach `config.toml` without ever
-/// reaching the session, so there is no `Command` to read them off — see
-/// `editor::EditorState::mark_startup_saved` for why that difference matters.
-///
-/// One `Section` per field that moved, so an Apply that changed only the
-/// rehearsal switch leaves the backend line exactly as the player wrote it.
-fn startup_sections(edits: editor::StartupEdits) -> Vec<config::persist::Section> {
-    let mut sections = Vec::new();
-    if let Some(dry_run) = edits.dry_run {
-        sections.push(config::persist::Section::DryRun(dry_run));
-    }
-    if let Some(backend) = edits.backend {
-        sections.push(config::persist::Section::Backend(backend));
-    }
-    sections
 }
 
 /// The Setup section titles for the "not saved" report — the same words the UI
@@ -425,7 +409,7 @@ fn render_tab_content(
     tab: Tab,
     editor: &mut EditorState,
     session_alive: bool,
-) -> editor::Committed {
+) -> Vec<Command> {
     match tab {
         // No inset: the shop table bleeds its hover fill to the edges itself.
         Tab::Shop => {
@@ -435,7 +419,7 @@ fn render_tab_content(
                 .show(ui, |ui| {
                     shop::render_shop_tab(ui, pane.view, pane.rows, pane.merchant, pane.detail)
                 });
-            editor::Committed::default()
+            Vec::new()
         }
         Tab::Setup => render_setup_tab(ui, editor, session_alive),
     }
@@ -448,8 +432,8 @@ fn render_setup_tab(
     ui: &mut egui::Ui,
     editor: &mut EditorState,
     session_alive: bool,
-) -> editor::Committed {
-    let mut clicked = editor::Committed::default();
+) -> Vec<Command> {
+    let mut clicked = Vec::new();
     egui::Panel::bottom("setup_commit")
         .frame(
             egui::Frame::side_top_panel(ui.style())
@@ -463,11 +447,7 @@ fn render_setup_tab(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             content_inset(ui, |ui| {
-                // `session_alive` goes *into* `edit_sections` rather than
-                // wrapping it: the Startup section must stay editable on a dead
-                // session, because the backend switch is the fallback for the
-                // actuator fault that killed it. See `editor::commit_row`.
-                editor::edit_sections(ui, editor, session_alive);
+                ui.add_enabled_ui(session_alive, |ui| editor::edit_sections(ui, editor));
             });
         });
     clicked
@@ -514,25 +494,19 @@ mod tests {
             merchant: "Secret Shop",
             detail: &|_| String::new(),
         };
-        render_tab_content(ui, &pane, *tab, editor, session_alive).commands
+        render_tab_content(ui, &pane, *tab, editor, session_alive)
     }
 
-    /// The second bridge, per field: nothing that did not move gets written.
+    /// The one command that becomes two keys, and the reason `persisted_sections`
+    /// is a `flat_map`.
     #[test]
-    fn only_the_startup_fields_that_moved_become_sections() {
-        assert!(startup_sections(editor::StartupEdits::default()).is_empty());
+    fn one_click_mode_command_persists_both_of_its_keys() {
+        let mode = ClickMode {
+            dry_run: true,
+            backend: config::ActuatorBackend::Input,
+        };
         assert_eq!(
-            startup_sections(editor::StartupEdits {
-                dry_run: Some(true),
-                ..Default::default()
-            }),
-            vec![config::persist::Section::DryRun(true)]
-        );
-        assert_eq!(
-            startup_sections(editor::StartupEdits {
-                dry_run: Some(true),
-                backend: Some(config::ActuatorBackend::Input),
-            }),
+            persisted_sections(&[Command::SetClickMode(mode)]),
             vec![
                 config::persist::Section::DryRun(true),
                 config::persist::Section::Backend(config::ActuatorBackend::Input),
@@ -540,7 +514,7 @@ mod tests {
         );
     }
 
-    /// Both Startup keys are one collapsible, so the "not saved" report must
+    /// Both Clicking keys are one collapsible, so the "not saved" report must
     /// name it once — not twice.
     #[test]
     fn the_not_saved_report_names_the_startup_block_once() {
@@ -672,7 +646,7 @@ mod tests {
             Filter::default(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let harness = Harness::new_ui(|ui| {
             render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
@@ -689,7 +663,7 @@ mod tests {
             Filter::default(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let mut harness = Harness::new_ui(|ui| {
             render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
@@ -710,7 +684,7 @@ mod tests {
             Filter::default(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let harness = Harness::new_ui(|ui| {
             render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
@@ -726,7 +700,7 @@ mod tests {
             Filter::default(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let harness = Harness::new_ui(|ui| {
             render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);
@@ -752,7 +726,7 @@ mod tests {
             Filter::default(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let harness = Harness::new_ui(|ui| {
             render_center(ui, &view, slots.rows(), &mut tab, &mut editor, true);

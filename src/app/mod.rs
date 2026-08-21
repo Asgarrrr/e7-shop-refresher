@@ -22,7 +22,7 @@ use futures_util::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tracing::info;
 
-use crate::actuator::{ActuatorHandle, Mode, SnapshotEpoch, plan};
+use crate::actuator::{ActuatorHandle, ClickMode, Mode, SnapshotEpoch, plan};
 use crate::capture::{CaptureHealth, CaptureSource};
 use crate::domain::control::{Controller, Limits};
 use crate::domain::filter::Filter;
@@ -69,6 +69,12 @@ pub enum Command {
     SetLimits(Limits),
     /// Live click-timing retune; applies to the next queued job.
     SetTimings(plan::Timings),
+    /// Live rehearsal/backend switch; applies to the next job the executor
+    /// dequeues.
+    ///
+    /// One variant carrying both, not two: they are applied together and a
+    /// single Apply must not be able to land in halves. See [`ClickMode`].
+    SetClickMode(ClickMode),
 }
 
 /// Cheap clones of the shared session state, for a view (the GUI) running
@@ -181,11 +187,18 @@ pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
     };
     let (job_tx, job_rx) = mpsc::channel::<plan::Job>(JOB_QUEUE);
     let timings = Arc::new(Mutex::new(config.actuator.timings));
+    // Seeded from the file, then owned by the player: `Command::SetClickMode`
+    // writes it and the executor snapshots it once per job.
+    let click_mode = Arc::new(Mutex::new(ClickMode {
+        dry_run: config.actuator.dry_run,
+        backend: config.actuator.backend,
+    }));
     let actuator = ActuatorHandle::new(
         actuator_mode(&config),
         SnapshotEpoch::default(),
         job_tx,
         timings,
+        click_mode,
     );
     let shutdown = ShutdownSignal::new();
     let session = Session {
@@ -197,6 +210,24 @@ pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
         shutdown: shutdown.clone(),
     };
     (session, handles, shutdown)
+}
+
+/// The backend as a trait object, for [`Session::run`]'s single spawn and for
+/// the swap it hands the executor.
+///
+/// `Send` in the bound because the executor is spawned onto a work-stealing
+/// runtime and the surface travels with it — the same requirement the concrete
+/// types met implicitly before they were boxed.
+#[cfg(all(windows, feature = "actuator"))]
+fn build_surface(
+    backend: crate::actuator::ActuatorBackend,
+) -> Box<dyn crate::actuator::Surface<Window = crate::actuator::win::Target> + Send> {
+    use crate::actuator::ActuatorBackend;
+    use crate::actuator::win::{MessageSurface, WinSurface};
+    match backend {
+        ActuatorBackend::Input => Box::new(WinSurface::default()),
+        ActuatorBackend::Message => Box::new(MessageSurface::default()),
+    }
 }
 
 #[cfg(all(windows, feature = "actuator"))]
@@ -310,36 +341,31 @@ impl Session {
 
         #[cfg(all(windows, feature = "actuator"))]
         {
-            use crate::actuator::run_executor;
-            use crate::actuator::win::{MessageSurface, WinSurface};
-            use crate::config::ActuatorBackend;
-            let dry_run = actuator.mode == Mode::DryRun;
-            match config.actuator.backend {
-                ActuatorBackend::Input => workers.spawn(
-                    "actuator",
-                    &fatal_tx,
-                    run_executor(
-                        WinSurface::default(),
-                        job_rx,
-                        gate.clone(),
-                        actuator.epoch.clone(),
-                        journal.clone(),
-                        dry_run,
-                    ),
+            use crate::actuator::win::Target;
+            use crate::actuator::{Surface, run_executor};
+            // One spawn over a boxed backend, where there used to be two arms
+            // choosing a concrete one for the session's life. Both shipped
+            // backends declare `type Window = Target`, so they unify under this
+            // object and the executor can swap them between jobs.
+            let surface = build_surface(actuator.click_mode().backend);
+            workers.spawn(
+                "actuator",
+                &fatal_tx,
+                run_executor(
+                    surface,
+                    job_rx,
+                    gate.clone(),
+                    actuator.epoch.clone(),
+                    journal.clone(),
+                    actuator.click_mode_cell(),
+                    // Replaces the whole backend rather than reconfiguring one:
+                    // the old surface has already released, and a fresh
+                    // `Default` is what the two arms above used to build.
+                    |backend, held: &mut Box<dyn Surface<Window = Target> + Send>| {
+                        *held = build_surface(backend);
+                    },
                 ),
-                ActuatorBackend::Message => workers.spawn(
-                    "actuator",
-                    &fatal_tx,
-                    run_executor(
-                        MessageSurface::default(),
-                        job_rx,
-                        gate.clone(),
-                        actuator.epoch.clone(),
-                        journal.clone(),
-                        dry_run,
-                    ),
-                ),
-            }
+            );
         }
         // Without an input backend the mode is Off and nothing ever submits.
         #[cfg(not(all(windows, feature = "actuator")))]

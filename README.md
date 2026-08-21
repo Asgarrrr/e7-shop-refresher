@@ -206,9 +206,11 @@ The app reads and writes its config at a per-user location, not beside the exe:
 
 The Setup tab's Apply writes back everything it can edit — `[filter]`,
 `[limits]`, `[actuator.timings]`, and the `dry_run` / `backend` keys under
-**Startup** — preserving every comment and every section it does not own. Those
-last two take effect on the next launch, and the Startup section says so beside
-them. Everything else is hand-edited, and two of those are deliberate:
+**Clicking** — preserving every comment and every section it does not own. All
+of them retune the running session: the click mode applies from the next clicks
+the actuator sends, so a job already under way finishes as it started. No
+restart, and nothing waits for one. Everything else is hand-edited, and two of
+those are deliberate:
 `server_url` can carry a credential and is kept out of the window, where it
 would pass through UI state and into any screenshot; `game_port` is not
 something a player sets from the window. On first run the bundled
@@ -228,7 +230,7 @@ file to regenerate the example on the next launch.
 | `capture.filter` | — | **Retired.** Still parsed so older files keep loading, then removed from your `config.toml` at the next startup; ignored (the backend builds its own filter from `game_port`) |
 | `[filter]` | matches everything | Item interest criteria (kinds, sets, substats, price) |
 | `[limits]` | no limits | Session stop limits (refreshes, crystals, matches, duration) |
-| `[actuator]` | live, posted clicks | `dry_run = true` journals planned clicks without sending input; `backend = "input"` drives the real cursor instead. Both editable in Setup → Startup; both take effect on restart |
+| `[actuator]` | live, posted clicks | `dry_run = true` journals planned clicks without sending input; `backend = "input"` drives the real cursor instead. Both editable in Setup → Clicking, and both take effect from the next clicks — no restart |
 
 ## Running
 
