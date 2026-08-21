@@ -194,16 +194,21 @@ pub struct LogSetup {
 /// Why a log-directory candidate was not used.
 ///
 /// Two different things can refuse a candidate, and they carry differently
-/// shaped errors: `tracing_appender` never sees the junction case, because the
-/// gate below runs before `Builder::build` gets a chance to create anything
-/// through it.
+/// shaped errors: the gate below runs first, so `Builder::build` is only ever
+/// handed a path whose every directory — the app-data root *and* the `logs`
+/// leaf it writes into — answered [`dirhandle::is_plain_directory`] moments
+/// earlier. Moments, not throughout: nothing here holds those directories open,
+/// so a junction swapped in between the gate and `build`'s own `create_dir_all`
+/// is still followed. The window is narrowed to that gap, not closed, which is
+/// the same trade `is_plain_directory` documents for its own answer.
 enum LogRefusal {
     /// `Builder::build` itself failed: permissions, a locked file, a full disk.
     Open(tracing_appender::rolling::InitError),
-    /// `dirhandle::open_directory_itself` refused the app-data root before
-    /// `build` ran — most likely a reparse point, occasionally just missing.
+    /// `dirhandle::open_directory_itself` refused one of the directories the
+    /// log file sits under, before `build` ran — most likely a reparse point,
+    /// occasionally a permission failure the create ahead of it could not fix.
     #[cfg(windows)]
-    Root(std::io::Error),
+    Gate(std::io::Error),
 }
 
 // Hand-written rather than `#[derive(Debug)]`: a derive's `fmt` reads its
@@ -216,7 +221,7 @@ impl std::fmt::Debug for LogRefusal {
         match self {
             Self::Open(err) => write!(f, "Open({err:?})"),
             #[cfg(windows)]
-            Self::Root(err) => write!(f, "Root({err:?})"),
+            Self::Gate(err) => write!(f, "Gate({err:?})"),
         }
     }
 }
@@ -254,18 +259,18 @@ impl LogSetup {
     }
 }
 
-/// Creates `root` if it is not there yet, then answers whether it is safe to
+/// Creates `dir` if it is not there yet, then answers whether it is safe to
 /// write into: a plain directory, never a junction or symlink.
 ///
 /// `create_dir_all`'s own result is not the authority — its error is dropped
 /// and [`dirhandle::is_plain_directory`] is asked regardless, because that is
 /// the only order that covers both directions this can fail:
 ///
-/// * `root` never existed — the single most common first run there is, on a
+/// * `dir` never existed — the single most common first run there is, on a
 ///   clean install with no `%LOCALAPPDATA%\arkyve-refresh-shop` yet. This
 ///   creates it, `is_plain_directory` finds a plain directory, and logging
 ///   proceeds exactly as it did before this gate existed.
-/// * `root` already existed as a junction. `create_dir_all` resolves through
+/// * `dir` already existed as a junction. `create_dir_all` resolves through
 ///   it and reports success — a junction does not stop directory creation
 ///   inside its target — but `dirhandle::is_plain_directory` opens with
 ///   `FILE_FLAG_OPEN_REPARSE_POINT`, so it still sees the junction itself, not
@@ -274,9 +279,34 @@ impl LogSetup {
 /// Same create-then-verify shape as `install::prepare_staging`: creating is
 /// never trusted on its own, a second, independent look decides.
 #[cfg(windows)]
-fn log_root_is_writable(root: &Path) -> bool {
-    let _ = std::fs::create_dir_all(root);
-    dirhandle::is_plain_directory(root)
+fn created_dir_is_plain(dir: &Path) -> bool {
+    let _ = std::fs::create_dir_all(dir);
+    dirhandle::is_plain_directory(dir)
+}
+
+/// The first directory on the way to the log file that [`created_dir_is_plain`]
+/// refuses, or `None` when every one of them is a plain directory.
+///
+/// Two are checked because two are written into: the app-data root, which this
+/// app creates, and `dir` — the `logs` leaf — which is the directory
+/// `tracing_appender::rolling::Builder::build` hands to `create_dir_all` and
+/// then to `File::create`, both of which resolve reparse points. Gating the
+/// root alone said nothing about the leaf, and the leaf is the reachable half:
+/// the root is created with ordinary inherited ACLs, never clamped the way
+/// `install`'s staging directory is, so a same-user process can delete `logs`
+/// between two runs and leave a junction under that name.
+///
+/// Root first, and the order is load-bearing: checking the leaf first would
+/// *create* it through a junctioned root and then find a perfectly plain
+/// directory sitting in the attacker's tree.
+#[cfg(windows)]
+fn refused_log_dir(dir: &Path) -> Option<PathBuf> {
+    if let Some(root) = dir.parent()
+        && !created_dir_is_plain(root)
+    {
+        return Some(root.to_owned());
+    }
+    (!created_dir_is_plain(dir)).then(|| dir.to_owned())
 }
 
 /// Installs the tracing subscriber over a daily-rotated file, because the
@@ -305,23 +335,21 @@ pub fn install_logging() -> (
     let mut guard = None;
     let mut file_writer = None;
     for dir in log_dirs() {
-        // Checked before `build`, not after: `build` creates the directory and
-        // opens the first file inside it, so a check placed after that call
-        // would only notice a redirected root once the write it exists to
-        // prevent had already gone through it. Windows-only, like `dirhandle`
-        // itself.
+        // Checked before `build`, not after: `build` creates the directory it
+        // was handed and opens the first file inside it, so a check placed
+        // after that call would only notice a redirected root — or a redirected
+        // `logs` leaf — once the write it exists to prevent had already gone
+        // through it. Windows-only, like `dirhandle` itself.
         #[cfg(windows)]
-        if let Some(root) = dir.parent()
-            && !log_root_is_writable(root)
-        {
+        if let Some(refused) = refused_log_dir(&dir) {
             let err = std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "{} is not a plain directory (a reparse point)",
-                    root.display()
+                    "{} is not a plain directory this process can open (a reparse point, a file, or a create that failed)",
+                    refused.display()
                 ),
             );
-            setup.refusals.push((dir, LogRefusal::Root(err)));
+            setup.refusals.push((dir, LogRefusal::Gate(err)));
             continue;
         }
         match tracing_appender::rolling::Builder::new()
@@ -664,31 +692,33 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn a_nonexistent_log_root_is_created_and_accepted() {
+    fn a_nonexistent_log_dir_is_created_and_accepted() {
         // Stands in for the single most common first run there is: a clean
         // install with no `%LOCALAPPDATA%\arkyve-refresh-shop` yet.
         // `install_logging` cannot be called from a test (the subscriber is
         // process-global, so a second call panics — see its doc comment), so
-        // this exercises `log_root_is_writable`, the predicate it gates on.
+        // this exercises `refused_log_dir`, the predicate it gates on.
         let parent = TempDir::new("fresh_log_root");
         let root = parent.join("arkyve-refresh-shop");
+        let logs = root.join("logs");
         assert!(
             !root.exists(),
             "the scratch setup must not have created this already"
         );
 
-        assert!(
-            log_root_is_writable(&root),
-            "a root that has simply never been created must not be refused: \
-             refusing it would leave a first run with no log file at all"
+        assert_eq!(
+            refused_log_dir(&logs),
+            None,
+            "a root and a leaf that have simply never been created must not be \
+             refused: refusing them would leave a first run with no log file at all"
         );
-        assert!(root.is_dir(), "the root must now exist");
+        assert!(logs.is_dir(), "both directories must now exist");
     }
 
     #[cfg(windows)]
     #[test]
     fn a_junctioned_log_root_is_refused_even_though_create_dir_all_resolves_through_it() {
-        // The bug `log_root_is_writable` exists to avoid: on a junctioned
+        // The bug `created_dir_is_plain` exists to avoid: on a junctioned
         // root, `create_dir_all` resolves through the junction and reports
         // success (the target already exists), so that success alone must
         // never be read as "the root is trustworthy".
@@ -703,9 +733,42 @@ mod tests {
             return;
         }
 
-        assert!(
-            !log_root_is_writable(&root),
+        assert_eq!(
+            refused_log_dir(&root.join("logs")).as_deref(),
+            Some(root.as_path()),
             "a junctioned root must be refused even after create_dir_all resolves through it"
+        );
+        assert!(
+            !victim.path().join("logs").exists(),
+            "the root is checked before the leaf is created, or creating the leaf \
+             is itself a write through the junction"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junctioned_logs_leaf_is_refused_under_a_plain_root() {
+        // The leaf, not the root, is the directory `Builder::build` writes
+        // into, and it is the reachable half: the root is created with
+        // inherited ACLs, so a same-user process can delete `logs` between two
+        // runs and leave this junction under that name. A gate that only
+        // proved the root would let the elevated process create the log file
+        // straight through it.
+        let home = TempDir::new("junctioned_logs_home");
+        let victim = TempDir::new("junctioned_logs_victim");
+        let root = home.join("arkyve-refresh-shop");
+        std::fs::create_dir_all(&root).unwrap();
+        let logs = root.join("logs");
+
+        if !junction(&logs, victim.path()) {
+            eprintln!("skipped: mklink /J is unavailable here");
+            return;
+        }
+
+        assert_eq!(
+            refused_log_dir(&logs).as_deref(),
+            Some(logs.as_path()),
+            "a plain root does not make the junction under it safe to write through"
         );
     }
 
