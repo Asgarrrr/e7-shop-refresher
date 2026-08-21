@@ -888,27 +888,9 @@ mod tests {
             SurfaceError::Recoverable("the game window moved or resized mid-job".to_owned()),
         ));
         for seed in [1, 2] {
-            rig.job_tx
-                .send(plan::refresh_job(
-                    Trigger::Refreshed,
-                    Timings::default(),
-                    Epoch(0),
-                    seed,
-                ))
-                .await
-                .unwrap();
+            rig.job_tx.send(refresh(seed)).await.unwrap();
         }
-        drop(rig.job_tx);
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            live_mode(),
-            no_reload,
-        )
-        .await;
+        rig.run(surface, live_mode()).await;
 
         // Job 1: one click lands, the second is refused, then the abort's
         // release. Job 2: both clicks and its own release.
@@ -957,6 +939,77 @@ mod tests {
         }
     }
 
+    /// The two-click refresh job these tests use as their generic unit of work.
+    /// `seed` stays a caller argument: a test that queues two jobs tells them
+    /// apart by it, and `every_input_and_the_release_see_the_window_that_job_acquired`
+    /// reads the two windows in that order. `Epoch(0)` is what a fresh [`rig`]'s
+    /// `SnapshotEpoch` reports, so a job built here is never stale by accident —
+    /// the one test about staleness builds its job by hand from `rig.epoch`.
+    fn refresh(seed: u64) -> Job {
+        plan::refresh_job(Trigger::Refreshed, Timings::default(), Epoch(0), seed)
+    }
+
+    /// A buy job for `rows`, at the same fixed epoch as [`refresh`]. Which rows
+    /// are planned is the whole subject of the tests that call this — a
+    /// bottom-group row is what makes the plan contain scrolls — so the slice
+    /// stays at the call site, including how each `Row` was built.
+    fn buy(rows: &[plan::Row]) -> Job {
+        plan::buy_job(Trigger::ShopOpened, Timings::default(), Epoch(0), rows, 42)
+    }
+
+    /// What a finished executor run leaves for the test to read. Returned
+    /// rather than hand-cloned above every call: [`run_executor`] takes the
+    /// journal and the gate by value, so each site used to clone whichever one
+    /// it was about one line before handing both away.
+    struct Ran {
+        journal: EventLog,
+        gate: WatchGate,
+    }
+
+    impl Rig {
+        /// Closes the submit side, then drives the executor over exactly what is
+        /// already queued so the loop ends on EOF rather than on a timer.
+        ///
+        /// Hides no verdict. `mode` is a caller argument because the rehearsal
+        /// switch is what several of these tests are about; the surface, with
+        /// whatever failure it was armed with, is built at the call site; and
+        /// the backend-swap hook is [`no_reload`], which panics — a test that
+        /// means to swap backends calls [`run_executor`] itself.
+        async fn run<S: Surface>(self, surface: S, mode: Arc<Mutex<ClickMode>>) -> Ran {
+            let ran = Ran {
+                journal: self.journal.clone(),
+                gate: self.gate.clone(),
+            };
+            drop(self.job_tx);
+            run_executor(
+                surface,
+                self.job_rx,
+                self.gate,
+                self.epoch,
+                self.journal,
+                mode,
+                no_reload,
+            )
+            .await;
+            ran
+        }
+
+        /// [`Rig::run`] under a ceiling, for the tests whose subject is that the
+        /// executor *keeps draining* after a fatal instead of wedging. The
+        /// wedge is the failure they watch for, so `expectation` — the sentence
+        /// a hang would print — stays at the call site, one per test.
+        async fn run_bounded<S: Surface>(
+            self,
+            surface: S,
+            mode: Arc<Mutex<ClickMode>>,
+            expectation: &str,
+        ) -> Ran {
+            tokio::time::timeout(Duration::from_secs(10), self.run(surface, mode))
+                .await
+                .expect(expectation)
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn executor_skips_stale_epoch_jobs() {
         let rig = rig();
@@ -969,21 +1022,10 @@ mod tests {
         );
         rig.epoch.bump(); // a newer shop arrived before the job started
         rig.job_tx.send(job).await.unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            live_mode(),
-            no_reload,
-        )
-        .await;
+        let ran = rig.run(surface, live_mode()).await;
         assert!(events.lock().unwrap().is_empty());
         // Dropped, but never silently: the submit side promised a click.
-        assert!(journal.to_entries().iter().any(|line| {
+        assert!(ran.journal.to_entries().iter().any(|line| {
             line.text
                 .contains("the shop changed — dropped planned clicks")
         }));
@@ -994,29 +1036,10 @@ mod tests {
         let rig = rig();
         rig.gate.set(false);
         let (surface, events) = FakeSurface::new(design_rect());
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            live_mode(),
-            no_reload,
-        )
-        .await;
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        let ran = rig.run(surface, live_mode()).await;
         assert!(events.lock().unwrap().is_empty());
-        assert!(journal.to_entries().iter().any(|line| {
+        assert!(ran.journal.to_entries().iter().any(|line| {
             line.text
                 .contains("the watch is off — dropped planned clicks")
         }));
@@ -1029,32 +1052,13 @@ mod tests {
         let releases = surface.releases.clone();
         let gate = rig.gate.clone();
         surface.on_input = Box::new(move || gate.set(false));
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            live_mode(),
-            no_reload,
-        )
-        .await;
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        let ran = rig.run(surface, live_mode()).await;
         // Two steps planned, only the first landed.
         assert_eq!(events.lock().unwrap().len(), 1);
         assert_eq!(*releases.lock().unwrap(), 1);
         assert!(
-            journal
+            ran.journal
                 .to_entries()
                 .iter()
                 .any(|line| line.text.contains("aborted remaining clicks"))
@@ -1068,30 +1072,11 @@ mod tests {
         let releases = surface.releases.clone();
         let epoch = rig.epoch.clone();
         surface.on_input = Box::new(move || epoch.bump());
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            live_mode(),
-            no_reload,
-        )
-        .await;
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        let ran = rig.run(surface, live_mode()).await;
         assert_eq!(events.lock().unwrap().len(), 1);
         assert_eq!(*releases.lock().unwrap(), 1);
-        assert!(journal.to_entries().iter().any(|line| {
+        assert!(ran.journal.to_entries().iter().any(|line| {
             line.text
                 .contains("the shop changed — aborted remaining clicks")
         }));
@@ -1103,40 +1088,22 @@ mod tests {
         let (surface, events) =
             FakeSurface::new(Err(SurfaceError::Fatal("game window not found".to_owned())));
         let releases = surface.releases.clone();
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
+        rig.job_tx.send(refresh(1)).await.unwrap();
         // The fatal no longer ends the task, so the producer has to close the
-        // channel for the loop to finish; the timeout fails the test if the
+        // channel for the loop to finish; the ceiling fails the test if the
         // fatal ever stops consuming.
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        let gate = rig.gate.clone();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            run_executor(
+        let ran = rig
+            .run_bounded(
                 surface,
-                rig.job_rx,
-                rig.gate,
-                rig.epoch,
-                rig.journal,
                 live_mode(),
-                no_reload,
-            ),
-        )
-        .await
-        .expect("the executor must keep draining after a fatal acquire, then end on EOF");
+                "the executor must keep draining after a fatal acquire, then end on EOF",
+            )
+            .await;
         assert!(events.lock().unwrap().is_empty());
-        assert!(!gate.is_enabled());
-        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
+        assert!(!ran.gate.is_enabled());
+        assert_eq!(ran.gate.next_halt().await, HaltSource::ActuatorFailed);
         assert_eq!(*releases.lock().unwrap(), 0, "acquire engaged nothing");
-        assert!(journal.to_entries().iter().any(|line| {
+        assert!(ran.journal.to_entries().iter().any(|line| {
             line.text
                 .contains("actuator: game window not found — stopping the loop")
         }));
@@ -1154,39 +1121,21 @@ mod tests {
             "game window vanished".to_owned(),
         )));
         let releases = surface.releases.clone();
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        let gate = rig.gate.clone();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            run_executor(
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        let ran = rig
+            .run_bounded(
                 surface,
-                rig.job_rx,
-                rig.gate,
-                rig.epoch,
-                rig.journal,
                 live_mode(),
-                no_reload,
-            ),
-        )
-        .await
-        .expect("a recoverable acquire must end the job, then the loop ends on EOF");
+                "a recoverable acquire must end the job, then the loop ends on EOF",
+            )
+            .await;
         assert!(events.lock().unwrap().is_empty());
         assert!(
-            gate.is_enabled(),
+            ran.gate.is_enabled(),
             "a transient blip must not halt the watch"
         );
         assert_eq!(*releases.lock().unwrap(), 0, "acquire engaged nothing");
-        assert!(journal.to_entries().iter().any(|line| {
+        assert!(ran.journal.to_entries().iter().any(|line| {
             line.text
                 .contains("actuator: game window vanished — aborted remaining clicks")
         }));
@@ -1206,36 +1155,19 @@ mod tests {
         ));
         let rig = rig();
         let (surface, events) = FakeSurface::new(Err(refusal));
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        let gate = rig.gate.clone();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            run_executor(
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        let ran = rig
+            .run_bounded(
                 surface,
-                rig.job_rx,
-                rig.gate,
-                rig.epoch,
-                rig.journal,
                 live_mode(),
-                no_reload,
-            ),
-        )
-        .await
-        .expect("a refused preflight must halt the watch, not wedge the executor");
+                "a refused preflight must halt the watch, not wedge the executor",
+            )
+            .await;
 
         assert!(events.lock().unwrap().is_empty(), "nothing may be clicked");
-        assert!(!gate.is_enabled());
-        let line = journal
+        assert!(!ran.gate.is_enabled());
+        let line = ran
+            .journal
             .to_entries()
             .into_iter()
             .find(|line| line.text.contains("stopping the loop"))
@@ -1264,37 +1196,19 @@ mod tests {
             SurfaceError::Fatal("could not raise the input shield".to_owned()),
         ));
         let releases = surface.releases.clone();
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        let gate = rig.gate.clone();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            run_executor(
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        let ran = rig
+            .run_bounded(
                 surface,
-                rig.job_rx,
-                rig.gate,
-                rig.epoch,
-                rig.journal,
                 live_mode(),
-                no_reload,
-            ),
-        )
-        .await
-        .expect("a fatal input must end the job, then the loop ends on EOF");
+                "a fatal input must end the job, then the loop ends on EOF",
+            )
+            .await;
         assert!(events.lock().unwrap().is_empty());
-        assert!(!gate.is_enabled());
-        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
+        assert!(!ran.gate.is_enabled());
+        assert_eq!(ran.gate.next_halt().await, HaltSource::ActuatorFailed);
         assert_eq!(*releases.lock().unwrap(), 1);
-        assert!(journal.to_entries().iter().any(|line| {
+        assert!(ran.journal.to_entries().iter().any(|line| {
             line.text
                 .contains("could not raise the input shield — stopping the loop")
         }));
@@ -1313,48 +1227,27 @@ mod tests {
         ));
         let releases = surface.releases.clone();
         rig.job_tx
-            .send(plan::buy_job(
-                Trigger::ShopOpened,
-                Timings::default(),
-                Epoch(0),
-                &[plan::Row::new(0).unwrap(), plan::Row::new(4).unwrap()],
-                42,
-            ))
+            .send(buy(&[
+                plan::Row::new(0).unwrap(),
+                plan::Row::new(4).unwrap(),
+            ]))
             .await
             .unwrap();
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        let gate = rig.gate.clone();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            run_executor(
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        let ran = rig
+            .run_bounded(
                 surface,
-                rig.job_rx,
-                rig.gate,
-                rig.epoch,
-                rig.journal,
                 live_mode(),
-                no_reload,
-            ),
-        )
-        .await
-        .expect("a fatal mid-job input must drop the queued work, then end on EOF");
+                "a fatal mid-job input must drop the queued work, then end on EOF",
+            )
+            .await;
         assert_eq!(events.lock().unwrap().len(), 3);
-        assert!(!gate.is_enabled());
-        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
+        assert!(!ran.gate.is_enabled());
+        assert_eq!(ran.gate.next_halt().await, HaltSource::ActuatorFailed);
         // Only the first job ever acquired: the queued one was refused before
         // the surface was touched.
         assert_eq!(*releases.lock().unwrap(), 1);
-        let lines = journal.to_entries();
+        let lines = ran.journal.to_entries();
         assert_eq!(
             lines
                 .iter()
@@ -1396,15 +1289,7 @@ mod tests {
             no_reload,
         ));
 
-        job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
+        job_tx.send(refresh(1)).await.unwrap();
         assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
         assert!(!gate.is_enabled());
         assert!(
@@ -1420,15 +1305,7 @@ mod tests {
             "the acknowledged cause must let it re-arm"
         );
 
-        job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                2,
-            ))
-            .await
-            .unwrap();
+        job_tx.send(refresh(2)).await.unwrap();
         drop(job_tx);
         tokio::time::timeout(Duration::from_secs(10), executor)
             .await
@@ -1461,33 +1338,18 @@ mod tests {
             SurfaceError::Recoverable("the game window moved or resized mid-job".to_owned()),
         ));
         let releases = surface.releases.clone();
-        let gate = rig.gate.clone();
         rig.job_tx
-            .send(plan::buy_job(
-                Trigger::ShopOpened,
-                Timings::default(),
-                Epoch(0),
-                &[plan::Row::new(0).unwrap(), plan::Row::new(4).unwrap()],
-                42,
-            ))
+            .send(buy(&[
+                plan::Row::new(0).unwrap(),
+                plan::Row::new(4).unwrap(),
+            ]))
             .await
             .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            live_mode(),
-            no_reload,
-        )
-        .await;
+        let ran = rig.run(surface, live_mode()).await;
         assert_eq!(events.lock().unwrap().len(), 3);
-        assert!(gate.is_enabled(), "no halt for a recoverable abort");
+        assert!(ran.gate.is_enabled(), "no halt for a recoverable abort");
         assert_eq!(*releases.lock().unwrap(), 1);
-        assert!(journal.to_entries().iter().any(|line| {
+        assert!(ran.journal.to_entries().iter().any(|line| {
             line.text
                 .contains("the game window moved or resized mid-job — aborted remaining clicks")
         }));
@@ -1502,39 +1364,12 @@ mod tests {
             SurfaceError::Recoverable("the game window moved or resized mid-job".to_owned()),
         ));
         let releases = surface.releases.clone();
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                2,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        let gate = rig.gate.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            live_mode(),
-            no_reload,
-        )
-        .await;
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        rig.job_tx.send(refresh(2)).await.unwrap();
+        let ran = rig.run(surface, live_mode()).await;
         // First job: one landed click, then the abort. Second job: both.
         assert_eq!(events.lock().unwrap().len(), 3);
-        assert!(gate.is_enabled());
+        assert!(ran.gate.is_enabled());
         assert_eq!(*releases.lock().unwrap(), 2);
     }
 
@@ -1552,32 +1387,12 @@ mod tests {
             height: 0,
         }));
         let releases = surface.releases.clone();
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        let gate = rig.gate.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            live_mode(),
-            no_reload,
-        )
-        .await;
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        let ran = rig.run(surface, live_mode()).await;
         assert!(events.lock().unwrap().is_empty());
-        assert!(gate.is_enabled());
+        assert!(ran.gate.is_enabled());
         assert_eq!(*releases.lock().unwrap(), 1);
-        assert!(journal.to_entries().iter().any(|line| {
+        assert!(ran.journal.to_entries().iter().any(|line| {
             line.text
                 .contains("degenerate client area 0×0 — aborted remaining clicks")
         }));
@@ -1610,27 +1425,11 @@ mod tests {
             let rig = rig();
             let (surface, events) = FakeSurface::new(Ok(rect));
             rig.job_tx
-                .send(plan::buy_job(
-                    Trigger::ShopOpened,
-                    Timings::default(),
-                    Epoch(0),
-                    &[plan::Row::new(0).expect("row 0 is one of the six")],
-                    42,
-                ))
+                .send(buy(&[plan::Row::new(0).expect("row 0 is one of the six")]))
                 .await
                 .unwrap();
-            drop(rig.job_tx);
             let started = tokio::time::Instant::now();
-            run_executor(
-                surface,
-                rig.job_rx,
-                rig.gate,
-                rig.epoch,
-                rig.journal,
-                live_mode(),
-                no_reload,
-            )
-            .await;
+            rig.run(surface, live_mode()).await;
             assert_eq!(
                 started.elapsed(),
                 Duration::ZERO,
@@ -1650,35 +1449,9 @@ mod tests {
         let releases = surface.releases.clone();
         let gate = rig.gate.clone();
         surface.on_input = Box::new(move || gate.set(false));
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                2,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            live_mode(),
-            no_reload,
-        )
-        .await;
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        rig.job_tx.send(refresh(2)).await.unwrap();
+        rig.run(surface, live_mode()).await;
         assert_eq!(*releases.lock().unwrap(), 1);
     }
 
@@ -1695,38 +1468,20 @@ mod tests {
             height: 800,
         }));
         let releases = surface.releases.clone();
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        let gate = rig.gate.clone();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            run_executor(
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        let ran = rig
+            .run_bounded(
                 surface,
-                rig.job_rx,
-                rig.gate,
-                rig.epoch,
-                rig.journal,
                 live_mode(),
-                no_reload,
-            ),
-        )
-        .await
-        .expect("a fatal coordinate conversion must end the job, then the loop ends on EOF");
+                "a fatal coordinate conversion must end the job, then the loop ends on EOF",
+            )
+            .await;
         assert!(events.lock().unwrap().is_empty());
-        assert!(!gate.is_enabled());
-        assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
+        assert!(!ran.gate.is_enabled());
+        assert_eq!(ran.gate.next_halt().await, HaltSource::ActuatorFailed);
         assert_eq!(*releases.lock().unwrap(), 1);
         assert!(
-            journal
+            ran.journal
                 .to_entries()
                 .iter()
                 .any(|line| line.text.contains("narrower than 16:9"))
@@ -1738,30 +1493,11 @@ mod tests {
         let rig = rig();
         let (surface, events) = FakeSurface::new(design_rect());
         let releases = surface.releases.clone();
-        rig.job_tx
-            .send(plan::refresh_job(
-                Trigger::Refreshed,
-                Timings::default(),
-                Epoch(0),
-                1,
-            ))
-            .await
-            .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rehearsal_mode(),
-            no_reload,
-        )
-        .await;
+        rig.job_tx.send(refresh(1)).await.unwrap();
+        let ran = rig.run(surface, rehearsal_mode()).await;
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(*releases.lock().unwrap(), 1);
-        let lines = journal.to_entries();
+        let lines = ran.journal.to_entries();
         assert_eq!(
             lines
                 .iter()
@@ -1781,27 +1517,13 @@ mod tests {
             let rig = rig();
             let (surface, _events) = FakeSurface::new(design_rect());
             let engaged = surface.engaged.clone();
-            rig.job_tx
-                .send(plan::refresh_job(
-                    Trigger::Refreshed,
-                    Timings::default(),
-                    Epoch(0),
-                    1,
-                ))
-                .await
-                .unwrap();
-            drop(rig.job_tx);
-            run_executor(
+            rig.job_tx.send(refresh(1)).await.unwrap();
+            rig.run(
                 surface,
-                rig.job_rx,
-                rig.gate,
-                rig.epoch,
-                rig.journal,
                 mode_cell(ClickMode {
                     dry_run,
                     ..ClickMode::default()
                 }),
-                no_reload,
             )
             .await;
             assert_eq!(
@@ -1821,31 +1543,14 @@ mod tests {
         let (surface, events) = FakeSurface::new(design_rect());
         let releases = surface.releases.clone();
         rig.job_tx
-            .send(plan::buy_job(
-                Trigger::ShopOpened,
-                Timings::default(),
-                Epoch(0),
-                // First row past `LAST_TOP_ROW`, which is `plan`-private here.
-                &[plan::Row::new(4).expect("row 4 is one of the six")],
-                42,
-            ))
+            // First row past `LAST_TOP_ROW`, which is `plan`-private here.
+            .send(buy(&[plan::Row::new(4).expect("row 4 is one of the six")]))
             .await
             .unwrap();
-        drop(rig.job_tx);
-        let journal = rig.journal.clone();
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            rehearsal_mode(),
-            no_reload,
-        )
-        .await;
+        let ran = rig.run(surface, rehearsal_mode()).await;
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(*releases.lock().unwrap(), 1);
-        let lines = journal.to_entries();
+        let lines = ran.journal.to_entries();
         assert_eq!(
             lines
                 .iter()
@@ -1867,13 +1572,7 @@ mod tests {
         };
         let (surface, events) = FakeSurface::new(Ok(rect));
         let releases = surface.releases.clone();
-        let job = plan::buy_job(
-            Trigger::ShopOpened,
-            Timings::default(),
-            Epoch(0),
-            &[plan::Row::new(1).unwrap()],
-            42,
-        );
+        let job = buy(&[plan::Row::new(1).unwrap()]);
         let expected: Vec<Recorded> = job
             .steps
             .iter()
@@ -1886,17 +1585,7 @@ mod tests {
             })
             .collect();
         rig.job_tx.send(job).await.unwrap();
-        drop(rig.job_tx);
-        run_executor(
-            surface,
-            rig.job_rx,
-            rig.gate,
-            rig.epoch,
-            rig.journal,
-            live_mode(),
-            no_reload,
-        )
-        .await;
+        rig.run(surface, live_mode()).await;
         assert_eq!(*events.lock().unwrap(), expected);
         assert_eq!(*releases.lock().unwrap(), 1);
     }
