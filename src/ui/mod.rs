@@ -372,9 +372,6 @@ fn persisted_sections(commands: &[Command]) -> Vec<config::persist::Section> {
 /// leaves the backend line exactly as the player wrote it.
 fn startup_sections(edits: editor::StartupEdits) -> Vec<config::persist::Section> {
     let mut sections = Vec::new();
-    if let Some(port) = edits.game_port {
-        sections.push(config::persist::Section::GamePort(port));
-    }
     if let Some(dry_run) = edits.dry_run {
         sections.push(config::persist::Section::DryRun(dry_run));
     }
@@ -393,12 +390,10 @@ fn section_labels(sections: &[config::persist::Section]) -> String {
             config::persist::Section::Filter(_) => "Hunt",
             config::persist::Section::Limits(_) => "Stop",
             config::persist::Section::Timings(_) => "Click timing",
-            // All three live in one collapsible, so one label points at it.
-            // Naming the key instead would send a player looking for a block
-            // called "game_port".
-            config::persist::Section::GamePort(_)
-            | config::persist::Section::DryRun(_)
-            | config::persist::Section::Backend(_) => "Startup",
+            // Both live in one collapsible, so one label points at it. Naming
+            // the key instead would send a player looking for a block called
+            // "dry_run".
+            config::persist::Section::DryRun(_) | config::persist::Section::Backend(_) => "Startup",
         })
         .collect();
     // The three Startup keys are three sections with one label, and they are
@@ -470,8 +465,8 @@ fn render_setup_tab(
             content_inset(ui, |ui| {
                 // `session_alive` goes *into* `edit_sections` rather than
                 // wrapping it: the Startup section must stay editable on a dead
-                // session, since a wrong `game_port` is one of the reasons the
-                // session is dead. See `editor::commit_row`.
+                // session, because the backend switch is the fallback for the
+                // actuator fault that killed it. See `editor::commit_row`.
                 editor::edit_sections(ui, editor, session_alive);
             });
         });
@@ -525,37 +520,32 @@ mod tests {
     /// The second bridge, per field: nothing that did not move gets written.
     #[test]
     fn only_the_startup_fields_that_moved_become_sections() {
-        let port = std::num::NonZeroU16::new(4001).expect("4001 is not zero");
         assert!(startup_sections(editor::StartupEdits::default()).is_empty());
         assert_eq!(
             startup_sections(editor::StartupEdits {
-                game_port: Some(port),
+                dry_run: Some(true),
                 ..Default::default()
             }),
-            vec![config::persist::Section::GamePort(port)]
+            vec![config::persist::Section::DryRun(true)]
         );
         assert_eq!(
             startup_sections(editor::StartupEdits {
-                game_port: Some(port),
                 dry_run: Some(true),
                 backend: Some(config::ActuatorBackend::Input),
             }),
             vec![
-                config::persist::Section::GamePort(port),
                 config::persist::Section::DryRun(true),
                 config::persist::Section::Backend(config::ActuatorBackend::Input),
             ]
         );
     }
 
-    /// The three Startup keys are one collapsible, so the "not saved" report
-    /// must name it once — not three times.
+    /// Both Startup keys are one collapsible, so the "not saved" report must
+    /// name it once — not twice.
     #[test]
     fn the_not_saved_report_names_the_startup_block_once() {
-        let port = std::num::NonZeroU16::new(4001).expect("4001 is not zero");
         let sections = vec![
             config::persist::Section::Limits(Limits::default()),
-            config::persist::Section::GamePort(port),
             config::persist::Section::DryRun(true),
             config::persist::Section::Backend(config::ActuatorBackend::Input),
         ];

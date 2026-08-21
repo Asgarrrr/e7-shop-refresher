@@ -205,12 +205,13 @@ The app reads and writes its config at a per-user location, not beside the exe:
 - **Other (dev):** `config.toml` in the working directory
 
 The Setup tab's Apply writes back everything it can edit — `[filter]`,
-`[limits]`, `[actuator.timings]`, and the `game_port` / `dry_run` / `backend`
-keys under **Startup** — preserving every comment and every section it does not
-own. Those last three take effect on the next launch, and the Startup section
-says so beside them. Only `server_url` and `[reconnect]` are hand-edited:
-`server_url` can carry a credential and is deliberately kept out of the window,
-where it would pass through UI state and into any screenshot. On first run the bundled
+`[limits]`, `[actuator.timings]`, and the `dry_run` / `backend` keys under
+**Startup** — preserving every comment and every section it does not own. Those
+last two take effect on the next launch, and the Startup section says so beside
+them. Everything else is hand-edited, and two of those are deliberate:
+`server_url` can carry a credential and is kept out of the window, where it
+would pass through UI state and into any screenshot; `game_port` is not
+something a player sets from the window. On first run the bundled
 `config.example.toml` (compiled into the exe) is written to that path, so a
 real, commented, valid file is always there to inspect or edit; later runs
 leave it untouched — with one exception: a file still carrying the retired keys
@@ -219,7 +220,7 @@ file to regenerate the example on the next launch.
 
 | Key | Default | Purpose |
 |-----|---------|---------|
-| `game_port` | `3333` | Game server TCP port. Editable in Setup → Startup; takes effect on restart |
+| `game_port` | `3333` | Game server TCP port. Edited in this file, not in the window: it is compiled into every adapter's capture filter when the app starts |
 | `server_url` | `wss://ingest.arkyve.dev/refresh-shop` | Analysis server |
 | `forward.server_to_client` | — | **Retired.** Still parsed so older files keep loading, then removed from your `config.toml` at the next startup; ignored (the server → client stream is the only one captured) |
 | `forward.client_to_server` | — | **Retired.** Still parsed so older files keep loading, then removed from your `config.toml` at the next startup; ignored (the client → server stream is never captured) |
@@ -294,8 +295,8 @@ Reading it yourself:
   *"Restrict Npcap driver's access to Administrators"* is the usual cause, and
   the app names that case explicitly.
 - Adapters open but no `first server-to-client segment admitted` → the tap is
-  running and the game server's traffic never matched. Check `game_port` against
-  the port the game actually uses — Setup → Startup, then restart the app.
+  running and the game server's traffic never matched. Check `game_port` in
+  `config.toml` against the port the game actually uses, then restart the app.
 - No `capture progress` line for a whole session → nothing is reaching the
   pipeline on `game_port`; same causes as above. Set
   `RUST_LOG=arkyve_refresh_shop=debug` to get the `capture funnel` line, which

@@ -1,15 +1,12 @@
-//! Startup: the settings a running session never reads again — the game port
-//! and the actuator's two mode switches — plus the notice that says so.
+//! Startup: the settings a running session never reads again — the actuator's
+//! two mode switches — plus the notice that says so.
 //!
 //! # Why this section is not like the other three
 //!
 //! Hunt, Stop and Click timing retune a live session: their Apply emits a
 //! `Command`, the session takes it, and the change is in effect before the
-//! player lets go of the mouse. None of the three below can do that, and the
-//! reason is different for each:
+//! player lets go of the mouse. Neither of the two below can do that:
 //!
-//! - `game_port` builds the kernel BPF filter, compiled into every adapter
-//!   when `PcapSource::open` runs once at startup (`capture/pcap/mod.rs`).
 //! - `backend` picks the `Surface` that is *moved into* `run_executor` along
 //!   with the only receiver for its job queue (`app::Session::run`).
 //! - `dry_run` is read by that same executor, and separately decides whether
@@ -21,10 +18,21 @@
 //! the next launch is worse than no editor at all: the player concludes the
 //! tool is broken, which is exactly the state they were already in when they
 //! came here.
+//!
+//! # `game_port` is deliberately not here
+//!
+//! It was, briefly (`8d25453`), and it was taken out again on the maintainer's
+//! decision: the port is not something a player sets from the window. It stays
+//! a `config.toml` key, and `README.md` says so rather than pointing at a field
+//! that does not exist.
+//!
+//! Note that it *would* have been the restart-only case with the hardest
+//! constraint of the three — the port is compiled into every adapter's kernel
+//! BPF filter when `PcapSource::open` runs, once, at process start — so nothing
+//! about that argument is lost by dropping it. If it is ever wanted back, the
+//! shape is in `8d25453`.
 
 use eframe::egui;
-
-use std::num::NonZeroU16;
 
 use super::super::theme;
 use crate::config::ActuatorBackend;
@@ -32,49 +40,35 @@ use crate::config::ActuatorBackend;
 /// What the Startup drafts start from: the values *this* process was launched
 /// with, read out of the config before `app::setup` consumes it.
 ///
-/// A struct rather than three parameters because they travel together through
+/// A struct rather than two parameters because they travel together through
 /// four call sites and mean one thing — "what a restart would currently do".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartupSettings {
-    pub game_port: NonZeroU16,
     pub dry_run: bool,
     pub backend: ActuatorBackend,
 }
 
 impl Default for StartupSettings {
     /// Taken from [`crate::config::Config`]'s own `Default` rather than
-    /// restated, so the drafts a
-    /// preview or a test starts from cannot drift away from the ones a player
-    /// with no config.toml gets. Pinned by
+    /// restated, so the drafts a preview or a test starts from cannot drift
+    /// away from the ones a player with no config.toml gets. Pinned by
     /// `the_defaults_are_the_loader_s_defaults`.
     fn default() -> Self {
         let config = crate::config::Config::default();
         Self {
-            game_port: config.game_port,
             dry_run: config.actuator.dry_run,
             backend: config.actuator.backend,
         }
     }
 }
 
-/// The port field's domain, and it is the loader's:
-/// [`NonZeroU16`] is `1..=65_535`.
-///
-/// Spelled out as a range rather than derived, because a `DragValue` needs
-/// concrete bounds — and pinned to the type by
-/// `the_port_field_is_bounded_by_what_the_config_accepts`, so widening one
-/// without the other fails a test instead of shipping.
-const PORT_MIN: u16 = 1;
-const PORT_MAX: u16 = u16::MAX;
-
 /// One-line recap for the folded Startup bar.
-pub(super) fn startup_summary(port: NonZeroU16, dry_run: bool, backend: ActuatorBackend) -> String {
-    let mode = if dry_run {
-        "rehearsal"
+pub(super) fn startup_summary(dry_run: bool, backend: ActuatorBackend) -> String {
+    if dry_run {
+        "rehearsal".to_owned()
     } else {
-        backend_label(backend)
-    };
-    format!("port {port} · {mode}")
+        backend_label(backend).to_owned()
+    }
 }
 
 /// The label a player reads, per backend. Not the TOML spelling: `message`
@@ -94,31 +88,6 @@ fn backend_hint(backend: ActuatorBackend) -> &'static str {
         ActuatorBackend::Message => "no focus stolen, the mouse stays yours",
         ActuatorBackend::Input => "moves the real cursor; use if posted clicks stop working",
     }
-}
-
-/// The game port, bounded to exactly what [`NonZeroU16`] accepts.
-///
-/// The draft is a `NonZeroU16` throughout rather than a `u16` validated on
-/// Apply: a field that can *hold* 0 is a field that can write `game_port = 0`
-/// to config.toml, which the next launch refuses fatally — the failure
-/// `hunt::grade_value` exists to prevent one field over.
-pub(super) fn port_row(ui: &mut egui::Ui, port: &mut NonZeroU16) {
-    row(ui, "game port", |ui| {
-        let mut raw = port.get();
-        let response = ui.add(
-            egui::DragValue::new(&mut raw)
-                .range(PORT_MIN..=PORT_MAX)
-                // The same reason `stop::duration_row` gives: clamping an
-                // existing value reports the response as changed, rewriting a
-                // draft nobody touched. The range cannot produce 0 anyway.
-                .clamp_existing_to_range(false),
-        );
-        if response.changed()
-            && let Some(edited) = NonZeroU16::new(raw)
-        {
-            *port = edited;
-        }
-    });
 }
 
 /// The rehearsal switch.
@@ -168,7 +137,7 @@ pub(super) fn restart_notice(ui: &mut egui::Ui, dirty: bool) {
     );
 }
 
-/// Width of the label column, so the three rows' values line up the way
+/// Width of the label column, so both rows' values line up the way
 /// `stop::limit_ledger_row` lines its own up.
 const LABEL_WIDTH: f32 = 130.0;
 
@@ -191,29 +160,6 @@ fn row(ui: &mut egui::Ui, label: &str, value: impl FnOnce(&mut egui::Ui)) {
 mod tests {
     use super::*;
     use crate::config::Config;
-
-    /// The rule this section owes, same shape as
-    /// `hunt::the_grade_field_is_bounded_by_what_the_config_accepts`: widen the
-    /// loader without widening the field and the tab refuses a legal port;
-    /// widen the field without the loader and the tab authors a config.toml the
-    /// next launch will not load.
-    #[test]
-    fn the_port_field_is_bounded_by_what_the_config_accepts() {
-        for port in [PORT_MIN, 3333, PORT_MAX] {
-            let config: Config = toml::from_str(&format!("game_port = {port}"))
-                .expect("the field must not offer a port the loader refuses");
-            assert_eq!(config.game_port.get(), port);
-        }
-        // The two just outside, and the reason the draft is a `NonZeroU16`:
-        // zero is the one value in `u16` the loader rejects, and a field that
-        // could produce it would write a config.toml that never loads again.
-        for outside in ["0", "65536"] {
-            assert!(
-                toml::from_str::<Config>(&format!("game_port = {outside}")).is_err(),
-                "the field must not be able to author {outside}"
-            );
-        }
-    }
 
     /// Both switches, from the widget's side: every value the selector offers
     /// must be one the loader reads back as the same variant. The writer's half
@@ -249,27 +195,22 @@ mod tests {
     fn the_defaults_are_the_loader_s_defaults() {
         let seeded = StartupSettings::default();
         let loaded: Config = toml::from_str("").expect("an empty config is valid");
-        assert_eq!(seeded.game_port, loaded.game_port);
         assert_eq!(seeded.dry_run, loaded.actuator.dry_run);
         assert_eq!(seeded.backend, loaded.actuator.backend);
     }
 
     #[test]
-    fn the_summary_names_the_port_and_the_mode() {
-        let port = NonZeroU16::new(3333).expect("3333 is not zero");
+    fn the_summary_names_the_mode() {
         assert_eq!(
-            startup_summary(port, false, ActuatorBackend::Message),
-            "port 3333 · posted clicks"
+            startup_summary(false, ActuatorBackend::Message),
+            "posted clicks"
         );
         assert_eq!(
-            startup_summary(port, false, ActuatorBackend::Input),
-            "port 3333 · real cursor"
+            startup_summary(false, ActuatorBackend::Input),
+            "real cursor"
         );
         // A rehearsal sends nothing, so which backend would have sent it is not
         // what the folded bar should be reporting.
-        assert_eq!(
-            startup_summary(port, true, ActuatorBackend::Input),
-            "port 3333 · rehearsal"
-        );
+        assert_eq!(startup_summary(true, ActuatorBackend::Input), "rehearsal");
     }
 }
