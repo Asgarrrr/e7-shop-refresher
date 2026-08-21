@@ -364,12 +364,12 @@ fn persisted_sections(commands: &[Command]) -> Vec<config::persist::Section> {
 }
 
 /// The restart-only half of the bridge above. Separate from
-/// [`persisted_sections`] because these three reach `config.toml` without ever
+/// [`persisted_sections`] because these two reach `config.toml` without ever
 /// reaching the session, so there is no `Command` to read them off — see
 /// `editor::EditorState::mark_startup_saved` for why that difference matters.
 ///
-/// One `Section` per field that moved, so an Apply that changed only the port
-/// leaves the backend line exactly as the player wrote it.
+/// One `Section` per field that moved, so an Apply that changed only the
+/// rehearsal switch leaves the backend line exactly as the player wrote it.
 fn startup_sections(edits: editor::StartupEdits) -> Vec<config::persist::Section> {
     let mut sections = Vec::new();
     if let Some(dry_run) = edits.dry_run {
