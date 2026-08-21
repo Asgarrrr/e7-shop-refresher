@@ -117,14 +117,29 @@ fn write_first_writable<'a>(paths: &'a [PathBuf], entry: &str) -> Option<&'a Pat
 
 fn append(path: &Path, entry: &str) -> std::io::Result<()> {
     use std::io::Write;
+    // Created before the gate below, not after: `is_plain_directory` is false
+    // for a directory that does not exist yet exactly as it is for a junction,
+    // and on a clean install nothing has made `%LOCALAPPDATA%\<app>` yet —
+    // `main` installs this hook as its first statement, ahead of the
+    // `install_logging` whose log root is what first creates that directory.
+    // Gating ahead of the create would refuse every panic in that window down
+    // to the temp fallback. Best-effort, and its result is not the authority:
+    // the error is dropped and the gate is asked regardless, because a
+    // junctioned parent makes this call *succeed* — it resolves through to a
+    // target that already exists — without making the parent trustworthy. The
+    // open below reports real failures. Same create-then-verify shape as
+    // `log_root_is_writable`.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     // Only the app-data candidate is gated, not the temp fallback: the latter
     // has no app-data root of its own to redirect (it is `temp_dir()` itself,
     // not a subdirectory this app created), and it is the ladder's guaranteed-
     // writable backstop — refusing it on top of the primary would leave a
-    // panic with nowhere to land. Refused before `create_dir_all` gets a
-    // chance to run: that call resolves reparse points same as everything
-    // else, so checking after it would only notice a redirected parent once
-    // the elevated write it exists to prevent had already gone through it.
+    // panic with nowhere to land. Still ahead of the open below, which is the
+    // write this gate exists to keep off the far end of a junction:
+    // `is_plain_directory` opens with `FILE_FLAG_OPEN_REPARSE_POINT`, so it
+    // sees the junction itself whatever the create above resolved through.
     // `write_first_writable` treats this `Err` like any other and walks to
     // the next candidate.
     #[cfg(windows)]
@@ -137,15 +152,10 @@ fn append(path: &Path, entry: &str) -> std::io::Result<()> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "{} is not a plain directory (a reparse point, or not created yet)",
+                "{} is not a plain directory (a reparse point, or uncreatable)",
                 parent.display()
             ),
         ));
-    }
-    // Best-effort: create the app-data parent so the path works before
-    // capture creates the folder; the open below reports real failures.
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
     }
     // Truncate rather than append past `MAX_CRASH_LOG_BYTES`; a metadata
     // error (file doesn't exist yet) means "not oversized", never "start over".
@@ -355,6 +365,10 @@ mod tests {
             return;
         }
 
+        // `create_dir_all` runs first now and reports success on this root —
+        // it resolves through the junction to a target that already exists —
+        // so that success alone must never be read as "the root is a plain
+        // directory".
         let result = append(&root.join("crash.log"), "entry\n");
 
         assert!(
@@ -364,6 +378,40 @@ mod tests {
         assert!(
             !victim.path().join("crash.log").exists(),
             "the entry was written through the junction into the victim directory"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_never_created_app_data_root_keeps_the_crash_log_out_of_temp() {
+        // The first run on a clean machine, which is every install's first
+        // run: `main` calls `crash::install` before `install_logging`, so a
+        // panic in between finds no `%LOCALAPPDATA%\<app>` at all. The root
+        // has to be created and then judged, not refused for being absent —
+        // refusing it sends the whole class of earliest, most interesting
+        // panics to the temp fallback while the preferred path stays empty.
+        let home = TempDir::new("fresh_home");
+        let root = home.path().join(crate::APP_DIR);
+        assert!(
+            !root.exists(),
+            "the fixture must not have created the app-data root already"
+        );
+        let preferred = root.join("crash.log");
+        let fallback = TempFile::new("fresh_fallback");
+
+        let candidates = [preferred.clone(), fallback.path().to_owned()];
+        let written = write_first_writable(&candidates, "entry\n");
+
+        assert_eq!(
+            written.map(PathBuf::as_path),
+            Some(preferred.as_path()),
+            "an app-data root that has simply never been created must not be refused"
+        );
+        let body = std::fs::read_to_string(&preferred).unwrap();
+        assert!(body.contains("entry"));
+        assert!(
+            !fallback.path().exists(),
+            "the temp fallback ran even though the preferred path was writable"
         );
     }
 
