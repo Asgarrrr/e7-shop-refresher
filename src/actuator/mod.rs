@@ -59,16 +59,59 @@ pub enum Mode {
     Live,
 }
 
+/// Input backend of the Windows build. Re-exported as
+/// [`crate::config::ActuatorBackend`], which is where `config.toml` names it.
+///
+/// Owned here rather than in `config` because [`run_executor`] reads it once
+/// per job to decide which [`Surface`] to drive, and this module imports
+/// nothing from `config`. `Deserialize` because the config layer parses
+/// straight into it — the arrangement [`plan::Timings`] already has.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActuatorBackend {
+    /// `SendInput`: drives the real cursor and forces the game window to the
+    /// foreground. Works whatever the engine reads input from — the fallback
+    /// if a game update stops honoring posted messages.
+    Input,
+    /// `PostMessageW`: posts synthetic mouse messages to the window — no
+    /// focus stolen, the player keeps the mouse. Live-validated against the
+    /// game (refresh, buys, wheel scroll, unfocused window).
+    #[default]
+    Message,
+}
+
+/// What the executor should do with the *next* job it dequeues: whether to send
+/// any input at all, and which Win32 path to send it through.
+///
+/// **One cell, not two atomics.** The pair is read together at the top of every
+/// job, and two independent atomics could be observed half-updated — a job
+/// running the old backend in the new rehearsal state, or the reverse. A single
+/// Apply must not be able to land in halves, so the pair travels as one value
+/// under one lock, exactly as [`Timings`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClickMode {
+    /// Plan and journal the clicks, send nothing.
+    pub dry_run: bool,
+    pub backend: ActuatorBackend,
+}
+
 /// The session's grip on the executor: submit jobs, bump the epoch, read and
-/// retune the player's extra waits.
+/// retune the player's extra waits and click mode.
 #[derive(Clone)]
 pub struct ActuatorHandle {
+    /// What the actuator is compiled and configured to do at all — `Off` when
+    /// no backend is built in. **Not** the rehearsal switch: that moved into
+    /// [`ClickMode`] when it became live, because a `Copy` field on a cloned
+    /// handle cannot carry a change to the executor.
     pub mode: Mode,
     pub epoch: SnapshotEpoch,
     jobs: mpsc::Sender<Job>,
     /// Shared with [`crate::app::setup`]'s live-edit path. Jobs bake the
     /// resolved waits at submit time, so the executor never touches it.
     timings: Arc<Mutex<Timings>>,
+    /// Shared with the executor, which snapshots it once per job. See
+    /// [`ClickMode`] for why it is one cell.
+    click_mode: Arc<Mutex<ClickMode>>,
 }
 
 impl ActuatorHandle {
@@ -77,12 +120,14 @@ impl ActuatorHandle {
         epoch: SnapshotEpoch,
         jobs: mpsc::Sender<Job>,
         timings: Arc<Mutex<Timings>>,
+        click_mode: Arc<Mutex<ClickMode>>,
     ) -> Self {
         Self {
             mode,
             epoch,
             jobs,
             timings,
+            click_mode,
         }
     }
 
@@ -116,6 +161,37 @@ impl ActuatorHandle {
     /// Poison-tolerant for the same reason as [`timings`](Self::timings).
     pub fn set_timings(&self, timings: Timings) {
         *lock(&self.timings) = timings;
+    }
+
+    /// The mode the next *dequeued* job runs in.
+    ///
+    /// Note the difference from [`timings`](Self::timings), and it is the whole
+    /// design: waits are baked in at **submit** time, so a job carries the
+    /// timings it was planned with. The mode is read at **dequeue** time, so a
+    /// job already sitting in the queue picks up a change made after it was
+    /// planned. Both are "applies to the next job" from the player's side; only
+    /// one of them can be baked in, because a job carries no surface.
+    #[must_use]
+    pub fn click_mode(&self) -> ClickMode {
+        *lock(&self.click_mode)
+    }
+
+    /// Swaps in the player's rehearsal switch and backend choice. Takes effect
+    /// on the next job the executor dequeues — never mid-job, see
+    /// [`run_executor`].
+    pub fn set_click_mode(&self, mode: ClickMode) {
+        *lock(&self.click_mode) = mode;
+    }
+
+    /// The cell itself, for the one caller that must *watch* it rather than
+    /// read it once: [`run_executor`], which snapshots it per job.
+    ///
+    /// Deliberately not `pub`-facing beyond that — everyone else goes through
+    /// [`click_mode`](Self::click_mode) and [`set_click_mode`](Self::set_click_mode),
+    /// so the lock is never held across anything.
+    #[must_use]
+    pub fn click_mode_cell(&self) -> Arc<Mutex<ClickMode>> {
+        Arc::clone(&self.click_mode)
     }
 }
 
@@ -238,6 +314,49 @@ pub trait Surface {
     }
 }
 
+/// Lets a boxed trait object stand in for a concrete backend, so
+/// [`run_executor`] can swap which one it drives between jobs while staying
+/// generic.
+///
+/// Both shipped backends declare `type Window = Target` — one shared type in
+/// `win::mod` — so `dyn Surface<Window = Target>` unifies them with no wrapper
+/// enum. Written as a blanket impl over `W` rather than over that one type so
+/// the test fake, whose `Window` is its own, is neither touched nor tempted
+/// into the box.
+impl<W> Surface for Box<dyn Surface<Window = W> + Send> {
+    type Window = W;
+
+    fn acquire(&mut self) -> Result<(Self::Window, plan::ClientRect), SurfaceError> {
+        (**self).acquire()
+    }
+
+    fn measure(&mut self) -> Result<(Self::Window, plan::ClientRect), SurfaceError> {
+        (**self).measure()
+    }
+
+    fn click(
+        &mut self,
+        window: &Self::Window,
+        at: (i32, i32),
+        press_ms: u64,
+    ) -> Result<(), SurfaceError> {
+        (**self).click(window, at, press_ms)
+    }
+
+    fn scroll(
+        &mut self,
+        window: &Self::Window,
+        at: (i32, i32),
+        notches: i32,
+    ) -> Result<(), SurfaceError> {
+        (**self).scroll(window, at, notches)
+    }
+
+    fn release(&mut self, window: &Self::Window) {
+        (**self).release(window);
+    }
+}
+
 /// Runs one blocking [`Surface`] call without starving the runtime.
 ///
 /// Every surface method parks its thread — 120-170 ms for a single click, a
@@ -330,15 +449,37 @@ impl<S: Surface> Drop for SurfaceJobGuard<'_, S> {
 /// the loop is what lets the player fix the cause, press Start, and recover with
 /// no process restart. (The UIPI halt is the one exception whose fix *is*
 /// restarting this app: the integrity level is fixed at process start.)
-pub async fn run_executor(
-    mut surface: impl Surface,
+pub async fn run_executor<S: Surface>(
+    mut surface: S,
     mut jobs: mpsc::Receiver<Job>,
     gate: WatchGate,
     epoch: SnapshotEpoch,
     journal: EventLog,
-    dry_run: bool,
+    click_mode: Arc<Mutex<ClickMode>>,
+    mut reload: impl FnMut(ActuatorBackend, &mut S),
 ) {
+    // The backend in hand. Compared against the snapshot below so `reload` runs
+    // only on an actual change: rebuilding every job would throw away whatever
+    // state a backend keeps across acquires for no reason.
+    let mut driving = lock(&click_mode).backend;
     while let Some(job) = jobs.recv().await {
+        // **Read once, here, and nowhere below.** `dry_run` used to be a
+        // parameter, so its three reads inside a job could not disagree. Now it
+        // can change under us, and a job that took the `measure` path and then
+        // sent real input would be acting on a rect it never engaged — or the
+        // reverse, stealing the foreground and then only journalling. Snapshot
+        // above `drop_reason` so the whole job, drop line included, describes
+        // one mode.
+        //
+        // Swapping the surface belongs here for a second reason: between jobs
+        // `SurfaceJobGuard` has already run its `release`, so nothing is owed to
+        // the backend being replaced.
+        let mode = *lock(&click_mode);
+        if mode.backend != driving {
+            reload(mode.backend, &mut surface);
+            driving = mode.backend;
+        }
+        let dry_run = mode.dry_run;
         if let Some(reason) = drop_reason(&job, &epoch, &gate) {
             // Dropping is correct; dropping silently is not — the submit
             // side already journaled the promised click.
@@ -492,6 +633,31 @@ mod tests {
     use plan::{ClientRect, Trigger};
     use std::sync::Mutex;
 
+    /// A mode cell the executor will read but nobody will write.
+    fn mode_cell(mode: ClickMode) -> Arc<Mutex<ClickMode>> {
+        Arc::new(Mutex::new(mode))
+    }
+
+    /// The default for every test that predates the live switch: real clicks,
+    /// the shipped backend.
+    fn live_mode() -> Arc<Mutex<ClickMode>> {
+        mode_cell(ClickMode::default())
+    }
+
+    fn rehearsal_mode() -> Arc<Mutex<ClickMode>> {
+        mode_cell(ClickMode {
+            dry_run: true,
+            ..ClickMode::default()
+        })
+    }
+
+    /// The swap hook for tests that never change backend. Panics rather than
+    /// no-ops: a test that reaches it has changed the backend without meaning
+    /// to, and a silent no-op would hide that.
+    fn no_reload<S>(_backend: ActuatorBackend, _surface: &mut S) {
+        panic!("this test must not swap the backend");
+    }
+
     #[tokio::test]
     async fn fail_disables_the_gate_and_latches_the_actuator_cause() {
         let journal = EventLog::default();
@@ -527,6 +693,7 @@ mod tests {
             SnapshotEpoch::default(),
             job_tx,
             Arc::clone(&timings),
+            Arc::new(Mutex::new(ClickMode::default())),
         );
         assert_eq!(handle.timings(), Timings::default());
         let retuned = plan::TimingPreset::Cautious.timings();
@@ -732,7 +899,16 @@ mod tests {
                 .unwrap();
         }
         drop(rig.job_tx);
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            live_mode(),
+            no_reload,
+        )
+        .await;
 
         // Job 1: one click lands, the second is refused, then the abort's
         // release. Job 2: both clicks and its own release.
@@ -795,7 +971,16 @@ mod tests {
         rig.job_tx.send(job).await.unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            live_mode(),
+            no_reload,
+        )
+        .await;
         assert!(events.lock().unwrap().is_empty());
         // Dropped, but never silently: the submit side promised a click.
         assert!(journal.to_entries().iter().any(|line| {
@@ -820,7 +1005,16 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            live_mode(),
+            no_reload,
+        )
+        .await;
         assert!(events.lock().unwrap().is_empty());
         assert!(journal.to_entries().iter().any(|line| {
             line.text
@@ -846,7 +1040,16 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            live_mode(),
+            no_reload,
+        )
+        .await;
         // Two steps planned, only the first landed.
         assert_eq!(events.lock().unwrap().len(), 1);
         assert_eq!(*releases.lock().unwrap(), 1);
@@ -876,7 +1079,16 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            live_mode(),
+            no_reload,
+        )
+        .await;
         assert_eq!(events.lock().unwrap().len(), 1);
         assert_eq!(*releases.lock().unwrap(), 1);
         assert!(journal.to_entries().iter().any(|line| {
@@ -908,7 +1120,15 @@ mod tests {
         let gate = rig.gate.clone();
         tokio::time::timeout(
             Duration::from_secs(10),
-            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
+            run_executor(
+                surface,
+                rig.job_rx,
+                rig.gate,
+                rig.epoch,
+                rig.journal,
+                live_mode(),
+                no_reload,
+            ),
         )
         .await
         .expect("the executor must keep draining after a fatal acquire, then end on EOF");
@@ -948,7 +1168,15 @@ mod tests {
         let gate = rig.gate.clone();
         tokio::time::timeout(
             Duration::from_secs(10),
-            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
+            run_executor(
+                surface,
+                rig.job_rx,
+                rig.gate,
+                rig.epoch,
+                rig.journal,
+                live_mode(),
+                no_reload,
+            ),
         )
         .await
         .expect("a recoverable acquire must end the job, then the loop ends on EOF");
@@ -992,7 +1220,15 @@ mod tests {
         let gate = rig.gate.clone();
         tokio::time::timeout(
             Duration::from_secs(10),
-            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
+            run_executor(
+                surface,
+                rig.job_rx,
+                rig.gate,
+                rig.epoch,
+                rig.journal,
+                live_mode(),
+                no_reload,
+            ),
         )
         .await
         .expect("a refused preflight must halt the watch, not wedge the executor");
@@ -1042,7 +1278,15 @@ mod tests {
         let gate = rig.gate.clone();
         tokio::time::timeout(
             Duration::from_secs(10),
-            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
+            run_executor(
+                surface,
+                rig.job_rx,
+                rig.gate,
+                rig.epoch,
+                rig.journal,
+                live_mode(),
+                no_reload,
+            ),
         )
         .await
         .expect("a fatal input must end the job, then the loop ends on EOF");
@@ -1092,7 +1336,15 @@ mod tests {
         let gate = rig.gate.clone();
         tokio::time::timeout(
             Duration::from_secs(10),
-            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
+            run_executor(
+                surface,
+                rig.job_rx,
+                rig.gate,
+                rig.epoch,
+                rig.journal,
+                live_mode(),
+                no_reload,
+            ),
         )
         .await
         .expect("a fatal mid-job input must drop the queued work, then end on EOF");
@@ -1140,7 +1392,8 @@ mod tests {
             rig.gate,
             rig.epoch,
             rig.journal,
-            false,
+            live_mode(),
+            no_reload,
         ));
 
         job_tx
@@ -1221,7 +1474,16 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            live_mode(),
+            no_reload,
+        )
+        .await;
         assert_eq!(events.lock().unwrap().len(), 3);
         assert!(gate.is_enabled(), "no halt for a recoverable abort");
         assert_eq!(*releases.lock().unwrap(), 1);
@@ -1260,7 +1522,16 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let gate = rig.gate.clone();
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            live_mode(),
+            no_reload,
+        )
+        .await;
         // First job: one landed click, then the abort. Second job: both.
         assert_eq!(events.lock().unwrap().len(), 3);
         assert!(gate.is_enabled());
@@ -1293,7 +1564,16 @@ mod tests {
         drop(rig.job_tx);
         let journal = rig.journal.clone();
         let gate = rig.gate.clone();
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            live_mode(),
+            no_reload,
+        )
+        .await;
         assert!(events.lock().unwrap().is_empty());
         assert!(gate.is_enabled());
         assert_eq!(*releases.lock().unwrap(), 1);
@@ -1341,7 +1621,16 @@ mod tests {
                 .unwrap();
             drop(rig.job_tx);
             let started = tokio::time::Instant::now();
-            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+            run_executor(
+                surface,
+                rig.job_rx,
+                rig.gate,
+                rig.epoch,
+                rig.journal,
+                live_mode(),
+                no_reload,
+            )
+            .await;
             assert_eq!(
                 started.elapsed(),
                 Duration::ZERO,
@@ -1380,7 +1669,16 @@ mod tests {
             .await
             .unwrap();
         drop(rig.job_tx);
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            live_mode(),
+            no_reload,
+        )
+        .await;
         assert_eq!(*releases.lock().unwrap(), 1);
     }
 
@@ -1411,7 +1709,15 @@ mod tests {
         let gate = rig.gate.clone();
         tokio::time::timeout(
             Duration::from_secs(10),
-            run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false),
+            run_executor(
+                surface,
+                rig.job_rx,
+                rig.gate,
+                rig.epoch,
+                rig.journal,
+                live_mode(),
+                no_reload,
+            ),
         )
         .await
         .expect("a fatal coordinate conversion must end the job, then the loop ends on EOF");
@@ -1443,7 +1749,16 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, true).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rehearsal_mode(),
+            no_reload,
+        )
+        .await;
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(*releases.lock().unwrap(), 1);
         let lines = journal.to_entries();
@@ -1482,7 +1797,11 @@ mod tests {
                 rig.gate,
                 rig.epoch,
                 rig.journal,
-                dry_run,
+                mode_cell(ClickMode {
+                    dry_run,
+                    ..ClickMode::default()
+                }),
+                no_reload,
             )
             .await;
             assert_eq!(
@@ -1514,7 +1833,16 @@ mod tests {
             .unwrap();
         drop(rig.job_tx);
         let journal = rig.journal.clone();
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, true).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            rehearsal_mode(),
+            no_reload,
+        )
+        .await;
         assert!(events.lock().unwrap().is_empty());
         assert_eq!(*releases.lock().unwrap(), 1);
         let lines = journal.to_entries();
@@ -1559,7 +1887,16 @@ mod tests {
             .collect();
         rig.job_tx.send(job).await.unwrap();
         drop(rig.job_tx);
-        run_executor(surface, rig.job_rx, rig.gate, rig.epoch, rig.journal, false).await;
+        run_executor(
+            surface,
+            rig.job_rx,
+            rig.gate,
+            rig.epoch,
+            rig.journal,
+            live_mode(),
+            no_reload,
+        )
+        .await;
         assert_eq!(*events.lock().unwrap(), expected);
         assert_eq!(*releases.lock().unwrap(), 1);
     }

@@ -130,7 +130,7 @@ fn started(limits: Limits) -> Controller {
 /// A controller started at t=0 with the recovery watchdog armed.
 fn recovering(limits: Limits) -> Controller {
     let mut ctrl = controller(limits);
-    ctrl.enable_recovery();
+    ctrl.set_recovery(true);
     assert!(ctrl.handle(Event::Start { now_ms: 0 }).is_empty());
     ctrl
 }
@@ -1507,6 +1507,52 @@ fn snapshot_watchdog_reclicks_confirm_then_reissues_then_halts() {
     assert_eq!(ctrl.expectation, None);
 }
 
+/// **The reason `set_recovery(false)` is not a bare field write.** `watchdog`
+/// has no notion of "armed": `recovery` gates *setting* deadlines, not
+/// honouring them. A deadline left behind by a disarm would climb the ladder
+/// and re-issue paid clicks for a rehearsal nobody is watching.
+#[test]
+fn disarming_recovery_drops_the_deadline_it_was_waiting_on() {
+    let mut ctrl = recovering(Limits::default());
+    assert_eq!(
+        ctrl.handle(snap(with_ids(dud_shop(None)), 1)),
+        vec![Action::Refresh]
+    );
+    assert!(
+        ctrl.expectation.is_some(),
+        "the issued refresh must have opened one"
+    );
+
+    ctrl.set_recovery(false);
+    assert_eq!(ctrl.expectation, None);
+    assert!(!ctrl.is_recovery_enabled());
+
+    // The rung that fired in `watchdog_reissue_respects_limits` is now silent.
+    assert!(
+        ctrl.handle(tick(past_rung(1))).is_empty(),
+        "a disarmed watchdog must not climb"
+    );
+    assert!(ctrl.handle(tick(past_rung(2))).is_empty());
+}
+
+/// Re-arming opens no deadline of its own: the proof the cleared expectation
+/// waited on belonged to a job that ran in the other mode. The *next* issued
+/// refresh is what re-opens one.
+#[test]
+fn rearming_recovery_does_not_resurrect_the_cleared_deadline() {
+    let mut ctrl = recovering(Limits::default());
+    let _ = ctrl.handle(snap(with_ids(dud_shop(None)), 1));
+    ctrl.set_recovery(false);
+    ctrl.set_recovery(true);
+
+    assert!(ctrl.is_recovery_enabled());
+    assert_eq!(ctrl.expectation, None, "re-arming restores nothing");
+    assert!(
+        ctrl.handle(tick(past_rung(3))).is_empty(),
+        "there is no missed proof to escalate on"
+    );
+}
+
 #[test]
 fn watchdog_reissue_respects_limits() {
     // The paid rung goes through the same gate as any refresh, so an exhausted
@@ -1660,7 +1706,7 @@ fn dead_stock_batch_arms_snapshot_not_purchase() {
         ..Filter::default()
     };
     let mut ctrl = Controller::new(filter, Limits::default());
-    ctrl.enable_recovery();
+    ctrl.set_recovery(true);
     let _ = ctrl.handle(Event::Start { now_ms: 0 });
     let mut shop = with_ids(hit_shop(None));
     shop.slots[2].limit = Some(PurchaseLimit {

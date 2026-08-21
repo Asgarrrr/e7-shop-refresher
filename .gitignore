@@ -1,6 +1,13 @@
 # Build
 /target
 
+# `just mutants` output — a scratch copy of the tree plus its report. Written
+# at the repo root by cargo-mutants, which `justfile` documents as an external
+# binary in neither Cargo.toml nor Cargo.lock; its report is read once and
+# thrown away.
+/mutants.out
+/mutants.out.old
+
 # Configuration locale (utiliser config.example.toml comme modèle)
 /config.toml
 

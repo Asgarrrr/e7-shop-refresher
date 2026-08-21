@@ -308,14 +308,34 @@ impl Controller {
         }
     }
 
-    /// Arms the recovery watchdog: every issued refresh/buy gets a deadline,
-    /// escalating nudge → re-issue → honest halt. Called once at wiring time,
-    /// only when the actuator really clicks (`Mode::Live`).
-    pub fn enable_recovery(&mut self) {
-        self.recovery = true;
+    /// Arms or disarms the recovery watchdog: while armed, every issued
+    /// refresh/buy gets a deadline, escalating nudge → re-issue → honest halt.
+    ///
+    /// Armed exactly when the actuator really clicks. That was once a wiring-
+    /// time fact, which is why this used to be a one-way `enable_recovery`; the
+    /// rehearsal switch is now live, so the same session can cross the line in
+    /// both directions.
+    ///
+    /// **Disarming clears [`Self::expectation`], and that is the whole reason
+    /// this is not a bare field write.** A deadline set while armed would
+    /// otherwise outlive the watchdog that owns it: the next [`Event::Tick`]
+    /// finds a pending expectation, and `watchdog` has no notion of "armed" —
+    /// `recovery` gates *setting* deadlines, not honouring them. The session
+    /// would climb the ladder and re-issue clicks for a rehearsal nobody is
+    /// watching.
+    ///
+    /// Re-arming deliberately does **not** restore it. The proof that
+    /// expectation waited on belongs to a job that ran in the other mode; the
+    /// next issued refresh opens a fresh one.
+    pub fn set_recovery(&mut self, enabled: bool) {
+        self.recovery = enabled;
+        if !enabled {
+            self.expectation = None;
+        }
     }
 
-    /// Whether the recovery watchdog is armed (set once at wiring time).
+    /// Whether the recovery watchdog is armed right now. Not a constant for the
+    /// session: see [`Self::set_recovery`].
     pub fn is_recovery_enabled(&self) -> bool {
         self.recovery
     }

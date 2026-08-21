@@ -1,73 +1,43 @@
-//! Startup: the settings a running session never reads again — the actuator's
-//! two mode switches — plus the notice that says so.
+//! Clicking: whether the actuator sends real input, and which Win32 path it
+//! sends it through.
 //!
-//! # Why this section is not like the other three
+//! Both are live. They were not, and the difference is worth keeping because
+//! the reason they became live is the reason this section is shaped the way it
+//! is: `config.example.toml` calls `backend = "input"` the fallback for when a
+//! game update stops honouring posted clicks, so the moment a player needs it
+//! is mid-session, with the tool having just stopped working. A field that
+//! answered "restart the app" at that moment was answering at the worst
+//! possible time.
 //!
-//! Hunt, Stop and Click timing retune a live session: their Apply emits a
-//! `Command`, the session takes it, and the change is in effect before the
-//! player lets go of the mouse. Neither of the two below can do that:
+//! # One value, not two fields
 //!
-//! - `backend` picks the `Surface` that is *moved into* `run_executor` along
-//!   with the only receiver for its job queue (`app::Session::run`).
-//! - `dry_run` is read by that same executor, and separately decides whether
-//!   the controller arms its recovery watchdog — a dry run produces no wire
-//!   feedback, so an armed watchdog would halt blaming the game.
+//! The pair travels as a single [`ClickMode`] from here to the executor:
+//! [`crate::app::Command::SetClickMode`] carries both, the shared cell holds
+//! both, and the executor snapshots both at once. A single Apply must not be
+//! able to land in halves — a job running the old backend in the new rehearsal
+//! state would engage the window and then only journal, which is the one
+//! outcome neither setting is allowed to produce.
 //!
-//! So each field carries a restart notice, and that notice is part of the
-//! feature rather than decoration. A setting that silently does nothing until
-//! the next launch is worse than no editor at all: the player concludes the
-//! tool is broken, which is exactly the state they were already in when they
-//! came here.
+//! # When a change takes effect
 //!
-//! # `game_port` is deliberately not here
-//!
-//! It was, briefly (`8d25453`), and it was taken out again on the maintainer's
-//! decision: the port is not something a player sets from the window. It stays
-//! a `config.toml` key, and `README.md` says so rather than pointing at a field
-//! that does not exist.
-//!
-//! Note that it *would* have been the restart-only case with the hardest
-//! constraint of the three — the port is compiled into every adapter's kernel
-//! BPF filter when `PcapSource::open` runs, once, at process start — so nothing
-//! about that argument is lost by dropping it. If it is ever wanted back, the
-//! shape is in `8d25453`.
+//! On the next job the executor *dequeues*, never mid-job. That is a stronger
+//! promise than the click timings beside it, which bake in at submit time: a
+//! job already queued still uses the waits it was planned with, but will run in
+//! whatever mode is current when it starts. Both read as "applies to the next
+//! clicks" to the player; only one of them can be baked in, because a job
+//! carries no surface.
 
 use eframe::egui;
 
 use super::super::theme;
-use crate::config::ActuatorBackend;
+use crate::actuator::{ActuatorBackend, ClickMode};
 
-/// What the Startup drafts start from: the values *this* process was launched
-/// with, read out of the config before `app::setup` consumes it.
-///
-/// A struct rather than two parameters because they travel together through
-/// four call sites and mean one thing — "what a restart would currently do".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StartupSettings {
-    pub dry_run: bool,
-    pub backend: ActuatorBackend,
-}
-
-impl Default for StartupSettings {
-    /// Taken from [`crate::config::Config`]'s own `Default` rather than
-    /// restated, so the drafts a preview or a test starts from cannot drift
-    /// away from the ones a player with no config.toml gets. Pinned by
-    /// `the_defaults_are_the_loader_s_defaults`.
-    fn default() -> Self {
-        let config = crate::config::Config::default();
-        Self {
-            dry_run: config.actuator.dry_run,
-            backend: config.actuator.backend,
-        }
-    }
-}
-
-/// One-line recap for the folded Startup bar.
-pub(super) fn startup_summary(dry_run: bool, backend: ActuatorBackend) -> String {
-    if dry_run {
+/// One-line recap for the folded Clicking bar.
+pub(super) fn clicking_summary(mode: ClickMode) -> String {
+    if mode.dry_run {
         "rehearsal".to_owned()
     } else {
-        backend_label(backend).to_owned()
+        backend_label(mode.backend).to_owned()
     }
 }
 
@@ -81,7 +51,7 @@ fn backend_label(backend: ActuatorBackend) -> &'static str {
     }
 }
 
-/// One line of explanation under each switch, in the terms
+/// One line of explanation under the switch, in the terms
 /// `config.example.toml` already uses.
 fn backend_hint(backend: ActuatorBackend) -> &'static str {
     match backend {
@@ -119,22 +89,19 @@ pub(super) fn backend_row(ui: &mut egui::Ui, backend: &mut ActuatorBackend) {
     });
 }
 
-/// The notice that makes the section honest. Rendered once under the three
-/// rows rather than three times: they share one reason and one remedy.
-pub(super) fn restart_notice(ui: &mut egui::Ui, dirty: bool) {
-    let text = if dirty {
-        "Apply writes these to config.toml — they take effect when you restart the app"
+/// When a pending change will bite. Replaces the restart notice this section
+/// used to carry, and is not decoration: "the next clicks" is a real delay a
+/// player would otherwise read as the switch having failed.
+pub(super) fn timing_notice(ui: &mut egui::Ui, dirty: bool) {
+    let (color, text) = if dirty {
+        (
+            theme::INK_MUTED,
+            "Apply changes the mode from the next clicks — a job already running finishes as it started",
+        )
     } else {
-        "these take effect when you restart the app"
+        (theme::INK_FAINT, "changes apply from the next clicks")
     };
-    ui.colored_label(
-        if dirty {
-            theme::INK_MUTED
-        } else {
-            theme::INK_FAINT
-        },
-        text,
-    );
+    ui.colored_label(color, text);
 }
 
 /// Width of the label column, so both rows' values line up the way
@@ -188,12 +155,12 @@ mod tests {
         }
     }
 
-    /// The drafts a fresh window shows must be the ones a fresh config.toml
-    /// would load. Restating them here instead of deriving them is how the two
-    /// drift, and a drifted default writes a change the player never made.
+    /// The draft a fresh window shows must be the one a fresh config.toml would
+    /// load. `ClickMode::default()` and the loader's default are two separate
+    /// declarations of the same intent, and this is what stops them drifting.
     #[test]
-    fn the_defaults_are_the_loader_s_defaults() {
-        let seeded = StartupSettings::default();
+    fn the_default_draft_is_the_loader_s_default() {
+        let seeded = ClickMode::default();
         let loaded: Config = toml::from_str("").expect("an empty config is valid");
         assert_eq!(seeded.dry_run, loaded.actuator.dry_run);
         assert_eq!(seeded.backend, loaded.actuator.backend);
@@ -202,15 +169,27 @@ mod tests {
     #[test]
     fn the_summary_names_the_mode() {
         assert_eq!(
-            startup_summary(false, ActuatorBackend::Message),
+            clicking_summary(ClickMode {
+                dry_run: false,
+                backend: ActuatorBackend::Message
+            }),
             "posted clicks"
         );
         assert_eq!(
-            startup_summary(false, ActuatorBackend::Input),
+            clicking_summary(ClickMode {
+                dry_run: false,
+                backend: ActuatorBackend::Input
+            }),
             "real cursor"
         );
         // A rehearsal sends nothing, so which backend would have sent it is not
         // what the folded bar should be reporting.
-        assert_eq!(startup_summary(true, ActuatorBackend::Input), "rehearsal");
+        assert_eq!(
+            clicking_summary(ClickMode {
+                dry_run: true,
+                backend: ActuatorBackend::Input
+            }),
+            "rehearsal"
+        );
     }
 }

@@ -25,6 +25,12 @@ fn timings() -> Arc<Mutex<plan::Timings>> {
     Arc::new(Mutex::new(plan::Timings::default()))
 }
 
+/// Live clicks on the shipped backend — what every test here assumed when the
+/// mode was a constructor argument rather than a live cell.
+fn click_mode() -> Arc<Mutex<crate::actuator::ClickMode>> {
+    Arc::new(Mutex::new(crate::actuator::ClickMode::default()))
+}
+
 /// Off-mode actuator: decisions keep the advice wording, nothing is submitted.
 fn off() -> ActuatorHandle {
     ActuatorHandle::new(
@@ -32,6 +38,7 @@ fn off() -> ActuatorHandle {
         SnapshotEpoch::default(),
         mpsc::channel(8).0,
         timings(),
+        click_mode(),
     )
 }
 
@@ -39,7 +46,13 @@ fn off() -> ActuatorHandle {
 fn recording(mode: Mode) -> (ActuatorHandle, mpsc::Receiver<plan::Job>) {
     let (jobs, rx) = mpsc::channel(8);
     (
-        ActuatorHandle::new(mode, SnapshotEpoch::default(), jobs, timings()),
+        ActuatorHandle::new(
+            mode,
+            SnapshotEpoch::default(),
+            jobs,
+            timings(),
+            click_mode(),
+        ),
         rx,
     )
 }
@@ -1331,7 +1344,13 @@ fn full_job_queue_journals_the_drop() {
             0,
         ))
         .expect("fills the queue");
-    let actuator = ActuatorHandle::new(Mode::Live, SnapshotEpoch::default(), job_tx, timings());
+    let actuator = ActuatorHandle::new(
+        Mode::Live,
+        SnapshotEpoch::default(),
+        job_tx,
+        timings(),
+        click_mode(),
+    );
     let controller = armed();
     on_message(
         &controller,
@@ -1357,7 +1376,13 @@ fn a_gone_executor_is_journaled_as_gone_not_as_a_full_queue() {
     let journal = EventLog::default();
     let (job_tx, job_rx) = mpsc::channel(8);
     drop(job_rx); // the executor task is over: the queue is empty, not full
-    let actuator = ActuatorHandle::new(Mode::Live, SnapshotEpoch::default(), job_tx, timings());
+    let actuator = ActuatorHandle::new(
+        Mode::Live,
+        SnapshotEpoch::default(),
+        job_tx,
+        timings(),
+        click_mode(),
+    );
     let controller = armed();
     on_message(
         &controller,
@@ -1384,7 +1409,7 @@ fn a_gone_executor_is_journaled_as_gone_not_as_a_full_queue() {
 /// `ShopItem::default()`.
 fn armed_recovering() -> Mutex<Controller> {
     let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
-    ctrl.enable_recovery();
+    ctrl.set_recovery(true);
     let _ = ctrl.handle(Event::Start { now_ms: 0 });
     Mutex::new(ctrl)
 }

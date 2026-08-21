@@ -134,19 +134,16 @@ pub struct ActuatorConfig {
 }
 
 /// Input backend of the Windows build.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActuatorBackend {
-    /// `SendInput`: drives the real cursor and forces the game window to the
-    /// foreground. Works whatever the engine reads input from — the fallback
-    /// if a game update stops honoring posted messages.
-    Input,
-    /// `PostMessageW`: posts synthetic mouse messages to the window — no
-    /// focus stolen, the player keeps the mouse. Live-validated against the
-    /// game (refresh, buys, wheel scroll, unfocused window).
-    #[default]
-    Message,
-}
+///
+/// Defined in [`crate::actuator`] and re-exported here, not the other way
+/// round. The executor reads it once per job to pick the `Surface` it drives,
+/// and `actuator` deliberately imports nothing from `config` — the dependency
+/// runs one way only. This is the same direction
+/// [`crate::actuator::plan::Timings`] already travels: a serde-deriving type
+/// owned by the layer that acts on it, consumed by the layer that parses it.
+///
+/// The re-export keeps every existing `config::ActuatorBackend` path working.
+pub use crate::actuator::ActuatorBackend;
 
 /// Vestigial: the backend builds its own BPF expression from `game_port` and
 /// sizes its buffer from its own snaplen, so both keys are parsed and ignored.

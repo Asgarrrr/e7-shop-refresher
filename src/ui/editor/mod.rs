@@ -6,24 +6,21 @@
 // A section file holds the parts that work on a `Filter` / `Limits` /
 // `Timings` handed in by the caller; everything reaching into `EditorState`
 // stays here.
+mod clicking;
 mod hunt;
-mod startup;
 mod stop;
 mod timing;
 mod timing_meter;
 
+use clicking::{backend_row, clicking_summary, dry_run_row, timing_notice};
 use hunt::{grade_value, hunt_summary, optional_value, quick_add_names, string_list, substat_reqs};
-use startup::{backend_row, dry_run_row, restart_notice, startup_summary};
 use stop::{duration_row, limit_row, stop_summary};
 use timing::{fine_tune_body, mode_hint, pass_estimate, timing_summary};
-
-// `pub`, not `pub(super)`: it is a parameter of `ui::ShopApp::new`, which is
-// public, so the type has to be reachable from outside the crate too.
-pub use startup::StartupSettings;
 
 use eframe::egui;
 
 use super::theme;
+use crate::actuator::ClickMode;
 #[cfg(test)]
 use crate::actuator::plan::DelayRange;
 use crate::actuator::plan::{TimingPreset, Timings};
@@ -50,19 +47,17 @@ pub(super) struct EditorState {
     applied_filter: Filter,
     applied_limits: Limits,
     applied_timings: Timings,
-    /// The three restart-only drafts and their twin. Grouped because they share
-    /// a lifecycle the three above do not: no session ever takes them, so their
-    /// twin is re-seeded by a successful *file write* rather than by a
-    /// delivered `Command` — see [`EditorState::mark_startup_saved`].
-    startup: StartupSettings,
-    applied_startup: StartupSettings,
+    /// The rehearsal switch and the click backend, drafted as one value because
+    /// one `Command` carries both — a single Apply must not land in halves.
+    click_mode: ClickMode,
+    applied_click_mode: ClickMode,
     name_input: String,
     set_input: String,
     substat_input: String,
     hunt_open: bool,
     stop_open: bool,
     timing_open: bool,
-    startup_open: bool,
+    clicking_open: bool,
     /// Whether the Custom segment is selected, revealing the per-action bars.
     fine_tune_open: bool,
 }
@@ -72,17 +67,17 @@ impl EditorState {
         filter: Filter,
         limits: Limits,
         timings: Timings,
-        startup: StartupSettings,
+        click_mode: ClickMode,
     ) -> Self {
         Self {
             applied_filter: filter.clone(),
             applied_limits: limits,
             applied_timings: timings,
-            applied_startup: startup,
+            applied_click_mode: click_mode,
             filter,
             limits,
             timings,
-            startup,
+            click_mode,
             name_input: String::new(),
             set_input: String::new(),
             substat_input: String::new(),
@@ -90,8 +85,8 @@ impl EditorState {
             stop_open: true,
             timing_open: false,
             // Folded on arrival: a player opens Setup to change what they hunt,
-            // not the port. Hunt and Stop keep the two slots that open.
-            startup_open: false,
+            // not how the clicks are sent. Hunt and Stop keep the two open slots.
+            clicking_open: false,
             fine_tune_open: false,
         }
     }
@@ -105,55 +100,10 @@ impl EditorState {
                 Command::SetFilter(filter) => self.applied_filter = filter.clone(),
                 Command::SetLimits(limits) => self.applied_limits = *limits,
                 Command::SetTimings(timings) => self.applied_timings = *timings,
+                Command::SetClickMode(mode) => self.applied_click_mode = *mode,
                 Command::Start | Command::Stop | Command::Toggle => {}
             }
         }
-    }
-
-    /// The twin for the restart-only drafts, re-seeded once `persist::save`
-    /// reported success.
-    ///
-    /// **This is deliberately not [`Self::mark_applied`]'s rule**, and the
-    /// difference is the whole reason these three are separate. A `Set*`
-    /// command is applied when the *session* took it; the file write that
-    /// follows is best-effort, and a failed one costs only the on-disk copy
-    /// because the live session is already retuned. Nothing takes these three
-    /// at all — the file **is** the application. So a failed write means
-    /// nothing happened, and Apply must stay lit rather than claim a change
-    /// that will not survive the restart it asks for.
-    pub(super) fn mark_startup_saved(&mut self) {
-        self.applied_startup = self.startup;
-    }
-
-    /// The restart-only drafts that moved, ready for the caller to turn into
-    /// `persist::Section`s. Per field, so an Apply that changed only the port
-    /// does not rewrite the backend line.
-    pub(super) fn startup_edits(&self) -> StartupEdits {
-        StartupEdits {
-            dry_run: (self.startup.dry_run != self.applied_startup.dry_run)
-                .then_some(self.startup.dry_run),
-            backend: (self.startup.backend != self.applied_startup.backend)
-                .then_some(self.startup.backend),
-        }
-    }
-}
-
-/// Which of the two restart-only drafts moved, and to what. `None` means
-/// unchanged and therefore not written.
-///
-/// Plain values rather than `persist::Section`s: the Command-to-Section mapping
-/// lives in `ui::mod`, deliberately in one place, and this is the second half
-/// of it — see `persisted_sections`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) struct StartupEdits {
-    pub(super) dry_run: Option<bool>,
-    pub(super) backend: Option<crate::config::ActuatorBackend>,
-}
-
-impl StartupEdits {
-    /// True when nothing moved, so the caller can skip the write entirely.
-    pub(super) fn is_empty(self) -> bool {
-        self.dry_run.is_none() && self.backend.is_none()
     }
 }
 
@@ -161,58 +111,60 @@ impl StartupEdits {
 /// at once; the live window mounts them as separate panels.
 #[cfg(test)]
 fn edit_setup(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
-    edit_sections(ui, editor, true);
+    edit_sections(ui, editor);
     ui.add_space(theme::SP_XL);
-    commit_row(ui, editor, true).commands
+    commit_row(ui, editor, true)
 }
 
 /// The four collapsible sections — the Setup tab's scrolling body.
 ///
-/// `session_alive` disables the first three and *not* the fourth. Hunt, Stop
-/// and Click timing retune a session, so with none running there is nothing to
-/// edit; the Startup three reach only config.toml, and a dead session is the
-/// state a player is most likely in when they need them.
-pub(super) fn edit_sections(ui: &mut egui::Ui, editor: &mut EditorState, session_alive: bool) {
-    ui.add_enabled_ui(session_alive, |ui| {
-        // Summaries are built only while folded. No space between collapsed
-        // bars: they tile on item spacing alone so hover strips meet with no
-        // dead seam.
-        let hunt = (!editor.hunt_open).then(|| hunt_summary(&editor.filter));
-        section(ui, "Hunt", hunt.as_deref(), &mut editor.hunt_open);
-        if editor.hunt_open {
-            hunt_body(ui, editor);
-            ui.add_space(theme::SP_SM);
-        }
-        let stop = (!editor.stop_open).then(|| stop_summary(&editor.limits));
-        section(ui, "Stop", stop.as_deref(), &mut editor.stop_open);
-        if editor.stop_open {
-            stop_body(ui, editor);
-            ui.add_space(theme::SP_SM);
-        }
-        let timing = (!editor.timing_open).then(|| timing_summary(&editor.timings));
-        section(ui, "Click timing", timing, &mut editor.timing_open);
-        if editor.timing_open {
-            timing_body(ui, editor);
-            ui.add_space(theme::SP_SM);
-        }
-    });
-    let startup = (!editor.startup_open)
-        .then(|| startup_summary(editor.startup.dry_run, editor.startup.backend));
-    section(ui, "Startup", startup.as_deref(), &mut editor.startup_open);
-    if editor.startup_open {
-        startup_body(ui, editor);
+/// No `session_alive` parameter, and its brief life is worth a sentence:
+/// `plans/042` added one so the restart-only settings could stay editable with
+/// no session running, since the file was the only place they landed.
+/// `plans/045` made them a live retune, so all four sections now need somewhere
+/// to send a command and the caller gates them together again.
+pub(super) fn edit_sections(ui: &mut egui::Ui, editor: &mut EditorState) {
+    // Summaries are built only while folded. No space between collapsed bars:
+    // they tile on item spacing alone so hover strips meet with no dead seam.
+    let hunt = (!editor.hunt_open).then(|| hunt_summary(&editor.filter));
+    section(ui, "Hunt", hunt.as_deref(), &mut editor.hunt_open);
+    if editor.hunt_open {
+        hunt_body(ui, editor);
+        ui.add_space(theme::SP_SM);
+    }
+    let stop = (!editor.stop_open).then(|| stop_summary(&editor.limits));
+    section(ui, "Stop", stop.as_deref(), &mut editor.stop_open);
+    if editor.stop_open {
+        stop_body(ui, editor);
+        ui.add_space(theme::SP_SM);
+    }
+    let timing = (!editor.timing_open).then(|| timing_summary(&editor.timings));
+    section(ui, "Click timing", timing, &mut editor.timing_open);
+    if editor.timing_open {
+        timing_body(ui, editor);
+        ui.add_space(theme::SP_SM);
+    }
+    let clicking = (!editor.clicking_open).then(|| clicking_summary(editor.click_mode));
+    section(
+        ui,
+        "Clicking",
+        clicking.as_deref(),
+        &mut editor.clicking_open,
+    );
+    if editor.clicking_open {
+        clicking_body(ui, editor);
         ui.add_space(theme::SP_SM);
     }
 }
 
-/// The Startup section's body. Last of the four because it is the only one a
-/// player never needs to open twice — and the notice closes it, so the last
-/// thing read before Apply is the sentence that says a restart is coming.
-fn startup_body(ui: &mut egui::Ui, editor: &mut EditorState) {
-    dry_run_row(ui, &mut editor.startup.dry_run);
-    backend_row(ui, &mut editor.startup.backend);
+/// The Clicking section's body. Last of the four, and the notice closes it, so
+/// the last thing read before Apply is the sentence saying when the change
+/// bites.
+fn clicking_body(ui: &mut egui::Ui, editor: &mut EditorState) {
+    dry_run_row(ui, &mut editor.click_mode.dry_run);
+    backend_row(ui, &mut editor.click_mode.backend);
     ui.add_space(theme::SP_SM);
-    restart_notice(ui, !editor.startup_edits().is_empty());
+    timing_notice(ui, editor.click_mode != editor.applied_click_mode);
 }
 
 /// One collapsible section bar plus the breathing room its open body needs.
@@ -415,40 +367,23 @@ fn preset_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Option<TimingPrese
     if custom { None } else { detected }
 }
 
-/// What one Apply produced: the retunes a live session must take, and the
-/// restart-only keys only the file can take.
-///
-/// Two fields rather than one list because they are committed by two different
-/// things — see [`EditorState::mark_startup_saved`].
-#[derive(Debug, Default)]
-pub(super) struct Committed {
-    pub(super) commands: Vec<Command>,
-    /// Empty unless Apply fired *and* a restart-only draft moved.
-    pub(super) startup: StartupEdits,
-}
-
 /// One primary Apply that emits every draft that moved. The twins are *not*
-/// touched here — [`EditorState::mark_applied`] and
-/// [`EditorState::mark_startup_saved`] re-seed them from what actually
-/// happened, so a click lost to a saturated queue or a failed write leaves
-/// Apply lit instead of claiming a setting nobody received. Disabled while
-/// nothing changed and while a changed filter is too unrestricted to arm.
+/// touched here — [`EditorState::mark_applied`] re-seeds them from what the
+/// session took, so a click lost to a saturated queue leaves Apply lit instead
+/// of claiming a setting nobody received. Disabled while nothing changed, while
+/// a changed filter is too unrestricted to arm, and once the session is dead.
 ///
-/// # Why a dead session does not always disable it
-///
-/// It used to, and for the three live-editable drafts that is right: a retune
-/// nobody can take should not look taken. The restart-only pair is the opposite
-/// case. `config.example.toml` calls `backend = "input"` the fallback for when
-/// a game update stops honouring posted clicks — and an actuator fault of
-/// exactly that kind is what halts the watch and kills the session. Refusing
-/// the write there would refuse it in the state it exists for. So a dead
-/// session still commits those two, and still refuses the rest.
+/// `plans/045` collapsed this back to one return value. While the click mode
+/// was restart-only it had no `Command`, so Apply had to hand the caller a
+/// second thing to persist and a second rule for when a draft counts as
+/// applied. It is a live retune now, so it rides the same channel and the same
+/// rule as the other three.
 #[must_use]
 pub(super) fn commit_row(
     ui: &mut egui::Ui,
     editor: &mut EditorState,
     session_alive: bool,
-) -> Committed {
+) -> Vec<Command> {
     // Bit-exact on purpose, `min`'s `f64` included: this is change detection,
     // not a numeric test, so an epsilon would make a real edit invisible. It
     // cannot survive a non-finite `min` (`NaN != NaN` lights Apply forever),
@@ -456,60 +391,51 @@ pub(super) fn commit_row(
     let dirty_filter = editor.filter != editor.applied_filter;
     let dirty_limits = editor.limits != editor.applied_limits;
     let dirty_timings = editor.timings != editor.applied_timings;
-    let startup_edits = editor.startup_edits();
-    let dirty_startup = !startup_edits.is_empty();
-    let dirty_live = dirty_filter || dirty_limits || dirty_timings;
+    let dirty_click_mode = editor.click_mode != editor.applied_click_mode;
+    let dirty = dirty_filter || dirty_limits || dirty_timings || dirty_click_mode;
     // Only a *changed* filter clears the arming bar, so an already-applied one
     // lets limit/timing edits through.
     let blocked = dirty_filter && editor.filter.is_unrestricted();
-    // The live drafts need somewhere to go; the restart-only ones need only the
-    // file, which is reachable whatever the session is doing.
-    let committable = (dirty_live && session_alive) || dirty_startup;
 
-    let mut committed = Committed::default();
+    let mut commands = Vec::new();
     ui.horizontal(|ui| {
         // The blocking reason wins the peek slot: it explains the dark button.
         if blocked {
             ui.weak("add at least one hunt criterion before Apply");
         } else if let Some(summary) =
-            dirty_summary(dirty_filter, dirty_limits, dirty_timings, dirty_startup)
+            dirty_summary(dirty_filter, dirty_limits, dirty_timings, dirty_click_mode)
         {
             ui.weak(summary);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let clicked = ui
-                .add_enabled_ui(committable && !blocked, |ui| {
+                .add_enabled_ui(session_alive && dirty && !blocked, |ui| {
                     theme::primary_button(ui, "Apply")
                 })
                 .inner
                 .clicked();
             if clicked {
-                // A dead session takes no command; pushing them anyway would
-                // have `mark_applied` clear a twin off a delivery that never
-                // happened.
-                if session_alive {
-                    if dirty_filter {
-                        committed
-                            .commands
-                            .push(Command::SetFilter(editor.filter.clone()));
-                    }
-                    if dirty_limits {
-                        committed.commands.push(Command::SetLimits(editor.limits));
-                    }
-                    if dirty_timings {
-                        committed.commands.push(Command::SetTimings(editor.timings));
-                    }
+                if dirty_filter {
+                    commands.push(Command::SetFilter(editor.filter.clone()));
                 }
-                committed.startup = startup_edits;
+                if dirty_limits {
+                    commands.push(Command::SetLimits(editor.limits));
+                }
+                if dirty_timings {
+                    commands.push(Command::SetTimings(editor.timings));
+                }
+                if dirty_click_mode {
+                    commands.push(Command::SetClickMode(editor.click_mode));
+                }
             }
         });
     });
-    committed
+    commands
 }
 
 /// The commit bar's peek, e.g. `Hunt, Stop edited`. Labels mirror the section
 /// titles so it points at the collapsible that changed.
-fn dirty_summary(filter: bool, limits: bool, timings: bool, startup: bool) -> Option<String> {
+fn dirty_summary(filter: bool, limits: bool, timings: bool, clicking: bool) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     if filter {
         parts.push("Hunt");
@@ -520,8 +446,8 @@ fn dirty_summary(filter: bool, limits: bool, timings: bool, startup: bool) -> Op
     if timings {
         parts.push("Click timing");
     }
-    if startup {
-        parts.push("Startup");
+    if clicking {
+        parts.push("Clicking");
     }
     (!parts.is_empty()).then(|| format!("{} edited", parts.join(", ")))
 }
@@ -569,108 +495,74 @@ mod tests {
             .build_ui(app)
     }
 
-    /// Drive `commit_row` once against a chosen session state, and report what
-    /// Apply committed. `edit_setup` hard-codes a live session, which is the
-    /// one thing these tests need to vary.
-    fn run_commit(editor: &mut EditorState, session_alive: bool) -> Committed {
-        let mut sent = Committed::default();
-        let mut harness = setup_harness(|ui| {
-            let committed = commit_row(ui, editor, session_alive);
-            if !committed.commands.is_empty() || !committed.startup.is_empty() {
-                sent = committed;
-            }
-        });
-        harness.get_by_label("Apply").click();
-        harness.run();
-        drop(harness);
-        sent
+    /// A click mode different from the seeded one.
+    fn other_mode() -> ClickMode {
+        ClickMode {
+            dry_run: true,
+            backend: crate::actuator::ActuatorBackend::Input,
+        }
     }
 
+    /// Apply carries the pair in one command. The point is that it cannot be
+    /// split: a job running the old backend in the new rehearsal state would
+    /// engage the window and then only journal.
     #[test]
-    fn only_the_startup_field_that_moved_is_written() {
+    fn the_click_mode_travels_as_one_command() {
         let mut editor = EditorState::new(
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
-        editor.startup.backend = crate::config::ActuatorBackend::Input;
-        let edits = editor.startup_edits();
-        assert_eq!(edits.backend, Some(crate::config::ActuatorBackend::Input));
+        editor.click_mode = other_mode();
         assert_eq!(
-            edits.dry_run, None,
-            "an untouched field must not be rewritten"
+            run_setup(&mut editor),
+            vec![Command::SetClickMode(other_mode())]
         );
     }
 
-    /// **The reason a dead session does not disable Apply.** The backend switch
-    /// is what `config.example.toml` calls the fallback for when a game update
-    /// stops honouring posted clicks — and an actuator fault of exactly that
-    /// kind is what halted the watch. Refusing the write on a dead session
-    /// would refuse it in the state it exists for.
+    /// Half a change is still a change: flipping only the rehearsal switch must
+    /// still send the backend alongside it, or the executor could read a pair
+    /// that never existed in the editor.
     #[test]
-    fn a_dead_session_still_commits_the_restart_only_settings() {
+    fn flipping_one_half_still_sends_both() {
         let mut editor = EditorState::new(
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
-        editor.startup.backend = crate::config::ActuatorBackend::Input;
-        let committed = run_commit(&mut editor, false);
+        editor.click_mode.dry_run = true;
+        let expected = ClickMode {
+            dry_run: true,
+            ..ClickMode::default()
+        };
         assert_eq!(
-            committed.startup.backend,
-            Some(crate::config::ActuatorBackend::Input)
-        );
-        assert!(
-            committed.commands.is_empty(),
-            "a dead session takes no command, so none may be reported as delivered"
+            run_setup(&mut editor),
+            vec![Command::SetClickMode(expected)]
         );
     }
 
-    /// The converse, and the older rule: a retune nobody can take must not be
-    /// committed just because the Startup section unlocked the button.
+    /// It follows the same twin rule as the other three now, and that is the
+    /// whole point of `plans/045`: a command lost to a saturated queue leaves
+    /// Apply lit rather than claiming a mode the executor never heard about.
     #[test]
-    fn a_dead_session_still_refuses_the_live_retunes() {
+    fn the_click_mode_draft_clears_only_on_a_delivered_command() {
         let mut editor = EditorState::new(
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
-        editor.limits.max_refreshes = Some(5);
-        editor.startup.dry_run = true;
-        let committed = run_commit(&mut editor, false);
-        assert_eq!(committed.startup.dry_run, Some(true));
-        assert!(
-            committed.commands.is_empty(),
-            "SetLimits must not travel on a dead session"
-        );
-        // And the draft stays dirty, so Apply stays lit for it.
-        assert_ne!(editor.limits, editor.applied_limits);
-    }
-
-    /// The lifecycle that makes these three different: the twin moves on a
-    /// successful *write*, not on a delivered command.
-    #[test]
-    fn a_startup_draft_stays_dirty_until_the_write_is_reported_good() {
-        let mut editor = EditorState::new(
-            named_filter(),
-            Limits::default(),
-            Timings::default(),
-            StartupSettings::default(),
-        );
-        editor.startup.backend = crate::config::ActuatorBackend::Input;
-        assert!(!editor.startup_edits().is_empty());
-        // `mark_applied` is the *other* rule; it must not clear this one, or a
-        // failed save would leave Apply dark over a change that never landed.
+        editor.click_mode = other_mode();
+        assert_ne!(editor.click_mode, editor.applied_click_mode);
         editor.mark_applied(&[Command::SetLimits(Limits::default())]);
-        assert!(
-            !editor.startup_edits().is_empty(),
-            "only a successful write clears a restart-only draft"
+        assert_ne!(
+            editor.click_mode, editor.applied_click_mode,
+            "another command's delivery must not clear this draft"
         );
-        editor.mark_startup_saved();
-        assert!(editor.startup_edits().is_empty());
+        editor.mark_applied(&[Command::SetClickMode(other_mode())]);
+        assert_eq!(editor.click_mode, editor.applied_click_mode);
     }
 
     #[test]
@@ -679,7 +571,7 @@ mod tests {
             Filter::default(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.filter = named_filter();
         assert_eq!(
@@ -694,7 +586,7 @@ mod tests {
             Filter::default(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.filter = named_filter();
         let commands = run_setup(&mut editor);
@@ -714,7 +606,7 @@ mod tests {
             Filter::default(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.filter = named_filter();
         editor.mark_applied(&[Command::Start, Command::Stop, Command::Toggle]);
@@ -727,7 +619,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         assert!(run_setup(&mut editor).is_empty());
     }
@@ -748,10 +640,10 @@ mod tests {
             filter,
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let harness = Harness::new_ui(|ui| {
-            edit_sections(ui, &mut editor, true);
+            edit_sections(ui, &mut editor);
         });
         drop(harness);
         assert_eq!(editor.filter.required_substats[0].min, Some(1.0));
@@ -765,7 +657,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.filter.names.clear();
         assert!(editor.filter.is_unrestricted());
@@ -781,12 +673,12 @@ mod tests {
         );
         assert_eq!(
             dirty_summary(true, true, true, true).as_deref(),
-            Some("Hunt, Stop, Click timing, Startup edited")
+            Some("Hunt, Stop, Click timing, Clicking edited")
         );
-        // Startup alone, which is the shape a dead-session Apply takes.
+        // The mode alone, which is the shape a rehearsal flip takes.
         assert_eq!(
             dirty_summary(false, false, false, true).as_deref(),
-            Some("Startup edited")
+            Some("Clicking edited")
         );
     }
 
@@ -796,7 +688,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.limits.max_refreshes = Some(5);
         let mut harness = Harness::new_ui(|ui| {
@@ -812,7 +704,7 @@ mod tests {
             Filter::default(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let mut harness = Harness::new_ui(|ui| {
             edit_setup(ui, &mut editor);
@@ -835,7 +727,7 @@ mod tests {
             filter,
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         {
             // Scoped so the assert below can read the draft: a first render
@@ -862,7 +754,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let mut harness = Harness::new_ui(|ui| {
             edit_setup(ui, &mut editor);
@@ -884,7 +776,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let mut harness = Harness::new_ui(|ui| {
             edit_setup(ui, &mut editor);
@@ -901,7 +793,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.timing_open = true;
         let mut harness = Harness::new_ui(|ui| {
@@ -919,7 +811,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.timing_open = true;
         let mut harness = Harness::new_ui(|ui| {
@@ -941,7 +833,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let harness = Harness::new_ui(|ui| {
             edit_setup(ui, &mut editor);
@@ -963,7 +855,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.timing_open = true;
         let mut harness = Harness::new_ui(|ui| {
@@ -988,7 +880,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             floored,
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.timing_open = true;
         let mut harness = Harness::new_ui(|ui| {
@@ -1023,7 +915,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.hunt_open = false;
         editor.stop_open = false;
@@ -1052,7 +944,7 @@ mod tests {
             named_filter(),
             limits,
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let mut harness = Harness::new_ui(|ui| {
             edit_setup(ui, &mut editor);
@@ -1068,7 +960,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.limits.max_refreshes = Some(7);
         let expected = Limits {
@@ -1091,7 +983,7 @@ mod tests {
             named_filter(),
             limits,
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         editor.hunt_open = false;
         editor.stop_open = true;
@@ -1122,7 +1014,7 @@ mod tests {
             named_filter(),
             Limits::default(),
             Timings::default(),
-            StartupSettings::default(),
+            ClickMode::default(),
         );
         let timings = Timings {
             refreshed: DelayRange::try_new(200, 800).expect("a valid fixture range"),

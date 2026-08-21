@@ -157,6 +157,11 @@ fn main() -> eframe::Result {
                         // Timings drive the actuator, not the controller: no
                         // domain event in this preview.
                         Command::SetTimings(_) => None,
+                        // Nor does the click mode, with one exception the
+                        // preview has no actuator to show: whether the mode
+                        // clicks for real decides `set_recovery`. There is no
+                        // executor here at all, so nothing to switch.
+                        Command::SetClickMode(_) => None,
                     };
                     if let Some(event) = event {
                         // Dropped for the same reason as the seeding above.
@@ -187,9 +192,9 @@ fn main() -> eframe::Result {
                 handles,
                 error,
                 Default::default(),
-                // The Startup drafts seed from `Config::default()`, which is
-                // what a preview should show: there is no launched session
-                // behind it whose real port could be reported.
+                // The Clicking drafts seed from `ClickMode::default()`, which
+                // is what a preview should show: there is no session behind it
+                // whose real mode could be reported.
                 Default::default(),
                 // scratch path: the design-mock preview must never overwrite the real config.toml on Apply
                 "ui_preview_scratch.toml".into(),

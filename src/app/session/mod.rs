@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 use crate::actuator::plan::{self, Trigger};
-use crate::actuator::{ActuatorHandle, Mode, SubmitError};
+use crate::actuator::{ActuatorBackend, ActuatorHandle, Mode, SubmitError};
 use crate::domain::control::{Action, BuyTarget, Controller, Event, Recovery, Status};
 use crate::journal::EventLog;
 use crate::render::{format_item, refusal_label, render_shop, status_label, stop_reason_label};
@@ -318,6 +318,27 @@ fn handle_command(
         Command::SetTimings(timings) => {
             actuator.set_timings(timings);
             return vec![">> click timings updated — applies to the next queued clicks".to_owned()];
+        }
+        // Not domain state either, with one exception that is: whether the
+        // actuator really clicks decides whether the recovery watchdog may arm.
+        // A rehearsal yields no wire feedback, so a deadline would self-halt the
+        // session — the rule `app::setup` applies once at wiring time, applied
+        // again here because the switch is now live.
+        Command::SetClickMode(mode) => {
+            actuator.set_click_mode(mode);
+            // `Mode::Off` means no backend is compiled in at all; nothing
+            // clicks whatever the switch says, so recovery stays dark.
+            let clicking = actuator.mode != Mode::Off && !mode.dry_run;
+            ctrl.set_recovery(clicking);
+            let what = if mode.dry_run {
+                "rehearsal on — clicks are planned and journaled, none are sent"
+            } else {
+                match mode.backend {
+                    ActuatorBackend::Message => "clicks are posted to the window",
+                    ActuatorBackend::Input => "clicks drive the real cursor",
+                }
+            };
+            return vec![format!(">> {what} — applies to the next queued clicks")];
         }
     };
     let before = ctrl.status();

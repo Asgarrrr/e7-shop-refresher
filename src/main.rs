@@ -192,7 +192,7 @@ fn run_mode(
     // executor — so this is the only moment the window can learn what a restart
     // would currently do. `game_port` is not among them on purpose: it has no
     // widget, so the window has nothing to seed. See `ui::editor::startup`.
-    let seed_startup = ui::StartupSettings {
+    let seed_click_mode = arkyve_refresh_shop::actuator::ClickMode {
         dry_run: config.actuator.dry_run,
         backend: config.actuator.backend,
     };
@@ -248,7 +248,7 @@ fn run_mode(
                 handles,
                 error,
                 seed_timings,
-                seed_startup,
+                seed_click_mode,
                 config_path,
             )))
         }),
