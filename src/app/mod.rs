@@ -162,7 +162,7 @@ pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
     if actuator_mode(&config) == Mode::Live {
         // Only real clicking gets watchdog deadlines: Off and DryRun produce
         // no wire feedback, so a deadline would self-halt both.
-        controller.enable_recovery();
+        controller.set_recovery(true);
     }
     let controller = Arc::new(Mutex::new(controller));
     // Both created here, ahead of `Session::run`, so a clone can ride in

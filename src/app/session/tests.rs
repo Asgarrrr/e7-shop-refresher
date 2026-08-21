@@ -1384,7 +1384,7 @@ fn a_gone_executor_is_journaled_as_gone_not_as_a_full_queue() {
 /// `ShopItem::default()`.
 fn armed_recovering() -> Mutex<Controller> {
     let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
-    ctrl.enable_recovery();
+    ctrl.set_recovery(true);
     let _ = ctrl.handle(Event::Start { now_ms: 0 });
     Mutex::new(ctrl)
 }
