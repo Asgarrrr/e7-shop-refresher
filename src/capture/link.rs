@@ -57,14 +57,39 @@ pub(super) enum LinkStrip {
     Fixed(usize),
 }
 
-/// 802.1Q tag protocol identifier.
-const TPID_8021Q: u16 = 0x8100;
-/// 802.1ad ("`QinQ`") service tag protocol identifier.
-const TPID_8021AD: u16 = 0x88A8;
+/// The tag protocol identifiers this module treats as a VLAN tag rather than
+/// as the `EtherType`.
+///
+/// Exactly the set libpcap's `vlan` keyword matches, which is what
+/// `capture::pcap::filter_candidates` puts in the kernel filter's tagged arms
+/// (named without a doc link: that module is behind the `pcap-backend` gate
+/// this one deliberately sits outside of, so the link would dangle in four of
+/// the six lanes): `gen_vlan_tpid_test()` in libpcap's `gencode.c` ors
+/// `ETHERTYPE_8021Q`, `ETHERTYPE_8021AD` and `ETHERTYPE_8021QINQ`, defined in
+/// its `ethertype.h` as `0x8100`, `0x88a8` and `0x9100`. The two sets have to
+/// be the same one: a TPID the filter admits but this does not recognise is a
+/// frame the driver forwards and this mis-strips, and a TPID this strips but
+/// the filter drops is unreachable code.
+///
+/// `0x9100` is the one that was missing — pre-standard `QinQ`, and the single
+/// input shape where [`ethernet_payload_offset`] used to return a *wrong*
+/// offset rather than `None`: the tag's TCI and the inner `EtherType` prepended
+/// to the IP header. That libpcap still generates a test for it is the reason
+/// to believe it is still in the field, and the reason it can arrive here.
+/// Refusing unknown 16-bit values outright is not the alternative it looks
+/// like: at that offset an unrecognised value is overwhelmingly an ordinary
+/// `EtherType`, so "refuse what is not a known TPID" means whitelisting
+/// `EtherType`s instead, which trades a rare wrong answer for a common one.
+const VLAN_TPIDS: [u16; 3] = [0x8100, 0x88A8, 0x9100];
 /// Bytes of Ethernet header before the `EtherType` field.
 const ETHERTYPE_OFFSET: usize = 12;
 /// Stacked VLAN tags tolerated before giving up: two covers 802.1ad's outer
 /// tag plus an inner 802.1Q one, as deep as a consumer machine will produce.
+///
+/// Two is also the deepest the kernel filter can deliver — the tagged rung's
+/// last arm is `vlan and vlan` (`capture::pcap::filter_candidates`) — so the
+/// depth and the TPID set in [`VLAN_TPIDS`] both match the filter exactly, and
+/// a third tag is refused here having already been dropped in the driver.
 const MAX_VLAN_TAGS: usize = 2;
 
 /// A link type this module cannot strip to an IP packet. Carries the raw `DLT`
@@ -131,7 +156,7 @@ fn ethernet_payload_offset(frame: &[u8]) -> Option<usize> {
     for _ in 0..=MAX_VLAN_TAGS {
         let field = frame.get(at..at + 2)?;
         let ethertype = u16::from_be_bytes([field[0], field[1]]);
-        if ethertype != TPID_8021Q && ethertype != TPID_8021AD {
+        if !VLAN_TPIDS.contains(&ethertype) {
             return Some(at + 2);
         }
         at += 4;
@@ -209,32 +234,64 @@ mod tests {
         );
     }
 
+    /// Every TPID libpcap's `vlan` keyword admits is stripped as a tag, not
+    /// read as an `EtherType`.
+    ///
+    /// The literals are written out rather than looped from [`VLAN_TPIDS`] on
+    /// purpose. The test this replaces iterated the same constant the code
+    /// branched on, so it could only ever agree with itself — and it did,
+    /// while `0x9100` was silently mis-stripped. These three are read off
+    /// libpcap's own source: `gen_vlan_tpid_test()` in `gencode.c` ors
+    /// `ETHERTYPE_8021Q`/`ETHERTYPE_8021AD`/`ETHERTYPE_8021QINQ`, which
+    /// `ethertype.h` defines as the values below. Adding a fourth constant
+    /// without a filter that admits it must fail here.
     #[test]
-    fn a_vlan_tag_pushes_the_ip_packet_four_bytes_further_along() {
-        for tpid in [TPID_8021Q, TPID_8021AD] {
+    fn every_tpid_the_kernel_filter_admits_is_stripped_as_a_tag() {
+        for tpid in [0x8100u16, 0x88A8, 0x9100] {
             let frame = ethernet_frame(&[tpid], b"ip packet");
-            assert_eq!(ethernet_payload_offset(&frame), Some(18), "tpid {tpid:#x}");
+            assert_eq!(
+                ethernet_payload_offset(&frame),
+                Some(18),
+                "tpid {tpid:#06x}"
+            );
+            // The exact bytes, not just the length: the failure mode is the
+            // tag's TCI plus the inner `EtherType` riding in front of the IP
+            // header, which an offset-only assertion would still catch but a
+            // "not longer than the frame" one would not.
             assert_eq!(
                 LinkStrip::Ethernet.ip_bytes(&frame),
                 Some(b"ip packet".as_slice()),
-                "tpid {tpid:#x}"
+                "tpid {tpid:#06x}"
             );
         }
     }
 
     #[test]
     fn a_double_tagged_qinq_frame_loses_both_tags() {
-        let frame = ethernet_frame(&[TPID_8021AD, TPID_8021Q], b"ip packet");
-        assert_eq!(ethernet_payload_offset(&frame), Some(22));
-        assert_eq!(
-            LinkStrip::Ethernet.ip_bytes(&frame),
-            Some(b"ip packet".as_slice())
-        );
+        // Outer service tag, inner customer tag — and the legacy 0x9100 pairing
+        // a switch that predates 802.1ad emits.
+        for outer in [0x88A8u16, 0x9100] {
+            let frame = ethernet_frame(&[outer, 0x8100], b"ip packet");
+            assert_eq!(
+                ethernet_payload_offset(&frame),
+                Some(22),
+                "outer {outer:#06x}"
+            );
+            assert_eq!(
+                LinkStrip::Ethernet.ip_bytes(&frame),
+                Some(b"ip packet".as_slice()),
+                "outer {outer:#06x}"
+            );
+        }
     }
 
+    /// `MAX_VLAN_TAGS` is two because the kernel filter's deepest arm is
+    /// `vlan and vlan` (`capture::pcap::filter_candidates`); a third tag is
+    /// refused here rather than mis-stripped, and would not have reached the
+    /// process anyway.
     #[test]
     fn a_vlan_stack_deeper_than_this_strips_is_refused_rather_than_mis_stripped() {
-        let frame = ethernet_frame(&[TPID_8021AD, TPID_8021Q, TPID_8021Q], b"ip packet");
+        let frame = ethernet_frame(&[0x88A8, 0x8100, 0x8100], b"ip packet");
         assert_eq!(ethernet_payload_offset(&frame), None);
         assert_eq!(LinkStrip::Ethernet.ip_bytes(&frame), None);
     }

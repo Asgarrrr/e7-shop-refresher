@@ -58,6 +58,36 @@ fn segment_span(bytes: &[u8], game_port: NonZeroU16) -> Option<SegmentSpan> {
         }
         NetSlice::Ipv6(ip) => {
             let header = ip.header();
+            // A header that declares no payload length hands length authority
+            // to the *captured slice*: `Ipv6Slice::from_slice` takes the
+            // `0 == header.payload_length() && slice.len() > Ipv6Header::LEN`
+            // branch at etherparse-0.20.3/src/net/ipv6_slice.rs:35 and records
+            // `LenSource::Slice`, so every byte after the 40-byte header comes
+            // back as TCP payload — an Ethernet trailer, or the next segment's
+            // headers inside a coalesced RSC/LRO superframe. IPv4's equivalent
+            // (a lying `total_length`) fails closed and at worst leaves a
+            // detectable gap; this one splices foreign bytes into the stream
+            // silently. Reverting this `return` makes
+            // `an_ipv6_packet_declaring_no_payload_length_is_refused` below
+            // report a payload of `[65, 66, 84, 82, 65, 73, 76, 69, 82]`
+            // ("ABTRAILER") for a segment whose header carried two bytes.
+            //
+            // Refusing costs this capture nothing observable. With
+            // `payload_length == 0` and nothing past the header, that same
+            // branch is not taken, the payload is empty, and `sliced.transport?`
+            // below already refused the packet for having no TCP header. The
+            // only other legitimate sender of a zero here is an RFC 2675
+            // jumbogram, which by definition carries more than 65 535 payload
+            // bytes and therefore needs a path MTU above 65 575 end to end.
+            // The filter is `tcp and src port <game_port>` on a game connection
+            // from a residential client to a remote server; that path's MTU is
+            // 1500. The one thing that does hand this function a buffer larger
+            // than an MTU is receive-side coalescing, and there the NIC rewrites
+            // the header of a frame it built itself — the largest measured here
+            // was 48 870 bytes (see `parse_segment` above), well inside a `u16`.
+            if header.payload_length() == 0 {
+                return None;
+            }
             (
                 IpAddr::V6(header.source_addr()),
                 IpAddr::V6(header.destination_addr()),
@@ -129,6 +159,14 @@ mod tests {
 
     const GAME_PORT: u16 = 3333;
     const GAME_PORT_NZ: NonZeroU16 = NonZeroU16::new(GAME_PORT).expect("3333 is not zero");
+
+    /// Documentation-range addresses (RFC 3849), one per side.
+    const IPV6_SERVER: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ];
+    const IPV6_CLIENT: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+    ];
 
     /// The three control bits [`parse_segment`] reads, so a test names the one
     /// it means rather than passing three positional booleans in the right
@@ -365,15 +403,9 @@ mod tests {
 
     #[test]
     fn ipv6_data_is_parsed() {
-        let server = [
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-        ];
-        let client = [
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
-        ];
         let bytes = ipv6_tcp(
-            (server, GAME_PORT),
-            (client, 51000),
+            (IPV6_SERVER, GAME_PORT),
+            (IPV6_CLIENT, 51000),
             7000,
             Flags::DATA,
             b"AB",
@@ -381,6 +413,69 @@ mod tests {
         let seg = parse_segment(bytes, GAME_PORT_NZ).expect("should parse");
         assert_eq!(seg.seq, 7000);
         assert_eq!(seg.payload, b"AB");
+    }
+
+    /// Fixed IPv6 header size, and the offset of its `payload_length` field,
+    /// per RFC 8200 §3 — spelled out because these tests edit the field by
+    /// hand, which is the only way to build a packet `PacketBuilder` refuses
+    /// to emit.
+    const IPV6_HEADER_LEN: usize = 40;
+    const IPV6_PAYLOAD_LENGTH_AT: Range<usize> = 4..6;
+
+    /// The length authority for an IPv6 payload is the header, not the bytes
+    /// that happened to be captured. A trailer past the declared length — an
+    /// Ethernet pad, or the next segment of a coalesced RSC frame — must not
+    /// reach reassembly.
+    ///
+    /// Asserts the exact payload rather than a bound on its length: the
+    /// failure this guards is bytes being *added*, and "no longer than the
+    /// frame" cannot see that.
+    #[test]
+    fn ipv6_stops_the_payload_where_the_header_says_it_ends() {
+        let mut bytes = ipv6_tcp(
+            (IPV6_SERVER, GAME_PORT),
+            (IPV6_CLIENT, 51000),
+            7100,
+            Flags::DATA,
+            b"AB",
+        );
+        bytes.extend_from_slice(b"TRAILER");
+        let seg = parse_segment(bytes, GAME_PORT_NZ).expect("should parse");
+        assert_eq!(seg.payload, b"AB");
+    }
+
+    /// The escape hatch at `etherparse-0.20.3/src/net/ipv6_slice.rs:35`: with
+    /// `payload_length == 0` and anything at all behind the header, etherparse
+    /// stops believing the header and takes the captured slice as the packet.
+    /// Everything trailing then arrives as stream bytes, undetectably.
+    #[test]
+    fn an_ipv6_packet_declaring_no_payload_length_is_refused() {
+        let mut bytes = ipv6_tcp(
+            (IPV6_SERVER, GAME_PORT),
+            (IPV6_CLIENT, 51000),
+            7200,
+            Flags::DATA,
+            b"AB",
+        );
+        // Tripwire on the fixture: without an honest length here first, zeroing
+        // the field would prove nothing about what the field controls.
+        let declared = u16::from_be_bytes([
+            bytes[IPV6_PAYLOAD_LENGTH_AT.start],
+            bytes[IPV6_PAYLOAD_LENGTH_AT.start + 1],
+        ]);
+        assert_eq!(
+            usize::from(declared),
+            bytes.len() - IPV6_HEADER_LEN,
+            "fixture should declare its whole payload before we zero the field"
+        );
+
+        bytes[IPV6_PAYLOAD_LENGTH_AT].fill(0);
+        bytes.extend_from_slice(b"TRAILER");
+        assert!(
+            parse_segment(bytes, GAME_PORT_NZ).is_none(),
+            "a packet that declares no payload length must be refused, not \
+             measured against the bytes that happened to be captured"
+        );
     }
 
     #[test]

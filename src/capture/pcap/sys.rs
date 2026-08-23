@@ -1014,7 +1014,8 @@ mod tests {
     // state, plus nine `unreachable_*` stubs for the entry points it must never
     // touch. `handle.handle: *mut PcapT` is never dereferenced by any of them —
     // it is carried around as an opaque token the way the real library treats an
-    // opaque `pcap_t`.
+    // opaque `pcap_t`. `open_device` is driven the same way through six more
+    // fakes and `opening_wpcap`, further down.
     //
     // Each `#[test]` fn runs on its own native thread (the default test
     // harness), so `thread_local!` state below is naturally scoped to one test
@@ -1137,7 +1138,15 @@ mod tests {
             })
         };
         static ERROR_TEXT: std::cell::RefCell<CString> = std::cell::RefCell::new(CString::new("").expect("no NUL"));
+        /// Every `pcap_close` the fake library was asked for, on this thread.
+        /// The one number the close contract is stated in: never 2, and never 0
+        /// once a `Handle` has been built.
         static CLOSE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// The three knobs [`ScriptedOpen`] sets; see its fields for what each
+        /// one makes `open_device` do.
+        static OPEN_SUCCEEDS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        static DATALINK: std::cell::Cell<c_int> = const { std::cell::Cell::new(SCRIPTED_DLT_EN10MB) };
+        static COMPILE_RC: std::cell::Cell<c_int> = const { std::cell::Cell::new(0) };
     }
 
     unsafe extern "C" fn scripted_next_ex(
@@ -1269,6 +1278,126 @@ mod tests {
         panic!("capture_loop must not call pcap_lib_version")
     }
 
+    // ---- The six more entry points `open_device` walks ----
+    //
+    // `open_device` is the other producer of a `Handle`, and the one that can
+    // fail after building it. Driving it needs `pcap_open_live`,
+    // `pcap_datalink`, `pcap_datalink_val_to_name`, `pcap_compile`,
+    // `pcap_setfilter` and `pcap_freecode` — six of the nine the stubs above
+    // leave panicking — so [`opening_wpcap`] overrides exactly those and leaves
+    // the other three panicking, which keeps them an assertion for this path
+    // too.
+
+    /// `DLT_EN10MB`, transcribed because `crate::capture::link`'s own constant
+    /// is private to that file. Nothing here depends on the number being right
+    /// silently: `an_opened_adapter_closes_once_when_dropped_and_not_before`
+    /// asserts `open_device` accepted it, so a wrong transcription fails.
+    const SCRIPTED_DLT_EN10MB: c_int = 1;
+
+    /// `DLT_IEEE802_11` — real 802.11 framing, the first value
+    /// `crate::capture::link`'s own
+    /// `an_unknown_link_type_yields_no_strip_so_the_device_is_skipped_rather_than_guessed_at`
+    /// lists. As above, the test that scripts it asserts the rejection, so this
+    /// cannot quietly become a supported link type.
+    const SCRIPTED_DLT_IEEE802_11: c_int = 105;
+
+    /// How far the fake driver lets one [`open_device`] call get.
+    struct ScriptedOpen {
+        /// `false` makes the fake `pcap_open_live` return null — a device the
+        /// driver refuses outright, before any `pcap_t` exists.
+        opens: bool,
+        /// What the fake `pcap_datalink` reports for the opened handle.
+        datalink: c_int,
+        /// The fake `pcap_compile`'s return code. Non-zero refuses every rung
+        /// of the filter ladder, since one fake answers them all.
+        compile_rc: c_int,
+    }
+
+    impl ScriptedOpen {
+        /// An adapter that opens, reports Ethernet framing and takes the first
+        /// filter it is offered: `open_device`'s success path end to end.
+        fn usable() -> Self {
+            Self {
+                opens: true,
+                datalink: SCRIPTED_DLT_EN10MB,
+                compile_rc: 0,
+            }
+        }
+
+        fn refusing_to_open() -> Self {
+            Self {
+                opens: false,
+                ..Self::usable()
+            }
+        }
+
+        fn reporting_datalink(datalink: c_int) -> Self {
+            Self {
+                datalink,
+                ..Self::usable()
+            }
+        }
+
+        /// `-1` is libpcap's `PCAP_ERROR`; `install_filter` only asks whether
+        /// the code is non-zero, so any of them takes the same branch.
+        fn refusing_every_filter() -> Self {
+            Self {
+                compile_rc: -1,
+                ..Self::usable()
+            }
+        }
+    }
+
+    unsafe extern "C" fn scripted_open_live(
+        _: *const c_char,
+        _: c_int,
+        _: c_int,
+        _: c_int,
+        _: *mut c_char,
+    ) -> *mut PcapT {
+        if OPEN_SUCCEEDS.with(std::cell::Cell::get) {
+            // The same dangling-but-never-dereferenced sentinel
+            // [`scripted_handle`] uses, and opaque to every fake here for the
+            // same reason.
+            std::ptr::NonNull::<PcapT>::dangling().as_ptr()
+        } else {
+            // The errbuf is left as `open_device` zeroed it, which is what a
+            // libpcap that failed without a message looks like; `errbuf_text`
+            // reads it back as empty.
+            std::ptr::null_mut()
+        }
+    }
+
+    unsafe extern "C" fn scripted_datalink(_: *mut PcapT) -> c_int {
+        DATALINK.with(std::cell::Cell::get)
+    }
+
+    unsafe extern "C" fn scripted_datalink_val_to_name(_: c_int) -> *const c_char {
+        // A `'static` NUL-terminated constant, which is what `open_device`'s
+        // `cstr` call needs and what the real `pcap_datalink_val_to_name`
+        // returns: a name it owns and never frees.
+        c"SCRIPTED".as_ptr()
+    }
+
+    unsafe extern "C" fn scripted_compile(
+        _: *mut PcapT,
+        _: *mut BpfProgram,
+        _: *const c_char,
+        _: c_int,
+        _: c_uint,
+    ) -> c_int {
+        // `program` is left exactly as `install_filter` zeroed it. Nothing is
+        // allocated, so the no-op `scripted_freecode` below frees nothing and
+        // the pair stays balanced whichever way the ladder goes.
+        COMPILE_RC.with(std::cell::Cell::get)
+    }
+
+    unsafe extern "C" fn scripted_setfilter(_: *mut PcapT, _: *mut BpfProgram) -> c_int {
+        0
+    }
+
+    unsafe extern "C" fn scripted_freecode(_: *mut BpfProgram) {}
+
     /// A real, already-loaded system library, exactly the way
     /// `the_search_flags_still_load_a_system_dll_by_absolute_path` proves the
     /// combination works: `version.dll` ships with every Windows install, its
@@ -1315,6 +1444,39 @@ mod tests {
             scripted_geterr,
             scripted_close,
         )
+    }
+
+    /// Resets the open-path fixture and returns a `Wpcap` [`open_device`] can
+    /// be driven through.
+    ///
+    /// Built on [`Wpcap::from_fns`] and then overridden field by field, rather
+    /// than by widening that constructor: its parameter list is the statement
+    /// that `capture_loop` and [`Handle`]'s [`Drop`] reach four entry points and
+    /// no others, and adding six parameters for a different caller would erase
+    /// it. What stays untouched here is load-bearing too — `pcap_findalldevs`,
+    /// `pcap_freealldevs` and `pcap_lib_version` keep their panicking stubs, and
+    /// `SCRIPT` is not filled, so a `pcap_next_ex` on this path finds nothing
+    /// scripted and panics as well.
+    fn opening_wpcap(scripted: ScriptedOpen) -> Wpcap {
+        OPEN_SUCCEEDS.with(|cell| cell.set(scripted.opens));
+        DATALINK.with(|cell| cell.set(scripted.datalink));
+        COMPILE_RC.with(|cell| cell.set(scripted.compile_rc));
+        CLOSE_CALLS.with(|calls| calls.set(0));
+        ERROR_TEXT.with(|cell| *cell.borrow_mut() = CString::new("").expect("no NUL"));
+        let mut wpcap = Wpcap::from_fns(
+            a_real_loaded_library(),
+            scripted_next_ex,
+            scripted_stats,
+            scripted_geterr,
+            scripted_close,
+        );
+        wpcap.open_live = scripted_open_live;
+        wpcap.datalink = scripted_datalink;
+        wpcap.datalink_val_to_name = scripted_datalink_val_to_name;
+        wpcap.compile = scripted_compile;
+        wpcap.setfilter = scripted_setfilter;
+        wpcap.freecode = scripted_freecode;
+        wpcap
     }
 
     /// Overrides what `pcap_geterr` returns, for the tests that read it back
@@ -2165,6 +2327,189 @@ mod tests {
             NEXT_EX_CALLS.with(std::cell::Cell::get),
             1,
             "the loop must not ask again once its sink is gone"
+        );
+    }
+
+    // ---- pcap_close: exactly once, on every path a Handle can leave by ----
+    //
+    // `Handle` exists to make that true by construction — no caller anywhere in
+    // the crate spells `pcap_close`, so no path can forget it and none can
+    // repeat it. Construction is not an assertion, though, and until these
+    // tests the fixture counted the closes without anyone reading the count.
+    // Measured while writing them, by removing `impl Drop for Handle` and
+    // running this module: six of the seven below fail and the other twenty-
+    // three tests here pass, which is what "nothing asserted the close" meant.
+    // Each names one way out of a `Handle` and the number of closes it owes.
+
+    #[test]
+    fn a_dropped_handle_closes_its_pcap_t_exactly_once() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wpcap = Arc::new(scripted_wpcap([], &stop));
+        let handle = scripted_handle(wpcap, LinkStrip::Ethernet);
+
+        assert_eq!(
+            CLOSE_CALLS.with(std::cell::Cell::get),
+            0,
+            "a live handle has closed nothing yet"
+        );
+        drop(handle);
+        assert_eq!(
+            CLOSE_CALLS.with(std::cell::Cell::get),
+            1,
+            "one Handle owns one pcap_t: dropping it closes that one, once — \
+             twice would be a double free of a live driver object"
+        );
+    }
+
+    /// The path the type is *for*. A capture thread can die between any two
+    /// `pcap_next_ex` calls, and no close is written on that path because none
+    /// can be: the unwind runs the drop glue, and the drop glue is the close.
+    #[test]
+    fn a_panic_while_a_handle_is_live_still_closes_it_exactly_once() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wpcap = Arc::new(scripted_wpcap([], &stop));
+
+        // No `AssertUnwindSafe`, unlike `actuator`'s poisoned-mutex test: the
+        // closure moves an `Arc<Wpcap>` and nothing else, and `Wpcap` is a table
+        // of `fn` pointers behind a `Library`, so the bound is satisfied outright.
+        let unwound = std::panic::catch_unwind(|| {
+            let _handle = scripted_handle(wpcap, LinkStrip::Ethernet);
+            panic!("the capture thread died holding an open adapter");
+        });
+
+        assert!(
+            unwound.is_err(),
+            "the test needs the panic to have unwound, not aborted"
+        );
+        assert_eq!(
+            CLOSE_CALLS.with(std::cell::Cell::get),
+            1,
+            "an adapter left open by a dead thread stays open for the life of \
+             the process, and nothing in this crate could close it afterwards"
+        );
+    }
+
+    /// The path production takes when nothing goes wrong: `capture_loop` takes
+    /// the `Handle` by value, so the close is the last thing its thread does.
+    #[test]
+    fn capture_loop_closes_the_handle_it_consumed() {
+        let (packets_tx, _packets_rx) = sync_channel(1);
+        let (failed_tx, _failed_rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
+
+        let wpcap = Arc::new(scripted_wpcap([ScriptedCall::timeout().stopping()], &stop));
+        let handle = scripted_handle(wpcap, LinkStrip::Ethernet);
+
+        let _counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
+
+        assert_eq!(
+            CLOSE_CALLS.with(std::cell::Cell::get),
+            1,
+            "the loop owns the handle it was handed, so returning from it \
+             closes the adapter — a leak here is one dead pcap_t per adapter \
+             per session"
+        );
+    }
+
+    #[test]
+    fn an_opened_adapter_closes_once_when_dropped_and_not_before() {
+        let wpcap = Arc::new(opening_wpcap(ScriptedOpen::usable()));
+        let filters = super::super::filter_candidates(NonZeroU16::new(3333).expect("not zero"));
+
+        let handle = open_device(&wpcap, r"\Device\NPF_{TEST}", &filters)
+            .expect("Ethernet framing and an accepted filter is a usable adapter");
+
+        assert_eq!(
+            CLOSE_CALLS.with(std::cell::Cell::get),
+            0,
+            "the handle open_device handed back is still open: closing it on \
+             the success path would hand the caller a dead pcap_t"
+        );
+        drop(handle);
+        assert_eq!(
+            CLOSE_CALLS.with(std::cell::Cell::get),
+            1,
+            "and the close arrives when the owner goes, not before and not twice"
+        );
+    }
+
+    /// `open_device` builds the owning wrapper before it can know whether the
+    /// adapter is usable — read at `sys.rs`'s "Owning wrapper first" comment,
+    /// where the `Handle` is constructed above both the datalink check and the
+    /// filter ladder. So both of its `?`s are closes, and this is the first.
+    #[test]
+    fn a_link_type_that_cannot_be_stripped_closes_the_half_configured_handle() {
+        let wpcap = Arc::new(opening_wpcap(ScriptedOpen::reporting_datalink(
+            SCRIPTED_DLT_IEEE802_11,
+        )));
+        let filters = super::super::filter_candidates(NonZeroU16::new(3333).expect("not zero"));
+
+        // `let ... else` rather than `expect_err`, here and in the two tests
+        // below: `expect_err` needs the `Ok` type to be `Debug`, and `Handle`
+        // does not implement it.
+        let Err(reason) = open_device(&wpcap, r"\Device\NPF_{WIFI}", &filters) else {
+            panic!("802.11 framing cannot be stripped to an IP packet")
+        };
+
+        assert!(reason.contains("cannot be stripped"), "{reason}");
+        assert_eq!(
+            CLOSE_CALLS.with(std::cell::Cell::get),
+            1,
+            "the pcap_t was opened before the link type was known, so a device \
+             this crate skips still costs one close"
+        );
+    }
+
+    /// The second of the two: a libpcap that refused every rung of the ladder.
+    /// `install_first_accepted` fails only once all of them are spent, so the
+    /// handle has been alive across several `pcap_compile` calls by the time
+    /// this `?` fires — and still owes exactly one close, not one per rung.
+    #[test]
+    fn a_refused_filter_ladder_closes_the_half_configured_handle() {
+        let wpcap = Arc::new(opening_wpcap(ScriptedOpen::refusing_every_filter()));
+        set_geterr_text("syntax error");
+        let filters = super::super::filter_candidates(NonZeroU16::new(3333).expect("not zero"));
+
+        let Err(reason) = open_device(&wpcap, r"\Device\NPF_{OLD}", &filters) else {
+            panic!("no installable filter means no usable adapter")
+        };
+
+        assert!(reason.contains("syntax error"), "{reason}");
+        assert_eq!(
+            CLOSE_CALLS.with(std::cell::Cell::get),
+            1,
+            "one close for the one handle, not one per refused rung"
+        );
+    }
+
+    /// The only exit that owes no close, and the reason the count is asserted
+    /// as a number rather than as "at least one": the early return above the
+    /// wrapper is the one path with no `pcap_t` to close, because `open_live`
+    /// returned null and no `Handle` was ever built around it.
+    #[test]
+    fn an_adapter_that_never_opened_is_never_closed() {
+        let wpcap = Arc::new(opening_wpcap(ScriptedOpen::refusing_to_open()));
+        let filters = super::super::filter_candidates(NonZeroU16::new(3333).expect("not zero"));
+
+        let Err(reason) = open_device(&wpcap, r"\Device\NPF_{GONE}", &filters) else {
+            panic!("a null pcap_t is a refusal, not a handle")
+        };
+
+        assert!(reason.contains("pcap_open_live"), "{reason}");
+        assert_eq!(
+            CLOSE_CALLS.with(std::cell::Cell::get),
+            0,
+            "nothing was opened, so nothing is owed a close — and the null \
+             libpcap handed back is not a pcap_t to hand it"
         );
     }
 }
