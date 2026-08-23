@@ -15,11 +15,30 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use arkyve_refresh_shop::{
     Config, app, config_path, crash, exit_code, fatal, install_logging, migrate,
     seed_config_if_missing, strip_and_report_retired_keys,
 };
+
+/// How long a closing process waits for the session to unwind (capture session
+/// closed, capture thread joined, uplink shut) before detaching it. Generous:
+/// this only ever runs once, on exit.
+///
+/// One value for both `run_mode` arms, not two. It bounds a *stuck* teardown,
+/// never a healthy one: a healthy one is already bounded from the inside by
+/// `app::workers`'s `WORKER_SHUTDOWN_GRACE` (250 ms), which
+/// `SessionWorkers::shutdown` spends twice, plus the capture thread join — so
+/// three seconds is the same wide margin in either build. The tempting reason
+/// to shorten it in the console build — a player watching a terminal rather
+/// than a window that has already vanished — is about *feedback* during the
+/// wait, and what answers that is the warning `teardown_failed` logs on
+/// timeout, which this build's player does see: `install_logging` tees the file
+/// writer with `std::io::stdout`. A second number would instead mean a console
+/// repro and a windowed repro detach at different points while that warning's
+/// `grace_s` field names only one of them.
+const TEARDOWN_GRACE: Duration = Duration::from_secs(3);
 
 fn main() -> ExitCode {
     // First statement: everything after this can panic, including the
@@ -137,7 +156,9 @@ fn main() -> ExitCode {
     )
 }
 
-/// Console-only build: the session blocks the main thread.
+/// Console-only build: the session runs on the runtime's workers and this
+/// thread waits for it, under the same [`TEARDOWN_GRACE`] the windowed arm
+/// applies once its window is gone.
 ///
 /// `_log_file` and `_dropped_ranges` are unused on purpose: this lane has a real
 /// terminal, so both are already on screen. The windowed arm has no such surface
@@ -150,17 +171,72 @@ fn run_mode(
     _log_file: Option<&std::path::Path>,
     _dropped_ranges: arkyve_refresh_shop::config::DroppedRanges,
 ) -> ExitCode {
-    let outcome = runtime.block_on(app::run(config));
+    use std::sync::{Arc, Mutex};
+
+    use arkyve_refresh_shop::sync::lock_ignoring_poison;
+
+    // A slot rather than the task's own return value, for the reason the
+    // windowed arm hands `supervise`'s outcome through `SessionErrorSlot`: the
+    // wait below can end before the task is joined, and a verdict written
+    // during the grace still has to reach the exit code.
+    let outcome: Arc<Mutex<Option<arkyve_refresh_shop::Result<()>>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&outcome);
+    // Carries nothing, and says only *when*: the Ctrl+C arm below abandons this
+    // receiver, so a verdict sent through it would be the one verdict lost.
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<()>();
+    // Spawned rather than run under `block_on`, so this thread keeps a wait it
+    // can put a deadline on. The handle is the join point for that deadline.
+    let session_task = runtime.spawn(async move {
+        let verdict = app::run(config).await;
+        // Poison-tolerant and written whole, for the windowed arm's reason:
+        // panicking here would report a dead session as a clean exit.
+        *lock_ignoring_poison(&slot) = Some(verdict);
+        // After the slot, so a wakeup below implies a readable verdict.
+        let _ = finished_tx.send(());
+    });
+
+    // Ctrl+C is this build's window close, and this listener is the second one:
+    // `app::session`'s `session_loop` pins its own and stops the session on the
+    // same press, while this one starts the deadline on the teardown that press
+    // begins. Without it this thread waits on the join with no bound at all —
+    // `app::workers`'s `CaptureWorker::stop_and_join` is an untimed
+    // `Thread::join`, and a `stop()` that fails to wake the capture thread never
+    // ends it (held by
+    // `worker_shutdown_stalls_when_stop_does_not_wake_the_capture_thread`) — and
+    // no later press can help, tokio's console control handler having returned
+    // TRUE since the first one (`SessionWorkers::shutdown` names the same
+    // swallowing for its own second deadline).
+    let abandoned = runtime.block_on(async move {
+        tokio::select! {
+            _ = finished_rx => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        // The windowed arm's call, unchanged and for its stated reason: a
+        // session the process had to abandon is a failed session.
+        arkyve_refresh_shop::teardown_failed(session_task, TEARDOWN_GRACE).await
+    });
     // Not a plain drop: `tokio::io::stdin` parks an uncancelable blocking read,
     // so dropping the runtime hangs exit until the player presses Enter.
     runtime.shutdown_background();
     // No window here, so its half of the contract is vacuously satisfied.
-    match outcome {
-        Ok(()) => exit_code(true, false),
-        Err(err) => {
+    match lock_ignoring_poison(&outcome).take() {
+        Some(Ok(())) => exit_code(true, abandoned),
+        Some(Err(err)) => {
             tracing::error!(error = ?err, "the session ended with a fatal error");
             eprintln!("Fatal error: {}", err.report());
             exit_code(true, true)
+        }
+        // No verdict means the task never reached the line that writes one, so
+        // `teardown_failed` took one of its two failure arms — a `JoinError`,
+        // or the grace expiring — and `abandoned` is true here by construction.
+        // Both arms log; this one also says it on the terminal, because that is
+        // where this build's player is looking.
+        None => {
+            eprintln!(
+                "The session did not finish within {} s of being asked to stop; exiting anyway.",
+                TEARDOWN_GRACE.as_secs()
+            );
+            exit_code(true, abandoned)
         }
     }
 }
@@ -178,14 +254,8 @@ fn run_mode(
 ) -> ExitCode {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
 
     use arkyve_refresh_shop::ui;
-
-    /// How long the closing window waits for the session to unwind (capture
-    /// session closed, capture thread joined, uplink shut). Generous: this
-    /// only ever runs once, on exit.
-    const TEARDOWN_GRACE: Duration = Duration::from_secs(3);
 
     // Read before setup consumes the config: these seed the window's timing
     // editor, which has no controller home.

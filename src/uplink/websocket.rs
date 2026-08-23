@@ -112,8 +112,11 @@ enum Outcome {
 ///   Every `%url` here resolves through `Display` — the redacted authority — so
 ///   no log line in this module can leak one.
 /// - `outbound`: closing it stops the loop.
-/// - `shutdown`: raced against every window this loop can park in, so teardown
-///   does not have to reach the task by `abort`.
+/// - `shutdown`: raced against every window this loop can park in — the
+///   handshake (`CONNECT_TIMEOUT`), the connected `pump`, the backoff
+///   `drain_until`, and the four `LinkUp`/`LinkDown` publications, which go
+///   through [`report_link_state`] for exactly that reason — so teardown does
+///   not have to reach the task by `abort`.
 pub async fn run(
     url: ServerUrl,
     outbound: mpsc::Receiver<BudgetedChunk>,
@@ -147,6 +150,12 @@ async fn run_with_connector<C, S>(
     S: Stream<Item = Result<Message, WsError>> + Sink<Message, Error = WsError> + Unpin,
 {
     let mut backoff = Backoff::new(initial_backoff, max_backoff);
+    // A second view of the same signal, needed because `session` below holds
+    // `shutdown` mutably borrowed across the window where `LinkUp` is published.
+    // Cloning a `watch::Receiver` shares the channel and copies only the
+    // per-receiver "seen" mark, and `wait_for_shutdown` reads the *value* before
+    // waiting on a change — so this view cannot miss a stop already requested.
+    let mut status_shutdown = shutdown.clone();
     // The player only hears transitions: the first failure reports the outage,
     // each retry stays a tracing detail, recovery reports once.
     let mut outage_reported = false;
@@ -215,8 +224,15 @@ async fn run_with_connector<C, S>(
                         // Spent, not banked: the next outage starts from zero,
                         // however long this link goes on to live.
                         connected_for = Duration::ZERO;
-                        if std::mem::take(&mut outage_reported) {
-                            let _ = inbound.send(UplinkEvent::LinkUp).await;
+                        if std::mem::take(&mut outage_reported)
+                            && !report_link_state(
+                                &inbound,
+                                UplinkEvent::LinkUp,
+                                &mut status_shutdown,
+                            )
+                            .await
+                        {
+                            return;
                         }
                         session.await
                     }
@@ -232,7 +248,15 @@ async fn run_with_connector<C, S>(
                         // the transition.
                         if !outage_reported {
                             outage_reported = true;
-                            let _ = inbound.send(UplinkEvent::LinkDown(reason)).await;
+                            if !report_link_state(
+                                &inbound,
+                                UplinkEvent::LinkDown(reason),
+                                &mut status_shutdown,
+                            )
+                            .await
+                            {
+                                return;
+                            }
                         }
                     }
                 }
@@ -244,16 +268,30 @@ async fn run_with_connector<C, S>(
                     // Safe to mirror into the journal: no `WsError` variant
                     // reachable from `connect_async` embeds the URL in its
                     // `Display` (checked against tungstenite 0.29).
-                    let _ = inbound.send(UplinkEvent::LinkDown(err.to_string())).await;
+                    if !report_link_state(
+                        &inbound,
+                        UplinkEvent::LinkDown(err.to_string()),
+                        &mut status_shutdown,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                 }
             }
             Err(_elapsed) => {
                 warn!(server = %url, attempt, "server handshake stalled — retrying");
                 if !outage_reported {
                     outage_reported = true;
-                    let _ = inbound
-                        .send(UplinkEvent::LinkDown("handshake stalled".to_owned()))
-                        .await;
+                    if !report_link_state(
+                        &inbound,
+                        UplinkEvent::LinkDown("handshake stalled".to_owned()),
+                        &mut status_shutdown,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -293,6 +331,44 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
         if shutdown.changed().await.is_err() {
             return;
         }
+    }
+}
+
+/// Publishes one link-state transition, racing the send against the stop signal.
+/// Returns `false` when the stop won, in which case the caller must return: the
+/// event was not delivered and never will be.
+///
+/// A bare `send().await` here is the one window `run`'s promise could not
+/// otherwise cover. `inbound` is bounded (`PIPELINE_QUEUE`), its only consumer
+/// is `app::session::session_loop`, and the moment that loop stops draining —
+/// blocked on the controller mutex the UI thread also takes, or already past its
+/// last iteration — is exactly the moment teardown asks this task to stop. The
+/// task would then leave through `SessionWorkers::shutdown`'s `abort`, after the
+/// grace deadline, rather than cooperatively.
+///
+/// Dropping the event costs nothing, and that is checkable rather than hoped.
+/// `shutdown` is set only by `ShutdownSignal::request` — the only setter, the
+/// `watch::Sender` being private to that newtype — which a closing window,
+/// Ctrl+C and `SessionWorkers::shutdown` call. `app::session`'s loop re-reads
+/// the signal at the top of every iteration and breaks *before* it can dispatch
+/// another `UplinkEvent`, so nothing will ever read this one. All it could have
+/// changed is `Controller::link_up`, which gates the recovery watchdog's
+/// deadlines, and the teardown event that same break dispatches ends the watch
+/// regardless. `pump` already discards an in-flight `Message` this way, through
+/// its `stopping` arm, and a `Shop` snapshot is the costlier loss.
+///
+/// `biased` for the same reason the rest of this module uses it: a stop already
+/// requested wins deterministically. It cannot cost a delivery in normal
+/// operation, because outside teardown `wait_for_shutdown` is always pending.
+async fn report_link_state(
+    inbound: &mpsc::Sender<UplinkEvent>,
+    event: UplinkEvent,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = wait_for_shutdown(shutdown) => false,
+        _ = inbound.send(event) => true,
     }
 }
 
@@ -1431,6 +1507,52 @@ mod tests {
         stop_tx.send(true).expect("the receiver is in the task");
         tokio::task::yield_now().await;
         assert!(task.is_finished(), "a requested stop drops the connection");
+        task.await.unwrap();
+    }
+
+    /// The fourth window, which the three above cannot reach: the loop is parked
+    /// neither in a timer nor in a socket but in `inbound.send`, on a channel the
+    /// session loop has stopped draining — which is what a session loop being
+    /// torn down *is*. Nothing about the link stalls here; the channel does.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_ends_an_outage_report_no_one_is_draining() {
+        // Held on purpose, like the three tests above: a closed outbound channel
+        // is the other way this loop stops, and would pass this for the wrong
+        // reason. It is never reached anyway — the send precedes the drain.
+        let (_raw_tx, raw_rx) = mpsc::channel::<BudgetedChunk>(1);
+        // Capacity one, pre-filled, never drained. `_event_rx` is held for the
+        // whole test: a *closed* channel would fail the send immediately and
+        // pass this for the wrong reason too.
+        let (event_tx, _event_rx) = mpsc::channel::<UplinkEvent>(1);
+        event_tx
+            .send(UplinkEvent::Message(ServerMessage::Ack))
+            .await
+            .expect("the receiver is held for the whole test");
+        let (stop_tx, stop_rx) = no_shutdown();
+
+        let task = tokio::spawn(run_with_connector(
+            test_url(),
+            raw_rx,
+            event_tx,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            stop_rx,
+            move |_url| ready(Err::<StalledLink, _>(WsError::ConnectionClosed)),
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "parked publishing the outage into a full channel, as intended"
+        );
+
+        stop_tx.send(true).expect("the receiver is in the task");
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "a requested stop must reach a task parked publishing LinkDown, \
+             not be left to `SessionWorkers::shutdown`'s abort"
+        );
         task.await.unwrap();
     }
 

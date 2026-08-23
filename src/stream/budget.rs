@@ -716,9 +716,38 @@ impl BudgetedChunk {
         }
         let budget = self.lease.budget.clone();
         loop {
+            // Constructed *before* the check below, and that order is the whole
+            // guard against a lost wakeup. `release` publishes with
+            // `notify_waiters`, which wakes only what is already waiting; the
+            // window this closes is a release landing after `try_retag` has
+            // failed and before this task parks, with no room left to try again.
+            //
+            // What closes it is not registration but the counter this future
+            // copies out at construction: `Notify::notified` snapshots
+            // `num_notify_waiters_calls` into the future
+            // (tokio 1.52.3, src/sync/notify.rs:565-575), and the first poll
+            // returns `Ready` without parking if that counter has moved since
+            // (same file, `poll_notified`, `State::Init`, line 1124 — and again
+            // at line 1156 under the waiters lock). So every `notify_waiters`
+            // after this line is seen, whether or not the waiter had registered.
+            //
+            // Move this line below the check and the window reopens: the
+            // reassembly task parks forever with the entire outbound quota free,
+            // and nothing logs it — `retag_outbound` has no timeout and its
+            // `Err` means "never", so the stall has no reporting path at all.
+            //
+            // No `enable()` here. It reads as the guard and is not: it is
+            // `poll_notified(None)` (notify.rs:1006), which takes the waiters
+            // lock and links the waiter early. That earns nothing against
+            // `notify_waiters` — the snapshot above already covers it — and this
+            // `Notify` never sees a `notify_one`, the one caller `enable` exists
+            // for. It cost two uncontended waiters-lock acquisitions per chunk on
+            // the path that never waits — the link in `poll_notified`, and the
+            // unlink `drop_notified` does for exactly the `State::Waiting` that
+            // link leaves behind (notify.rs:1041-1048, 1345-1346). Unmeasured, so
+            // this is not a claimed speed-up; it is one less line that has to be
+            // understood before the line above it can be.
             let notified = budget.0.released.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
             if self.lease.try_retag(Stage::Outbound) {
                 return Ok(self);
             }
@@ -831,6 +860,59 @@ mod tests {
         assert_eq!(budget.snapshot().current_total, 0);
     }
 
+    /// The global half of `reserve_new`'s refusal, on its own. Every stage
+    /// quota here is free — the held bytes have been retagged off capture — so
+    /// only `total > limits.global` can say no, and deleting that half admits a
+    /// segment this asserts is refused.
+    ///
+    /// [`byte_budget_never_exceeds_global_limit`] cannot make that distinction:
+    /// its `test_budget(96, 96, 64, 64)` has both halves refusing the same
+    /// segment, so either one alone still passes it.
+    #[test]
+    fn the_global_ceiling_refuses_a_segment_every_stage_quota_would_admit() {
+        // Global 96, capture 64: a second 64-byte segment overruns the global by
+        // 32 while fitting an empty capture stage exactly.
+        let budget = test_budget(96, 64, 64, 64);
+        let mut held = budget.admit_capture(sized_seg(flow(), 0, 8, 64)).unwrap();
+        // Takes the 64 charged bytes off capture, leaving the stage this
+        // admission is checked against completely empty.
+        assert!(held.payload.try_retag_pending());
+        let stats = budget.snapshot();
+        assert_eq!((stats.current_total, stats.current_capture), (64, 0));
+
+        let rejected = budget.admit_capture(sized_seg(flow(), 8, 8, 64));
+
+        assert!(
+            rejected.is_err(),
+            "64 + 64 overruns the 96-byte global ceiling, with capture at 0/64"
+        );
+        assert_eq!(budget.snapshot().current_total, 64);
+        drop(held);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// The stage half of the same refusal, on its own. The global ceiling is
+    /// 4 KiB clear of the 128 bytes at stake, so only
+    /// `stage_total > self.stage_limit(stage)` can say no.
+    #[test]
+    fn a_stage_quota_refuses_a_segment_the_global_ceiling_would_admit() {
+        let budget = test_budget(4096, 64, 4096, 4096);
+        let held = budget.admit_capture(sized_seg(flow(), 0, 8, 64)).unwrap();
+        let stats = budget.snapshot();
+        assert_eq!((stats.current_total, stats.current_capture), (64, 64));
+
+        let rejected = budget.admit_capture(sized_seg(flow(), 8, 8, 64));
+
+        assert!(
+            rejected.is_err(),
+            "64 + 64 overruns the 64-byte capture quota, with the total at 64/4096"
+        );
+        let stats = budget.snapshot();
+        assert_eq!((stats.current_total, stats.current_capture), (64, 64));
+        drop(held);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
     #[tokio::test]
     async fn byte_budget_leases_release_and_retag_stage_bytes() {
         let budget = test_budget(128, 128, 128, 128);
@@ -856,6 +938,60 @@ mod tests {
         }
         assert_eq!(budget.snapshot().current_total, 0);
         assert_eq!(budget.snapshot().high_water_total, 64);
+    }
+
+    /// A high-water mark is a maximum, not the last reading. The neighbouring
+    /// [`byte_budget_high_water_is_monotonic_under_repeated_pressure`] never
+    /// admits a *smaller* total after a larger one, so it passes with
+    /// `usage.high_water = total` in place of the `.max`; this is the case that
+    /// separates the two.
+    #[test]
+    fn the_high_water_mark_survives_a_smaller_total_admitted_after_a_larger_one() {
+        let budget = test_budget(128, 128, 128, 128);
+        let peak = budget.admit_capture(sized_seg(flow(), 0, 8, 64)).unwrap();
+        assert_eq!(budget.snapshot().high_water_total, 64);
+        drop(peak);
+        assert_eq!(budget.snapshot().current_total, 0);
+
+        let smaller = budget.admit_capture(sized_seg(flow(), 8, 4, 8)).unwrap();
+
+        let stats = budget.snapshot();
+        assert_eq!(
+            stats.current_total, 8,
+            "the live gauge does follow the drop"
+        );
+        assert_eq!(
+            stats.high_water_total, 64,
+            "the peak is the largest total ever charged, not the latest one"
+        );
+        drop(smaller);
+        assert_eq!(budget.snapshot().high_water_total, 64);
+    }
+
+    /// A drop is charged the bytes the lease reserved — what the pipeline
+    /// actually gives back — and not the buffer that is left of them, which
+    /// `drain_front` and `HalfStream::absorb` shrink independently.
+    /// `dropped_bytes` is what `ui::capture_health` reports as lost and what the
+    /// backpressure `warn!` carries, so a charge of `0` (or of `len()`) reads as
+    /// a pipeline that dropped a segment weighing nothing.
+    #[test]
+    fn a_dropped_chunk_is_charged_the_whole_reservation_it_gives_back() {
+        let budget = test_budget(128, 128, 128, 128);
+        // Length 8, capacity 64: the two numbers a `record_drop` could reach for
+        // are far enough apart to name each other in a failure.
+        let admitted = budget.admit_capture(sized_seg(flow(), 0, 8, 64)).unwrap();
+        assert_eq!(budget.snapshot().current_total, 64);
+
+        admitted.into_payload().record_drop();
+
+        let stats = budget.snapshot();
+        assert_eq!(
+            (stats.dropped_segments, stats.dropped_bytes),
+            (1, 64),
+            "the reservation is 64 bytes; the buffer inside it is 8"
+        );
+        // Charged and given back: consuming the chunk dropped its lease too.
+        assert_eq!(stats.current_total, 0);
     }
 
     /// The total and its breakdown are one number read two ways, so no sequence

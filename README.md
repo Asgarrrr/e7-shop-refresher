@@ -9,20 +9,24 @@ buys matched items via click emulation.
 ## How it works
 
 ```
-Npcap tap ─▶ parse IP/TCP ─▶ TCP reassembly ─▶ gate ─▶ WebSocket ─▶ server
- (passive)                   (ordered/dedup)                  ▲         │
-                                                       snapshots ◀──────┘
+Npcap tap ─▶ parse IP/TCP ─▶ gate ─▶ TCP reassembly ─▶ WebSocket ─▶ server
+ (passive)                            (ordered/dedup)         ▲         │
+                                                        snapshots ◀─────┘
 ```
 
 - **Capture**: an Npcap read-only tap on every network adapter yields a *copy*
   of the game-port TCP packets; the originals continue on their way intact. The
-  tool is never a proxy and never owns the game's socket — nothing can be
-  injected, dropped or rewritten, by this code or by any later addition to it,
-  because a capture handle physically cannot send. The kernel-side filter is
-  fixed (`tcp and src port 3333`, built from `game_port`), so no other traffic
-  on the machine is even copied. The `src` narrows it further: only what the
-  game *server* sends is copied, and the client → server half never leaves the
-  driver.
+  tool is never a proxy and never owns the game's socket, and nothing is
+  injected, dropped or rewritten: the `wpcap.dll` surface bound in
+  `capture/pcap/sys.rs` is thirteen symbols wide and none of them transmit —
+  no `pcap_sendpacket`, no `pcap_inject` — so there is no send path to call.
+  That is a property of what this code binds, not a physical impossibility: a
+  future contributor could add one, and only review stands in the way. The
+  kernel-side filter *is* enforced: it is built from `game_port` alone
+  (`tcp and src port 3333`), no config key can widen it, and an adapter whose
+  filter fails to compile or install is skipped rather than captured
+  unfiltered. The `src` narrows it further — only what the game *server* sends
+  is copied, and the client → server half never leaves the driver.
 - **Reassembly**: captured segments (possibly out of order or retransmitted) are
   recomposed into an ordered byte stream, per connection.
 - **Forwarding**: the raw server → client stream is sent as-is to the analysis
