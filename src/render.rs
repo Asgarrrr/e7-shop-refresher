@@ -67,8 +67,15 @@ pub(crate) fn grouped(n: u32) -> String {
     out
 }
 
-/// An amount, or an em-dash while it is unknown. The one absent-value policy
-/// shared by the status-bar balance tiles and the slot table's price column.
+/// An amount, or an em-dash while it is unknown: the slot table's price column,
+/// which is its only caller.
+///
+/// It used to be shared with the status bar's balances, and the split is the
+/// point rather than an oversight. A dash holds a column's width open, which a
+/// table needs and a strip does not — rendered in the strip it produced
+/// "— skystones · — gold", punctuation outweighing information. The strip says
+/// what it is waiting for in a sentence instead (`statusbar::balances_strip`),
+/// so this policy is now the table's alone.
 ///
 /// Generic over `Display`, not `u32`: grouping is the currency's own rendering
 /// (`impl Display for Gold`/`Crystals`), so this function's only job is the
@@ -93,7 +100,9 @@ pub(crate) fn status_summary(controller: &Controller) -> (&'static str, Option<&
         Status::Paused if controller.checklist().is_empty() => {
             ("Paused", Some("buy, then refresh"))
         }
-        Status::Paused => ("Paused", Some("buy — auto-resumes")),
+        // No dash inside the clause: the caller joins word and clause with one,
+        // and a second turned the line into three fragments.
+        Status::Paused => ("Paused", Some("buy what you want, it resumes on its own")),
         Status::Stopped(reason) => ("Stopped", Some(stop_reason_label(reason))),
     }
 }
@@ -121,23 +130,24 @@ pub(crate) fn refusal_label(reason: RefusalReason) -> &'static str {
 /// beside "Stopped", and the line the journal reports a halt with.
 pub(crate) fn stop_reason_label(reason: StopReason) -> &'static str {
     match reason {
-        StopReason::PlayerStopped => "player stopped",
-        StopReason::SessionEnded => "session ended",
-        StopReason::ActuatorFailed => "clicker failed — see the journal",
-        StopReason::Unresponsive => "no response from the game — see the journal",
-        StopReason::OutOfFunds => "out of crystals",
+        // Not "player stopped": the caller prefixes "Stopped — ", and a clause
+        // that repeats its own word says nothing twice.
+        StopReason::PlayerStopped => "at your request",
+        // The distinction this variant exists for, in the player's words —
+        // see its doc: they must not be told their own stop did this.
+        StopReason::SessionEnded => "the session ended on its own",
+        // Comma, not a dash: the caller already spent the line's one dash.
+        StopReason::ActuatorFailed => "the clicker failed, details in the journal",
+        StopReason::Unresponsive => "the game stopped responding, details in the journal",
+        // Skystones, not crystals. `max_spend` is crystals in the domain and
+        // Skystones on screen — the rule `view::caption` states and these two
+        // were breaking, against a window whose balance strip says SKYSTONES.
+        StopReason::OutOfFunds => "no skystones left",
         StopReason::MaxRefreshes => "refresh limit reached",
-        StopReason::MaxSpend => "crystal budget reached",
+        StopReason::MaxSpend => "skystone budget reached",
         StopReason::MaxMatches => "match limit reached",
         StopReason::Timeout => "session time limit reached",
     }
-}
-
-/// Merchant name, or the shared fallback when the snapshot omits it — the one
-/// place the default label lives, so the console dump and the GUI header never
-/// disagree.
-pub(crate) fn merchant_label(merchant: Option<&str>) -> &str {
-    merchant.unwrap_or("Secret Shop")
 }
 
 /// Prints the snapshot for the console build.
@@ -155,7 +165,10 @@ pub(crate) fn merchant_label(merchant: Option<&str>) -> &str {
 pub(crate) fn render_shop(snapshot: &ShopSnapshot) {
     #[cfg(not(feature = "gui"))]
     {
-        println!("\n[{}]", merchant_label(snapshot.merchant.as_deref()));
+        println!(
+            "\n[{}]",
+            snapshot.merchant.as_deref().unwrap_or("Secret Shop")
+        );
         for (index, item) in snapshot.slots.iter().enumerate() {
             println!("  {}", format_item(item, index));
         }
@@ -265,12 +278,6 @@ mod tests {
         assert!(format_item(&item, 1).starts_with("slot 2 · "));
     }
 
-    #[test]
-    fn merchant_label_falls_back_when_absent() {
-        assert_eq!(merchant_label(Some("Secret Shop VIP")), "Secret Shop VIP");
-        assert_eq!(merchant_label(None), "Secret Shop");
-    }
-
     /// Capturing stdout in a Rust test needs a dependency this crate does not
     /// have, so this asserts the property structurally instead: in the `gui`
     /// build `render_shop`'s body is compiled out entirely (see its `#[cfg]`),
@@ -299,7 +306,7 @@ mod tests {
         assert_eq!(status_summary(&armed), ("Idle", Some("ready to start")));
         let _ = armed.handle(Event::Start { now_ms: 0 });
         let _ = armed.handle(Event::Stop);
-        assert_eq!(status_summary(&armed), ("Stopped", Some("player stopped")));
+        assert_eq!(status_summary(&armed), ("Stopped", Some("at your request")));
     }
 
     #[test]

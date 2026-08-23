@@ -4,16 +4,20 @@
 use eframe::egui;
 
 use super::theme;
+use super::theme::cell;
 use super::view::{SlotRow, ViewState};
 
 /// `detail` is a callback rather than a `SlotRow` field, since egui only asks
-/// for the hovered row — see `view::slot_detail`. `merchant` is likewise built
-/// on demand by `view::merchant_heading` rather than carried in `view`.
+/// for the hovered row — see `view::slot_detail`.
+///
+/// No merchant heading: `ShopSnapshot::merchant` is a constant, not a name —
+/// every snapshot this app ever receives carries the same value, "Lobby". A
+/// heading that always reads the same word credits nothing and, to a player
+/// who has never heard the game call it that, reads as the wrong screen.
 pub(super) fn render_shop_tab(
     ui: &mut egui::Ui,
     view: &ViewState,
     rows: &[SlotRow],
-    merchant: &str,
     detail: &dyn Fn(usize) -> String,
 ) {
     // Keyed on "no capture yet", not empty rows: a tolerated slotless
@@ -35,11 +39,6 @@ pub(super) fn render_shop_tab(
         });
         return;
     }
-    // Only on the table path: the welcome screen precedes any capture, so
-    // there is no merchant to name, and naming one above the degraded notice
-    // above would credit a snapshot that never yielded a usable shop.
-    ui.heading(merchant);
-    ui.add_space(theme::SP_XS);
     shop_table(ui, rows, detail);
 }
 
@@ -139,18 +138,6 @@ fn column_rects(row: egui::Rect) -> [egui::Rect; 4] {
     ]
 }
 
-/// One table cell: a truncating label placed in its column rect.
-fn cell(ui: &mut egui::Ui, rect: egui::Rect, align_right: bool, text: egui::RichText) {
-    let layout = if align_right {
-        egui::Layout::right_to_left(egui::Align::Center)
-    } else {
-        egui::Layout::left_to_right(egui::Align::Center)
-    };
-    ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(layout), |ui| {
-        ui.add(egui::Label::new(text).truncate());
-    });
-}
-
 /// Welcome screen until the first snapshot lands.
 fn render_quick_start(ui: &mut egui::Ui) {
     ui.add_space(theme::SP_XL);
@@ -190,37 +177,27 @@ mod tests {
     use crate::domain::filter::Filter;
     use crate::domain::shop::{ShopItem, ShopSnapshot};
 
-    use super::super::view::{SlotRows, ViewState, merchant_heading, slot_detail, view_state};
+    use super::super::view::{SlotRows, ViewState, slot_detail, view_state};
     use super::*;
 
     fn idle_view() -> ViewState {
-        view_state(&Controller::new(Filter::default(), Limits::default()))
+        view_state(&Controller::new(Filter::default(), Limits::default()), 0)
     }
 
-    /// Builds a captured controller with a specific merchant, so a test can
-    /// exercise [`merchant_heading`]'s own fallback rather than hand-writing
-    /// the label it is supposed to compute.
-    fn captured_with_merchant(
-        merchant: Option<&str>,
-        slots: Vec<ShopItem>,
-    ) -> (Controller, ViewState, SlotRows) {
+    fn captured(slots: Vec<ShopItem>) -> (Controller, ViewState, SlotRows) {
         let mut ctrl = Controller::new(Filter::default(), Limits::default());
         let _ = ctrl.handle(Event::Snapshot {
             snapshot: ShopSnapshot {
-                merchant: merchant.map(str::to_owned),
+                merchant: None,
                 slots,
                 refresh: None,
             },
             now_ms: 0,
         });
-        let view = view_state(&ctrl);
+        let view = view_state(&ctrl, 0);
         let mut rows = SlotRows::default();
         rows.sync(&ctrl);
         (ctrl, view, rows)
-    }
-
-    fn captured(slots: Vec<ShopItem>) -> (Controller, ViewState, SlotRows) {
-        captured_with_merchant(None, slots)
     }
 
     /// No test here hovers a row, so this only needs to exist.
@@ -231,9 +208,7 @@ mod tests {
     #[test]
     fn quick_start_shows_before_any_capture() {
         let view = idle_view();
-        let harness = Harness::new_ui(|ui| {
-            render_shop_tab(ui, &view, &[], "Secret Shop", &|_| String::new())
-        });
+        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view, &[], &|_| String::new()));
         harness.get_by_label("QUICK START");
     }
 
@@ -244,8 +219,7 @@ mod tests {
             ..ShopItem::default()
         }]);
         let detail = details(&ctrl);
-        let harness =
-            Harness::new_ui(|ui| render_shop_tab(ui, &view, rows.rows(), "Secret Shop", &detail));
+        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view, rows.rows(), &detail));
         assert!(harness.query_by_label("QUICK START").is_none());
         harness.get_by_label("SLOT");
     }
@@ -256,8 +230,7 @@ mod tests {
     fn slotless_snapshot_shows_a_hint_that_blames_nobody_not_quick_start() {
         let (ctrl, view, rows) = captured(vec![]);
         let detail = details(&ctrl);
-        let harness =
-            Harness::new_ui(|ui| render_shop_tab(ui, &view, rows.rows(), "Secret Shop", &detail));
+        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view, rows.rows(), &detail));
         assert!(harness.query_by_label("QUICK START").is_none());
         harness.get_by_label(
             "the last shop message carried no usable slots — if this repeats, send the log",
@@ -270,38 +243,17 @@ mod tests {
         );
     }
 
-    /// The test whose absence let the heading disappear once already
-    /// (`15ecc71`): it must query the *rendered* tab, not a projection value,
-    /// or a redesign could delete the widget again without turning this red.
+    /// The wire's `merchant` is never rendered: every real capture carries the
+    /// same engine-internal constant (`"lobby"`), not a name worth showing —
+    /// see the module doc comment on [`render_shop_tab`].
     #[test]
-    fn the_shop_tab_names_the_merchant() {
-        let (ctrl, view, rows) = captured_with_merchant(
-            Some("Secret Shop VIP"),
-            vec![ShopItem {
-                slot: 1,
-                ..ShopItem::default()
-            }],
-        );
-        let merchant = merchant_heading(&ctrl);
+    fn the_shop_tab_never_shows_a_merchant_heading() {
+        let (ctrl, view, rows) = captured(vec![ShopItem {
+            slot: 1,
+            ..ShopItem::default()
+        }]);
         let detail = details(&ctrl);
-        let harness =
-            Harness::new_ui(|ui| render_shop_tab(ui, &view, rows.rows(), &merchant, &detail));
-        harness.get_by_label("Secret Shop VIP");
-    }
-
-    #[test]
-    fn a_snapshot_without_a_merchant_falls_back_to_the_default_name() {
-        let (ctrl, view, rows) = captured_with_merchant(
-            None,
-            vec![ShopItem {
-                slot: 1,
-                ..ShopItem::default()
-            }],
-        );
-        let merchant = merchant_heading(&ctrl);
-        let detail = details(&ctrl);
-        let harness =
-            Harness::new_ui(|ui| render_shop_tab(ui, &view, rows.rows(), &merchant, &detail));
-        harness.get_by_label("Secret Shop");
+        let harness = Harness::new_ui(|ui| render_shop_tab(ui, &view, rows.rows(), &detail));
+        assert!(harness.query_by_label("Lobby").is_none());
     }
 }

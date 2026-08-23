@@ -9,8 +9,9 @@ use super::super::theme;
 use super::{arm_optional, count_label, optional_field};
 use crate::domain::control::Limits;
 
-/// One-line recap of the active stop limits for the folded Stop bar.
-pub(super) fn stop_summary(limits: &Limits) -> String {
+/// One-line recap of the active stop limits for the folded Stop bar — and, one
+/// level up, for the idle status band (`view::plan_summary`).
+pub(in crate::ui) fn stop_summary(limits: &Limits) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(n) = limits.max_refreshes {
         parts.push(count_label(

@@ -20,6 +20,9 @@ pub(super) fn render_journal_header(
     latest: Option<&str>,
     margin: egui::Margin,
 ) -> bool {
+    // The peek reads the same convention the body strips — a collapsed
+    // journal showing a raw `">> "` would be the one place the marker survived.
+    let latest = latest.map(|line| strip_marker(line).1);
     let (content, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
     let ml = f32::from(margin.left);
@@ -93,27 +96,74 @@ pub(super) fn render_journal_header(
     response.clicked()
 }
 
+/// Every producer prefixes an event line with `">> "` and, under a MATCH,
+/// its detail lines with three spaces — see the modules under `src/app` and
+/// `src/actuator`. This is the one place that convention is read back: the
+/// marker becomes color and indent instead of literal characters, so the
+/// domain wording never has to know how the window ends up drawing it.
+///
+/// Returns whether `text` was a detail line, and the text with its marker
+/// removed.
+fn strip_marker(text: &str) -> (bool, &str) {
+    if let Some(detail) = text.strip_prefix("   ") {
+        (true, detail)
+    } else {
+        (false, text.strip_prefix(">> ").unwrap_or(text))
+    }
+}
+
+/// The color an event line paints, from the level [`crate::journal::EventLog`]
+/// stamped it with. Reuses the visuals `theme::apply` already set for the
+/// error banner and the status bar, rather than a palette of its own.
+fn severity_color(ui: &egui::Ui, level: tracing::Level) -> egui::Color32 {
+    match level {
+        tracing::Level::ERROR => ui.visuals().error_fg_color,
+        tracing::Level::WARN => ui.visuals().warn_fg_color,
+        _ => theme::INK_MUTED,
+    }
+}
+
 /// The scrolling log body, rendered only while the journal is open.
 pub(super) fn render_journal_body(ui: &mut egui::Ui, journal: &[LogLine]) {
     // `show_rows` lays out only the visible slice, and its uniform-row math
     // requires exactly one visual row per entry — so long lines extend into a
     // horizontal scroll instead of wrapping.
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
     egui::ScrollArea::both()
         .id_salt("journal")
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .show_rows(ui, row_height, journal.len(), |ui, rows| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-            // One buffer for the whole visible slice, so a row costs the one
-            // copy `RichText` makes and nothing else.
-            let mut row = String::with_capacity(64);
+            let mut stamp = String::with_capacity(16);
             for line in &journal[rows] {
-                row.clear();
-                write_timestamp(&mut row, line.at_ms);
-                row.push_str("  ");
-                row.push_str(&line.text);
-                ui.monospace(row.as_str());
+                stamp.clear();
+                write_timestamp(&mut stamp, line.at_ms);
+                stamp.push_str("  ");
+                let (detail, body) = strip_marker(&line.text);
+                let color = if detail {
+                    theme::INK_FAINT
+                } else {
+                    severity_color(ui, line.level)
+                };
+                // One job per row, timestamp and body in the same monospace
+                // font so the columns still line up, but only the body takes
+                // the severity color — a warning is a warning, its stamp
+                // isn't.
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    &stamp,
+                    0.0,
+                    egui::TextFormat::simple(font.clone(), theme::INK_FAINT),
+                );
+                if detail {
+                    // Two more spaces than a plain line, so a MATCH's targets
+                    // read as nested under it rather than merely dimmer.
+                    job.append("  ", 0.0, egui::TextFormat::simple(font.clone(), color));
+                }
+                job.append(body, 0.0, egui::TextFormat::simple(font.clone(), color));
+                ui.label(job);
             }
         });
 }
@@ -163,6 +213,14 @@ mod tests {
         out
     }
 
+    fn line(at_ms: u64, text: &str, level: tracing::Level) -> LogLine {
+        LogLine {
+            at_ms,
+            text: text.into(),
+            level,
+        }
+    }
+
     #[test]
     fn timestamp_rolls_into_hours() {
         assert_eq!(timestamp(59_000), "+0:59");
@@ -172,12 +230,29 @@ mod tests {
 
     #[test]
     fn journal_lines_render_with_timestamps() {
-        let lines = vec![LogLine {
-            at_ms: 61_000,
-            text: "refresh advised".into(),
-        }];
+        let lines = vec![line(61_000, "refresh advised", tracing::Level::INFO)];
         let harness = Harness::new_ui(|ui| render_journal_body(ui, &lines));
         harness.get_by_label("+1:01  refresh advised");
+    }
+
+    #[test]
+    fn the_event_marker_is_stripped_not_shown() {
+        let lines = vec![line(0, ">> watching — open the shop", tracing::Level::INFO)];
+        let harness = Harness::new_ui(|ui| render_journal_body(ui, &lines));
+        harness.get_by_label("+0:00  watching — open the shop");
+    }
+
+    #[test]
+    fn a_match_detail_line_keeps_its_indent_once_the_marker_is_gone() {
+        let lines = vec![line(
+            0,
+            "   Reforged Sword · 250,000g",
+            tracing::Level::INFO,
+        )];
+        let harness = Harness::new_ui(|ui| render_journal_body(ui, &lines));
+        // Two more spaces than a plain line's single gap after the stamp —
+        // the indent that used to be the three literal spaces themselves.
+        harness.get_by_label("+0:00    Reforged Sword · 250,000g");
     }
 
     #[test]
@@ -206,5 +281,14 @@ mod tests {
             render_journal_header(ui, true, Some("bought a thing"), margin);
         });
         assert!(open.query_by_label("Journal · bought a thing").is_none());
+    }
+
+    #[test]
+    fn the_peek_strips_the_event_marker_too() {
+        let margin = egui::Margin::symmetric(16, 10);
+        let collapsed = Harness::new_ui(|ui| {
+            render_journal_header(ui, false, Some(">> bought a thing"), margin);
+        });
+        collapsed.get_by_label("Journal · bought a thing");
     }
 }

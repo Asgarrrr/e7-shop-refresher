@@ -13,8 +13,13 @@ mod timing;
 mod timing_meter;
 
 use clicking::{backend_row, clicking_summary, dry_run_row, timing_notice};
-use hunt::{grade_value, hunt_summary, optional_value, quick_add_names, string_list, substat_reqs};
-use stop::{duration_row, limit_row, stop_summary};
+use hunt::{grade_value, optional_value, quick_add_names, string_list, substat_reqs};
+use stop::{duration_row, limit_row};
+// Re-exported one level up: the idle status band describes the plan with the
+// same two summaries the folded Hunt and Stop bars use, so the window has one
+// phrasing per draft rather than two that drift.
+pub(super) use hunt::hunt_summary;
+pub(super) use stop::stop_summary;
 use timing::{fine_tune_body, mode_hint, pass_estimate, timing_summary};
 
 use eframe::egui;
@@ -54,6 +59,13 @@ pub(super) struct EditorState {
     name_input: String,
     set_input: String,
     substat_input: String,
+    /// One fold flag per section, five loose fields rather than a bitset or an
+    /// array indexed by section. Each is only ever handed to [`section`] as
+    /// `&mut editor.<name>_open`, named at every use and never passed
+    /// positionally, so there is no site where two could be swapped unnoticed;
+    /// an index would invent one. All thirty-two combinations are legal and
+    /// mean what they say — a player folds whatever they are done with — so
+    /// there is no impossible state left for an enum to rule out.
     hunt_open: bool,
     stop_open: bool,
     timing_open: bool,
@@ -378,83 +390,144 @@ fn preset_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Option<TimingPrese
 /// second thing to persist and a second rule for when a draft counts as
 /// applied. It is a live retune now, so it rides the same channel and the same
 /// rule as the other three.
+///
+/// The shared `&EditorState` is what makes the paragraph above checkable: the
+/// only way to break the twin rule from here is to widen this borrow, which is
+/// a line in a diff rather than an assignment buried in the click branch.
 #[must_use]
 pub(super) fn commit_row(
     ui: &mut egui::Ui,
-    editor: &mut EditorState,
+    editor: &EditorState,
     session_alive: bool,
 ) -> Vec<Command> {
-    // Bit-exact on purpose, `min`'s `f64` included: this is change detection,
-    // not a numeric test, so an epsilon would make a real edit invisible. It
-    // cannot survive a non-finite `min` (`NaN != NaN` lights Apply forever),
-    // which is why neither the loader nor `substat_reqs` admits one.
-    let dirty_filter = editor.filter != editor.applied_filter;
-    let dirty_limits = editor.limits != editor.applied_limits;
-    let dirty_timings = editor.timings != editor.applied_timings;
-    let dirty_click_mode = editor.click_mode != editor.applied_click_mode;
-    let dirty = dirty_filter || dirty_limits || dirty_timings || dirty_click_mode;
+    let dirty = Dirty::of(editor);
     // Only a *changed* filter clears the arming bar, so an already-applied one
     // lets limit/timing edits through.
-    let blocked = dirty_filter && editor.filter.is_unrestricted();
+    let blocked = dirty.filter && editor.filter.is_unrestricted();
 
     let mut commands = Vec::new();
     ui.horizontal(|ui| {
         // The blocking reason wins the peek slot: it explains the dark button.
         if blocked {
             ui.weak("add at least one hunt criterion before Apply");
-        } else if let Some(summary) =
-            dirty_summary(dirty_filter, dirty_limits, dirty_timings, dirty_click_mode)
-        {
+        } else if let Some(summary) = dirty.summary() {
             ui.weak(summary);
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let clicked = ui
-                .add_enabled_ui(session_alive && dirty && !blocked, |ui| {
-                    theme::primary_button(ui, "Apply")
-                })
-                .inner
-                .clicked();
-            if clicked {
-                if dirty_filter {
-                    commands.push(Command::SetFilter(editor.filter.clone()));
+        // An explicit id, so the button's identity is its own and not its rank
+        // in the sequence: the peek beside it is conditional, and egui numbers
+        // an unsalted widget by that rank, so Apply changed id on the very
+        // frame the peek appeared — which is the frame an edit brings the
+        // button alive. Its rect does not move with it (right-aligned, while
+        // the peek fills the space to its left), so egui saw one rect claimed
+        // by two ids and said so — `changed id between passes`, 18 times in one
+        // session's log — while the hover, focus and in-flight click it keys by
+        // id were dropped at each flip.
+        //
+        // `UiBuilder::id` and not `push_id`: a salt only names a *child* of the
+        // parent id, and egui still folds the parent's auto-id counter into
+        // that child's own — so the salted button drifts exactly as far as the
+        // unsalted one did. Only `IdSource::Explicit` leaves the counter out.
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .id(ui.id().with("apply"))
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
+                let clicked = ui
+                    .add_enabled_ui(session_alive && dirty.any() && !blocked, |ui| {
+                        theme::primary_button(ui, "Apply")
+                    })
+                    .inner
+                    .clicked();
+                if clicked {
+                    if dirty.filter {
+                        commands.push(Command::SetFilter(editor.filter.clone()));
+                    }
+                    if dirty.limits {
+                        commands.push(Command::SetLimits(editor.limits));
+                    }
+                    if dirty.timings {
+                        commands.push(Command::SetTimings(editor.timings));
+                    }
+                    if dirty.click_mode {
+                        commands.push(Command::SetClickMode(editor.click_mode));
+                    }
                 }
-                if dirty_limits {
-                    commands.push(Command::SetLimits(editor.limits));
-                }
-                if dirty_timings {
-                    commands.push(Command::SetTimings(editor.timings));
-                }
-                if dirty_click_mode {
-                    commands.push(Command::SetClickMode(editor.click_mode));
-                }
-            }
-        });
+            },
+        );
     });
     commands
 }
 
-/// The commit bar's peek, e.g. `Hunt, Stop edited`. Labels mirror the section
-/// titles so it points at the collapsible that changed.
-fn dirty_summary(filter: bool, limits: bool, timings: bool, clicking: bool) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
-    if filter {
-        parts.push("Hunt");
+/// Which of the four drafts differ from their applied twins, decided once per
+/// frame and then read four times over.
+///
+/// One value rather than four `bool` locals because they were being read
+/// positionally: `dirty_summary(filter, limits, timings, clicking)` type-checks
+/// under every permutation of its arguments, so a transposed pair would name
+/// the wrong section in the peek — and that peek is the only thing telling a
+/// player which part of config.toml Apply is about to overwrite. Fields carry
+/// the name to each use instead.
+///
+/// Four `bool`s and no further folding: they are one per draft the session can
+/// be sent, they are read one at a time by name, and the flat alternative — the
+/// commands themselves, built each frame and discarded unless clicked — would
+/// clone the whole [`Filter`] on every repaint to answer a question about
+/// whether it changed.
+#[derive(Clone, Copy, Default)]
+struct Dirty {
+    filter: bool,
+    limits: bool,
+    timings: bool,
+    click_mode: bool,
+}
+
+impl Dirty {
+    /// Bit-exact on purpose, `min`'s `f64` included: this is change detection,
+    /// not a numeric test, so an epsilon would make a real edit invisible. It
+    /// cannot survive a non-finite `min` (`NaN != NaN` lights Apply forever),
+    /// which is why neither the loader nor [`substat_reqs`] admits one.
+    fn of(editor: &EditorState) -> Self {
+        Self {
+            filter: editor.filter != editor.applied_filter,
+            limits: editor.limits != editor.applied_limits,
+            timings: editor.timings != editor.applied_timings,
+            click_mode: editor.click_mode != editor.applied_click_mode,
+        }
     }
-    if limits {
-        parts.push("Stop");
+
+    /// Whether Apply has anything to send at all.
+    const fn any(self) -> bool {
+        self.filter || self.limits || self.timings || self.click_mode
     }
-    if timings {
-        parts.push("Click timing");
+
+    /// The commit bar's peek, e.g. `Hunt, Stop edited`. Labels mirror the
+    /// section titles so it points at the collapsible that changed.
+    fn summary(self) -> Option<String> {
+        let mut parts: Vec<&str> = Vec::new();
+        if self.filter {
+            parts.push("Hunt");
+        }
+        if self.limits {
+            parts.push("Stop");
+        }
+        if self.timings {
+            parts.push("Click timing");
+        }
+        if self.click_mode {
+            parts.push("Clicking");
+        }
+        (!parts.is_empty()).then(|| format!("{} edited", parts.join(", ")))
     }
-    if clicking {
-        parts.push("Clicking");
-    }
-    (!parts.is_empty()).then(|| format!("{} edited", parts.join(", ")))
 }
 
 #[cfg(test)]
 mod tests {
-    use egui_kittest::{Harness, kittest::Queryable};
+    use std::cell::RefCell;
+
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
 
     use super::*;
 
@@ -666,18 +739,35 @@ mod tests {
 
     #[test]
     fn dirty_summary_joins_the_changed_section_labels() {
-        assert_eq!(dirty_summary(false, false, false, false), None);
+        assert_eq!(Dirty::default().summary(), None);
         assert_eq!(
-            dirty_summary(true, false, false, false).as_deref(),
+            Dirty {
+                filter: true,
+                ..Dirty::default()
+            }
+            .summary()
+            .as_deref(),
             Some("Hunt edited")
         );
         assert_eq!(
-            dirty_summary(true, true, true, true).as_deref(),
+            Dirty {
+                filter: true,
+                limits: true,
+                timings: true,
+                click_mode: true,
+            }
+            .summary()
+            .as_deref(),
             Some("Hunt, Stop, Click timing, Clicking edited")
         );
         // The mode alone, which is the shape a rehearsal flip takes.
         assert_eq!(
-            dirty_summary(false, false, false, true).as_deref(),
+            Dirty {
+                click_mode: true,
+                ..Dirty::default()
+            }
+            .summary()
+            .as_deref(),
             Some("Clicking edited")
         );
     }
@@ -696,6 +786,44 @@ mod tests {
         });
         harness.run();
         harness.get_by_label("Stop edited");
+    }
+
+    /// The peek label is conditional, and egui derives an unsalted widget's id
+    /// from its rank in the sequence — so the summary appearing renumbered
+    /// everything after it, Apply included, on the very frame Apply came alive.
+    /// The button's rect never moves (it is right-aligned in a pinned bar), so
+    /// egui saw one rect claimed by two ids and logged `changed id between
+    /// passes` — 18 of them in one session's log — while the interaction state
+    /// it keys by id was discarded at each flip.
+    #[test]
+    fn the_apply_button_keeps_its_id_when_the_peek_appears() {
+        let editor = RefCell::new(EditorState::new(
+            named_filter(),
+            Limits::default(),
+            Timings::default(),
+            ClickMode::default(),
+        ));
+        let mut harness = setup_harness(|ui| {
+            let _ = commit_row(ui, &editor.borrow(), true);
+        });
+        harness.run();
+        let button = harness.get_by_label("Apply");
+        let (clean, rect) = (button.accesskit_node().id(), button.rect());
+
+        // One edit: the peek label appears ahead of the button.
+        editor.borrow_mut().limits.max_refreshes = Some(5);
+        harness.run();
+
+        let button = harness.get_by_label("Apply");
+        assert_eq!(
+            button.accesskit_node().id(),
+            clean,
+            "the id egui keys the button's interaction state by"
+        );
+        // The other half of the collision, and why egui could see it at all:
+        // right-aligned, the button holds its rect while the peek fills the
+        // space to its left.
+        assert_eq!(button.rect(), rect);
     }
 
     #[test]

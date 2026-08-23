@@ -27,13 +27,57 @@ use crate::domain::control::Status;
 use crate::journal::LogLine;
 use crate::watch::HaltSource;
 
-use capture_health::{CaptureHealthView, render_capture_health};
+use capture_health::{capture_view, render_capture_health};
 use editor::EditorState;
-use view::{SlotRow, SlotRows, ViewState, merchant_heading, slot_detail, view_state};
+use view::{SlotRow, SlotRows, ViewState, slot_detail, view_state};
 
 /// Where the session's terminal outcome lands (fatal error, crash, or clean
 /// end): written once by the spawn wrapper in `main`, shown as a banner.
 pub type SessionErrorSlot = Arc<Mutex<Option<String>>>;
+
+/// The window's only width. Pinned rather than merely suggested: every panel
+/// below is laid out against it, so a window that could be widened would be
+/// showing a layout nobody tuned. Callers set it as the inner size *and* as both
+/// bounds — a minimum alone still lets the frame grow.
+pub const WINDOW_WIDTH: f32 = 440.0;
+
+/// Shortest the open journal may be dragged, and the height it opens at. The
+/// default is clamped into the range at use, because a short window shrinks the
+/// range's top below it.
+///
+/// The opening height is read against [`CAPTURE_HEALTH_SHARE`], not on its own:
+/// the readout may take over half the panel, so what the log actually gets is
+/// the rest. At 600 the log gets the better part of the window, which on the
+/// default 824-high frame leaves the centre pane close to the `160.0` floor
+/// [`journal_sizing`] reserves for it.
+const JOURNAL_MIN: f32 = 80.0;
+const JOURNAL_DEFAULT: f32 = 600.0;
+
+/// The share of the open journal the capture readout may take before it starts
+/// scrolling inside itself, leaving the rest to the log.
+///
+/// A little over half: the readout is at most a sentence, a note and a counts
+/// line, so it reaches this only on a window narrow enough to wrap all three —
+/// exactly the case where the log must not be squeezed to nothing.
+const CAPTURE_HEALTH_SHARE: f32 = 0.55;
+
+/// The open journal's opening height and its ceiling, for a window with
+/// `available` pixels left above it.
+///
+/// Both halves matter and only one of them used to be there. The ceiling is
+/// floored at [`JOURNAL_MIN`] so a short window cannot invert the range — and
+/// the opening height is then clamped *into* that range, because a window short
+/// enough to pull the ceiling under [`JOURNAL_DEFAULT`] otherwise asks the panel
+/// to open taller than it is allowed to be. That is how the journal ended up
+/// shorter than its own content, clipping the capture readout and the log with
+/// it.
+///
+/// `160.0` is the room left for everything above: status bar, tab strip, and
+/// enough of the centre pane to stay a pane.
+fn journal_sizing(available: f32) -> (f32, f32) {
+    let ceiling = (available - 160.0).max(JOURNAL_MIN);
+    (JOURNAL_DEFAULT.clamp(JOURNAL_MIN, ceiling), ceiling)
+}
 
 /// A poisoned lock means the session panicked. Keep rendering the last state —
 /// the banner is what reports that crash, and it cannot be drawn from a thread
@@ -144,26 +188,31 @@ impl eframe::App for ShopApp {
         // Poll-based repaint: 4 Hz keeps the window fresh without coupling
         // app.rs to egui.
         ui.ctx().request_repaint_after(Duration::from_millis(250));
-        // One short hold for both: the projection reads `Copy` state, and rows
-        // re-derive only if the shop or checklist moved.
-        let (view, merchant) = {
+        // One short hold: the projection reads `Copy` state, and rows re-derive
+        // only if the shop or checklist moved.
+        //
+        // The clock is read outside the lock and handed in: it is the session's
+        // own (`EventLog::now_ms`), the one the session stamps domain events
+        // with, so the elapsed time the band shows and the duration limit the
+        // controller enforces cannot drift apart.
+        let now_ms = self.handles.journal.now_ms();
+        let view = {
             let ctrl = lock_ignoring_poison(&self.handles.controller);
             self.slots.sync(&ctrl);
-            (view_state(&ctrl), merchant_heading(&ctrl))
+            view_state(&ctrl, now_ms)
         };
         // Two atomic loads and one short-lived-lock snapshot, neither held
         // past this block: the same "no lock across a frame" rule the
         // controller read above follows.
+        //
+        // Three reads and no state of its own. Which run this describes is
+        // decided by `app::session`, on the edge that opens the `WatchGate`, so
+        // the frame has no edge to detect and nothing to remember between
+        // repaints — see `capture_health::capture_view`.
         let capture = {
             let counters = self.handles.capture_health.snapshot();
             let pipeline = self.handles.budget.snapshot();
-            CaptureHealthView {
-                delivered: counters.delivered,
-                unparsed: counters.unparsed,
-                admitted: counters.admitted,
-                dropped_segments: pipeline.dropped_segments,
-                resyncs: pipeline.resyncs,
-            }
+            capture_view(&counters, &pipeline, self.handles.run_baseline.baseline())
         };
         let generation = self.handles.journal.generation();
         if generation != self.journal_generation {
@@ -178,25 +227,26 @@ impl eframe::App for ShopApp {
         // `theme::EDGE` as the side inset, so the table text lines up under the
         // status bar.
         let margin = egui::Margin::symmetric(theme::EDGE, 10);
+        // The status band closes itself — with the run's gauge, or a plain rule
+        // — and that closing line has to land on the panel's last pixel. Bottom
+        // padding under it, plus a separator of egui's own below that, left a
+        // band edge, a strip of nothing, and a second edge. So: no padding, no
+        // separator, and `statusbar` owns the edge in both of its bands.
+        let band_margin = egui::Margin {
+            bottom: 0,
+            ..margin
+        };
         let clicked = egui::Panel::top("status_bar")
-            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
+            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(band_margin))
+            .show_separator_line(false)
             .show(ui, |ui| {
-                let clicked = statusbar::render_status_bar(
+                statusbar::render_status_bar(
                     ui,
                     &view,
                     outcome.as_deref(),
                     session_alive,
                     &self.fetcher,
-                );
-                // New content appended after the status bar's own, not a
-                // redesign of it: gated on the same "a run exists" condition
-                // its stat tiles already use, since every counter reads as a
-                // meaningless zero before `Start`.
-                if !matches!(view.status_kind, Status::Idle) {
-                    ui.add_space(theme::SP_SM);
-                    render_capture_health(ui, &capture);
-                }
-                clicked
+                )
             })
             .inner;
         let open = self.journal_open;
@@ -210,11 +260,10 @@ impl eframe::App for ShopApp {
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(margin))
             .resizable(open);
         if open {
-            // Floored at the min so a short window can't invert the range.
-            let journal_max = (ui.available_rect_before_wrap().height() - 160.0).max(80.0);
+            let (default, journal_max) = journal_sizing(ui.available_rect_before_wrap().height());
             panel = panel
-                .default_size(200.0)
-                .size_range(egui::Rangef::new(80.0, journal_max));
+                .default_size(default)
+                .size_range(egui::Rangef::new(JOURNAL_MIN, journal_max));
         }
         panel.show(ui, |ui| {
             if journal::render_journal_header(ui, open, latest, margin) {
@@ -224,6 +273,42 @@ impl eframe::App for ShopApp {
                 // Reserves the header's bottom margin, so its hover fill does
                 // not cover the first log line.
                 ui.add_space(f32::from(margin.bottom));
+                // Above the log, and only here: the status bar is what a player
+                // watches while a run goes well, so a diagnostic readout parked
+                // in it reads as a standing verdict on a healthy session. This
+                // panel is the one someone opens to find out what is happening,
+                // and it is collapsed by default — so its own disclosure is the
+                // gate, and no second toggle is needed inside it.
+                //
+                // Gated on the same "a run exists" condition the status bar's
+                // haul row uses: before `Start` every counter is a zero that
+                // diagnoses nothing.
+                if !matches!(view.status_kind, Status::Idle) {
+                    // Capped, and scrollable past the cap. How tall this readout
+                    // is depends on how far its sentence and note wrap, which
+                    // depends on the window's width — so on a narrow window it
+                    // could outgrow the panel, clip itself, and take the log
+                    // down with it. The cap keeps the majority of the panel for
+                    // the log whatever the text does; the scrollbar only appears
+                    // in the case that used to be a rendering bug.
+                    let capped = (ui.available_height() * CAPTURE_HEALTH_SHARE).max(48.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("capture_health")
+                        .max_height(capped)
+                        // Fills the width, shrinks to the text's own height, so
+                        // a one-line readout reserves nothing it does not use.
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| render_capture_health(ui, &capture));
+                    // Full-bleed and undimmed, unlike the status bar's: this
+                    // one divides two zones — a readout and a log — where that
+                    // one divides two rows of the same block. egui's own
+                    // `separator` stops at the side margin, which left the
+                    // capture block looking like a floating paragraph rather
+                    // than a region with an edge.
+                    ui.add_space(theme::SP_SM);
+                    theme::rule(ui, theme::HAIRLINE);
+                    ui.add_space(theme::SP_SM);
+                }
                 journal::render_journal_body(ui, &self.journal_cache);
             }
         });
@@ -240,7 +325,6 @@ impl eframe::App for ShopApp {
         let pane = ShopPane {
             view: &view,
             rows: self.slots.rows(),
-            merchant: &merchant,
             detail: &detail,
         };
         let applied = egui::CentralPanel::default()
@@ -249,10 +333,24 @@ impl eframe::App for ShopApp {
                 render_tab_content(ui, &pane, self.tab, &mut self.editor, session_alive)
             })
             .inner;
+        self.commit(clicked.into_iter().chain(applied));
+    }
+}
+
+impl ShopApp {
+    /// Hands this frame's clicks to the session and records what it took.
+    ///
+    /// Split out of [`eframe::App::ui`] because it is the one part of a frame
+    /// that draws nothing: everything above it reads state and paints panels,
+    /// and this writes — to the session's queue, to the editor's applied marks,
+    /// and to `config.toml`. Keeping it inline put a channel send, a
+    /// persistence policy and a two-sink error report in the middle of a list
+    /// of panels.
+    fn commit(&mut self, commands: impl Iterator<Item = Command>) {
         // Dispatch first, then record: "applied" state and persistence both key
         // off what the session actually took.
         let mut delivered = Vec::new();
-        for command in clicked.into_iter().chain(applied) {
+        for command in commands {
             if deliver_command(&self.handles, command.clone()) {
                 delivered.push(command);
             }
@@ -274,11 +372,16 @@ impl eframe::App for ShopApp {
                 "config.toml not saved"
             );
             // `push`: the file half is the `warn!` above with its fields, which
-            // `emit_at` would drop while duplicating the prose.
-            self.handles.journal.push(&[format!(
-                "config.toml not saved ({labels}): {}",
-                err.report()
-            )]);
+            // `emit_at` would drop while duplicating the prose. Same level, so
+            // the window colors it the same as a line that did go through
+            // `emit_at`.
+            self.handles.journal.push(
+                tracing::Level::WARN,
+                &[format!(
+                    "config.toml not saved ({labels}): {}",
+                    err.report()
+                )],
+            );
         }
     }
 }
@@ -295,20 +398,37 @@ fn deliver_command(handles: &SessionHandles, command: Command) -> bool {
     if handles.commands.try_send(command).is_err() {
         tracing::debug!("a player command was dropped: the session queue is full or closed");
         // `push`, not `emit_at`: the file half is the `debug!` above, a level
-        // `emit_at` can't express (INFO/WARN/ERROR only).
-        handles
-            .journal
-            .push(&[">> command dropped — the session is busy, try again".to_owned()]);
+        // `emit_at` can't express (INFO/WARN/ERROR only). `Level::WARN` here is
+        // only the window's color for the line, not a second file record.
+        handles.journal.push(
+            tracing::Level::WARN,
+            &[">> command dropped — the session is busy, try again".to_owned()],
+        );
         return false;
     }
     true
 }
 
 /// The tab strip: labels over a full-width hairline, active segment underlined.
-fn render_tabs(ui: &mut egui::Ui, tab: &mut Tab) {
+///
+/// The strip takes no side margin so its hairline and hover fills reach the
+/// window edges, which leaves it to place its own labels on [`theme::EDGE`]:
+/// a `SelectableLabel`'s `button_padding.x` is narrower, and left the words four
+/// pixels inside the line every other text in the window stands on. (The
+/// `CentralPanel` has no margin either, but its contents re-apply the inset.)
+///
+/// Returns the span it underlined the active tab with — a painted line leaves no
+/// widget behind, so this is the only way a test can see where the marker went.
+fn render_tabs(ui: &mut egui::Ui, tab: &mut Tab) -> egui::Rangef {
     // Tabs read as tabs, not buttons: pill fills stripped, the active one
     // marked by an underline instead.
     let tabs = ui.horizontal(|ui| {
+        // Read before the labels are placed: both the lead-in and the underline
+        // are stated relative to this rather than to a literal.
+        let pad = egui::vec2(ui.spacing().button_padding.x, 0.0);
+        // Lands the *word* on the edge line, the padding being already part of
+        // what stands between the panel and the glyphs.
+        ui.add_space(f32::from(theme::EDGE) - pad.x);
         let visuals = &mut ui.style_mut().visuals;
         visuals.selection.bg_fill = egui::Color32::TRANSPARENT;
         visuals.widgets.hovered.weak_bg_fill = egui::Color32::TRANSPARENT;
@@ -318,7 +438,10 @@ fn render_tabs(ui: &mut egui::Ui, tab: &mut Tab) {
         visuals.widgets.inactive.fg_stroke.color = theme::INK_MUTED;
         let shop = ui.selectable_value(tab, Tab::Shop, "Shop").rect;
         let setup = ui.selectable_value(tab, Tab::Setup, "Setup").rect;
-        if *tab == Tab::Shop { shop } else { setup }
+        // The word's extent, not the clickable box: the box is sized for a
+        // finger, and underlining it put the marker a padding wide of the word
+        // on both sides — on the leading tab, out to the window frame.
+        (if *tab == Tab::Shop { shop } else { setup }).shrink2(pad)
     });
     // The accent underline shares the hairline's y and paints second, so the
     // two read as one baseline.
@@ -328,14 +451,13 @@ fn render_tabs(ui: &mut egui::Ui, tab: &mut Tab) {
         baseline,
         ui.visuals().widgets.noninteractive.bg_stroke,
     );
-    ui.painter().hline(
-        tabs.inner.x_range(),
-        baseline,
-        egui::Stroke::new(2.0, theme::ACCENT),
-    );
+    let marker = tabs.inner.x_range();
+    ui.painter()
+        .hline(marker, baseline, egui::Stroke::new(2.0, theme::ACCENT));
     // Reserves the lower half of the 2px underline, which is centred on the
     // baseline and would otherwise be clipped.
     ui.add_space(theme::SP_XS);
+    marker
 }
 
 /// The persistable sections for a batch of Apply commands. The non-`Set*` arm
@@ -388,15 +510,11 @@ fn section_labels(sections: &[config::persist::Section]) -> String {
 }
 
 /// Everything the Shop tab's content needs, bundled so `render_tab_content`
-/// stays under clippy's argument limit: none of these four are read by the
+/// stays under clippy's argument limit: none of these three are read by the
 /// `Tab::Setup` arm, only by `Tab::Shop`'s call into `shop::render_shop_tab`.
 struct ShopPane<'a> {
     view: &'a ViewState,
     rows: &'a [SlotRow],
-    /// The heading `shop::render_shop_tab` paints — built once per frame by
-    /// `view::merchant_heading`, alongside `detail` rather than inside `view`
-    /// itself. See that function's doc comment for why.
-    merchant: &'a str,
     detail: &'a dyn Fn(usize) -> String,
 }
 
@@ -417,7 +535,7 @@ fn render_tab_content(
                 .id_salt("tab-shop")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    shop::render_shop_tab(ui, pane.view, pane.rows, pane.merchant, pane.detail)
+                    shop::render_shop_tab(ui, pane.view, pane.rows, pane.detail)
                 });
             Vec::new()
         }
@@ -466,6 +584,44 @@ pub(super) fn content_inset<R>(
 }
 
 #[cfg(test)]
+mod sizing_tests {
+    use super::{JOURNAL_DEFAULT, JOURNAL_MIN, journal_sizing};
+
+    /// The journal must never be asked to open at a height outside the range it
+    /// is given, at any window size. It was, on a short window, and the panel
+    /// that came out was shorter than its content — which egui then clipped,
+    /// taking the capture readout and the first log lines off screen.
+    #[test]
+    fn the_journal_never_opens_outside_its_own_size_range() {
+        // Past the plausible ends on both sides: a window smaller than the
+        // chrome above it yields a negative `available`, which is what made the
+        // range invert in the first place.
+        for available in [
+            -400.0, -1.0, 0.0, 1.0, 120.0, 240.0, 330.0, 361.0, 900.0, 4000.0,
+        ] {
+            let (default, ceiling) = journal_sizing(available);
+            assert!(
+                ceiling >= JOURNAL_MIN,
+                "inverted range at {available}: ceiling {ceiling}"
+            );
+            assert!(
+                (JOURNAL_MIN..=ceiling).contains(&default),
+                "default {default} outside {JOURNAL_MIN}..={ceiling} at {available}"
+            );
+        }
+    }
+
+    /// A tall window still opens the journal at the size it was tuned to, so
+    /// the clamp above is a floor for small windows and not a redesign.
+    #[test]
+    fn a_tall_window_still_opens_the_journal_at_its_tuned_height() {
+        let (default, ceiling) = journal_sizing(1000.0);
+        assert_eq!(default, JOURNAL_DEFAULT);
+        assert!(ceiling > JOURNAL_DEFAULT);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use egui_kittest::{Harness, kittest::Queryable};
 
@@ -485,13 +641,10 @@ mod tests {
         editor: &mut EditorState,
         session_alive: bool,
     ) -> Vec<Command> {
-        render_tabs(ui, tab);
-        // No test here reaches the merchant heading — see `src/ui/shop.rs`'s
-        // own tests for that — so this shim only needs a stand-in string.
+        let _ = render_tabs(ui, tab);
         let pane = ShopPane {
             view,
             rows,
-            merchant: "Secret Shop",
             detail: &|_| String::new(),
         };
         render_tab_content(ui, &pane, *tab, editor, session_alive)
@@ -529,7 +682,7 @@ mod tests {
     fn project(controller: &Controller) -> (ViewState, SlotRows) {
         let mut slots = SlotRows::default();
         slots.sync(controller);
-        (view_state(controller), slots)
+        (view_state(controller, 0), slots)
     }
 
     fn idle_view() -> (ViewState, SlotRows) {
@@ -636,6 +789,76 @@ mod tests {
         assert!(deliver_command(&handles, command.clone()));
 
         assert_eq!(persisted_sections(&[command]).len(), 1);
+    }
+
+    /// Every text in this window stands on [`theme::EDGE`] — the status band's
+    /// figures, the slot table's columns, the journal. The tab strip takes no
+    /// side margin, so it has to place its labels itself, and it did not: a
+    /// `SelectableLabel` brings its own narrower `button_padding.x`, which left
+    /// the two words four pixels inside the line everything else shares.
+    ///
+    /// Measured against the `Ui`'s own left, so it means "on the edge line" at
+    /// whatever origin a harness hands it — and under the real theme, since the
+    /// four pixels are the gap between [`theme::EDGE`] and the [`theme::SP_MD`]
+    /// `apply` installs. On stock spacing this would pass while the window did
+    /// not, which the `pad` assertion below guards.
+    #[test]
+    fn the_tab_labels_stand_on_the_windows_edge_line() {
+        let placed = std::cell::Cell::new((0.0, 0.0));
+        let mut tab = Tab::Shop;
+        let mut harness = Harness::new_ui(|ui| {
+            theme::apply(ui.ctx());
+            placed.set((ui.max_rect().left(), ui.spacing().button_padding.x));
+            render_tabs(ui, &mut tab);
+        });
+        // A second frame: `apply` writes through the context, so the first one
+        // is laid out on the style it replaces.
+        harness.run();
+        let (origin, pad) = placed.get();
+        assert_eq!(
+            pad,
+            theme::SP_MD,
+            "the theme is not installed; this test would measure nothing"
+        );
+        // The label's box starts a padding short of its word; the word is what
+        // has to land on the line.
+        let word = harness.get_by_label("Shop").rect().left() + pad;
+        assert!(
+            (word - origin - f32::from(theme::EDGE)).abs() < 0.5,
+            "tab label at {} from the panel edge, expected {}",
+            word - origin,
+            theme::EDGE
+        );
+    }
+
+    /// The active tab's underline covers its word and nothing else.
+    ///
+    /// The expected width is asked of the font, not recomputed from the padding
+    /// `render_tabs` reads: a test that redoes the code's arithmetic agrees with
+    /// it by construction, including when both are wrong.
+    #[test]
+    fn the_active_tabs_underline_covers_its_word_only() {
+        let mut tab = Tab::Shop;
+        let measured = std::cell::Cell::new((0.0, 0.0));
+        let mut harness = Harness::new_ui(|ui| {
+            theme::apply(ui.ctx());
+            let marker = render_tabs(ui, &mut tab);
+            let font = egui::TextStyle::Button.resolve(ui.style());
+            let word = ui.ctx().fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap("Shop".to_owned(), font, theme::INK)
+                    .size()
+                    .x
+            });
+            measured.set((marker.span(), word));
+        });
+        harness.run();
+
+        let (marker, word) = measured.get();
+        assert!(
+            (marker - word).abs() < 1.0,
+            "the underline spans {marker} for a word {word} wide"
+        );
     }
 
     #[test]

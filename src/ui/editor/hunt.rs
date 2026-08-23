@@ -19,7 +19,9 @@ const GRADE_MAX: u8 = 4;
 /// restricts, the summary must say so: every field [`Filter::is_unrestricted`]
 /// counts has to appear, or the bar reads "nothing selected" over a hunt that
 /// arms, refreshes forever and buys nothing.
-pub(super) fn hunt_summary(filter: &Filter) -> String {
+/// Visible to the whole window, not just Setup: the idle status band reuses it
+/// to say what a run would hunt (`view::plan_summary`).
+pub(in crate::ui) fn hunt_summary(filter: &Filter) -> String {
     let mut parts: Vec<String> = Vec::new();
     for name in &filter.names {
         // The haul's wire→label map, so a token reads "Covenant" and not

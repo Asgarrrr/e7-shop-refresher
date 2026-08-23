@@ -1,11 +1,15 @@
-//! Crystal-blue dark theme: the palette, the visual style, and the status →
-//! color mapping. Widgets take colors from here, never hand-picked hex.
-//! Hierarchy comes from size and color alone, with a single saturated element
-//! (the primary button) per screen.
+//! Crystal-blue dark theme: the palette and the visual style. Widgets take
+//! colors from here, never hand-picked hex.
+//!
+//! Hierarchy comes from size, ink level and fill — not from hue. Nothing here
+//! maps a session state to a colour any more: the run says what it is doing
+//! with a figure, a [`gauge`] and the verb on its command, so the green/amber/
+//! red dot that used to sit in the status bar is gone along with the mapping
+//! behind it. The accent survives in three places that are not states: the
+//! active tab's underline, the selection fill, and [`primary_button`] — which
+//! now marks a commit (Setup's Apply) rather than permanent chrome.
 
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle};
-
-use crate::domain::control::{Status, StopReason};
 
 const PAGE: Color32 = Color32::from_rgb(0x0d, 0x0d, 0x0d);
 const PANEL: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x19);
@@ -23,8 +27,13 @@ pub(super) const INK_MUTED: Color32 = Color32::from_rgb(0xc3, 0xc2, 0xb7);
 pub(super) const INK_FAINT: Color32 = Color32::from_rgb(0x89, 0x87, 0x81);
 /// Hairline strokes and separators (panel dividers, the table's header rule).
 pub(super) const HAIRLINE: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2a);
-/// Watching: the loop is doing its job.
-const GREEN: Color32 = Color32::from_rgb(0x0c, 0xa3, 0x0c);
+/// The slab command's edge and its hover fill: one step either side of
+/// [`STRIPE`], so a full-width control reads as a surface that can be pressed
+/// rather than as a saturated call to action.
+const SLAB_EDGE: Color32 = Color32::from_rgb(0x35, 0x35, 0x2f);
+const SLAB_HOVER: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x29);
+/// The rule under a bare verb, and the same rule lifted while it is hovered.
+const VERB_RULE: Color32 = Color32::from_rgb(0x46, 0x45, 0x3f);
 /// Paused, and stops the player planned (limits).
 pub(super) const AMBER: Color32 = Color32::from_rgb(0xfa, 0xb2, 0x19);
 /// Stops the player did not plan (machine faults).
@@ -115,6 +124,41 @@ pub(super) fn apply(ctx: &egui::Context) {
 /// values, so a retune in [`apply`] carries over.
 pub(super) fn section(text: &str) -> egui::RichText {
     egui::RichText::new(text.to_uppercase()).small().weak()
+}
+
+/// A full-bleed hairline across the panel, painted past the side margin so it
+/// reaches the window edges like the tab strip's rule and the tables' own.
+///
+/// Takes its colour because the two callers divide different things: a rule
+/// between rows of one block is dimmed, a rule between blocks is not.
+pub(super) fn rule(ui: &mut egui::Ui, color: Color32) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+    ui.painter().hline(
+        ui.clip_rect().x_range(),
+        rect.center().y,
+        Stroke::new(1.0, color),
+    );
+}
+
+/// One table cell: a truncating label placed in its column rect.
+///
+/// Shared by both tables in this window — the shop's slot list and the capture
+/// counters — so a header and its values are placed the same way in each. It
+/// lived in [`super::shop`] while there was only one; a second copy beside the
+/// second table is how two tables drift into two idioms.
+///
+/// Truncating rather than wrapping, because a cell that grows a second line
+/// pushes its row out of step with the column rects the caller computed.
+pub(super) fn cell(ui: &mut egui::Ui, rect: egui::Rect, align_right: bool, text: egui::RichText) {
+    let layout = if align_right {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(layout), |ui| {
+        ui.add(egui::Label::new(text).truncate());
+    });
 }
 
 /// The one emphasis size, shared by the status label and the primary button.
@@ -259,71 +303,93 @@ pub(super) fn caret(painter: &egui::Painter, row: egui::Rect, open: bool, color:
     painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
 }
 
-/// The status dot's color: green = working, amber = waiting on the player or a
-/// limit they set, red = the machine gave up, faint = nothing running.
-pub(super) fn status_color(status: Status) -> Color32 {
-    match status {
-        Status::Idle => INK_FAINT,
-        Status::Watching => GREEN,
-        Status::Paused => AMBER,
-        Status::Stopped(reason) => match reason {
-            StopReason::PlayerStopped => INK_FAINT,
-            StopReason::OutOfFunds
-            | StopReason::MaxRefreshes
-            | StopReason::MaxSpend
-            | StopReason::MaxMatches
-            | StopReason::Timeout => AMBER,
-            StopReason::SessionEnded | StopReason::ActuatorFailed | StopReason::Unresponsive => RED,
-        },
+/// The run's one command while nothing has run yet: full width, one step above
+/// the panel, edged rather than filled.
+///
+/// Not [`primary_button`], and the difference is the point. A saturated pill is
+/// sized for the instant someone decides to start, but the status bar showed it
+/// for the whole run — an hour of the loudest object on screen bought two
+/// clicks. This one only exists in the band that has nothing else to say;
+/// once a run is live the command is a [`bare_verb`], and the accent survives
+/// exactly where a commit is being made, on Setup's Apply.
+pub(super) fn slab_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let widgets = &mut ui.style_mut().visuals.widgets;
+        for state in [
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+        ] {
+            state.bg_stroke = Stroke::new(1.0, SLAB_EDGE);
+        }
+        widgets.inactive.weak_bg_fill = STRIPE;
+        widgets.hovered.weak_bg_fill = SLAB_HOVER;
+        widgets.active.weak_bg_fill = STRIPE;
+        let width = ui.available_width();
+        ui.add_sized([width, 36.0], egui::Button::new(emphasis(text)))
+    })
+    .inner
+}
+
+/// A command reduced to its verb over a hairline: no fill, no border, the same
+/// typographic register as the tab strip.
+///
+/// What `Stop` gets while a run is live. Stopping is rare and deliberate, so it
+/// needs to be reachable and legible, not loud — and a word on a rule cannot
+/// out-shout the figure it sits beside.
+///
+/// The rule is painted rather than a text underline: an underline takes the
+/// text's colour, which would put a full-ink line under a word that is
+/// deliberately quiet.
+pub(super) fn bare_verb(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    // Its own padding, well under the theme's `SP_MD`/`SP_SM` button box: that
+    // box is sized for a filled control, and here it would hang the rule eight
+    // pixels below the word and stretch it a dozen either side — an underline
+    // that clearly belongs to something else.
+    let response = ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(2.0, SP_XS);
+        ui.add(egui::Button::new(text).frame(false))
+    });
+    let response = response.inner;
+    let rule = if response.hovered() { INK } else { VERB_RULE };
+    let rect = response.rect;
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom() - 1.0,
+        Stroke::new(1.0, if ui.is_enabled() { rule } else { HAIRLINE }),
+    );
+    response
+}
+
+/// A full-bleed 2px gauge: how far the run has gone towards the limit that will
+/// stop it. Painted past the side margin like [`rule`], whose geometry it
+/// borrows and whose job it also does — it closes the status band against the
+/// tab strip, which is why an unbounded run falls back to a plain rule rather
+/// than leaving the edge off.
+///
+/// The fill is [`INK_MUTED`] and not an accent: a gauge that fills means "this
+/// is about to stop", which is a fact and not an alarm.
+pub(super) fn gauge(ui: &mut egui::Ui, ratio: f32) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 2.0), egui::Sense::hover());
+    let track = ui.clip_rect().x_range();
+    let y = rect.center().y;
+    ui.painter().hline(track, y, Stroke::new(2.0, HAIRLINE));
+    // Clamped here as well as at the source: this is the call that turns a
+    // number into pixels, and a stray ratio would paint outside the panel.
+    let filled = track.min + track.span() * ratio.clamp(0.0, 1.0);
+    if filled > track.min {
+        ui.painter().hline(
+            egui::Rangef::new(track.min, filled),
+            y,
+            Stroke::new(2.0, INK_MUTED),
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn status_color_idle_and_player_stop_read_as_calm() {
-        assert_eq!(status_color(Status::Idle), INK_FAINT);
-        assert_eq!(
-            status_color(Status::Stopped(StopReason::PlayerStopped)),
-            INK_FAINT
-        );
-    }
-
-    #[test]
-    fn status_color_watching_is_green() {
-        assert_eq!(status_color(Status::Watching), GREEN);
-    }
-
-    #[test]
-    fn status_color_paused_is_amber() {
-        assert_eq!(status_color(Status::Paused), AMBER);
-    }
-
-    #[test]
-    fn status_color_limit_stops_are_amber() {
-        for reason in [
-            StopReason::OutOfFunds,
-            StopReason::MaxRefreshes,
-            StopReason::MaxSpend,
-            StopReason::MaxMatches,
-            StopReason::Timeout,
-        ] {
-            assert_eq!(status_color(Status::Stopped(reason)), AMBER);
-        }
-    }
-
-    #[test]
-    fn status_color_failure_stops_are_red() {
-        for reason in [
-            StopReason::SessionEnded,
-            StopReason::ActuatorFailed,
-            StopReason::Unresponsive,
-        ] {
-            assert_eq!(status_color(Status::Stopped(reason)), RED);
-        }
-    }
 
     #[test]
     fn section_headers_render_as_capitals() {
