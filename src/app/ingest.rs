@@ -203,6 +203,32 @@ pub(super) fn capture_loop_budgeted(
                 continue;
             }
         };
+        // Re-read, because the one at the top of this iteration is stale by now:
+        // the gate is shut from other threads (`app::workers::shutdown`'s
+        // `gate.set(false)`, the GUI's Stop, `WatchGate::request_halt` from the
+        // actuator), and between that read and this send sit
+        // `source.take_capture_loss` above and `budget.admit_capture`, which takes
+        // the usage `Mutex`. A gate shutting in that window forwarded this segment
+        // anyway; `a_gate_shut_mid_iteration_forwards_nothing` below is that
+        // segment, and it fails without these four lines.
+        //
+        // Nothing is counted, matching the `!enabled` skip above, which counts
+        // nothing either: no byte reaches reassembly while the gate is shut, so
+        // there is no continuity for this hole to break, and the next arming
+        // already owes a re-anchor before any byte goes out. `continue` drops
+        // `segment`, and its lease hands the reserved bytes back
+        // (`stream::budget::PayloadLease::drop`).
+        //
+        // `was_enabled` has to record the shut: this iteration is the only
+        // observer of it, so without the store a gate that re-opens before the
+        // next `next_segment` returns would show `enabled == was_enabled` and
+        // raise no arming — leaving the segment dropped here as a silent gap.
+        // `a_gate_shut_and_reopened_between_two_segments_still_re_anchors` is
+        // that shape.
+        if !gate.is_enabled() {
+            was_enabled = false;
+            continue;
+        }
         match tx.try_send(CaptureEvent::Budgeted(segment)) {
             Ok(()) => {
                 admitted_segments += 1;
@@ -312,6 +338,152 @@ mod tests {
         fn take_capture_loss(&mut self) -> Option<CaptureLoss> {
             self.lost.take()
         }
+    }
+
+    /// Shuts the gate from *inside* an iteration, at the one point the loop
+    /// hands control back to the source after it has already read the gate:
+    /// `take_capture_loss`. Stands in for the threads that really shut it — the
+    /// GUI's Stop, `app::workers::shutdown`, `WatchGate::request_halt` — landing
+    /// in the window between that read and the send at the bottom of the loop.
+    ///
+    /// `None`, so the shut is the only thing this source does: a reported loss
+    /// would enqueue a resync and confuse what the assertions read.
+    struct ShutsGateMidIteration {
+        gate: WatchGate,
+        segment: Option<Segment>,
+    }
+
+    impl PacketSource for ShutsGateMidIteration {
+        fn next_segment(&mut self) -> Result<Segment> {
+            self.segment
+                .take()
+                .ok_or_else(|| crate::Error::Capture("characterization complete".to_owned()))
+        }
+
+        fn take_capture_loss(&mut self) -> Option<CaptureLoss> {
+            self.gate.set(false);
+            None
+        }
+    }
+
+    /// The cutoff is the gate, not the iteration that read it.
+    ///
+    /// The loop reads the gate once per segment and then does real work —
+    /// `take_capture_loss`, the pressure checks, `admit_capture` and its mutex —
+    /// before it sends. A Stop landing in there was answered one segment late.
+    #[test]
+    fn a_gate_shut_mid_iteration_forwards_nothing() {
+        let gate = WatchGate::new(true);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (fatal_tx, _fatal_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let budget = PipelineBudget::new();
+
+        capture_loop_budgeted(
+            Box::new(ShutsGateMidIteration {
+                gate: gate.clone(),
+                segment: Some(initial_anchor_segment(1000, b"AB")),
+            }),
+            event_tx,
+            gate,
+            shutdown_rx,
+            fatal_tx,
+            budget.clone(),
+            PressureResync::default(),
+        );
+
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the gate was shut before the send; nothing may cross it"
+        );
+        let stats = budget.snapshot();
+        // The segment was admitted before the gate shut, so its lease is the
+        // thing this skip can leak. Zero here is the release.
+        assert_eq!(stats.current_capture, 0, "the admitted lease is given back");
+        assert_eq!(stats.current_total, 0);
+        // Matching the `!enabled` skip at the top of the loop, which counts
+        // nothing: a shut gate is a stop, not a pipeline fault.
+        assert_eq!(stats.dropped_segments, 0);
+        assert_eq!(stats.resyncs, 0);
+    }
+
+    /// Shuts the gate mid-iteration on the first segment and has re-opened it by
+    /// the time the second is handed over — so no `is_enabled` read at the top of
+    /// an iteration ever sees it shut. `set(true)` on every segment is the
+    /// shipped shape: `session::apply` re-projects the status on every dispatch.
+    struct ShutsThenReopens {
+        gate: WatchGate,
+        segment: Segment,
+        remaining: usize,
+        /// One shut only: on the second iteration `take_capture_loss` is called
+        /// twice (once for the arming drain at the top), and a second shut there
+        /// would close the gate the test just re-opened.
+        shuts: bool,
+    }
+
+    impl PacketSource for ShutsThenReopens {
+        fn next_segment(&mut self) -> Result<Segment> {
+            let Some(remaining) = self.remaining.checked_sub(1) else {
+                return Err(crate::Error::Capture(
+                    "characterization complete".to_owned(),
+                ));
+            };
+            self.remaining = remaining;
+            self.gate.set(true);
+            Ok(self.segment.clone())
+        }
+
+        fn take_capture_loss(&mut self) -> Option<CaptureLoss> {
+            if std::mem::take(&mut self.shuts) {
+                self.gate.set(false);
+            }
+            None
+        }
+    }
+
+    /// The gap the re-read opens, and the re-anchor that closes it.
+    ///
+    /// Skipping the send leaves a hole in the byte stream, so the reassembler
+    /// owes a re-anchor before the next forwarded byte. It gets one only if the
+    /// loop remembers that it saw the gate shut — a gate that shuts and re-opens
+    /// between two `next_segment` calls is invisible to every other read.
+    #[test]
+    fn a_gate_shut_and_reopened_between_two_segments_still_re_anchors() {
+        let gate = WatchGate::new(true);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (fatal_tx, _fatal_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let second = initial_anchor_segment(1000, b"AB");
+
+        capture_loop_budgeted(
+            Box::new(ShutsThenReopens {
+                gate: gate.clone(),
+                segment: second.clone(),
+                remaining: 2,
+                shuts: true,
+            }),
+            event_tx,
+            gate,
+            shutdown_rx,
+            fatal_tx,
+            PipelineBudget::new(),
+            PressureResync::default(),
+        );
+
+        assert!(
+            matches!(event_rx.try_recv(), Ok(CaptureEvent::Resync)),
+            "the skipped segment is a hole; the next byte needs a fresh origin"
+        );
+        match event_rx.try_recv().expect("the second segment follows") {
+            CaptureEvent::Budgeted(segment) => assert_eq!(segment.seq, second.seq),
+            CaptureEvent::Resync | CaptureEvent::PressureResync => {
+                panic!("expected the second segment after the resync")
+            }
+        }
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the first segment never went out"
+        );
     }
 
     #[test]

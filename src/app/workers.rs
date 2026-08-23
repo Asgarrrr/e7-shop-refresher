@@ -32,8 +32,17 @@ pub(super) struct CaptureWorker {
 }
 
 impl CaptureWorker {
-    /// Wakes and joins the OS thread synchronously. A timeout here would only
-    /// detach an unabortable thread, so shutdown capability is the finite join.
+    /// Wakes and joins the OS thread synchronously. A timeout *here* would only
+    /// detach an unabortable thread, so the join stays untimed and the bound
+    /// lives one level up, in the process: both `run_mode` arms hand the whole
+    /// session to `teardown_failed(.., TEARDOWN_GRACE)` (`src/main.rs`), which
+    /// aborts the wait and logs the detach when the grace expires.
+    ///
+    /// It is not "the finite join": when `stop()` fails to wake the thread this
+    /// never returns, and that process-level grace is the only thing that ends
+    /// the wait — held by
+    /// `worker_shutdown_stalls_when_stop_does_not_wake_the_capture_thread`
+    /// below.
     fn stop_and_join(&mut self) {
         self.stop.stop();
         if let Some(thread) = self.thread.take()
@@ -380,6 +389,36 @@ mod tests {
         (CaptureSource::new(source, stop), state, live)
     }
 
+    /// A capture whose `stop()` does not wake the parked receive — the pcap
+    /// failure `stop_and_join` carries no bound of its own against. The shared
+    /// state comes back so the caller can release the thread itself once it has
+    /// measured the stall.
+    fn unwakeable_capture() -> (CaptureSource, SharedBlockingCapture) {
+        let state = Arc::new((Mutex::new(BlockingCaptureState::default()), Condvar::new()));
+        let live = Arc::new(AtomicUsize::new(0));
+        let source = BlockingSource {
+            state: state.clone(),
+            _live: LiveGuard::new(&live),
+            events: None,
+        };
+        (CaptureSource::new(source, NoopStop), state)
+    }
+
+    /// Releases a capture thread parked by [`unwakeable_capture`] on the way
+    /// out, an assertion failure included: the blocking task
+    /// `SessionWorkers::shutdown` leaves behind outlives the abort, and the
+    /// test runtime's drop waits for the blocking pool — so without this a
+    /// failing assertion would hang the test binary instead of reporting.
+    struct ReleaseOnDrop(SharedBlockingCapture);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let (lock, wake) = &*self.0;
+            crate::sync::lock_ignoring_poison(lock).stopped = true;
+            wake.notify_all();
+        }
+    }
+
     fn wait_until_capture_blocks(state: &SharedBlockingCapture) {
         let (lock, wake) = &**state;
         let mut state = lock.lock().expect("blocking capture mutex poisoned");
@@ -586,6 +625,53 @@ mod tests {
             fatal_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
         ));
+    }
+
+    /// The premise `stop_and_join`'s comment rests on, and the reason the
+    /// process-level grace exists: a `stop()` that does not wake the capture
+    /// thread leaves `SessionWorkers::shutdown` with no deadline of its own,
+    /// and only `teardown_failed` ends the wait. Give this session's own
+    /// teardown an internal bound and this fails, because `teardown_failed`
+    /// would then report a session that finished rather than one abandoned.
+    ///
+    /// A real clock and a short grace, unlike its neighbours: under
+    /// `start_paused` the runtime never auto-advances while the `spawn_blocking`
+    /// that `SessionWorkers::shutdown` parks the capture join in is still in
+    /// flight, so the deadline is never reached — measured, this test ran past
+    /// libtest's "has been running for over 60 seconds" notice and had to be
+    /// killed. Nothing below asserts *how long* the wait was, only that it had
+    /// to be cut short, so the grace is sized for the test rather than for the
+    /// process.
+    #[tokio::test]
+    async fn worker_shutdown_stalls_when_stop_does_not_wake_the_capture_thread() {
+        let (source, state) = unwakeable_capture();
+        let _release = ReleaseOnDrop(state.clone());
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let shutdown_tx = ShutdownSignal::new();
+        let shutdown_rx = shutdown_tx.subscribe();
+        let (fatal_tx, _fatal_rx) = mpsc::channel(1);
+        let capture = spawn_capture(
+            source,
+            event_tx,
+            WatchGate::new(false),
+            shutdown_rx,
+            fatal_tx,
+        )
+        .unwrap();
+        wait_until_capture_blocks(&state);
+        let workers = SessionWorkers::new(shutdown_tx, capture);
+
+        let teardown = tokio::spawn(async move {
+            let (actuator, _job_rx) = fake_actuator();
+            workers.shutdown(&WatchGate::new(true), actuator).await;
+        });
+
+        // The call both of `main.rs`'s `run_mode` arms make on the whole
+        // session, standing in for its `TEARDOWN_GRACE`.
+        assert!(
+            crate::teardown_failed(teardown, Duration::from_millis(200)).await,
+            "a capture stop that never wakes the thread must be reported as an abandoned session"
+        );
     }
 
     #[tokio::test(start_paused = true)]

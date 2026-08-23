@@ -229,4 +229,72 @@ mod tests {
         assert!(!pressure.is_blocking_segments());
         assert_eq!(budget.snapshot().resyncs, 1);
     }
+
+    /// A closed metadata channel is the shutdown path, and it must clear the
+    /// marker rather than leave it standing. Without the `store(Resync::Ack)` on
+    /// `Closed`, the state sticks at `Enqueued` for an acknowledgement that can
+    /// never come — the consumer is gone — so `is_blocking_segments` answers
+    /// `true` for the rest of the process and capture refuses every later
+    /// segment while retrying a marker no queue will take.
+    #[test]
+    fn a_closed_queue_clears_the_marker_instead_of_blocking_segments_forever() {
+        let budget = PipelineBudget::new();
+        let pressure = PressureResync::default();
+        let (tx, rx) = mpsc::channel(4);
+        drop(rx);
+
+        assert!(pressure.request(&budget, ResyncCause::ByteQuota));
+        assert!(pressure.is_blocking_segments());
+
+        assert!(!pressure.try_enqueue(&tx), "a closed queue took no marker");
+
+        assert!(
+            !pressure.is_blocking_segments(),
+            "a marker owed to a consumer that no longer exists must not hold capture shut"
+        );
+        // And the episode is genuinely over, not merely unreported: a later
+        // request can open a fresh one.
+        assert!(pressure.request(&budget, ResyncCause::DriverRing));
+        assert_eq!(budget.snapshot().resyncs, 2);
+    }
+
+    /// `try_enqueue` runs once per captured packet while a marker is owed, so
+    /// its two no-op paths carry the "never enqueued twice, never lost" promise:
+    /// with a marker already in the queue it reports success without queueing a
+    /// second one, and with nothing owed it reports failure without queueing at
+    /// all.
+    #[test]
+    fn try_enqueue_queues_one_marker_per_episode_and_none_outside_one() {
+        let budget = PipelineBudget::new();
+        let pressure = PressureResync::default();
+        let (tx, mut rx) = mpsc::channel(4);
+
+        // Nothing owed: the CAS off `Pending` fails and no marker is queued.
+        assert!(
+            !pressure.try_enqueue(&tx),
+            "no episode is open, so there is nothing to enqueue"
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(!pressure.is_blocking_segments());
+
+        assert!(pressure.request(&budget, ResyncCause::ByteQuota));
+        assert!(pressure.try_enqueue(&tx));
+        // Already queued: the same failing CAS, and this time the answer is
+        // "done", still without a second marker.
+        assert!(
+            pressure.try_enqueue(&tx),
+            "the marker is already in the queue; this call has nothing left to do"
+        );
+        assert!(pressure.try_enqueue(&tx));
+        assert!(
+            pressure.is_blocking_segments(),
+            "a queued marker still holds later segments behind it"
+        );
+
+        assert!(matches!(rx.try_recv(), Ok(CaptureEvent::PressureResync)));
+        assert!(
+            rx.try_recv().is_err(),
+            "three try_enqueue calls, one marker"
+        );
+    }
 }

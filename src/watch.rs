@@ -1,9 +1,18 @@
 //! The "Shop Watch" capture and action gate.
 //!
-//! While off, the captured stream is not forwarded and the actuator rejects
-//! work. The controller normally projects its status into the gate, while a
-//! shared halt-cause latch lets safety-critical producers force it off
-//! synchronously without relying on a bounded command queue.
+//! While off, no further captured bytes are admitted and the actuator rejects
+//! work. This gate is read on the data path in exactly one place — `app::ingest`,
+//! at the top of its per-packet loop and again immediately before it forwards —
+//! so "off" means "nothing more is taken in", not "everything stops": work
+//! already admitted runs to completion, which is up to `CAPTURE_EVENT_QUEUE`
+//! events (512, `app::pressure`), whatever `stream::reassembly` is buffering, and
+//! up to `PIPELINE_QUEUE` chunks (256, `app::mod`). Draining them is the
+//! behaviour this gate wants: cutting the backlog off would hand the analysis
+//! server a message truncated halfway through.
+//!
+//! The controller normally projects its status into the gate, while a shared
+//! halt-cause latch lets safety-critical producers force it off synchronously
+//! without relying on a bounded command queue.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -62,8 +71,9 @@ struct Inner {
     halt_notify: Notify,
 }
 
-/// The capture and action gate: while it is shut, captured bytes are not
-/// forwarded and the actuator refuses jobs. One `Arc` behind a cheap clone,
+/// The capture and action gate: while it is shut, no captured bytes are admitted
+/// — see the module doc for what already-admitted work still does — and the
+/// actuator refuses jobs. One `Arc` behind a cheap clone,
 /// shared by the GUI thread, the session loop, the capture thread and the
 /// actuator task. The crate's only safety cutoff, so a halt latches (see
 /// [`WatchGate::request_halt`]) and the controller's status projection cannot

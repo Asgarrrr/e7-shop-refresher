@@ -61,12 +61,16 @@ impl SessionGate {
     /// the zero this run's capture verdict counts from.
     ///
     /// The baseline is read *before* the store that opens the gate, and kept only
-    /// if that store was the arming edge. No packet crosses a shut gate, so
-    /// nothing this run does can land in between; taken after the gate opened,
-    /// the read could already include the re-anchor the capture thread records on
-    /// the first packet past it — the same fault as the 250 ms the window used to
-    /// take, only shorter. See `stream::RunBaselineCell::counters_now` for what
-    /// *can* land there, and why charging it here is the safe direction.
+    /// if that store was the arming edge. Nothing *this* run does can land in
+    /// between: the gate is still shut across both statements, and while it is
+    /// shut `app::ingest` admits no segment — it is the crate's only data-path
+    /// read of the gate, at the top of its loop and again immediately before it
+    /// forwards. Taken after the gate opened, the read could already include the
+    /// re-anchor the capture thread records on the first packet past it — the
+    /// same fault as the 250 ms the window used to take, only shorter. See
+    /// `stream::RunBaselineCell::counters_now` for what *can* land there — the
+    /// previous run's backlog draining through reassembly, which a shut gate does
+    /// not stop — and why charging it here is the safe direction.
     ///
     /// Unconditional, and so is the read in front of it: which projection is the
     /// arming edge is not knowable before [`WatchGate::set`] resolves it, and a
@@ -275,17 +279,38 @@ pub(super) async fn session_loop(
             _ = &mut tick_wakeup => {}
         }
     };
-    // See [`FATAL_REPORT_GRACE`].
-    let mut raced_failure = None;
-    if matches!(exit, Exit::UplinkClosed)
-        && fatal_open
-        && let Ok(Some(error)) = tokio::time::timeout(FATAL_REPORT_GRACE, fatal_errors.recv()).await
-    {
+    // Every exit that is not already a fatal has to look, because a fatal can
+    // lose the race to it and the process would then exit SUCCESS on a session
+    // that crashed — `error!` still reaches the log file, but not the banner and
+    // not the exit code. How long each waits differs:
+    //
+    // - `UplinkClosed` waits [`FATAL_REPORT_GRACE`]: the closed channel *is* the
+    //   panicking worker's sender dropping, so a report is provably in flight and
+    //   worth parking for.
+    // - `PlayerStopped` does not wait at all. Nothing about a Ctrl+C or a closed
+    //   window says a fatal is coming, so a grace here would be a flat 150 ms of
+    //   dead time on every clean stop, spent for a banner a player who just shut
+    //   the window is not reading. What it must still catch is the fatal already
+    //   sitting in the channel, and that race is real: `ctrl_c` sits *above*
+    //   `fatal_errors` in the `biased` select above, and the shutdown check at the
+    //   top of the loop runs before the select at all, so either can break out
+    //   over a queued report. `try_recv` takes exactly that one.
+    let raced_failure = if !fatal_open {
+        None
+    } else {
+        match exit {
+            Exit::UplinkClosed => tokio::time::timeout(FATAL_REPORT_GRACE, fatal_errors.recv())
+                .await
+                .unwrap_or(None),
+            Exit::PlayerStopped => fatal_errors.try_recv().ok(),
+            Exit::Fatal(_) => None,
+        }
+    };
+    if let Some(error) = &raced_failure {
         journal.emit_at(
             tracing::Level::ERROR,
             &[format!(">> session aborted — {error}")],
         );
-        raced_failure = Some(error);
     }
     // The window (GUI build) outlives the loop, so leave honest state behind:
     // controller stopped, gate off, a journal line saying why.
@@ -814,3 +839,79 @@ fn render_match(lines: &mut Vec<String>, targets: &[BuyTarget], controller: &Con
 
 #[cfg(test)]
 mod tests;
+
+/// The player-stop half of the fatal race, which [`tests`] covers only for
+/// `Exit::UplinkClosed`.
+///
+/// Both player-stop exits can break out while a worker's crash report is already
+/// sitting unread in `fatal_errors`: the shutdown check runs above the `select!`
+/// entirely, and the `ctrl_c` arm sits *above* `fatal_errors` in the biased
+/// order. While only `UplinkClosed` drained, `Session::run` returned `Ok(())`,
+/// `app::supervise` reported "session ended", and the process exited SUCCESS on a
+/// session that had crashed.
+#[cfg(test)]
+mod player_stop_fatal_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::actuator::{ClickMode, SnapshotEpoch};
+    use crate::domain::control::Limits;
+    use crate::domain::filter::Filter;
+
+    /// The four handles [`session_loop`] borrows, at their quietest: an unarmed
+    /// controller, an empty journal, an actuator that submits nothing. The
+    /// subject is the post-loop drain, which none of the three takes part in.
+    fn handles() -> (Mutex<Controller>, SessionGate, EventLog, ActuatorHandle) {
+        (
+            Mutex::new(Controller::new(Filter::default(), Limits::default())),
+            SessionGate::for_test(false),
+            EventLog::default(),
+            ActuatorHandle::new(
+                Mode::Off,
+                SnapshotEpoch::default(),
+                mpsc::channel(1).0,
+                Arc::new(Mutex::new(plan::Timings::default())),
+                Arc::new(Mutex::new(ClickMode::default())),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_fatal_already_queued_is_reported_when_the_player_stops() {
+        let (controller, gate, journal, actuator) = handles();
+        let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
+        let (_message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
+        let (error_tx, error_rx) = mpsc::channel::<String>(1);
+        error_tx
+            .try_send("network capture: the adapter died".to_owned())
+            .expect("the crash report is queued before the stop is seen");
+        // Raised before the loop starts, so it breaks at the top and the
+        // `select!` — and with it the `fatal_errors` arm — never runs at all.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+
+        let failure = session_loop(
+            &controller,
+            &gate,
+            &journal,
+            &actuator,
+            command_rx,
+            message_rx,
+            error_rx,
+            shutdown_rx,
+        )
+        .await;
+
+        assert_eq!(
+            failure,
+            Some("network capture: the adapter died".to_owned()),
+            "a crashed session must not exit SUCCESS because the player stopped it"
+        );
+        assert!(
+            journal
+                .to_entries()
+                .iter()
+                .any(|line| line.text.contains("session aborted")),
+            "the banner has to say why, not just that the app is shutting down"
+        );
+    }
+}
