@@ -240,9 +240,15 @@ fn run_mode(
     let result = eframe::run_native(
         arkyve_refresh_shop::APP_NAME,
         eframe::NativeOptions {
+            // Width is pinned: min and max agree, so the window is only ever
+            // 440pt wide and the panels are laid out against a single known
+            // measure. Height stays free — the journal is the one surface that
+            // benefits from more room — and opens at the height the layout was
+            // tuned at rather than at the minimum.
             viewport: eframe::egui::ViewportBuilder::default()
-                .with_inner_size([500.0, 560.0])
-                .with_min_inner_size([440.0, 460.0]),
+                .with_inner_size([ui::WINDOW_WIDTH, 824.0])
+                .with_min_inner_size([ui::WINDOW_WIDTH, 460.0])
+                .with_max_inner_size([ui::WINDOW_WIDTH, 10_000.0]),
             ..Default::default()
         },
         Box::new(move |cc| {

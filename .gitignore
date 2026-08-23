@@ -39,6 +39,13 @@ Thumbs.db
 # cite — vérifié avant de les retirer du suivi.
 /docs
 
+# Outillage d'agent — même espèce que /.claude ci-dessus : un pack de règles
+# installé localement et son verrou, pas du code produit. Rien dans src/,
+# build.rs, Cargo.toml, justfile ou .github/ ne les cite — vérifié avant de les
+# ignorer.
+/.agents
+/skills-lock.json
+
 # Runtime panic log (crash.log; app-data first, temp-dir fallback)
 crash.log
 

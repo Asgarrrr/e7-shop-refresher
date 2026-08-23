@@ -152,6 +152,10 @@ windows-sys = { version = "0.61", features = [
     # restricted to administrators" apart from "this machine has no adapters".
     "Win32_System_Registry",
     "Win32_System_SystemServices",
+    # `SetThreadPriority`, so the thread draining the capture funnel
+    # (`app::workers::spawn_capture_with_budget`) outruns unrelated CPU load
+    # on a busy machine instead of losing scheduling races to it.
+    "Win32_System_Threading",
     # `CreateDirectoryW` with a `SECURITY_ATTRIBUTES`, so the staging directory
     # is born with `install::STAGING_DACL` instead of spending a window with
     # `%TEMP%`'s inherited ACEs.
@@ -186,6 +190,13 @@ test = false
 # with no capture backend. Reuses the real `ShopApp`, hence `gui`.
 [[example]]
 name = "ui_preview"
+required-features = ["gui"]
+
+# The header's haul row laid out three ways at once, for a spacing call that
+# could not be made from the shipped window alone. Pulls `src/ui/theme.rs` in by
+# path, so it needs the same feature for `eframe` but none of the session.
+[[example]]
+name = "haul_variants"
 required-features = ["gui"]
 
 # Dependencies are compiled once and reused by every dev and test build; at

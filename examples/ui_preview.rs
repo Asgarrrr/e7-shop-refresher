@@ -24,7 +24,7 @@ use arkyve_refresh_shop::domain::shop::{
     CatalogId, Crystals, Gold, ItemKind, PurchaseLimit, RefreshMeta, ShopItem, ShopSnapshot,
 };
 use arkyve_refresh_shop::journal::EventLog;
-use arkyve_refresh_shop::ui::{SessionErrorSlot, ShopApp};
+use arkyve_refresh_shop::ui::{SessionErrorSlot, ShopApp, WINDOW_WIDTH};
 use arkyve_refresh_shop::watch::WatchGate;
 
 use eframe::egui;
@@ -119,14 +119,26 @@ fn main() -> eframe::Result {
         });
         gate.set(matches!(ctrl.status(), Status::Watching | Status::Paused));
     }
-    journal.push(&[
-        "armed — watching the Secret Shop".to_owned(),
-        "shop captured · 6 slots".to_owned(),
-        "match · slot 1 · ticketrare_name · 184,000 gold".to_owned(),
-        "match · slot 2 · ticketspecial_name · 280,000 gold".to_owned(),
-        "bought · ticketrare_name · 300,184,000 gold left".to_owned(),
-        "bought · Wondrous Potion Vial · 300,000,000 gold left".to_owned(),
-    ]);
+    journal.push(
+        tracing::Level::INFO,
+        &[
+            "armed — watching the Secret Shop".to_owned(),
+            "shop captured · 6 slots".to_owned(),
+            "match · slot 1 · ticketrare_name · 184,000 gold".to_owned(),
+            "match · slot 2 · ticketspecial_name · 280,000 gold".to_owned(),
+            "bought · ticketrare_name · 300,184,000 gold left".to_owned(),
+            "bought · Wondrous Potion Vial · 300,000,000 gold left".to_owned(),
+        ],
+    );
+    // One of each severity, so the preview shows every color the journal uses.
+    journal.push(
+        tracing::Level::WARN,
+        &[">> config.toml not saved (Stop): permission denied".to_owned()],
+    );
+    journal.push(
+        tracing::Level::ERROR,
+        &[">> session aborted — the actuator link dropped".to_owned()],
+    );
 
     let (commands, mut receiver) = mpsc::channel::<Command>(16);
     let handles =
@@ -181,9 +193,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Arkyve Refresh Shop — UI preview",
         eframe::NativeOptions {
+            // Same geometry as the real window, pin included: a preview 280pt
+            // wider than anything the app can open is previewing a layout that
+            // does not exist.
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([720.0, 680.0])
-                .with_min_inner_size([520.0, 480.0]),
+                .with_inner_size([WINDOW_WIDTH, 824.0])
+                .with_min_inner_size([WINDOW_WIDTH, 460.0])
+                .with_max_inner_size([WINDOW_WIDTH, 10_000.0]),
             ..Default::default()
         },
         Box::new(move |cc| {

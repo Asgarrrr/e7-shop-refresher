@@ -304,9 +304,31 @@ Reading it yourself:
   `RUST_LOG=arkyve_refresh_shop=debug` to get the `capture funnel` line, which
   separates "no packet was ever delivered" from "packets arrived and the parser
   rejected them".
-- `the capture driver dropped packets` → the kernel ring overflowed; the byte
-  stream has a hole and the session resyncs by itself. Frequent enough to be
-  noticeable means the machine could not keep up with the capture.
+- `the capture driver dropped packets`, `the capture funnel is full`,
+  `stream table full`, or any line ending `dropping until resync
+  acknowledgement` → the byte stream lost continuity somewhere and the session
+  re-anchored by itself. Every one of them carries a **`cause`** field naming
+  where. In the window the same thing is said as a sentence: **open the
+  JOURNAL panel** at the bottom, and a `CAPTURE` line sits above the log with
+  the counts beside it. The two use the same cause names, so a pasted readout
+  and a pasted log line line up:
+
+  | `cause` | What it means |
+  |---------|---------------|
+  | `driver_ring` | Npcap's kernel ring overflowed. The only one that is about the wire: this machine could not keep up with the traffic |
+  | `capture_funnel` | The frames were captured and this app did not drain them in time. A busy machine, not a network fault |
+  | `byte_quota` | The pipeline's memory budget filled — bytes arrived faster than the server link drained them |
+  | `metadata_queue` | Reassembly fell behind the capture thread |
+  | `reassembly_stream`, `reassembly_shared` | A gap behind a lost packet never filled, in one flow's buffer or in the shared one. A passive tap is never shown that packet again |
+  | `stream_evicted` | More than 64 connections on `game_port` crowded out the game's own flow |
+
+  One or two across a session is ordinary and costs at most one shop refresh.
+  A steady stream of them is worth reporting — **with the cause**, which is the
+  part that says whether the answer is the network, the machine, or this app.
+- `an adapter that has delivered nothing dropped packets` (at `debug`) → an
+  adapter the game does not use is losing packets, and it is being ignored on
+  purpose. Every adapter is open, so without that rule a VPN tap or a Hyper-V
+  vSwitch could re-anchor a session it has nothing to do with.
 - `session heartbeat` lines with a growing `since_last_shop_s` → the pipeline
   is alive but no shop is arriving; compare `gate_armed` (is the watch armed?)
   with the `server link down` lines (is the server reachable?).
