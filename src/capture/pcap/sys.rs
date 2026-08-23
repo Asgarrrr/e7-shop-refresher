@@ -51,6 +51,10 @@ const PROMISCUOUS: c_int = 0;
 /// the driver and is compiled once.
 const OPTIMIZE_FILTER: c_int = 1;
 
+/// `PCAP_CHAR_ENC_UTF_8`, from `pcap/pcap.h`. See
+/// [`Wpcap::init_string_encoding`].
+const CHAR_ENC_UTF_8: c_uint = 0x0000_0001;
+
 /// Netmask for `pcap_compile`. Zero is correct, not merely tolerated: it feeds
 /// only broadcast-relative primitives, which no rung of
 /// [`super::filter_candidates`] uses.
@@ -63,7 +67,8 @@ const FILTER_NETMASK: c_uint = 0;
 /// reads the text libpcap set for it. `-2` (`PCAP_ERROR_BREAK`) is returned
 /// after `pcap_breakloop` and at the end of a savefile, and this crate does
 /// neither: `grep -rn breakloop src/` finds nothing — teardown is the stop flag
-/// plus [`READ_TIMEOUT_MS`] — and every handle here comes from `pcap_open_live`.
+/// plus [`READ_TIMEOUT_MS`] — and every handle here comes from `pcap_create`, not
+/// from a savefile.
 /// An arm matching it would be a branch no test could reach except by scripting
 /// the code it exists for.
 ///
@@ -145,16 +150,42 @@ type PcapT = c_void;
 /// The subset of `wpcap.dll` this backend uses, resolved once at open time.
 ///
 /// Every entry point is a stable libpcap export, and a missing symbol is caught
-/// here, at load, not at the call. Every field stays private to this module:
-/// each of the thirteen was verified against libpcap's ABI. `pub(super)` only
-/// because the parent's `open` loads it and passes it back in.
+/// here, at load, not at the call — except the one declared [`Option`], which
+/// libpcap gained later than the rest and whose absence costs nothing this
+/// backend cannot do without. Every field stays private to this module: each of
+/// the nineteen required entry points was verified against libpcap's ABI.
+/// `pub(super)` only because the parent's `open` loads it and passes it back in.
 pub(super) struct Wpcap {
     /// Kept solely to pin the library in memory: the function pointers below
     /// are only valid while it stays loaded.
     _lib: libloading::Library,
     findalldevs: unsafe extern "C" fn(*mut *mut PcapIf, *mut c_char) -> c_int,
     freealldevs: unsafe extern "C" fn(*mut PcapIf),
-    open_live: unsafe extern "C" fn(*const c_char, c_int, c_int, c_int, *mut c_char) -> *mut PcapT,
+    /// The seven that replaced `pcap_open_live`: six calls in sequence, plus
+    /// `pcap_statustostr` to read what a failed one meant.
+    ///
+    /// `pcap_open_live` is not deprecated, but in libpcap's own source it is a
+    /// wrapper that sets three of libpcap's eight portable capture options and
+    /// activates — and the option this backend most needs, immediate delivery, is
+    /// one of the five it leaves out of reach. Configuring before activating is also the only way to have the
+    /// setting in force *from the first packet*: the previous shape opened at
+    /// Npcap's 16 000-byte default and lowered it afterwards, leaving a window
+    /// that spanned the datalink check and the whole filter ladder.
+    create: unsafe extern "C" fn(*const c_char, *mut c_char) -> *mut PcapT,
+    set_snaplen: unsafe extern "C" fn(*mut PcapT, c_int) -> c_int,
+    set_promisc: unsafe extern "C" fn(*mut PcapT, c_int) -> c_int,
+    set_timeout: unsafe extern "C" fn(*mut PcapT, c_int) -> c_int,
+    /// libpcap 1.5.0 and later. Required, not optional: on Windows it lowers to
+    /// the same `PacketSetMinToCopy(adapter, 0)` that `pcap_setmintocopy` does,
+    /// and a `wpcap.dll` too old to export it is `WinPcap` rather than Npcap — a
+    /// library this backend asks the player to replace anyway, with
+    /// [`INSTALL_HINT`], rather than silently capturing 115 ms late.
+    set_immediate_mode: unsafe extern "C" fn(*mut PcapT, c_int) -> c_int,
+    activate: unsafe extern "C" fn(*mut PcapT) -> c_int,
+    /// Turns an activation status code into text. The errbuf handed to
+    /// `pcap_create` says nothing about a failure that happens in
+    /// `pcap_activate`.
+    statustostr: unsafe extern "C" fn(c_int) -> *const c_char,
     close: unsafe extern "C" fn(*mut PcapT),
     datalink: unsafe extern "C" fn(*mut PcapT) -> c_int,
     datalink_val_to_name: unsafe extern "C" fn(c_int) -> *const c_char,
@@ -166,6 +197,10 @@ pub(super) struct Wpcap {
     stats: unsafe extern "C" fn(*mut PcapT, *mut PcapStat) -> c_int,
     geterr: unsafe extern "C" fn(*mut PcapT) -> *mut c_char,
     lib_version: unsafe extern "C" fn() -> *const c_char,
+    /// `pcap_init`, libpcap 1.10.0 and later, so optional: an older
+    /// `wpcap.dll` still captures, it just keeps the legacy string encoding.
+    /// See [`Wpcap::init_string_encoding`].
+    init: Option<unsafe extern "C" fn(c_uint, *mut c_char) -> c_int>,
 }
 
 /// Search flags for every candidate below, and the reason the bare name
@@ -257,7 +292,6 @@ impl Wpcap {
             let resolved = Wpcap {
                 findalldevs: sym!(b"pcap_findalldevs\0"),
                 freealldevs: sym!(b"pcap_freealldevs\0"),
-                open_live: sym!(b"pcap_open_live\0"),
                 close: sym!(b"pcap_close\0"),
                 datalink: sym!(b"pcap_datalink\0"),
                 datalink_val_to_name: sym!(b"pcap_datalink_val_to_name\0"),
@@ -268,8 +302,25 @@ impl Wpcap {
                 stats: sym!(b"pcap_stats\0"),
                 geterr: sym!(b"pcap_geterr\0"),
                 lib_version: sym!(b"pcap_lib_version\0"),
+                create: sym!(b"pcap_create\0"),
+                set_snaplen: sym!(b"pcap_set_snaplen\0"),
+                set_promisc: sym!(b"pcap_set_promisc\0"),
+                set_timeout: sym!(b"pcap_set_timeout\0"),
+                set_immediate_mode: sym!(b"pcap_set_immediate_mode\0"),
+                activate: sym!(b"pcap_activate\0"),
+                statustostr: sym!(b"pcap_statustostr\0"),
+                // Not through `sym!`: that macro abandons the whole DLL
+                // candidate on a miss, and this one symbol is optional.
+                //
+                // SAFETY: as `sym!` — one exported name resolved against the
+                // signature transcribed above, valid while `_lib` holds the
+                // module loaded. A miss yields `None` and is never called.
+                init: unsafe { lib.get(b"pcap_init\0") }
+                    .map(|symbol: libloading::Symbol<_>| *symbol)
+                    .ok(),
                 _lib: lib,
             };
+            resolved.init_string_encoding();
             return Ok((resolved, path));
         }
         // Candidate paths and OS errors go to the log, not the player: they
@@ -280,6 +331,48 @@ impl Wpcap {
             "no wpcap.dll could be loaded"
         );
         Err(Error::Capture(INSTALL_HINT.to_owned()))
+    }
+
+    /// Asks libpcap to treat every string it takes and returns as UTF-8.
+    ///
+    /// Without this, `pcap_init(3PCAP)` says strings "are treated as being in
+    /// the local ANSI code page on Windows" — so on a French install an adapter
+    /// description containing `é` arrives as cp1252 `0xE9`, which is not valid
+    /// UTF-8, and [`cstr`]'s lossy conversion renders it `U+FFFD`. The player
+    /// then reads a mangled adapter name in the one log line that tells them
+    /// which adapter refused them.
+    ///
+    /// Called from [`Self::load`], which is the only place that can honour
+    /// "before any other pcap call".
+    ///
+    /// No guard against being called twice, and it does not need one: libpcap's
+    /// `pcap_init` returns 0 immediately once initialised, and errors only when
+    /// a *different* encoding is requested than the one already in force. Since
+    /// this crate asks for the same value from its one call site, a repeat would
+    /// be a no-op. An earlier draft wrapped this in a `std::sync::Once` and justified it
+    /// with "a second call would return `PCAP_ERROR` for being too late" —
+    /// libpcap has no such check, and the guard was protecting against nothing.
+    ///
+    /// Failure is not propagated: a library too old to export `pcap_init`, or
+    /// one that refuses the option, still captures perfectly. Only the encoding
+    /// of its strings is at stake, and the warning says exactly that.
+    fn init_string_encoding(&self) {
+        let Some(init) = self.init else {
+            debug!("this wpcap.dll exports no pcap_init; strings stay in the local code page");
+            return;
+        };
+        let mut errbuf = [0 as c_char; PCAP_ERRBUF_SIZE];
+        // SAFETY: `errbuf` is exactly `PCAP_ERRBUF_SIZE` bytes and outlives the
+        // call, which is what `pcap_init` documents it writes into. The option
+        // is a plain integer.
+        let rc = unsafe { init(CHAR_ENC_UTF_8, errbuf.as_mut_ptr()) };
+        if rc != 0 {
+            warn!(
+                reason = %errbuf_text(&errbuf),
+                "pcap_init refused UTF-8; adapter names and libpcap errors may render \
+                 as U+FFFD on a non-ASCII Windows locale"
+            );
+        }
     }
 
     pub(super) fn version(&self) -> String {
@@ -322,7 +415,7 @@ impl Wpcap {
     ///
     /// Only `next_ex`, `stats`, `geterr` and `close` are parameters: those are
     /// the only four entry points [`capture_loop`] and [`Handle`]'s [`Drop`]
-    /// reach. The other nine are wired to stubs that panic if called — see
+    /// reach. The other fifteen are wired to stubs that panic if called — see
     /// `tests::unreachable_*` — which is itself an assertion that this loop
     /// touches nothing else.
     ///
@@ -341,7 +434,13 @@ impl Wpcap {
             _lib: lib,
             findalldevs: tests::unreachable_findalldevs,
             freealldevs: tests::unreachable_freealldevs,
-            open_live: tests::unreachable_open_live,
+            create: tests::unreachable_create,
+            set_snaplen: tests::unreachable_set_int,
+            set_promisc: tests::unreachable_set_int,
+            set_timeout: tests::unreachable_set_int,
+            set_immediate_mode: tests::unreachable_set_int,
+            activate: tests::unreachable_activate,
+            statustostr: tests::unreachable_statustostr,
             close,
             datalink: tests::unreachable_datalink,
             datalink_val_to_name: tests::unreachable_datalink_val_to_name,
@@ -352,6 +451,10 @@ impl Wpcap {
             stats,
             geterr,
             lib_version: tests::unreachable_lib_version,
+            // `None`, not an `unreachable_*` stub: absent is a state the real
+            // loader can produce, and `capture_loop` — all these fakes exist to
+            // drive — never touches it.
+            init: None,
         }
     }
 }
@@ -437,7 +540,7 @@ unsafe impl Send for Handle {}
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // SAFETY: `self.handle` was returned non-null by `pcap_open_live` and
+        // SAFETY: `self.handle` was returned non-null by `pcap_create` and
         // is unclosed (this is the only close, and `Handle` is not `Clone`); no
         // receive can be in flight, because the thread that would issue it is
         // the one running this drop.
@@ -503,28 +606,24 @@ pub(super) fn open_device(
     // SAFETY: `device_c` and `errbuf` outlive the call and are, respectively, a
     // NUL-terminated name and a `PCAP_ERRBUF_SIZE` buffer. A null return is
     // failure, handled without dereferencing it.
-    let raw = unsafe {
-        (wpcap.open_live)(
-            device_c.as_ptr(),
-            SNAPLEN,
-            PROMISCUOUS,
-            READ_TIMEOUT_MS,
-            errbuf.as_mut_ptr(),
-        )
-    };
+    let raw = unsafe { (wpcap.create)(device_c.as_ptr(), errbuf.as_mut_ptr()) };
     if raw.is_null() {
-        return Err(format!("pcap_open_live: {}", errbuf_text(&errbuf)));
+        return Err(format!("pcap_create: {}", errbuf_text(&errbuf)));
     }
     // Owning wrapper first, so every failure below closes the handle by drop
-    // rather than a `pcap_close` repeated on each path. The strip is
-    // provisional because `pcap_datalink` cannot be asked before the handle
-    // exists, and the handle must not exist unowned.
+    // rather than a `pcap_close` repeated on each path. That now covers the
+    // configure-and-activate sequence too: a `pcap_t` between `pcap_create` and
+    // `pcap_activate` is still a handle `pcap_close` must be given. The strip is
+    // provisional because `pcap_datalink` cannot be asked before the handle is
+    // activated, and the handle must not exist unowned.
     let mut handle = Handle {
         wpcap: Arc::clone(wpcap),
         handle: raw,
         device: device.to_owned(),
         strip: LinkStrip::Fixed(0),
     };
+
+    configure_and_activate(&handle, device)?;
 
     // SAFETY: `handle.handle` is the live `pcap_t` just opened, and this thread
     // is its only user until it moves into a capture thread.
@@ -552,6 +651,129 @@ pub(super) fn open_device(
         "adapter opened and filtered"
     );
     Ok(handle)
+}
+
+/// Applies this backend's four capture options to a created-but-not-yet-active
+/// handle, then activates it.
+///
+/// # Why immediate mode is the point of this function
+///
+/// `pcap_activate` is where Npcap decides how long the driver may sit on
+/// captured bytes before waking a reader. Without immediate mode it installs a
+/// 16 000-byte threshold — larger than an entire shop response, measured at
+/// 6 520 bytes over six segments — so the response is held until
+/// [`READ_TIMEOUT_MS`] expires rather than delivered when it arrives. Measured
+/// on a live session, 2026-08-23, four refresh episodes against the same server:
+///
+/// | | 16 000-byte threshold | immediate mode |
+/// |---|---|---|
+/// | client SYN to the server's SYN/ACK | 0 ms | 16–18 ms |
+/// | request to the 6 520-byte response | 213 ms | 90–104 ms |
+///
+/// A round trip cannot take 0 ms across the internet: under the threshold those
+/// arrival stamps were quantised by the driver's flush, not by the wire. What
+/// immediate mode buys is ~115 ms per refresh, which an actuator clicking on
+/// what it just saw pays in full.
+///
+/// It buys nothing about *timestamps*. Frames landing in one flush are indeed
+/// indistinguishable in time — that is how the measurement above was read — but
+/// the instrument that read it stamped arrivals itself. Nothing in this crate
+/// consumes [`PcapPktHdr`]'s `tv_sec`/`tv_usec`, so no production timing
+/// improves here. If one ever should, note that Npcap's default timestamp type
+/// is `PCAP_TSTAMP_HOST_HIPREC_UNSYNCED`: monotonic, and not comparable to a log
+/// line or to `SystemTime::now`.
+///
+/// # Warnings are not failures
+///
+/// `pcap_activate` returns 0 for success, a *negative* code for failure, and a
+/// *positive* one for "activated, but something you asked for was not honoured"
+/// — `PCAP_WARNING_PROMISC_NOTSUP` and friends. Treating positive as failure
+/// would refuse adapters that work; ignoring it silently would hide a capture
+/// running on terms other than the ones requested. So it is logged and kept.
+fn configure_and_activate(handle: &Handle, device: &str) -> std::result::Result<(), String> {
+    /// Immediate delivery on. See this function's doc for what it is worth.
+    const IMMEDIATE: c_int = 1;
+
+    let wpcap = &handle.wpcap;
+    // A table, so the four options are data and the call below is the only
+    // `unsafe` — they share one signature and one safety argument, and writing
+    // them as four inline calls would mean four copies of that argument.
+    let options: [(
+        &str,
+        unsafe extern "C" fn(*mut PcapT, c_int) -> c_int,
+        c_int,
+    ); 4] = [
+        ("pcap_set_snaplen", wpcap.set_snaplen, SNAPLEN),
+        ("pcap_set_promisc", wpcap.set_promisc, PROMISCUOUS),
+        ("pcap_set_timeout", wpcap.set_timeout, READ_TIMEOUT_MS),
+        (
+            "pcap_set_immediate_mode",
+            wpcap.set_immediate_mode,
+            IMMEDIATE,
+        ),
+    ];
+    for (option, set, value) in options {
+        // SAFETY: `handle.handle` is the live `pcap_t` this thread just created
+        // and has not yet activated, which is the state every one of these
+        // setters requires; each takes an integer and returns a status code,
+        // reading no memory through a pointer.
+        let rc = unsafe { set(handle.handle, value) };
+        if rc != 0 {
+            // These fail only with `PCAP_ERROR_ACTIVATED`, which cannot happen
+            // here — the handle is not activated until below. `statustostr`
+            // rather than `pcap_geterr`: an unactivated handle has no error
+            // text of its own to report.
+            return Err(format!("{option}: {}", status_text(wpcap, rc)));
+        }
+    }
+
+    // SAFETY: the handle is the live, configured `pcap_t` above, activated
+    // exactly once; the call returns a status code.
+    let status = unsafe { (wpcap.activate)(handle.handle) };
+    if status < 0 {
+        // The errbuf `pcap_create` was handed says nothing about this failure:
+        // an activated-or-failed handle carries its own message.
+        //
+        // SAFETY: the handle is live and exclusively this thread's.
+        let reason = unsafe { wpcap.error_text(handle.handle) };
+        let reason = if reason.is_empty() {
+            status_text(wpcap, status)
+        } else {
+            reason
+        };
+        return Err(format!("pcap_activate: {reason}"));
+    }
+    if status > 0 {
+        warn!(
+            device = %short_device_name(device),
+            warning = %status_text(wpcap, status),
+            "this adapter activated with a warning; capture runs on terms other than \
+             the ones requested"
+        );
+    }
+    Ok(())
+}
+
+/// libpcap's own word for a status code, for the paths where no handle can
+/// speak for itself.
+fn status_text(wpcap: &Wpcap, status: c_int) -> String {
+    // SAFETY: `pcap_statustostr` takes an integer and reads no memory through a
+    // pointer; what it returns is library-owned and never freed.
+    let text = unsafe { (wpcap.statustostr)(status) };
+    // SAFETY: that pointer is NUL-terminated and alive for the whole process —
+    // or null, which `cstr` tolerates — and it is copied here rather than
+    // retained. Not a *constant*, though, for an unrecognised code: libpcap
+    // formats into a function-static buffer and hands that back, so two threads
+    // calling this at once could tear each other's message. Every caller today
+    // is `open_device`, which runs in a sequential loop before any capture
+    // thread exists; a future caller from a capture thread would need this
+    // copy to move under a lock.
+    let text = unsafe { cstr(text) };
+    if text.is_empty() {
+        format!("status {status}")
+    } else {
+        text
+    }
 }
 
 /// Installs the first filter in `filters` that this adapter's libpcap accepts,
@@ -1142,11 +1364,21 @@ mod tests {
         /// The one number the close contract is stated in: never 2, and never 0
         /// once a `Handle` has been built.
         static CLOSE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        /// The three knobs [`ScriptedOpen`] sets; see its fields for what each
+        /// The four knobs [`ScriptedOpen`] sets; see its fields for what each
         /// one makes `open_device` do.
         static OPEN_SUCCEEDS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         static DATALINK: std::cell::Cell<c_int> = const { std::cell::Cell::new(SCRIPTED_DLT_EN10MB) };
         static COMPILE_RC: std::cell::Cell<c_int> = const { std::cell::Cell::new(0) };
+        /// What `pcap_activate` will answer: 0, a positive warning, or a
+        /// negative failure.
+        static ACTIVATE_STATUS: std::cell::Cell<c_int> = const { std::cell::Cell::new(0) };
+        /// Every option set on the handle and the activation, in call order,
+        /// as `(step, value)`. Order rather than a set of flags, because
+        /// "immediate mode was requested" and "immediate mode was requested
+        /// *before the handle went live*" are different claims and only the
+        /// second is the one worth pinning.
+        static OPEN_SEQUENCE: std::cell::RefCell<Vec<(&'static str, c_int)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
     unsafe extern "C" fn scripted_next_ex(
@@ -1219,7 +1451,7 @@ mod tests {
         CLOSE_CALLS.with(|calls| calls.set(calls.get() + 1));
     }
 
-    // The nine entry points `capture_loop` and `Handle::drop` must never reach.
+    // The fifteen entry points `capture_loop` and `Handle::drop` must never reach.
     // Panicking, not a silent no-op, so a future change that makes the loop
     // call a fourth or fifth entry point fails loudly here instead of shipping
     // unnoticed.
@@ -1235,14 +1467,27 @@ mod tests {
         panic!("capture_loop must not call pcap_freealldevs")
     }
 
-    pub(super) unsafe extern "C" fn unreachable_open_live(
+    pub(super) unsafe extern "C" fn unreachable_create(
         _: *const c_char,
-        _: c_int,
-        _: c_int,
-        _: c_int,
         _: *mut c_char,
     ) -> *mut PcapT {
-        panic!("capture_loop must not call pcap_open_live")
+        panic!("capture_loop must not call pcap_create")
+    }
+
+    /// One stub for the four `pcap_set_*` options, which share a signature.
+    /// Merged deliberately: four identical panicking bodies would say the same
+    /// thing four times, and the message names the shape rather than one option
+    /// because whichever of them is reached, the fault is the same.
+    pub(super) unsafe extern "C" fn unreachable_set_int(_: *mut PcapT, _: c_int) -> c_int {
+        panic!("capture_loop must not set a capture option")
+    }
+
+    pub(super) unsafe extern "C" fn unreachable_activate(_: *mut PcapT) -> c_int {
+        panic!("capture_loop must not call pcap_activate")
+    }
+
+    pub(super) unsafe extern "C" fn unreachable_statustostr(_: c_int) -> *const c_char {
+        panic!("capture_loop must not call pcap_statustostr")
     }
 
     pub(super) unsafe extern "C" fn unreachable_datalink(_: *mut PcapT) -> c_int {
@@ -1278,14 +1523,15 @@ mod tests {
         panic!("capture_loop must not call pcap_lib_version")
     }
 
-    // ---- The six more entry points `open_device` walks ----
+    // ---- The entry points `open_device` walks ----
     //
     // `open_device` is the other producer of a `Handle`, and the one that can
-    // fail after building it. Driving it needs `pcap_open_live`,
+    // fail after building it. Driving it needs `pcap_create`, the four
+    // `pcap_set_*` options, `pcap_activate`, `pcap_statustostr`,
     // `pcap_datalink`, `pcap_datalink_val_to_name`, `pcap_compile`,
-    // `pcap_setfilter` and `pcap_freecode` — six of the nine the stubs above
-    // leave panicking — so [`opening_wpcap`] overrides exactly those and leaves
-    // the other three panicking, which keeps them an assertion for this path
+    // `pcap_setfilter` and `pcap_freecode` — so [`opening_wpcap`] overrides
+    // exactly those and leaves `pcap_findalldevs`, `pcap_freealldevs` and
+    // `pcap_lib_version` panicking, which keeps them an assertion for this path
     // too.
 
     /// `DLT_EN10MB`, transcribed because `crate::capture::link`'s own constant
@@ -1303,7 +1549,7 @@ mod tests {
 
     /// How far the fake driver lets one [`open_device`] call get.
     struct ScriptedOpen {
-        /// `false` makes the fake `pcap_open_live` return null — a device the
+        /// `false` makes the fake `pcap_create` return null — a device the
         /// driver refuses outright, before any `pcap_t` exists.
         opens: bool,
         /// What the fake `pcap_datalink` reports for the opened handle.
@@ -1311,6 +1557,9 @@ mod tests {
         /// The fake `pcap_compile`'s return code. Non-zero refuses every rung
         /// of the filter ladder, since one fake answers them all.
         compile_rc: c_int,
+        /// What the fake `pcap_activate` answers. Negative is a failure that
+        /// costs the adapter; positive is a warning it must survive.
+        activate_status: c_int,
     }
 
     impl ScriptedOpen {
@@ -1321,6 +1570,7 @@ mod tests {
                 opens: true,
                 datalink: SCRIPTED_DLT_EN10MB,
                 compile_rc: 0,
+                activate_status: 0,
             }
         }
 
@@ -1348,13 +1598,46 @@ mod tests {
         }
     }
 
-    unsafe extern "C" fn scripted_open_live(
-        _: *const c_char,
-        _: c_int,
-        _: c_int,
-        _: c_int,
-        _: *mut c_char,
-    ) -> *mut PcapT {
+    /// Records one step of the open sequence, so a test can assert not just
+    /// *that* an option was set but that it was set **before** activation —
+    /// which is the whole reason `pcap_create` replaced `pcap_open_live` here.
+    fn record_open_step(step: &'static str, value: c_int) {
+        OPEN_SEQUENCE.with(|steps| steps.borrow_mut().push((step, value)));
+    }
+
+    unsafe extern "C" fn scripted_set_snaplen(_: *mut PcapT, value: c_int) -> c_int {
+        record_open_step("snaplen", value);
+        0
+    }
+
+    unsafe extern "C" fn scripted_set_promisc(_: *mut PcapT, value: c_int) -> c_int {
+        record_open_step("promisc", value);
+        0
+    }
+
+    unsafe extern "C" fn scripted_set_timeout(_: *mut PcapT, value: c_int) -> c_int {
+        record_open_step("timeout", value);
+        0
+    }
+
+    unsafe extern "C" fn scripted_set_immediate_mode(_: *mut PcapT, value: c_int) -> c_int {
+        record_open_step("immediate", value);
+        0
+    }
+
+    unsafe extern "C" fn scripted_activate(_: *mut PcapT) -> c_int {
+        let status = ACTIVATE_STATUS.with(std::cell::Cell::get);
+        record_open_step("activate", status);
+        status
+    }
+
+    unsafe extern "C" fn scripted_statustostr(_: c_int) -> *const c_char {
+        // A `'static` NUL-terminated constant, as the real `pcap_statustostr`
+        // returns: library-owned, never freed.
+        c"SCRIPTED STATUS".as_ptr()
+    }
+
+    unsafe extern "C" fn scripted_create(_: *const c_char, _: *mut c_char) -> *mut PcapT {
         if OPEN_SUCCEEDS.with(std::cell::Cell::get) {
             // The same dangling-but-never-dereferenced sentinel
             // [`scripted_handle`] uses, and opaque to every fake here for the
@@ -1462,6 +1745,8 @@ mod tests {
         DATALINK.with(|cell| cell.set(scripted.datalink));
         COMPILE_RC.with(|cell| cell.set(scripted.compile_rc));
         CLOSE_CALLS.with(|calls| calls.set(0));
+        ACTIVATE_STATUS.with(|cell| cell.set(scripted.activate_status));
+        OPEN_SEQUENCE.with(|steps| steps.borrow_mut().clear());
         ERROR_TEXT.with(|cell| *cell.borrow_mut() = CString::new("").expect("no NUL"));
         let mut wpcap = Wpcap::from_fns(
             a_real_loaded_library(),
@@ -1470,7 +1755,13 @@ mod tests {
             scripted_geterr,
             scripted_close,
         );
-        wpcap.open_live = scripted_open_live;
+        wpcap.create = scripted_create;
+        wpcap.set_snaplen = scripted_set_snaplen;
+        wpcap.set_promisc = scripted_set_promisc;
+        wpcap.set_timeout = scripted_set_timeout;
+        wpcap.set_immediate_mode = scripted_set_immediate_mode;
+        wpcap.activate = scripted_activate;
+        wpcap.statustostr = scripted_statustostr;
         wpcap.datalink = scripted_datalink;
         wpcap.datalink_val_to_name = scripted_datalink_val_to_name;
         wpcap.compile = scripted_compile;
@@ -1794,10 +2085,10 @@ mod tests {
     #[test]
     fn an_error_buffer_is_read_up_to_its_terminator_and_no_further() {
         let mut errbuf = [0 as c_char; PCAP_ERRBUF_SIZE];
-        for (slot, byte) in errbuf.iter_mut().zip(b"pcap_open_live failed\0junk") {
+        for (slot, byte) in errbuf.iter_mut().zip(b"pcap_create failed\0junk") {
             *slot = byte.cast_signed();
         }
-        assert_eq!(errbuf_text(&errbuf), "pcap_open_live failed");
+        assert_eq!(errbuf_text(&errbuf), "pcap_create failed");
         // Filled to the last byte with no terminator: truncated, not read past.
         let unterminated = [b'x'.cast_signed(); PCAP_ERRBUF_SIZE];
         assert_eq!(errbuf_text(&unterminated).len(), PCAP_ERRBUF_SIZE);
@@ -2442,6 +2733,137 @@ mod tests {
         );
     }
 
+    /// The whole reason `pcap_create` replaced `pcap_open_live`: immediate mode
+    /// has to be in force *from the first packet*, so it must be set on an
+    /// unactivated handle. The previous shape opened at Npcap's 16 000-byte
+    /// threshold and lowered it afterwards, leaving a window that spanned the
+    /// datalink check and the entire filter ladder.
+    ///
+    /// The order is the assertion. A test that only checked "immediate mode was
+    /// requested" would pass just as happily on the shape this replaced, which
+    /// requested it too — 115 ms late, once per refresh
+    /// (see [`configure_and_activate`]).
+    #[test]
+    fn immediate_mode_is_requested_before_the_handle_is_activated() {
+        let wpcap = Arc::new(opening_wpcap(ScriptedOpen::usable()));
+        let filters = super::super::filter_candidates(NonZeroU16::new(3333).expect("not zero"));
+
+        let _handle = open_device(&wpcap, r"\Device\NPF_{TEST}", &filters)
+            .expect("Ethernet framing and an accepted filter is a usable adapter");
+
+        let steps = OPEN_SEQUENCE.with(|steps| steps.borrow().clone());
+        let immediate = steps
+            .iter()
+            .position(|&(step, value)| step == "immediate" && value == 1)
+            .expect("immediate delivery must be requested");
+        let activate = steps
+            .iter()
+            .position(|&(step, _)| step == "activate")
+            .expect("the handle must be activated");
+        assert!(
+            immediate < activate,
+            "immediate mode set after activation is the 16 000-byte window this \
+             replaced: {steps:?}"
+        );
+        // And the three carried over from `pcap_open_live`, which took them as
+        // arguments and so could not be forgotten. They can be now.
+        assert!(steps.contains(&("snaplen", SNAPLEN)), "{steps:?}");
+        assert!(steps.contains(&("promisc", PROMISCUOUS)), "{steps:?}");
+        assert!(steps.contains(&("timeout", READ_TIMEOUT_MS)), "{steps:?}");
+    }
+
+    /// `pcap_activate` answers three ways, not two: negative is a failure,
+    /// **positive is a warning on a handle that works**. Refusing a warning
+    /// would discard adapters over a promiscuous-mode notice they never needed
+    /// — this backend asks for promiscuous *off*.
+    #[test]
+    fn an_adapter_that_activates_with_a_warning_is_still_usable() {
+        /// `PCAP_WARNING_PROMISC_NOTSUP`, the one a real driver is likeliest to
+        /// answer with.
+        const WARNING: c_int = 2;
+        let wpcap = Arc::new(opening_wpcap(ScriptedOpen {
+            activate_status: WARNING,
+            ..ScriptedOpen::usable()
+        }));
+        let filters = super::super::filter_candidates(NonZeroU16::new(3333).expect("not zero"));
+
+        let handle = open_device(&wpcap, r"\Device\NPF_{WARN}", &filters)
+            .expect("a warning is not a failure");
+
+        drop(handle);
+        assert_eq!(
+            CLOSE_CALLS.with(std::cell::Cell::get),
+            1,
+            "and it is an ordinary handle otherwise — closed once, by its owner"
+        );
+    }
+
+    /// The other side of the same three-way answer: a negative status must cost
+    /// the adapter *and* close the `pcap_t` that `pcap_create` handed back. A
+    /// created-but-unactivated handle is still a handle `pcap_close` owns.
+    ///
+    /// The reason text is asserted, not just the close, and it has to be: the
+    /// errbuf `pcap_create` was handed says nothing about a failure that happens
+    /// inside `pcap_activate`, so the message must come from the *handle*. An
+    /// earlier version of this test asserted only `contains("pcap_activate")` —
+    /// a literal from this crate's own format string — which left the whole
+    /// point of that code path unobserved: deleting the `pcap_geterr` read
+    /// passed it, and so did reading the (empty) create errbuf instead.
+    #[test]
+    fn a_failed_activation_reports_the_handles_own_reason_and_closes_it() {
+        /// `PCAP_ERROR_PERM_DENIED`.
+        const FAILURE: c_int = -8;
+        let wpcap = Arc::new(opening_wpcap(ScriptedOpen {
+            activate_status: FAILURE,
+            ..ScriptedOpen::usable()
+        }));
+        set_geterr_text("you don't have permission to capture on that device");
+        let filters = super::super::filter_candidates(NonZeroU16::new(3333).expect("not zero"));
+
+        let Err(reason) = open_device(&wpcap, r"\Device\NPF_{DENIED}", &filters) else {
+            panic!("an adapter that will not activate is not a usable adapter");
+        };
+
+        assert!(reason.contains("pcap_activate"), "{reason}");
+        assert!(
+            reason.contains("you don't have permission"),
+            "the handle's own account of the failure is the actionable half, and \
+             it is the half `pcap_create`'s errbuf cannot supply: {reason}"
+        );
+        assert_eq!(
+            CLOSE_CALLS.with(std::cell::Cell::get),
+            1,
+            "the handle existed before activation failed, so it must be closed"
+        );
+    }
+
+    /// Not every failing libpcap sets an error string — several status codes are
+    /// documented as leaving it empty — so the fallback to `pcap_statustostr`
+    /// carries the message on its own. Without this case the fallback is written
+    /// but never taken, and a reader could not tell whether it works.
+    #[test]
+    fn an_activation_failure_with_no_error_text_falls_back_to_the_status_name() {
+        const FAILURE: c_int = -8;
+        let wpcap = Arc::new(opening_wpcap(ScriptedOpen {
+            activate_status: FAILURE,
+            ..ScriptedOpen::usable()
+        }));
+        // `opening_wpcap` leaves the error text empty, which is the state under
+        // test; naming it here so the absence reads as deliberate.
+        set_geterr_text("");
+        let filters = super::super::filter_candidates(NonZeroU16::new(3333).expect("not zero"));
+
+        let Err(reason) = open_device(&wpcap, r"\Device\NPF_{QUIET}", &filters) else {
+            panic!("an adapter that will not activate is not a usable adapter");
+        };
+
+        assert!(
+            reason.contains("SCRIPTED STATUS"),
+            "an empty error text must fall through to the status name, not report \
+             an empty reason: {reason}"
+        );
+    }
+
     /// `open_device` builds the owning wrapper before it can know whether the
     /// adapter is usable — read at `sys.rs`'s "Owning wrapper first" comment,
     /// where the `Handle` is constructed above both the datalink check and the
@@ -2493,8 +2915,13 @@ mod tests {
 
     /// The only exit that owes no close, and the reason the count is asserted
     /// as a number rather than as "at least one": the early return above the
-    /// wrapper is the one path with no `pcap_t` to close, because `open_live`
+    /// wrapper is the one path with no `pcap_t` to close, because `pcap_create`
     /// returned null and no `Handle` was ever built around it.
+    ///
+    /// Distinct from `a_failed_activation_costs_the_adapter_and_closes_its_handle`,
+    /// which is the *next* failure along and owes exactly one close: between the
+    /// two of them, the boundary at which `open_device` starts owning a handle
+    /// is pinned from both sides.
     #[test]
     fn an_adapter_that_never_opened_is_never_closed() {
         let wpcap = Arc::new(opening_wpcap(ScriptedOpen::refusing_to_open()));
@@ -2504,7 +2931,7 @@ mod tests {
             panic!("a null pcap_t is a refusal, not a handle")
         };
 
-        assert!(reason.contains("pcap_open_live"), "{reason}");
+        assert!(reason.contains("pcap_create"), "{reason}");
         assert_eq!(
             CLOSE_CALLS.with(std::cell::Cell::get),
             0,
