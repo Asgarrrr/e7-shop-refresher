@@ -143,6 +143,29 @@ pub struct Reassembler {
     streams: HashMap<FlowKey, HalfStream>,
     /// Monotonic activity stamp, bumped per segment; the eviction clock.
     clock: u64,
+    /// Flows whose connection has ended, and where each one ended.
+    ///
+    /// Retiring a flow frees its `baseline` and `next_off` — which are also the
+    /// only things that make a second copy of a segment recognisable as history.
+    /// `capture::pcap` opens *every* adapter and justifies it by saying this
+    /// module dedupes by sequence number, so a machine with two adapters on the
+    /// same traffic sees every segment twice; before this map, the duplicate of
+    /// a FIN *carrying payload* — the ordinary way the game's connections end —
+    /// re-anchored a fresh stream and delivered those bytes a second time. The
+    /// game opens a connection every ~1.7s, so that was a corrupted byte stream
+    /// at the end of each one, on the default configuration.
+    ///
+    /// One `u32` per dead flow, capped at [`MAX_STREAMS`] and evicted stalest
+    /// first, which is the same discipline `streams` itself follows.
+    retired: HashMap<FlowKey, RetiredFlow>,
+}
+
+/// Where a retired flow ended: the sequence one past its last delivered byte,
+/// and when it was retired, for eviction.
+#[derive(Clone, Copy)]
+struct RetiredFlow {
+    end_seq: u32,
+    at: u64,
 }
 
 impl Reassembler {
@@ -198,6 +221,13 @@ impl Reassembler {
         if segment.syn && self.syn_starts_new_incarnation(&segment) {
             self.streams.remove(&key);
         }
+        if segment.syn {
+            // A SYN is the one thing allowed to declare a new incarnation on a
+            // reused four-tuple, so it also ends the old one's history: the
+            // sequence space restarts and the retired bound no longer describes
+            // anything.
+            self.retired.remove(&key);
+        }
         if !self.streams.contains_key(&key) {
             // A close for a flow nothing is tracking has nothing to end, and
             // admitting it would be worse than useless: it would anchor a
@@ -207,6 +237,16 @@ impl Reassembler {
             // will use, and an RST is the end of the connection outright — so
             // the entry could only ever be retired empty.
             if is_bare_close(&segment) {
+                return ReassemblyOutcome::Chunks(Vec::new());
+            }
+            // History, not data. Without this a second adapter's copy of the
+            // closing segment anchors a fresh stream on bytes already
+            // delivered — see [`Reassembler::retired`].
+            if self
+                .retired
+                .get(&key)
+                .is_some_and(|ended| ends_at_or_before(&segment, ended.end_seq))
+            {
                 return ReassemblyOutcome::Chunks(Vec::new());
             }
             if self.streams.len() >= MAX_STREAMS {
@@ -368,6 +408,31 @@ impl Reassembler {
     /// and charged, they are discarded here undelivered, and the gap in front of
     /// them can never be filled: same shape as [`ResyncCause::StreamEvicted`],
     /// different cause, because the stream table had nothing to do with it.
+    /// Records where a flow ended, evicting the stalest bound when the map is
+    /// full. Capped rather than aged: the duplicate this exists to catch is the
+    /// same packet off a second adapter, which arrives within milliseconds, so
+    /// holding [`MAX_STREAMS`] connections' worth of history — well over a
+    /// minute at the game's ~1.7s cadence — is far more than the window needs.
+    fn remember_retired(&mut self, key: FlowKey, end_seq: u32) {
+        if self.retired.len() >= MAX_STREAMS
+            && !self.retired.contains_key(&key)
+            && let Some(stalest) = self
+                .retired
+                .iter()
+                .min_by_key(|(_, flow)| flow.at)
+                .map(|(key, _)| *key)
+        {
+            self.retired.remove(&stalest);
+        }
+        self.retired.insert(
+            key,
+            RetiredFlow {
+                end_seq,
+                at: self.clock,
+            },
+        );
+    }
+
     fn retire(&mut self, key: &FlowKey, retirement: Retirement, budget: &PipelineBudget) {
         let retired = self
             .streams
@@ -375,6 +440,9 @@ impl Reassembler {
             .expect("the flow was just pushed into through this same key");
         let delivered_bytes = retired.next_off;
         let stranded_bytes = retired.pending_bytes;
+        // Taken before the drop below, which is what frees the only other copy
+        // of this bound.
+        self.remember_retired(*key, retired.expected_seq());
         // Before the snapshot below, so the pool total it prints is the one that
         // already has these bytes back — the rule `warn_stream_evicted` follows.
         drop(retired);
@@ -408,6 +476,18 @@ fn is_bare_close(segment: &BudgetedSegment) -> bool {
     (segment.fin || segment.rst) && !segment.syn && segment.payload().is_empty()
 }
 
+/// Whether every byte this segment carries was already delivered by a flow that
+/// has since retired at `end_seq` — one past that flow's last byte.
+///
+/// Wrap-relative, like every other sequence comparison here: `seq_diff` reads
+/// the difference in the signed half-space, so this stays right across the 2^32
+/// boundary. Anything ending *after* the retired bound carries something new and
+/// is left to open a fresh stream.
+fn ends_at_or_before(segment: &BudgetedSegment, end_seq: u32) -> bool {
+    let len = u32::try_from(segment.payload().len()).unwrap_or(u32::MAX);
+    seq_diff(segment.seq.wrapping_add(len), end_seq) <= 0
+}
+
 /// How a tracked flow's connection ended, once [`HalfStream`] can say the flow
 /// is safe to drop.
 #[derive(Clone, Copy)]
@@ -436,11 +516,10 @@ struct HalfStream {
     pending: BTreeMap<i64, BudgetedChunk>,
     pending_bytes: usize,
     /// Offset of the sequence number the FIN occupies — one past the server's
-    /// last byte — once one has been seen.
+    /// last byte — once one has been seen in the window.
     ///
-    /// First writer wins, as `syn_seq` does: a retransmitted FIN names the same
-    /// position, and a *different* one would mean a new incarnation, which only
-    /// a SYN is allowed to declare here.
+    /// Earliest wins, and only from a FIN that does not end behind `next_off`;
+    /// see the two guards where it is written.
     fin_off: Option<i64>,
     /// An in-sequence RST was seen. Not an offset, because unlike a FIN there is
     /// nothing to wait to reach: an abort is effective where it lands.
@@ -476,8 +555,25 @@ impl HalfStream {
         // currently expecting a byte — see `Reassembler::push_budgeted` on RFC
         // 5961 §3.2 and why a passive tap owes itself that test.
         if fin {
-            self.fin_off
-                .get_or_insert(offset + payload.as_slice().len() as i64);
+            let at = offset + payload.as_slice().len() as i64;
+            // Two guards, both of which the RST line below already had and the
+            // FIN had neither.
+            //
+            // In-window: a FIN ending *behind* the byte this stream is waiting
+            // for describes a connection that has already delivered past it, so
+            // it is a stale copy or a forgery — and honouring it retired a live
+            // flow. Half the sequence space maps behind `next_off`, so this was
+            // reachable by accident, and it was silent: `retirement` counts a
+            // close, not a resync, so nothing reported the teardown.
+            //
+            // Earliest wins, not first seen: a FIN names one fixed position, so
+            // a second naming a *different* one is not new information. Taking
+            // the first let a single forged FIN far ahead pin `fin_off` beyond
+            // anything the connection would reach, and the flow then never
+            // retired at all — the slot churn retirement exists to prevent.
+            if at >= self.next_off {
+                self.fin_off = Some(self.fin_off.map_or(at, |seen| seen.min(at)));
+            }
         }
         self.reset |= rst && offset == self.next_off;
 
@@ -570,21 +666,19 @@ impl HalfStream {
         // One `entry` probe: a held chunk is displaced only once the new one
         // has cleared both quotas.
         match self.pending.entry(offset) {
-            Entry::Occupied(mut slot) => {
-                // Keep only the largest segment seen at a given offset.
-                if slot.get().as_slice().len() >= payload.as_slice().len() {
-                    return Ok(());
-                }
-                let held = pending_after_release(self.pending_bytes, slot.get().capacity());
-                let Some(total) = fits_pending(held, capacity) else {
-                    return Err(PressureCause::Stream);
-                };
-                if !payload.try_retag_pending() {
-                    return Err(PressureCause::Shared);
-                }
-                self.pending_bytes = total;
-                // Returns the displaced chunk, whose lease releases as it drops.
-                drop(slot.insert(payload));
+            Entry::Occupied(_) => {
+                // First copy wins, which is what a TCP endpoint delivers and
+                // what `absorb` already does for bytes past the gap: a byte it
+                // has handed on is never revisited. This kept the *longest*
+                // instead, so which copy of an ambiguous overlap reached the
+                // server depended on whether the gap ahead of it had closed yet
+                // — the classic reassembly-ambiguity divergence, and two
+                // opposite rules inside one module.
+                //
+                // The bytes a longer duplicate carries past the held one are not
+                // lost: they arrive again in the next in-order segment, or the
+                // stream resyncs. Preferring them would mean trusting a second
+                // writer over a first, which is the property being refused.
             }
             Entry::Vacant(slot) => {
                 let Some(total) = fits_pending(self.pending_bytes, capacity) else {
@@ -1675,6 +1769,127 @@ mod tests {
         assert_eq!(budget.snapshot().resyncs, 0);
         drop(reassembler);
         assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// Two copies of one offset disagreeing: the first is delivered.
+    ///
+    /// The buffer used to keep the *longest*, while `absorb` keeps the first —
+    /// so which copy the server received depended on whether the gap ahead had
+    /// closed yet. A TCP endpoint delivers the first, and one module cannot hold
+    /// two opposite rules for the same question.
+    #[test]
+    fn the_first_copy_of_a_contradictory_overlap_is_the_one_delivered() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let mut push = |segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let game = flow();
+
+        assert_eq!(push(seg_on(game, 1000, b"AB")), b"AB");
+        // Both land past the gap at 1002, so both are buffered rather than
+        // delivered — the window where the two rules disagreed.
+        assert!(push(seg_on(game, 1004, b"EF")).is_empty());
+        assert!(push(seg_on(game, 1004, b"xxxx")).is_empty());
+
+        assert_eq!(
+            push(seg_on(game, 1002, b"CD")),
+            b"CDEF",
+            "the longer late copy must not displace the one already held"
+        );
+    }
+
+    /// A FIN ending behind the window does not retire a live flow.
+    ///
+    /// The RST one line below it in `HalfStream::push` has always been checked
+    /// against `next_off` — RFC 5961 §3.2, which the module argues a passive tap
+    /// owes itself. The FIN had no such test, and half the sequence space maps
+    /// behind `next_off`, so a stale or crafted copy tore the flow down: the
+    /// stream lost its `baseline`, the next segment re-anchored, and delivery
+    /// stopped being a suffix. Silently, too — a close is not counted as a
+    /// resync, so nothing reported it.
+    #[test]
+    fn a_fin_behind_the_window_does_not_retire_the_flow() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let game = flow();
+
+        assert_eq!(push(&mut reassembler, seg_on(game, 1000, b"AB")), b"AB");
+        assert!(push(&mut reassembler, fin_on(game, 1000, b"")).is_empty());
+
+        assert!(
+            reassembler.streams.contains_key(&game),
+            "a close that names a byte already delivered ends nothing"
+        );
+        // And the stream still reads as one: without the guard the flow was
+        // gone, so this re-anchored at 1002 and delivered out of order.
+        assert_eq!(push(&mut reassembler, seg_on(game, 1002, b"CD")), b"CD");
+        assert_eq!(budget.snapshot().resyncs, 0);
+    }
+
+    /// A FIN far ahead cannot pin the close out of reach.
+    ///
+    /// `fin_off` took the first writer, so one segment naming a position the
+    /// connection would never reach kept `retirement` waiting forever and the
+    /// flow held its slot until eviction — the churn retirement was added to
+    /// remove. A FIN names one fixed position, so the earliest is the only one
+    /// that can be right.
+    #[test]
+    fn a_fin_far_ahead_does_not_outrank_the_one_that_ends_the_stream() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let game = flow();
+
+        assert_eq!(push(&mut reassembler, seg_on(game, 1000, b"AB")), b"AB");
+        // Ahead of everything this connection will send.
+        assert!(push(&mut reassembler, fin_on(game, 1002 + (1 << 30), b"")).is_empty());
+        assert!(push(&mut reassembler, fin_on(game, 1002, b"")).is_empty());
+
+        assert!(
+            !reassembler.streams.contains_key(&game),
+            "the real close must retire the flow whatever a later-numbered FIN claimed"
+        );
+    }
+
+    /// The second adapter's copy of a closing segment is history, not data.
+    ///
+    /// `capture::pcap` opens every adapter and justifies it by saying this
+    /// module dedupes by sequence number, so on a two-adapter machine every
+    /// segment arrives twice. Retirement frees the `baseline`/`next_off` pair
+    /// that recognises a duplicate, and a FIN carrying the connection's last
+    /// bytes is not a *bare* close, so before [`Reassembler::retired`] the
+    /// duplicate re-anchored a fresh stream and delivered `CD` again — `ABCDCD`,
+    /// at the end of every connection, on the default configuration.
+    ///
+    /// Delivery must be a suffix of the stream. Repeating four bytes is neither
+    /// a permutation nor a gap, so nothing downstream can detect it.
+    #[test]
+    fn a_duplicate_of_the_closing_segment_is_not_delivered_twice() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let mut push = |segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let game = flow();
+
+        assert_eq!(push(seg_on(game, 1000, b"AB")), b"AB");
+        // The same packet, off the other adapter.
+        assert!(push(seg_on(game, 1000, b"AB")).is_empty());
+        assert_eq!(push(fin_on(game, 1002, b"CD")), b"CD");
+
+        assert!(
+            push(fin_on(game, 1002, b"CD")).is_empty(),
+            "the closing segment's duplicate must not be delivered a second time"
+        );
+        // The same shape a plain retransmission takes, which the open-every-
+        // adapter design also relies on being free.
+        assert!(push(seg_on(game, 1000, b"AB")).is_empty());
     }
 
     /// An abort is not a close. It retires the flow whatever state it was in —
