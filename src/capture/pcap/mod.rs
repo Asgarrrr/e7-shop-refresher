@@ -97,17 +97,19 @@ const _: () = {
 ///
 /// `delivered` counts frames pulled off every adapter, already stripped of
 /// their link header; `admitted` and `unparsed` are the two ways they end. Only
-/// `parse_segment` can drop one here, and `delivered` at zero means the adapters
-/// are open but the kernel filter matches no traffic. `unparsed` alone climbing
-/// is the ambiguous one — a broken strip and an idle game's keepalives look the
-/// same from here; see [`CaptureCounters`].
+/// `parse_segment` can drop one here, and `delivered` at zero means no game
+/// traffic has been captured — which, measured, is what a running game looks
+/// like whenever the player is not asking it for anything; see
+/// [`CaptureCounters`] for the session that established it.
 ///
 /// Where the line between the two falls moved on 2026-08-22: `parse_segment`
 /// now keeps FIN and RST, so a connection ending counts as `admitted` where it
 /// used to count as `unparsed`. The field reading these counters produced before
-/// that — 224 unparsed per 1000 delivered, roughly 22% — was ACKs, FINs and
-/// RSTs together, and only the ACKs are still in it. A log from an older build
-/// is not comparable on this ratio.
+/// that — 224 unparsed per 1000 delivered, roughly 22% — now has a cause: a
+/// server sends nine frames per episode, of which the old code refused two, the
+/// bare ACK and the closing RST, and 2/9 is 222 per 1000. The two numbers are
+/// near, not equal, and [`CaptureCounters`] says why they need not be. One in
+/// nine is left, and it is one bare ACK per shop request.
 ///
 /// A thin wrapper over [`CaptureHealth`], not a fresh set of counters: the
 /// atomics it increments are the exact ones [`PcapSource::counters`] hands to

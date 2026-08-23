@@ -132,22 +132,45 @@ impl LinkStrip {
 ///
 /// ⚠ **Untested.** The measured machine has `VlanSupport=0`, so no tagged frame
 /// was ever observed; this exists so a player who does run tagged VLANs doesn't
-/// see a silent parse failure. Symptom if broken: `unparsed` climbing in
-/// lockstep with `delivered`, with `admitted` stuck at zero.
+/// see a silent parse failure.
+///
+/// The symptom depends on *how* it breaks, and the two look nothing alike from
+/// the counters:
+///
+/// - A stack deeper than [`MAX_VLAN_TAGS`] returns `None`, and
+///   `sys::capture_loop` drops such a frame **before the funnel** — so
+///   `record_delivered` never sees it and every counter stays at zero, exactly
+///   like a wrong `game_port`. This is the documented limit, so it is the likely
+///   one, and it is the reading `ui::capture_health`'s `delivered == 0` note now
+///   names.
+/// - A *mis-computed* offset returns `Some` bytes that decode to nothing, which
+///   is what makes `delivered` climb with `admitted` stuck at zero. That is a
+///   bug in the arithmetic below, not the depth limit.
 ///
 /// The window shows that state without anyone needing a debug build, but not
-/// as its headline, and that is not hedging. An idle game keeps its connection
-/// to `game_port` alive, and the kernel filter admits all of it, so its
-/// keepalive ACKs reach `parse_segment` and are refused for carrying no stream
-/// bytes. These counters therefore read identically for a broken strip and for
-/// a player who has simply not opened the shop yet — and the second is
-/// overwhelmingly the common case, so the row states only that no shop data has
-/// arrived. This failure mode is named in `ui::capture_health`'s `detail`,
-/// behind the collapsing header, which is where a player looking for a fault
-/// goes and a player walking to the shop never does.
+/// as its headline. This paragraph used to explain that restraint by saying an
+/// idle game keeps its connection to `game_port` alive, so its keepalive ACKs
+/// would arrive and be refused for carrying no stream bytes — making a broken
+/// strip and a player still walking to the shop read identically. A live
+/// session on 2026-08-23 disproved the premise: between actions the game holds
+/// no connection on that port at all, so there are no keepalives to be refused,
+/// and a player who has not yet made the game *ask* for the shop sits at
+/// `delivered == 0` rather than in this state. See `super::CaptureCounters`.
 ///
-/// Telling the two apart for certain would need `unparsed` split by *why* the
-/// frame was refused — no stream bytes, versus undecodable — which nothing
+/// What that leaves is a state reached by frames arriving and none parsing.
+/// The first frame a server sends in an episode is its SYN/ACK, which
+/// `parse_segment` admits, so a healthy session should pass through this state
+/// only briefly — which makes it a better signal for this failure than the old
+/// reading allowed, not a worse one. It is still not a certainty: that is one
+/// session on one network path, and a reconnect, an error reply or a lossier
+/// link could in principle deliver frames that do not parse without the strip
+/// being at fault. So the row still states rather than accuses, and the
+/// suspicion lives in `ui::capture_health`'s `detail`, behind the collapsing
+/// header, where a player looking for a fault goes and a player walking to the
+/// shop never does.
+///
+/// Telling the two apart for certain would still need `unparsed` split by *why*
+/// the frame was refused — no stream bytes, versus undecodable — which nothing
 /// records today.
 fn ethernet_payload_offset(frame: &[u8]) -> Option<usize> {
     let mut at = ETHERTYPE_OFFSET;

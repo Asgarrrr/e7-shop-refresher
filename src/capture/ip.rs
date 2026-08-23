@@ -113,8 +113,12 @@ fn segment_span(bytes: &[u8], game_port: NonZeroU16) -> Option<SegmentSpan> {
     // and a patched build then logged 46 evictions in ~90 s.
     //
     // A pure ACK is the one control packet that says nothing either way, and it
-    // is still dropped here — it is also the bulk of what the field measured as
-    // 224 unparsed frames per 1000 delivered.
+    // is still dropped here. It is now *all* of what the field measured as 224
+    // unparsed frames per 1000 delivered: that ratio was this ACK plus the RST
+    // below it, two of the nine frames a server sends per shop request, and the
+    // RST has since moved to the admitted side. One frame per request is the
+    // whole remaining cost, which is why the kernel filter was left alone rather
+    // than taught to test for a payload — see `super::CaptureCounters`.
     if tcp.payload().is_empty() && !tcp.syn() && !tcp.fin() && !tcp.rst() {
         return None;
     }

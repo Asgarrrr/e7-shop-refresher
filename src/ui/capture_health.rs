@@ -116,12 +116,18 @@ pub(super) fn capture_view(
 ///
 /// This row appears the moment a session is armed, and the ordinary way a run
 /// begins is: press Start in the lobby, then walk to the Secret Shop. Both
-/// arms describe that walk, and both used to state it as a finding — the
-/// second not merely alarming but wrong. An idle game keeps its connection to
-/// `game_port` alive and the kernel filter admits all of it, so its keepalive
-/// ACKs reach `parse_segment` and are refused for carrying no stream bytes:
-/// `unparsed` climbs, `admitted` stays at zero, and the row announced that
-/// none of this looked like the game's traffic when every byte of it was.
+/// arms describe that walk, and both used to state it as a finding, which
+/// alarms a player whose session is behaving perfectly.
+///
+/// The reason given here for the first arm used to be that an idle game keeps
+/// its connection to `game_port` alive, so its keepalive ACKs would arrive and
+/// be refused for carrying no stream bytes. That is not what the game does. A
+/// live session measured on 2026-08-23 held **no connection at all** between
+/// actions: 280 s in the lobby and ten minutes with the shop open, both at zero
+/// frames. The connection is built for one request and destroyed after the
+/// response, in about 150 ms. So `delivered == 0` is not a stalled walk to the
+/// shop — it is every second of a healthy session in which the player has not
+/// yet asked the game for anything, and it persists after the shop is open.
 ///
 /// The instruction that *does* belong to this moment is already given, once,
 /// where an instruction belongs — `app::session`'s `>> watching — open the
@@ -148,13 +154,32 @@ pub(super) fn capture_view(
 /// the reassembler can retire a closed flow instead of holding its slot.
 ///
 /// That widening only ever moves a session *out* of this arm, and only for the
-/// benign reading of it. `admitted` cannot decrease, and the fault reading — a
-/// link strip this adapter defeats, which [`detail`] names — is a session in
-/// which nothing parses at all, so no close is admitted there either. What is
-/// left in the arm is therefore slightly more specific to the fault than it was,
-/// not less; what it loses is a player whose game opened and closed a connection
-/// before they reached the shop, who now reads "capture looks healthy". That is
-/// also true of them.
+/// benign reading of it: `admitted` cannot decrease, and a session in which
+/// nothing parses at all admits no close either.
+///
+/// The 2026-08-23 measurement takes that further than the widening did: in
+/// every episode observed, the **first** downstream frame was the server's
+/// SYN/ACK, which `parse_segment` admits. On that evidence a healthy session
+/// does not sit here for any length of time — it passes through in the instant
+/// between an adapter's first frame and its parse.
+///
+/// How far that generalises is not established, and the wording respects that.
+/// It is one session, one server and one network path; a reconnect, an error
+/// reply or a lossier link could deliver frames that do not parse without
+/// anything being broken, and none of those was ruled out — only not seen. So
+/// the sentence stays unalarmed and the row states rather than accuses.
+///
+/// # Which arm the strip fault actually lands in
+///
+/// Not this one, for the failure `capture::link` documents — and [`detail`]
+/// used to say otherwise, which a review caught. `ip_bytes` returns `None` for
+/// a VLAN stack deeper than `MAX_VLAN_TAGS`, and `sys::capture_loop` drops that
+/// frame *before* the funnel, so `record_delivered` never counts it: that
+/// player sits at `delivered == 0`, indistinguishable from a wrong `game_port`,
+/// and the note there now names both. What lands *here* is a strip that returns
+/// bytes at the wrong offset — a bug in that arithmetic rather than its
+/// documented limit — which is why this note asks for a report instead of
+/// naming a cause the player could act on.
 ///
 /// `delivered == 0` also covers two situations the counters cannot tell apart:
 /// a backend that never counts anything, and one that has not captured a packet
@@ -248,12 +273,18 @@ const fn resync_sentence(cause: ResyncCause) -> &'static str {
 /// or `None`, when the sentence is the whole story.
 ///
 /// This is the half of a diagnosis that has no honest place on a status row.
-/// Both states it covers are, overwhelmingly, a player who has not opened the
-/// shop yet; both can also be a real misconfiguration, and no counter here can
-/// separate them (`capture::link`'s doc says the same from the other side).
-/// Shown unprompted it would be a false alarm on nearly every session, and
-/// withheld entirely it would leave the one player who *is* misconfigured with
-/// a row that says "waiting" forever.
+/// The first state it covers is, overwhelmingly, a player who has not made the
+/// game ask for the shop yet — which now includes standing in an open shop
+/// without refreshing, because the game sends nothing between requests. It can
+/// also be a wrong `game_port`, and no counter here can separate them
+/// (`capture::link`'s doc says the same from the other side). Shown unprompted
+/// it would be a false alarm on nearly every session, and withheld entirely it
+/// would leave the one player who *is* misconfigured with a row that says
+/// "waiting" forever.
+///
+/// The second state is the reverse and its note says so: frames arriving while
+/// nothing parses is a strip fault almost immediately, so what belongs here is
+/// how long it may honestly last, not what to expect while waiting.
 ///
 /// Inside the journal it is neither: nobody opens that panel except to find
 /// out why something is not working, so the reader has already supplied the
@@ -262,13 +293,16 @@ const fn resync_sentence(cause: ResyncCause) -> &'static str {
 const fn detail(view: &CaptureHealthView) -> Option<&'static str> {
     if view.delivered == 0 {
         Some(
-            "Expected until the shop is open. If it already is, `game_port` in config.toml \
-             is wrong.",
+            "Expected until the game asks for the shop — opening it or refreshing it. The \
+             game sends nothing on this port in between. If you have refreshed and this has \
+             not changed: `game_port` in config.toml is wrong, or this adapter's framing \
+             cannot be stripped — a VLAN tag stack deeper than two is the known case.",
         )
     } else if view.admitted == 0 {
         Some(
-            "Expected while the shop is closed. If it is already open, this adapter's \
-             framing is not being stripped — a VLAN tag is the known case.",
+            "Expected only briefly: the first frame of a shop request normally parses. If it \
+             persists, frames are arriving and decoding to nothing — worth reporting with \
+             the log.",
         )
     } else {
         None
@@ -369,9 +403,12 @@ mod tests {
         }
     }
 
-    /// Nothing captured, and the game's connection visible but silent: the two
-    /// states that make up the ordinary first seconds of a run, when Start has
-    /// been pressed in the lobby and the player is walking to the Secret Shop.
+    /// Nothing captured, and frames captured with none parsed: the two states a
+    /// session can be in before any shop data has arrived. Only the first is
+    /// ordinary — measured, the game sends nothing at all between requests, so a
+    /// run sits in it from Start until the first refresh. The second is a strip
+    /// fault within milliseconds; it is here because the row must not accuse in
+    /// either of them.
     fn pre_shop_states() -> [CaptureHealthView; 2] {
         [
             CaptureHealthView::default(),
@@ -384,9 +421,10 @@ mod tests {
     }
 
     /// Both used to read as findings about that walk — "nothing has matched the
-    /// capture filter", "none of it looks like the game's" — and the second was
-    /// simply false: an idle game keeps its connection alive, so those unparsed
-    /// frames *are* the game's, carrying no shop bytes yet.
+    /// capture filter", "none of it looks like the game's" — and the first is
+    /// the one that had to stop accusing: a game that has simply not been asked
+    /// for the shop yet sends nothing, so that sentence called a healthy session
+    /// broken for as long as the player took to press refresh.
     ///
     /// The row states what is so and stops there. It does not advise either:
     /// `app::session` already emits `>> watching — open the shop` into the
@@ -409,24 +447,39 @@ mod tests {
         }
     }
 
-    /// What to check when the shop *is* already open is real, and it survives
-    /// — inside the journal panel, which a player reaches only by opening it.
-    /// Withheld entirely, the one genuinely misconfigured player is left with a
-    /// row that says "waiting" forever.
+    /// What to check when the game *has* been asked for the shop is real, and it
+    /// survives — inside the journal panel, which a player reaches only by
+    /// opening it. Withheld entirely, the one genuinely misconfigured player is
+    /// left with a row that says "waiting" forever.
     #[test]
     fn what_to_check_is_rendered_once_the_journal_is_open() {
-        let [nothing_captured, only_keepalives] = pre_shop_states();
+        let [nothing_captured, nothing_parsed] = pre_shop_states();
 
         let filter_note = detail(&nothing_captured).expect("the silent state has a note");
         assert!(filter_note.contains("game_port"), "{filter_note}");
+        // The trigger is a request, not a room: a player standing in an open
+        // shop without refreshing is still in this state, and a note that told
+        // them to suspect `game_port` for it would send them to edit a correct
+        // config file.
+        assert!(filter_note.contains("refresh"), "{filter_note}");
+        // And the VLAN fault belongs to *this* note, which is the correction a
+        // review forced. `capture::link`'s `ip_bytes` returns `None` for a tag
+        // stack deeper than `MAX_VLAN_TAGS`, and `sys::capture_loop` drops such
+        // a frame before the funnel — so `record_delivered` never sees it and
+        // that player sits here, at zero, not in the arm below. The note used to
+        // name VLAN only in the other arm, which sent the one player it was
+        // written for to go and edit a correct `game_port`.
+        assert!(filter_note.contains("VLAN"), "{filter_note}");
 
-        // `capture::link`'s untested VLAN strip is the fault behind this one.
-        let strip_note = detail(&only_keepalives).expect("the keepalive state has a note");
-        assert!(strip_note.contains("VLAN"), "{strip_note}");
+        let strip_note = detail(&nothing_parsed).expect("the unparsed state has a note");
+        assert!(
+            !strip_note.contains("VLAN"),
+            "the documented VLAN fault cannot produce this state: {strip_note}"
+        );
 
         for (view, note) in [
             (nothing_captured, filter_note),
-            (only_keepalives, strip_note),
+            (nothing_parsed, strip_note),
         ] {
             assert!(
                 note.starts_with("Expected"),

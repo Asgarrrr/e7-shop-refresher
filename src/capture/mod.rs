@@ -114,22 +114,32 @@ const _: () = {
 /// [`parse_segment`] could not turn into a [`Segment`], and how many were
 /// admitted to the pipeline.
 ///
-/// `delivered` staying at zero means the adapters are open but nothing matches
-/// the capture filter. `unparsed` alone climbing means frames arrive on
-/// `game_port` and none of them decodes into anything this pipeline acts on —
-/// which is a broken link strip (see [`link`]) *or* an idle game whose
-/// connection is alive while the player has not opened the shop, and these three
-/// counters cannot tell those apart.
+/// `delivered` staying at zero is the **ordinary** state of a running game, not
+/// a fault: measured on a live session (2026-08-23), the game holds no
+/// connection to `game_port` at all between actions — 280 s in the lobby and
+/// 10 min with the shop open produced zero frames. Traffic exists only during an
+/// episode, which lasts about 150 ms: a fresh connection, one request, the
+/// response, a RST. So this counter moves when the player asks the game for
+/// something and stays put otherwise.
+///
+/// `unparsed` alone climbing is a different matter than it used to be. The
+/// reading this doc gave it — "a broken link strip *or* an idle game whose
+/// keepalives carry no bytes" — was half wrong, because that idle game sends
+/// nothing to keep alive. The first downstream frame of every episode is the
+/// server's SYN/ACK, which [`parse_segment`] admits, so a session with frames
+/// delivered and none admitted has a strip that this adapter defeats (see
+/// [`link`]) far more often than anything benign.
 ///
 /// What `unparsed` counts narrowed on 2026-08-22: [`parse_segment`] used to
 /// refuse every zero-payload segment that was not a SYN, and now keeps FIN and
 /// RST as well, because retiring a closed flow is something reassembly does act
-/// on. So a bare ACK — and a frame that decoded to nothing at all — is what is
-/// left in here, and a field reading of 224 unparsed per 1000 delivered is not
-/// comparable across that change.
-/// See `ui::capture_health` for how that ambiguity is worded rather than
-/// resolved: the row states the common reading, and the fault reading lives one
-/// disclosure away in its `detail`.
+/// on. That accounts for the old field reading of 224 unparsed per 1000
+/// delivered: of the nine frames a server sends per episode, two — one bare ACK
+/// and the closing RST — were refused, and 2/9 is 222 per 1000. Close enough to
+/// name the cause, not the same number: a session counter is not a per-episode
+/// ratio, and a partial episode at either end of the measurement window moves it.
+/// With RST admitted it is one frame in nine, and that one bare ACK is all a
+/// stricter kernel filter could ever save.
 ///
 /// `Copy`, not a reference or a guard: [`PacketSource::counters`] takes a
 /// few atomic loads and hands back a value, so a caller never holds anything
