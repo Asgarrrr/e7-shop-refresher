@@ -26,14 +26,16 @@ mod sys;
 
 use std::num::NonZeroU16;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use super::{CaptureCounters, CaptureHealth, CaptureStop, PacketSource, Segment, parse_segment};
+use super::{
+    CaptureCounters, CaptureHealth, CaptureLoss, CaptureStop, PacketSource, Segment, parse_segment,
+};
 use crate::error::{Error, Result};
 use sys::{INSTALL_HINT, READ_TIMEOUT_MS, SNAPLEN, Wpcap, capture_loop, enumerate, open_device};
 
@@ -42,29 +44,70 @@ use sys::{INSTALL_HINT, READ_TIMEOUT_MS, SNAPLEN, Wpcap, capture_loop, enumerate
 /// than after five hundred packets.
 const FUNNEL_LOG_EVERY: u64 = 500;
 
-/// Stripped frames the funnel holds before a capture thread starts dropping
-/// them.
+/// Bytes of stripped frame the funnel holds before a capture thread starts
+/// dropping them. The bound that binds.
 ///
 /// The one place a captured frame sits *outside*
 /// [`crate::stream::PipelineBudget`]: nothing is charged until `admit_capture`,
 /// which runs only after [`PacketSource::next_segment`] has dequeued. What this
 /// holds is therefore added to the pipeline's stated 32 MiB ceiling rather than
-/// counted inside it, and the depth keeps that addition small and *stated*: at
-/// most [`SNAPLEN`] an item, so 4 MiB worst case, against an unbounded
-/// `channel()` whose worst case was the address space.
+/// counted inside it, and this keeps that addition small and *stated*: **4 MiB,
+/// and 4 MiB is all of it** — [`FunnelBytes::reserve`] refuses any frame that
+/// would cross the line, so the total queued never exceeds it whatever sizes
+/// arrive, against an unbounded `channel()` whose worst case was the address
+/// space.
 ///
-/// Sixteen is a jitter buffer, not a queue — it only covers the single consumer
-/// being descheduled — and it bounds *teardown*, since the receiver drains and
-/// parses every queued frame before it can see the disconnect.
-const FRAME_QUEUE_DEPTH: usize = 16;
+/// It replaces a bound of sixteen *slots*, which reached the same 4 MiB only by
+/// assuming every slot held a [`SNAPLEN`] superframe. Field evidence says they
+/// do not: one session, ten adapters, `queue_depth=16`, 68 seconds into an
+/// armed run on a machine that was also playing a video — three overflow
+/// episodes inside 42 ms (`resyncs` 1, 2 and 3 at 01:00:48.355, .380 and .397),
+/// each logging `bytes=1396`. That is a burst overrunning the buffer, not a
+/// consumer running chronically late, and at ~1.4 KB a frame those sixteen
+/// slots were 22 KB of real buffering under a ceiling stated as 4 MiB. Spending
+/// the same stated ceiling on the bytes themselves holds about **3 000**
+/// ordinary frames instead of sixteen.
+const FRAME_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Frames the funnel holds regardless of their size: the backstop under
+/// [`FRAME_QUEUE_BYTES`], not the working bound.
+///
+/// `sync_channel` needs a slot count, and this one is picked to *lose* to the
+/// byte cap on ordinary traffic: 4 MiB over 4 096 slots is 1 KiB a slot, so
+/// anything from a kilobyte a frame up — every game frame measured, at 1396
+/// bytes — exhausts the bytes first, at about 3 000 frames. The slots bind only
+/// under a flood of frames smaller than that, where their job is *teardown*:
+/// [`PacketSource::next_segment`] parses every queued frame before it can
+/// observe the disconnect, so this is the number of `parse_segment` calls a
+/// stop can have to wait through. Four thousand of them is microseconds against
+/// the one [`READ_TIMEOUT_MS`] window a join already costs.
+const FRAME_QUEUE_SLOTS: usize = 4096;
+
+// The byte cap must be the one that binds for the traffic this backend was
+// built for, or the slot backstop is silently the real bound and the doc above
+// is a story. 1396 bytes is the frame size the field log reported.
+const _: () = {
+    assert!(FRAME_QUEUE_BYTES / 1396 < FRAME_QUEUE_SLOTS);
+    // And a single frame must always fit, or an empty funnel would still refuse
+    // the very superframe RSC coalescing exists to produce.
+    assert!(SNAPLEN.cast_unsigned() as usize <= FRAME_QUEUE_BYTES);
+};
 
 /// Where packets that reach this process go to die.
 ///
 /// `delivered` counts frames pulled off every adapter, already stripped of
 /// their link header; `admitted` and `unparsed` are the two ways they end. Only
-/// `parse_segment` can drop one here, so `unparsed` alone explains a
-/// healthy-looking session that yields nothing, while `delivered` at zero means
-/// the adapters are open but the kernel filter matches no traffic.
+/// `parse_segment` can drop one here, and `delivered` at zero means the adapters
+/// are open but the kernel filter matches no traffic. `unparsed` alone climbing
+/// is the ambiguous one — a broken strip and an idle game's keepalives look the
+/// same from here; see [`CaptureCounters`].
+///
+/// Where the line between the two falls moved on 2026-08-22: `parse_segment`
+/// now keeps FIN and RST, so a connection ending counts as `admitted` where it
+/// used to count as `unparsed`. The field reading these counters produced before
+/// that — 224 unparsed per 1000 delivered, roughly 22% — was ACKs, FINs and
+/// RSTs together, and only the ACKs are still in it. A log from an older build
+/// is not comparable on this ratio.
 ///
 /// A thin wrapper over [`CaptureHealth`], not a fresh set of counters: the
 /// atomics it increments are the exact ones [`PcapSource::counters`] hands to
@@ -95,6 +138,77 @@ fn log_funnel(counters: CaptureCounters) {
         unparsed = counters.unparsed,
         "capture funnel"
     );
+}
+
+/// How many bytes of stripped frame are sitting in the funnel channel right
+/// now: charged by the capture thread that sends one, credited back by the
+/// consumer that dequeues it.
+///
+/// A slot count alone cannot bound memory and buffering at the same time. One
+/// slot holds anything from a bare ACK to a [`SNAPLEN`] superframe, so a depth
+/// chosen against the worst case buys almost nothing for the ordinary one —
+/// which is exactly how sixteen slots came to be described as 4 MiB while
+/// holding 22 KB of the traffic actually measured. Counting the bytes decouples
+/// the two: [`FRAME_QUEUE_BYTES`] fixes the memory, and how many frames that is
+/// falls out of how big they really are.
+///
+/// # Ordering
+///
+/// `Relaxed` on every access, in the register [`LossFlag`] and [`PcapStop`]
+/// already use: this counter publishes no data — the frames travel the channel,
+/// which carries its own happens-before edge from producer to consumer — and
+/// every access here is a read-modify-write of one location, so each is
+/// guaranteed to see what the previous one left in that location's modification
+/// order, which is all the arithmetic needs.
+///
+/// # What a race between two producers costs
+///
+/// [`Self::reserve`] charges first and refunds if it overshot, so the bytes
+/// *actually queued* never exceed [`FRAME_QUEUE_BYTES`] however many capture
+/// threads race: the stated ceiling does not depend on timing. What the race
+/// can cost instead is a spurious refusal — while a losing producer's refund is
+/// in flight, another thread reads a total inflated by up to one frame per
+/// competing adapter and may drop a frame that would have fitted. That window
+/// opens only once occupancy is within one [`SNAPLEN`] of the cap, and the
+/// thread whose overcharge opened it is being refused in the same instant, so
+/// the race can deepen an overflow episode by a frame per adapter and can never
+/// start one.
+pub(super) struct FunnelBytes(AtomicUsize);
+
+impl FunnelBytes {
+    pub(super) fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
+
+    /// Claims room for a frame of `bytes`, or refuses it.
+    ///
+    /// Charge-then-refund rather than load-then-charge, which would let two
+    /// producers both pass the check and queue past the cap: the ceiling
+    /// [`FRAME_QUEUE_BYTES`] states is the one a reader adds to the pipeline's
+    /// 32 MiB by hand, and it should not be a ceiling that holds only when the
+    /// adapters happen not to interleave.
+    pub(super) fn reserve(&self, bytes: usize) -> bool {
+        let before = self.0.fetch_add(bytes, Ordering::Relaxed);
+        if before.saturating_add(bytes) <= FRAME_QUEUE_BYTES {
+            return true;
+        }
+        self.0.fetch_sub(bytes, Ordering::Relaxed);
+        false
+    }
+
+    /// Gives the room back. Every path that takes a frame *out* of the channel
+    /// owes exactly one of these: a missed one is not a leak of memory but of
+    /// permission, and it wedges the funnel shut for the rest of the session.
+    pub(super) fn release(&self, bytes: usize) {
+        self.0.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    /// What the tests assert the accounting on. Not exposed to production: no
+    /// decision here is taken on the level, only on whether one frame fits.
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// A capture thread's parting message, sent only when it stopped on an error.
@@ -155,12 +269,19 @@ impl Default for Pacing {
 pub struct PcapSource {
     /// Stripped IP packets, funnelled from every capture thread.
     ///
-    /// Bounded, at [`FRAME_QUEUE_DEPTH`], and never blocking: a blocking send
-    /// would park a capture thread outside the driver whenever the consumer
-    /// lagged, overflowing the kernel ring behind it. A full funnel instead
-    /// drops the newest frame and raises the same `capture_loss` flag the
-    /// driver's `ps_drop` raises, so the pipeline re-anchors (`sys::forward`).
+    /// Bounded twice — by [`FRAME_QUEUE_BYTES`], which is what binds on real
+    /// traffic, and by [`FRAME_QUEUE_SLOTS`] underneath it — and never
+    /// blocking: a blocking send would park a capture thread outside the driver
+    /// whenever the consumer lagged, overflowing the kernel ring behind it. A
+    /// frame that would cross either bound is instead dropped where it was
+    /// captured and raises the same [`LossFlag`] the driver's `ps_drop` raises,
+    /// so the pipeline re-anchors (`sys::forward`) — under
+    /// [`CaptureLoss::Funnel`], because the frame died in here, not on the wire.
     packets: Receiver<Vec<u8>>,
+    /// The byte half of that bound, shared with every capture thread: they
+    /// charge it in `sys::forward`, [`PacketSource::next_segment`] credits it
+    /// back at the dequeue. See [`FunnelBytes`].
+    funnel_bytes: Arc<FunnelBytes>,
     /// One message per capture thread that died on an error. See
     /// [`AdapterFailure`] for why this is not the channel above.
     failures: Receiver<AdapterFailure>,
@@ -174,8 +295,8 @@ pub struct PcapSource {
     game_port: NonZeroU16,
     /// Set when any capture thread's `pcap_stats` drop counter moves, or when
     /// one has to drop a frame because this funnel is full; cleared by
-    /// `take_capture_loss`.
-    capture_loss: Arc<AtomicBool>,
+    /// `take_capture_loss`. See [`LossFlag`] for why it carries which.
+    capture_loss: Arc<LossFlag>,
     /// Shared with [`PcapStop`], and with every capture thread.
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
@@ -204,6 +325,85 @@ impl CaptureStop for PcapStop {
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// The shared "packets were lost" signal, carrying *which* loss it was.
+///
+/// One per [`PcapSource`], written by every capture thread and read-and-cleared
+/// by [`PcapSource::take_capture_loss`]. It was an `AtomicBool` until the two
+/// losses it conflates turned out to want opposite advice from the player:
+/// [`CaptureLoss::DriverRing`] means the machine could not keep up with the
+/// wire, [`CaptureLoss::Funnel`] means this process could not keep up with
+/// itself.
+///
+/// **First cause wins**, by `compare_exchange` from [`Self::NONE`]. A ring
+/// overflow is exactly the thing that then floods the funnel, so last-writer
+/// semantics would reliably name the consequence and hide the cause. Between one
+/// `take` and the next the flag reports what *started* the episode; the count of
+/// episodes is `stream`'s job, not this flag's.
+///
+/// `Relaxed` throughout, for the reason [`PcapStop`] gives about the stop flag:
+/// the discriminant is the whole message, and the frames publish through the
+/// channel, which carries its own edge.
+pub(super) struct LossFlag(AtomicU8);
+
+impl LossFlag {
+    /// Not a [`CaptureLoss`] variant: "nothing outstanding" is the flag's own
+    /// state, and giving it a discriminant here keeps it out of an enum whose
+    /// every variant should be a real loss a player can be told about.
+    const NONE: u8 = 0;
+    const DRIVER_RING: u8 = 1;
+    const FUNNEL: u8 = 2;
+
+    pub(super) fn new() -> Self {
+        Self(AtomicU8::new(Self::NONE))
+    }
+
+    /// Records `cause` unless a loss is already outstanding.
+    pub(super) fn raise(&self, cause: CaptureLoss) {
+        let _ = self.0.compare_exchange(
+            Self::NONE,
+            Self::discriminant(cause),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Reads and clears in one step, as the `AtomicBool` `swap` it replaces did:
+    /// the read-and-clear must be atomic against a capture thread raising the
+    /// flag again.
+    pub(super) fn take(&self) -> Option<CaptureLoss> {
+        match self.0.swap(Self::NONE, Ordering::Relaxed) {
+            Self::NONE => None,
+            Self::DRIVER_RING => Some(CaptureLoss::DriverRing),
+            Self::FUNNEL => Some(CaptureLoss::Funnel),
+            other => {
+                report_unknown_loss(other);
+                // Conservative, as `app::pressure`'s `Resync::from_u8` is:
+                // this flag's whole purpose is to force a re-anchor, and
+                // inventing `None` would skip one that was genuinely owed.
+                Some(CaptureLoss::DriverRing)
+            }
+        }
+    }
+
+    const fn discriminant(cause: CaptureLoss) -> u8 {
+        match cause {
+            CaptureLoss::DriverRing => Self::DRIVER_RING,
+            CaptureLoss::Funnel => Self::FUNNEL,
+        }
+    }
+}
+
+/// Kept out of [`LossFlag::take`], which runs once per captured packet.
+#[cold]
+#[inline(never)]
+fn report_unknown_loss(value: u8) {
+    error!(
+        value,
+        "unknown capture-loss discriminant; assuming driver loss"
+    );
+    debug_assert!(false, "LossFlag holds only its own discriminants");
 }
 
 impl PcapSource {
@@ -267,8 +467,9 @@ impl PcapSource {
         }
 
         let stop = Arc::new(AtomicBool::new(false));
-        let capture_loss = Arc::new(AtomicBool::new(false));
-        let (sender, packets) = sync_channel(FRAME_QUEUE_DEPTH);
+        let capture_loss = Arc::new(LossFlag::new());
+        let (sender, packets) = sync_channel(FRAME_QUEUE_SLOTS);
+        let funnel_bytes = Arc::new(FunnelBytes::new());
         let (failed_sender, failures) = channel();
         let named: Vec<(String, _)> = handles
             .into_iter()
@@ -282,11 +483,19 @@ impl PcapSource {
         let mut threads = Vec::with_capacity(named.len());
         start_capture_threads(&stop, &mut threads, named, |name, handle| {
             let sender = sender.clone();
+            let funnel_bytes = Arc::clone(&funnel_bytes);
             let failed_sender = failed_sender.clone();
             let stop = Arc::clone(&stop);
             let capture_loss = Arc::clone(&capture_loss);
             std::thread::Builder::new().name(name).spawn(move || {
-                capture_loop(handle, &sender, &failed_sender, &stop, &capture_loss);
+                capture_loop(
+                    handle,
+                    &sender,
+                    &funnel_bytes,
+                    &failed_sender,
+                    &stop,
+                    &capture_loss,
+                );
             })
         })?;
         // The original senders must go, or the receivers could never observe a
@@ -302,13 +511,18 @@ impl PcapSource {
             // so in its own warning.
             filter = %filters[0],
             snaplen = SNAPLEN,
-            queue_depth = FRAME_QUEUE_DEPTH,
+            // Both bounds, because which one binds depends on the frame sizes
+            // this machine's adapters actually deliver — and a log that named
+            // only the slots is how the previous sizing went unquestioned.
+            queue_bytes = FRAME_QUEUE_BYTES,
+            queue_slots = FRAME_QUEUE_SLOTS,
             "Npcap capture open (passive copy; originals untouched)"
         );
 
         Ok((
             Self {
                 packets,
+                funnel_bytes,
                 failures,
                 failed: Vec::new(),
                 blind_since: None,
@@ -487,6 +701,14 @@ impl PacketSource for PcapSource {
         loop {
             let packet = match self.packets.recv_timeout(self.pacing.poll) {
                 Ok(packet) => {
+                    // The room this frame occupied goes back the instant it
+                    // leaves the channel — ahead of the parse, and ahead of
+                    // every `continue` below it. Releasing anywhere later would
+                    // make the accounting depend on whether a frame parsed, and
+                    // a single missed release ratchets the funnel permanently
+                    // shut: `reserve` would refuse frames for room nothing is
+                    // holding, forever, on a channel with empty slots.
+                    self.funnel_bytes.release(packet.len());
                     // Whoever sent it, the tap is not blind: it passed the
                     // kernel filter, so some adapter is still on the server's
                     // path.
@@ -500,6 +722,11 @@ impl PacketSource for PcapSource {
                     self.report_if_blind()?;
                     continue;
                 }
+                // `Disconnected` is only reported on an *empty* channel, so
+                // every frame that was ever queued has already been released
+                // through the arm above. The one path that removes frames
+                // without releasing is this source being dropped outright,
+                // which drops the counter in the same breath.
                 Err(RecvTimeoutError::Disconnected) => {
                     self.reap_failures();
                     return Err(self.tap_closed());
@@ -520,12 +747,23 @@ impl PacketSource for PcapSource {
             if admitted == 1 {
                 // `parse_segment` admits nothing but the game server, so this
                 // proves filter, port, adapter choice and strip all agree; its
-                // absence means capture is open but sees nothing. The client's
-                // port, not its address: on IPv6 that is the player's globally
-                // routable one, in a file they're asked to email.
+                // absence means capture is open but sees nothing. That argument
+                // is about where the frame came from and survives `parse_segment`
+                // admitting FIN and RST: the source-port and decode checks a
+                // segment passes to reach here are the same ones, whatever bits
+                // its header had set. The client's port, not its address: on
+                // IPv6 that is the player's globally routable one, in a file
+                // they're asked to email.
+                //
+                // All three control bits are logged, and not only `syn`, because
+                // a zero-payload segment reads as a fault without them. This line
+                // has been seen with `payload=0 syn=true`; `payload=0` with every
+                // flag false would now be the surprising one.
                 info!(
                     payload = segment.payload.len(),
                     syn = segment.syn,
+                    fin = segment.fin,
+                    rst = segment.rst,
                     server = %segment.flow.server,
                     client_port = segment.flow.client.port(),
                     "first server-to-client segment admitted"
@@ -536,11 +774,8 @@ impl PacketSource for PcapSource {
         }
     }
 
-    fn take_capture_loss(&mut self) -> bool {
-        // `swap`, not load-then-store: the read-and-clear must be atomic
-        // against a capture thread setting it again. `Relaxed` for the reason
-        // given at `PcapStop` — there is no payload behind the flag.
-        self.capture_loss.swap(false, Ordering::Relaxed)
+    fn take_capture_loss(&mut self) -> Option<CaptureLoss> {
+        self.capture_loss.take()
     }
 
     /// The live counters the window reads: the exact atomics [`PcapSource::open`]
@@ -640,8 +875,12 @@ impl PcapSource {
     /// [`PcapSource::open`] is unrunnable without Npcap, while what needs
     /// pinning — what this side does when one producer dies with its siblings
     /// still holding the channel open — lives entirely on this side of them.
+    /// [`FunnelBytes`] comes in the same way and for the same reason: the
+    /// charge is a producer's and the release is this side's, so a test holding
+    /// both ends is the only place that pairing can be asserted.
     fn from_channels(
         packets: Receiver<Vec<u8>>,
+        funnel_bytes: Arc<FunnelBytes>,
         failures: Receiver<AdapterFailure>,
         game_port: NonZeroU16,
         pacing: Pacing,
@@ -649,12 +888,13 @@ impl PcapSource {
     ) -> Self {
         Self {
             packets,
+            funnel_bytes,
             failures,
             failed: Vec::new(),
             blind_since: None,
             pacing,
             game_port,
-            capture_loss: Arc::new(AtomicBool::new(false)),
+            capture_loss: Arc::new(LossFlag::new()),
             stop: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
             funnel: Funnel(health),
@@ -664,8 +904,7 @@ impl PcapSource {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::mpsc::sync_channel;
+    use std::sync::mpsc::{SyncSender, sync_channel};
 
     use super::*;
 
@@ -688,9 +927,17 @@ mod tests {
     /// into a named failure rather than a hung suite.
     const NEVER_PARKS: Duration = Duration::from_secs(5);
 
+    /// The funnel exactly as [`PcapSource::open`] builds it: one channel at
+    /// [`FRAME_QUEUE_SLOTS`] and the [`FunnelBytes`] both ends share. A test
+    /// that built the channel alone would hold only half the bound.
+    fn funnel() -> (SyncSender<Vec<u8>>, Receiver<Vec<u8>>, Arc<FunnelBytes>) {
+        let (frames, packets) = sync_channel(FRAME_QUEUE_SLOTS);
+        (frames, packets, Arc::new(FunnelBytes::new()))
+    }
+
     #[test]
     fn a_dead_adapter_ends_the_session_even_while_its_siblings_hold_the_funnel_open() {
-        let (frames, packets) = sync_channel(FRAME_QUEUE_DEPTH);
+        let (frames, packets, funnel_bytes) = funnel();
         let (report, failures) = channel();
         // Siblings still holding a sender, with nothing to say because the
         // kernel filter matches nothing on their adapters. The receiver's only
@@ -698,6 +945,7 @@ mod tests {
         let siblings = (frames.clone(), frames);
         let mut source = PcapSource::from_channels(
             packets,
+            funnel_bytes,
             failures,
             game_port(),
             immediate(),
@@ -734,11 +982,12 @@ mod tests {
 
     #[test]
     fn an_idle_adapter_dying_costs_its_own_thread_and_nothing_else() {
-        let (frames, packets) = sync_channel(FRAME_QUEUE_DEPTH);
+        let (frames, packets, funnel_bytes) = funnel();
         let (report, failures) = channel();
         let sibling = frames.clone();
         let mut source = PcapSource::from_channels(
             packets,
+            funnel_bytes,
             failures,
             game_port(),
             immediate(),
@@ -942,11 +1191,17 @@ mod tests {
     /// "the window's counters saw it".
     #[test]
     fn published_counters_report_exactly_what_next_segment_processed() {
-        let (frames, packets) = sync_channel(FRAME_QUEUE_DEPTH);
+        let (frames, packets, funnel_bytes) = funnel();
         let (_report, failures) = channel();
         let health = CaptureHealth::default();
-        let mut source =
-            PcapSource::from_channels(packets, failures, game_port(), immediate(), health.clone());
+        let mut source = PcapSource::from_channels(
+            packets,
+            funnel_bytes,
+            failures,
+            game_port(),
+            immediate(),
+            health.clone(),
+        );
 
         frames
             .send(ipv4_tcp_from_game_port(b"AB"))
@@ -972,5 +1227,68 @@ mod tests {
         // The handle `open` would have shared with the window is the exact
         // one these increments landed on — not a copy that could disagree.
         assert_eq!(health.snapshot(), counters);
+    }
+
+    /// The consumer half of [`FunnelBytes`]' contract: a dequeue gives the room
+    /// back, so a funnel that fills and drains over and over keeps taking
+    /// frames.
+    ///
+    /// The regression this exists for is not a memory leak but a permission
+    /// leak. Miss the release on any path that removes a frame — the parse
+    /// failure that `continue`s, a future early return — and the counter
+    /// ratchets: within a couple of fills `reserve` refuses everything, on a
+    /// channel with four thousand empty slots, and every capture thread drops
+    /// every frame and raises [`CaptureLoss::Funnel`] for the rest of the
+    /// session. That is worse than the sixteen slots this replaced, and
+    /// silent, so it is asserted rather than reasoned about.
+    ///
+    /// The producer half — charge, then `try_send` — is `sys::forward`, pinned
+    /// in `sys::tests`. This plays it directly, because it is the pairing that
+    /// is under test and not either side alone.
+    #[test]
+    fn a_dequeue_gives_the_room_back_so_a_funnel_that_fills_and_drains_keeps_taking_frames() {
+        let (frames, packets, funnel_bytes) = funnel();
+        let (_report, failures) = channel();
+        let mut source = PcapSource::from_channels(
+            packets,
+            Arc::clone(&funnel_bytes),
+            failures,
+            game_port(),
+            immediate(),
+            CaptureHealth::default(),
+        );
+
+        // An ordinary game frame, near the 1396 bytes the field log reported.
+        let frame = ipv4_tcp_from_game_port(&[0xE7; 1_340]);
+        let a_full_funnel = FRAME_QUEUE_BYTES / frame.len();
+        assert!(
+            a_full_funnel < FRAME_QUEUE_SLOTS,
+            "the bytes must run out before the slots, or this fills the wrong bound"
+        );
+
+        for pass in 1..=3 {
+            for queued in 0..a_full_funnel {
+                assert!(
+                    funnel_bytes.reserve(frame.len()),
+                    "pass {pass}: the funnel refused frame {queued} of {a_full_funnel} — \
+                     the release on dequeue is leaking room"
+                );
+                frames.send(frame.clone()).expect("the receiver is alive");
+            }
+            assert!(
+                !funnel_bytes.reserve(frame.len()),
+                "pass {pass}: and it is genuinely full at that point"
+            );
+            for drained in 0..a_full_funnel {
+                source
+                    .next_segment()
+                    .unwrap_or_else(|err| panic!("pass {pass}, frame {drained}: {err}"));
+            }
+            assert_eq!(
+                funnel_bytes.in_flight(),
+                0,
+                "pass {pass}: an emptied funnel must hold no room at all"
+            );
+        }
     }
 }

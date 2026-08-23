@@ -403,6 +403,18 @@ impl Controller {
         self.gold_balance
     }
 
+    /// When the current run armed, on the session clock — `None` before the
+    /// first `Start`, and kept across a stop so the final totals stay readable.
+    ///
+    /// Exposed for the window, which reads it against the same clock
+    /// (`EventLog::now_ms`) the session stamps events with. Elapsed time is
+    /// derived rather than stored because nothing in the domain needs a *live*
+    /// duration: [`Self::has_duration_elapsed`] is evaluated against the
+    /// `now_ms` of whatever event is being handled.
+    pub fn started_at(&self) -> Option<u64> {
+        self.started_at
+    }
+
     /// The returned actions **are** the decision; the state mutation alone is
     /// not the output. `clippy::must_use_candidate` cannot flag a `&mut self`
     /// method, so this attribute is the only thing that catches a dropped

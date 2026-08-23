@@ -28,6 +28,8 @@ pub fn parse_segment(mut frame: Vec<u8>, game_port: NonZeroU16) -> Option<Segmen
         flow: span.flow,
         seq: span.seq,
         syn: span.syn,
+        fin: span.fin,
+        rst: span.rst,
         payload: frame,
     })
 }
@@ -39,6 +41,8 @@ struct SegmentSpan {
     flow: FlowKey,
     seq: u32,
     syn: bool,
+    fin: bool,
+    rst: bool,
     payload: Range<usize>,
 }
 
@@ -69,10 +73,19 @@ fn segment_span(bytes: &[u8], game_port: NonZeroU16) -> Option<SegmentSpan> {
         return None;
     };
 
-    // Control packets carry no stream bytes, and reassembly never tears a
-    // half-stream down on FIN. Only SYN, which anchors the baseline, and
-    // data-bearing segments matter.
-    if tcp.payload().is_empty() && !tcp.syn() {
+    // Control packets carry no stream bytes, but three of them still say
+    // something reassembly acts on: SYN anchors the baseline, and FIN and RST
+    // end the connection, which is what lets `stream::Reassembler` give the
+    // flow's slot back instead of holding it until the table needs it. FIN and
+    // RST used to be refused here, and that refusal was the whole reason a
+    // closed connection was never retired: one short connection every ~1.7 s
+    // filled all 64 slots with the game's own dead clones inside two minutes,
+    // and a patched build then logged 46 evictions in ~90 s.
+    //
+    // A pure ACK is the one control packet that says nothing either way, and it
+    // is still dropped here — it is also the bulk of what the field measured as
+    // 224 unparsed frames per 1000 delivered.
+    if tcp.payload().is_empty() && !tcp.syn() && !tcp.fin() && !tcp.rst() {
         return None;
     }
 
@@ -91,6 +104,8 @@ fn segment_span(bytes: &[u8], game_port: NonZeroU16) -> Option<SegmentSpan> {
         flow,
         seq: tcp.sequence_number(),
         syn: tcp.syn(),
+        fin: tcp.fin(),
+        rst: tcp.rst(),
         payload: subslice_range(bytes, tcp.payload())?,
     })
 }
@@ -115,21 +130,49 @@ mod tests {
     const GAME_PORT: u16 = 3333;
     const GAME_PORT_NZ: NonZeroU16 = NonZeroU16::new(GAME_PORT).expect("3333 is not zero");
 
+    /// The three control bits [`parse_segment`] reads, so a test names the one
+    /// it means rather than passing three positional booleans in the right
+    /// order.
+    #[derive(Clone, Copy)]
+    struct Flags {
+        syn: bool,
+        fin: bool,
+        rst: bool,
+    }
+
+    impl Flags {
+        const DATA: Self = Self {
+            syn: false,
+            fin: false,
+            rst: false,
+        };
+        const SYN: Self = Self {
+            syn: true,
+            fin: false,
+            rst: false,
+        };
+        const FIN: Self = Self {
+            syn: false,
+            fin: true,
+            rst: false,
+        };
+        const RST: Self = Self {
+            syn: false,
+            fin: false,
+            rst: true,
+        };
+    }
+
     /// Build an IPv4 TCP packet (IP layer down, no Ethernet) as raw bytes.
     fn ipv4_tcp(
         src: ([u8; 4], u16),
         dst: ([u8; 4], u16),
         seq: u32,
-        syn: bool,
+        flags: Flags,
         payload: &[u8],
     ) -> Vec<u8> {
-        let mut b = PacketBuilder::ipv4(src.0, dst.0, 64).tcp(src.1, dst.1, seq, 64_240);
-        if syn {
-            b = b.syn();
-        }
-        let mut out = Vec::with_capacity(b.size(payload.len()));
-        b.write(&mut out, payload).expect("write packet");
-        out
+        let b = PacketBuilder::ipv4(src.0, dst.0, 64).tcp(src.1, dst.1, seq, 64_240);
+        write_tcp(b, flags, payload)
     }
 
     /// Build an IPv6 TCP packet (IP layer down, no Ethernet) as raw bytes.
@@ -137,12 +180,26 @@ mod tests {
         src: ([u8; 16], u16),
         dst: ([u8; 16], u16),
         seq: u32,
-        syn: bool,
+        flags: Flags,
         payload: &[u8],
     ) -> Vec<u8> {
-        let mut b = PacketBuilder::ipv6(src.0, dst.0, 64).tcp(src.1, dst.1, seq, 64_240);
-        if syn {
+        let b = PacketBuilder::ipv6(src.0, dst.0, 64).tcp(src.1, dst.1, seq, 64_240);
+        write_tcp(b, flags, payload)
+    }
+
+    fn write_tcp(
+        mut b: etherparse::PacketBuilderStep<etherparse::TcpHeader>,
+        flags: Flags,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        if flags.syn {
             b = b.syn();
+        }
+        if flags.fin {
+            b = b.fin();
+        }
+        if flags.rst {
+            b = b.rst();
         }
         let mut out = Vec::with_capacity(b.size(payload.len()));
         b.write(&mut out, payload).expect("write packet");
@@ -153,7 +210,7 @@ mod tests {
     fn a_segment_sent_by_the_game_port_is_parsed_and_names_both_endpoints() {
         let server = ([104, 116, 20, 111], GAME_PORT); // src port == game_port
         let client = ([192, 168, 1, 10], 51000);
-        let bytes = ipv4_tcp(server, client, 1000, false, b"AB");
+        let bytes = ipv4_tcp(server, client, 1000, Flags::DATA, b"AB");
         let seg = parse_segment(bytes, GAME_PORT_NZ).expect("should parse");
         assert_eq!(seg.flow.server, SocketAddr::from((server.0, server.1)));
         assert_eq!(seg.flow.client, SocketAddr::from((client.0, client.1)));
@@ -170,7 +227,7 @@ mod tests {
             ([104, 116, 20, 111], GAME_PORT),
             ([192, 168, 1, 10], 51000),
             8000,
-            false,
+            Flags::DATA,
             b"AB",
         );
         let frame_capacity = bytes.capacity();
@@ -190,19 +247,76 @@ mod tests {
             ([192, 168, 1, 10], 51000),
             ([104, 116, 20, 111], GAME_PORT), // dst port == game_port
             2000,
-            false,
+            Flags::DATA,
             b"XY",
         );
         assert!(parse_segment(bytes, GAME_PORT_NZ).is_none());
     }
 
+    /// The one zero-payload control packet still refused here, and now the only
+    /// thing `unparsed` counts besides an undecodable frame.
     #[test]
     fn pure_ack_is_dropped() {
         let bytes = ipv4_tcp(
             ([104, 116, 20, 111], GAME_PORT),
             ([192, 168, 1, 10], 51000),
             3000,
-            false,
+            Flags::DATA,
+            b"",
+        );
+        assert!(parse_segment(bytes, GAME_PORT_NZ).is_none());
+    }
+
+    /// A bare FIN and a bare RST reach reassembly, which is the whole of the
+    /// root-cause fix: with them refused here, a closed connection kept its slot
+    /// in the stream table until something else needed it, and the game opening
+    /// one short connection every ~1.7 s filled all 64 slots with its own dead
+    /// clones inside two minutes.
+    #[test]
+    fn a_close_reaches_reassembly_even_carrying_no_bytes() {
+        for (flags, expected_fin, expected_rst) in
+            [(Flags::FIN, true, false), (Flags::RST, false, true)]
+        {
+            let bytes = ipv4_tcp(
+                ([104, 116, 20, 111], GAME_PORT),
+                ([192, 168, 1, 10], 51000),
+                3100,
+                flags,
+                b"",
+            );
+            let seg = parse_segment(bytes, GAME_PORT_NZ).expect("a close must be kept");
+            assert_eq!(seg.fin, expected_fin);
+            assert_eq!(seg.rst, expected_rst);
+            assert!(!seg.syn);
+            assert!(seg.payload.is_empty());
+        }
+    }
+
+    /// A FIN riding the last data segment — the ordinary shape of an orderly
+    /// close — keeps both its bytes and its flag.
+    #[test]
+    fn a_data_bearing_fin_keeps_its_payload_and_its_flag() {
+        let bytes = ipv4_tcp(
+            ([104, 116, 20, 111], GAME_PORT),
+            ([192, 168, 1, 10], 51000),
+            3200,
+            Flags::FIN,
+            b"AB",
+        );
+        let seg = parse_segment(bytes, GAME_PORT_NZ).expect("should parse");
+        assert!(seg.fin);
+        assert_eq!(seg.payload, b"AB");
+    }
+
+    /// The direction guard is upstream of the flag test, so the client's own
+    /// close is still not a segment: only the server's half is reassembled.
+    #[test]
+    fn a_close_sent_to_the_game_port_is_still_not_a_segment() {
+        let bytes = ipv4_tcp(
+            ([192, 168, 1, 10], 51000),
+            ([104, 116, 20, 111], GAME_PORT),
+            3300,
+            Flags::FIN,
             b"",
         );
         assert!(parse_segment(bytes, GAME_PORT_NZ).is_none());
@@ -215,7 +329,7 @@ mod tests {
             ([104, 116, 20, 111], GAME_PORT),
             ([192, 168, 1, 10], 51000),
             4000,
-            true,
+            Flags::SYN,
             b"",
         );
         let seg = parse_segment(bytes, GAME_PORT_NZ).expect("SYN should be kept");
@@ -230,7 +344,7 @@ mod tests {
             ([104, 116, 20, 111], 4444),
             ([192, 168, 1, 10], 51000),
             5000,
-            false,
+            Flags::DATA,
             b"AB",
         );
         assert!(parse_segment(bytes, GAME_PORT_NZ).is_none());
@@ -242,7 +356,7 @@ mod tests {
             ([104, 116, 20, 111], GAME_PORT),
             ([192, 168, 1, 10], 51000),
             6000,
-            false,
+            Flags::DATA,
             b"AB",
         );
         assert!(parse_segment(bytes[..bytes.len() / 2].to_vec(), GAME_PORT_NZ).is_none());
@@ -257,7 +371,13 @@ mod tests {
         let client = [
             0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
         ];
-        let bytes = ipv6_tcp((server, GAME_PORT), (client, 51000), 7000, false, b"AB");
+        let bytes = ipv6_tcp(
+            (server, GAME_PORT),
+            (client, 51000),
+            7000,
+            Flags::DATA,
+            b"AB",
+        );
         let seg = parse_segment(bytes, GAME_PORT_NZ).expect("should parse");
         assert_eq!(seg.seq, 7000);
         assert_eq!(seg.payload, b"AB");
@@ -270,7 +390,7 @@ mod tests {
             ([104, 116, 20, 111], GAME_PORT),
             ([192, 168, 1, 10], 51000),
             1000,
-            false,
+            Flags::DATA,
             b"AB",
         );
         let seg = parse_segment(bytes, GAME_PORT_NZ).expect("parse");
@@ -310,8 +430,8 @@ mod tests {
                     .collect();
                 if let Some(segment) = parse_segment(bytes, GAME_PORT_NZ) {
                     assert!(
-                        segment.syn || !segment.payload.is_empty(),
-                        "a data segment with no payload got through"
+                        segment.syn || segment.fin || segment.rst || !segment.payload.is_empty(),
+                        "a segment with neither payload nor a control bit got through"
                     );
                 }
             }
@@ -324,7 +444,7 @@ mod tests {
             ([104, 116, 20, 111], GAME_PORT),
             ([192, 168, 1, 10], 51_000),
             1_000,
-            false,
+            Flags::DATA,
             b"PAYLOAD-BYTES",
         );
         let mut parsed = 0_u32;

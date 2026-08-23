@@ -156,6 +156,22 @@ impl Crystals {
     pub const fn saturating_sub(self, rhs: Self) -> Self {
         Self(self.0.saturating_sub(rhs.0))
     }
+
+    /// How far `self` has gone towards `cap`, clamped to `0.0..=1.0` — what the
+    /// window's gauge fills to when the crystal budget is the binding limit.
+    ///
+    /// A method rather than two [`Crystals::get`] calls at the call site: that
+    /// getter documents itself as not-for-arithmetic, and a ratio is
+    /// arithmetic. Keeping the division in here is what stops a view from
+    /// dividing crystals by gold. A zero cap reads as already reached, since a
+    /// budget of nothing is spent the moment it exists.
+    #[must_use]
+    pub fn ratio_of(self, cap: Self) -> f32 {
+        if cap.0 == 0 {
+            return 1.0;
+        }
+        (self.0 as f32 / cap.0 as f32).clamp(0.0, 1.0)
+    }
 }
 
 /// Thousands-grouped, and only that way: one rendering per currency, so no
@@ -753,5 +769,29 @@ mod tests {
     fn a_trailing_control_character_does_not_leave_a_space_behind() {
         let snapshot = parse(r#"{"slots":[{"name":"Covenant Bookmark\n"}]}"#);
         assert_eq!(snapshot.slots[0].name.as_deref(), Some("Covenant Bookmark"));
+    }
+
+    /// The gauge's fill: bounded at both ends, because a budget tightened
+    /// below what a run already spent otherwise paints past the panel.
+    #[test]
+    fn a_spend_ratio_stays_inside_the_gauge() {
+        assert_eq!(
+            Crystals::new(75).ratio_of(Crystals::new(150)),
+            0.5,
+            "half a budget"
+        );
+        assert_eq!(Crystals::new(0).ratio_of(Crystals::new(150)), 0.0);
+        assert_eq!(
+            Crystals::new(400).ratio_of(Crystals::new(150)),
+            1.0,
+            "a budget lowered under what is already spent"
+        );
+    }
+
+    /// A budget of nothing is spent the moment it exists — the alternative is
+    /// a division by zero handed to a painter.
+    #[test]
+    fn a_zero_budget_reads_as_already_reached() {
+        assert_eq!(Crystals::new(0).ratio_of(Crystals::new(0)), 1.0);
     }
 }

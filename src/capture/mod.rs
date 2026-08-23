@@ -74,6 +74,17 @@ pub struct Segment {
     /// TCP sequence number of the first byte of `payload`.
     pub seq: u32,
     pub syn: bool,
+    /// The server sent its last byte: an orderly close. Occupies one sequence
+    /// number of its own, after `payload`, which is the position reassembly
+    /// must have delivered through before the flow can be let go.
+    pub fin: bool,
+    /// The server aborted the connection. Not the orderly close's twin — it can
+    /// arrive with bytes still outstanding, and nothing will retransmit them.
+    ///
+    /// Two flags rather than one three-state field, matching `syn`: each is one
+    /// bit of the TCP header read straight off the wire, and
+    /// `stream::Reassembler` answers a different question for each.
+    pub rst: bool,
     /// The server-to-client bytes: the captured frame's own allocation trimmed
     /// in place (see [`parse_segment`]), so `capacity()` stays the whole
     /// frame's for the segment's life — the memory actually retained, and what
@@ -88,7 +99,13 @@ pub struct Segment {
 const _: () = {
     // Two `SocketAddr` (32 each: the IPv6 variant is 28 bytes plus a tag).
     assert!(size_of::<FlowKey>() == 64);
-    // 64 (FlowKey) + 24 (Vec) + 4 (seq) + 1 (syn), padded to 96.
+    // 64 (FlowKey) + 24 (Vec) + 4 (seq) + 3 (syn, fin, rst), padded to 96.
+    //
+    // Re-measured 2026-08-22, when `fin` and `rst` were added so a closed
+    // connection could be retired instead of lingering until eviction: still
+    // 96. The two new bools landed in padding `syn` was already sitting in — 93
+    // bytes and 95 bytes both round up to the same 96 under the `Vec`'s 8-byte
+    // alignment — so retiring flows costs nothing per captured packet.
     assert!(size_of::<Segment>() == 96);
 };
 
@@ -97,10 +114,22 @@ const _: () = {
 /// [`parse_segment`] could not turn into a [`Segment`], and how many were
 /// admitted to the pipeline.
 ///
-/// `unparsed` alone climbing explains a healthy-looking session that yields
-/// nothing; `delivered` staying at zero means the adapters are open but
-/// nothing matches the capture filter. See `ui::capture_health::diagnosis`
-/// for where that reasoning is rendered.
+/// `delivered` staying at zero means the adapters are open but nothing matches
+/// the capture filter. `unparsed` alone climbing means frames arrive on
+/// `game_port` and none of them decodes into anything this pipeline acts on —
+/// which is a broken link strip (see [`link`]) *or* an idle game whose
+/// connection is alive while the player has not opened the shop, and these three
+/// counters cannot tell those apart.
+///
+/// What `unparsed` counts narrowed on 2026-08-22: [`parse_segment`] used to
+/// refuse every zero-payload segment that was not a SYN, and now keeps FIN and
+/// RST as well, because retiring a closed flow is something reassembly does act
+/// on. So a bare ACK — and a frame that decoded to nothing at all — is what is
+/// left in here, and a field reading of 224 unparsed per 1000 delivered is not
+/// comparable across that change.
+/// See `ui::capture_health` for how that ambiguity is worded rather than
+/// resolved: the row states the common reading, and the fault reading lives one
+/// disclosure away in its `detail`.
 ///
 /// `Copy`, not a reference or a guard: [`PacketSource::counters`] takes a
 /// few atomic loads and hands back a value, so a caller never holds anything
@@ -215,6 +244,23 @@ impl CaptureHealth {
     }
 }
 
+/// How a backend lost captured packets.
+///
+/// Both holes look identical downstream — a passive tap never sees already-ACKed
+/// bytes again either way, so both force the same re-anchor — but they are not
+/// the same problem, and the player is told which. One says the machine could
+/// not keep up with the wire; the other says this process could not keep up with
+/// itself, which no amount of network troubleshooting will fix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureLoss {
+    /// The driver's own drop counter moved: packets matched the kernel filter
+    /// and the capture ring had no room for them.
+    DriverRing,
+    /// The backend captured frames and could not hand them on: its funnel to
+    /// the pipeline was full. Inside this process, start to finish.
+    Funnel,
+}
+
 /// Blocking source of TCP segments. Implementations observe traffic without
 /// ever modifying it.
 pub trait PacketSource: Send {
@@ -222,14 +268,19 @@ pub trait PacketSource: Send {
     fn next_segment(&mut self) -> Result<Segment>;
 
     /// Reports, and clears, whether the backend lost captured packets since
-    /// the previous call.
+    /// the previous call — and to what.
     ///
     /// A passive tap never sees already-ACKed bytes again, so a hole from
     /// backend-side loss can never be filled by retransmission — the capture
     /// loop resyncs instead of waiting for a gap fill that will not arrive.
     /// Backends that cannot lose packets keep the default.
-    fn take_capture_loss(&mut self) -> bool {
-        false
+    ///
+    /// The [`CaptureLoss`] is not decoration: it is the only place the
+    /// difference between "the wire outran this machine" and "this process
+    /// outran itself" is still known. By the time `app::ingest` has turned it
+    /// into a counted re-anchor, both are one hole in a byte stream.
+    fn take_capture_loss(&mut self) -> Option<CaptureLoss> {
+        None
     }
 
     /// A snapshot of what this source has counted so far. See

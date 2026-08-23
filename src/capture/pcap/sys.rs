@@ -20,7 +20,8 @@ use std::sync::mpsc::{Sender, SyncSender, TrySendError};
 
 use tracing::{debug, info_span, warn};
 
-use super::{AdapterFailure, short_device_name};
+use super::{AdapterFailure, FunnelBytes, LossFlag, short_device_name};
+use crate::capture::CaptureLoss;
 use crate::capture::link::{LinkStrip, UnsupportedDatalink};
 use crate::error::{Error, Result};
 
@@ -673,9 +674,10 @@ pub(super) struct LoopCounters {
 pub(super) fn capture_loop(
     handle: Handle,
     packets: &SyncSender<Vec<u8>>,
+    funnel_bytes: &FunnelBytes,
     failed: &Sender<AdapterFailure>,
     stop: &AtomicBool,
-    capture_loss: &AtomicBool,
+    capture_loss: &LossFlag,
 ) -> LoopCounters {
     let wpcap: &Wpcap = &handle.wpcap;
     // One span per adapter thread, so every line it and `poll_drops` emit
@@ -725,17 +727,19 @@ pub(super) fn capture_loop(
                     unstrippable += 1;
                     continue;
                 };
-                let forwarded = forward(packets, ip, capture_loss, &mut overflowed);
+                let forwarded = forward(packets, funnel_bytes, ip, capture_loss, &mut overflowed);
                 if matches!(forwarded, Forwarded::SourceGone) {
                     break; // The source is gone; nothing left to feed.
                 }
                 if delivered.is_multiple_of(STATS_EVERY_PACKETS) {
-                    poll_drops(wpcap, &handle, &mut dropped, capture_loss);
+                    poll_drops(wpcap, &handle, &mut dropped, capture_loss, delivered);
                 }
             }
             // Normal, and the only moment an idle adapter gets to look at the
-            // stop flag or at its drop counter.
-            NEXT_EX_TIMEOUT => poll_drops(wpcap, &handle, &mut dropped, capture_loss),
+            // stop flag or at its drop counter. `delivered` is what stops that
+            // idle adapter charging the session for drops on a link the game
+            // does not use — see `poll_drops`.
+            NEXT_EX_TIMEOUT => poll_drops(wpcap, &handle, &mut dropped, capture_loss, delivered),
             _ => {
                 // SAFETY: the handle is still live and exclusively this thread's;
                 // `pcap_geterr` reads its internal error buffer.
@@ -806,41 +810,72 @@ fn failure_reason(text: String, rc: c_int) -> String {
 /// What [`forward`] did with a frame.
 enum Forwarded {
     Queued,
-    /// The funnel was full. Counted and flagged, never waited on.
+    /// The funnel had no room. Counted and flagged, never waited on.
     Dropped,
     SourceGone,
 }
 
 /// Hands one stripped IP packet to the funnel, and decides what happens when
-/// the funnel is full.
+/// the funnel has no room for it.
 ///
-/// `try_send`, not a blocking send, for two reasons. Parking here parks this
-/// thread *outside* `pcap_next_ex`, where the kernel ring keeps filling, so a
-/// consumer stall would become unbounded driver-side loss. And the receiver is
-/// a field of [`super::PcapSource`], whose fields drop *after* the [`Drop`]
-/// body that joins these threads, so a producer parked in `send` would be
-/// joined by the thread holding the only thing that could wake it.
+/// Two bounds, checked in the order that makes the memory one authoritative:
+/// the frame's bytes are charged to [`FunnelBytes`] first, and only a frame
+/// that fits under [`super::FRAME_QUEUE_BYTES`] is offered to the channel,
+/// whose own [`super::FRAME_QUEUE_SLOTS`] is the backstop beneath. Either
+/// refusal is the same outcome, and either refund is unconditional — a charge
+/// that outlived the frame it was made for would shut the funnel for good.
 ///
-/// The dropped frame is reported through the same `capture_loss` flag the
-/// driver's `ps_drop` uses, which `app::ingest` turns into a counted re-anchor.
+/// `try_send`, not a blocking send, for two reasons, and the byte cap changes
+/// neither. Parking here parks this thread *outside* `pcap_next_ex`, where the
+/// kernel ring keeps filling, so a consumer stall would become unbounded
+/// driver-side loss. And the receiver is a field of [`super::PcapSource`],
+/// whose fields drop *after* the [`Drop`] body that joins these threads, so a
+/// producer parked in `send` would be joined by the thread holding the only
+/// thing that could wake it. Nothing on this path can block: `reserve` is two
+/// atomic read-modify-writes and `try_send` is what it says.
+///
+/// The dropped frame is reported through the same [`LossFlag`] the driver's
+/// `ps_drop` uses, which `app::ingest` turns into a counted re-anchor — under
+/// [`CaptureLoss::Funnel`], because nothing on the network lost this frame: it
+/// was captured, and this process did not take it in time.
 fn forward(
     packets: &SyncSender<Vec<u8>>,
+    funnel_bytes: &FunnelBytes,
     ip: &[u8],
-    capture_loss: &AtomicBool,
+    capture_loss: &LossFlag,
     overflowed: &mut u64,
 ) -> Forwarded {
+    if !funnel_bytes.reserve(ip.len()) {
+        return refuse(ip.len(), capture_loss, overflowed);
+    }
     match packets.try_send(ip.to_vec()) {
         Ok(()) => Forwarded::Queued,
         Err(TrySendError::Full(frame)) => {
-            *overflowed += 1;
-            capture_loss.store(true, Ordering::Relaxed);
-            if *overflowed == 1 {
-                warn_funnel_full(frame.len());
-            }
-            Forwarded::Dropped
+            funnel_bytes.release(frame.len());
+            refuse(frame.len(), capture_loss, overflowed)
         }
-        Err(TrySendError::Disconnected(_)) => Forwarded::SourceGone,
+        // Not `refuse`: nobody is left to resync, and the loop is about to end
+        // on this return anyway. The refund still happens, because the frame
+        // never reached the channel and this thread may not be the last.
+        Err(TrySendError::Disconnected(frame)) => {
+            funnel_bytes.release(frame.len());
+            Forwarded::SourceGone
+        }
     }
+}
+
+/// A frame the funnel had no room for, whichever bound said so.
+///
+/// One function for both refusals so they cannot drift: a frame refused on
+/// bytes and a frame refused on slots are the same hole in the same byte
+/// stream, and the player is owed the same re-anchor for each.
+fn refuse(bytes: usize, capture_loss: &LossFlag, overflowed: &mut u64) -> Forwarded {
+    *overflowed += 1;
+    capture_loss.raise(CaptureLoss::Funnel);
+    if *overflowed == 1 {
+        warn_funnel_full(bytes);
+    }
+    Forwarded::Dropped
 }
 
 /// Once per thread, not per dropped frame: a full funnel is either absent or
@@ -867,13 +902,41 @@ fn implausible_caplen_error(caplen: c_uint) -> String {
     )
 }
 
-/// Reads the driver's counters and reports any *new* drop as capture loss.
+/// Reads the driver's counters and reports any *new* drop as capture loss —
+/// unless this adapter has never delivered a frame.
 ///
 /// `ps_drop` is packets the kernel threw away on a full capture ring. A passive
 /// tap never sees already-ACKed bytes again, so that hole can never be filled
 /// by a retransmission — the condition
 /// [`crate::capture::PacketSource::take_capture_loss`] exists to report.
-fn poll_drops(wpcap: &Wpcap, handle: &Handle, previous: &mut c_uint, capture_loss: &AtomicBool) {
+///
+/// # Why an idle adapter's drops are not the session's problem
+///
+/// [`super::PcapSource::open`] opens *every* adapter, and one [`LossFlag`] is
+/// shared by all of their threads. This function also runs on the
+/// [`NEXT_EX_TIMEOUT`] arm, which is the only moment an adapter with no traffic
+/// at all looks at anything — so without this guard a VPN tap or a Hyper-V
+/// vSwitch that never carried a game packet could force the game's own stream to
+/// re-anchor, discarding a half-received shop snapshot over a drop on a link the
+/// game does not use.
+///
+/// `delivered == 0` is the same rule [`super::PcapSource::reap_failures`]
+/// already applies to a dying adapter, and for the same reason: this backend
+/// believes in no adapter in particular, so an idle one must not cost the
+/// session. It accepts the same trade, too — a drop of what would have been an
+/// adapter's *first* frame is indistinguishable from an idle adapter's noise,
+/// and is let through as noise.
+///
+/// The baseline advances either way. Skipping the whole function instead would
+/// leave `previous` at zero, so the first poll after the adapter went live would
+/// read every drop it ever had as one fresh delta and re-anchor on history.
+fn poll_drops(
+    wpcap: &Wpcap,
+    handle: &Handle,
+    previous: &mut c_uint,
+    capture_loss: &LossFlag,
+    delivered: u64,
+) {
     let mut stats = PcapStat::default();
     // SAFETY: `stats` is a live, fully-initialized `pcap_stat` of the layout
     // the library expects, with room for the Windows-only tail it may write,
@@ -890,8 +953,26 @@ fn poll_drops(wpcap: &Wpcap, handle: &Handle, previous: &mut c_uint, capture_los
         return;
     }
     *previous = stats.ps_drop;
-    capture_loss.store(true, Ordering::Relaxed);
+    if delivered == 0 {
+        debug_idle_adapter_drop(delta);
+        return;
+    }
+    capture_loss.raise(CaptureLoss::DriverRing);
     warn_capture_loss(delta, stats);
+}
+
+/// Out of line like [`warn_capture_loss`], and `debug!` rather than `warn!`: on
+/// a machine with a dozen virtual adapters this is ordinary background noise,
+/// and it is not the session's problem. Recorded at all only because "the drops
+/// were on an adapter the game never used" is otherwise unanswerable from a log.
+/// The adapter is named by the enclosing span.
+#[cold]
+#[inline(never)]
+fn debug_idle_adapter_drop(lost: c_uint) {
+    debug!(
+        lost,
+        "an adapter that has delivered nothing dropped packets; not resyncing the session"
+    );
 }
 
 /// The rare half of [`poll_drops`], out of line: that runs on every read
@@ -1281,18 +1362,28 @@ mod tests {
         frame
     }
 
+    /// The slot backstop, reached here at a depth of one because five-byte
+    /// frames never come near [`super::FRAME_QUEUE_BYTES`] — the shape a flood
+    /// of tiny frames has, and the only shape the slots still bound.
     #[test]
     fn a_full_funnel_drops_the_frame_and_flags_capture_loss_without_parking_the_thread() {
         let (sender, packets) = sync_channel(1);
         let sender = Arc::new(sender);
-        let capture_loss = Arc::new(AtomicBool::new(false));
+        let funnel_bytes = Arc::new(FunnelBytes::new());
+        let capture_loss = Arc::new(LossFlag::new());
         let mut overflowed = 0;
         assert!(matches!(
-            forward(&sender, b"first", &capture_loss, &mut overflowed),
+            forward(
+                &sender,
+                &funnel_bytes,
+                b"first",
+                &capture_loss,
+                &mut overflowed
+            ),
             Forwarded::Queued
         ));
         assert_eq!(overflowed, 0);
-        assert!(!capture_loss.load(Ordering::Relaxed));
+        assert_eq!(capture_loss.take(), None);
 
         // The funnel is full and nothing is draining it: the moment a blocking
         // bounded send would park this thread outside the driver. Run on its
@@ -1300,10 +1391,17 @@ mod tests {
         let (done, outcome) = std::sync::mpsc::channel();
         std::thread::spawn({
             let sender = Arc::clone(&sender);
+            let funnel_bytes = Arc::clone(&funnel_bytes);
             let capture_loss = Arc::clone(&capture_loss);
             move || {
                 let mut overflowed = 0;
-                let forwarded = forward(&sender, b"second", &capture_loss, &mut overflowed);
+                let forwarded = forward(
+                    &sender,
+                    &funnel_bytes,
+                    b"second",
+                    &capture_loss,
+                    &mut overflowed,
+                );
                 let _ = done.send((matches!(forwarded, Forwarded::Dropped), overflowed));
             }
         });
@@ -1313,10 +1411,13 @@ mod tests {
 
         assert!(was_dropped, "the newest frame is what gives way");
         assert_eq!(counted, 1, "and it is counted, not silently gone");
-        assert!(
-            capture_loss.load(Ordering::Relaxed),
+        assert_eq!(
+            capture_loss.take(),
+            Some(CaptureLoss::Funnel),
             "a dropped frame is a hole in the byte stream, and the pipeline must resync \
-             rather than wait for a retransmission a passive tap never sees"
+             rather than wait for a retransmission a passive tap never sees — as `Funnel`, \
+             because the frame was captured and died in this process, so telling the player \
+             to look at their connection would send them after the wrong thing"
         );
         assert_eq!(
             packets.try_recv().expect("the first frame"),
@@ -1326,9 +1427,134 @@ mod tests {
 
         drop(packets);
         assert!(matches!(
-            forward(&sender, b"third", &capture_loss, &mut overflowed),
+            forward(
+                &sender,
+                &funnel_bytes,
+                b"third",
+                &capture_loss,
+                &mut overflowed
+            ),
             Forwarded::SourceGone
         ));
+        // Every refusal and every disconnect refunded what it charged: the
+        // first frame's five bytes are all that is outstanding, and it is still
+        // in the channel this test took it out of by value above.
+        assert_eq!(funnel_bytes.in_flight(), b"first".len());
+    }
+
+    /// The measured defect, inverted into a test.
+    ///
+    /// One session, ten adapters, `queue_depth=16`, 68 seconds into an armed
+    /// run on a machine that was also playing a video: three overflow episodes
+    /// inside 42 ms, each logging `bytes=1396`. A burst overrunning a
+    /// sixteen-slot buffer, not a consumer running chronically late — so the
+    /// fix has to be that the buffer holds the burst, and this is the assertion
+    /// that it does. At the old depth it fails on the seventeenth frame.
+    #[test]
+    fn a_burst_that_would_have_overrun_sixteen_slots_is_taken_whole() {
+        let (sender, packets) = sync_channel(super::super::FRAME_QUEUE_SLOTS);
+        let funnel_bytes = FunnelBytes::new();
+        let capture_loss = LossFlag::new();
+        let mut overflowed = 0;
+
+        // The size the field log reported, and a burst two orders of magnitude
+        // past the bound it overran, with nothing draining behind it.
+        let frame = vec![0xE7u8; 1396];
+        const BURST: usize = 1_000;
+        for sent in 0..BURST {
+            assert!(
+                matches!(
+                    forward(
+                        &sender,
+                        &funnel_bytes,
+                        &frame,
+                        &capture_loss,
+                        &mut overflowed
+                    ),
+                    Forwarded::Queued
+                ),
+                "frame {sent} of {BURST} was refused; a 4 MiB funnel holds about 3000 of these"
+            );
+        }
+
+        assert_eq!(overflowed, 0, "nothing was dropped");
+        assert_eq!(
+            capture_loss.take(),
+            None,
+            "and the player is told nothing, because nothing was lost"
+        );
+        assert_eq!(funnel_bytes.in_flight(), BURST * frame.len());
+        assert_eq!(packets.try_iter().count(), BURST, "every frame is queued");
+    }
+
+    /// The byte cap is the bound that binds, not the slot backstop.
+    ///
+    /// Both are real, and a test that only counted admitted frames could not
+    /// tell which one refused: here the slots are left with three quarters of
+    /// their capacity free at the moment the refusal comes, so only the bytes
+    /// can have caused it. That is what makes [`super::FRAME_QUEUE_BYTES`]'
+    /// stated 4 MiB the ceiling a reader adds to the pipeline's 32 MiB, rather
+    /// than an upper bound the slots usually beat them to.
+    #[test]
+    fn the_byte_cap_refuses_the_frame_that_would_cross_it_while_slots_are_still_free() {
+        let (sender, packets) = sync_channel(super::super::FRAME_QUEUE_SLOTS);
+        let funnel_bytes = FunnelBytes::new();
+        let capture_loss = LossFlag::new();
+        let mut overflowed = 0;
+
+        // 4 KiB a frame: big enough that the bytes run out at a quarter of the
+        // slots, small enough to be a frame a coalescing NIC really produces.
+        let frame = vec![0xE7u8; 4096];
+        let admissible = super::super::FRAME_QUEUE_BYTES / frame.len();
+        for sent in 0..admissible {
+            assert!(
+                matches!(
+                    forward(
+                        &sender,
+                        &funnel_bytes,
+                        &frame,
+                        &capture_loss,
+                        &mut overflowed
+                    ),
+                    Forwarded::Queued
+                ),
+                "frame {sent} fits under the cap and must be taken"
+            );
+        }
+        assert!(
+            admissible < super::super::FRAME_QUEUE_SLOTS,
+            "the slots must still have room, or this test asserts the wrong bound"
+        );
+
+        assert!(
+            matches!(
+                forward(
+                    &sender,
+                    &funnel_bytes,
+                    &frame,
+                    &capture_loss,
+                    &mut overflowed
+                ),
+                Forwarded::Dropped
+            ),
+            "the frame that would cross 4 MiB is refused"
+        );
+        assert_eq!(overflowed, 1, "and counted, not silently gone");
+        assert_eq!(
+            capture_loss.take(),
+            Some(CaptureLoss::Funnel),
+            "under Funnel: the frame was captured and died in this process"
+        );
+        assert_eq!(
+            funnel_bytes.in_flight(),
+            admissible * frame.len(),
+            "the refused frame's charge was refunded, or the funnel would ratchet shut"
+        );
+        assert_eq!(
+            packets.try_iter().count(),
+            admissible,
+            "the refused frame was dropped, never queued"
+        );
     }
 
     #[test]
@@ -1474,7 +1700,8 @@ mod tests {
         let (packets_tx, packets_rx) = sync_channel(1);
         let (failed_tx, failed_rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let capture_loss = AtomicBool::new(false);
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
 
         let wpcap = Arc::new(scripted_wpcap(
             [ScriptedCall::ok(pkthdr(caplen), frame).stopping()],
@@ -1482,7 +1709,14 @@ mod tests {
         ));
         let handle = scripted_handle(wpcap, LinkStrip::Ethernet);
 
-        let counters = capture_loop(handle, &packets_tx, &failed_tx, &stop, &capture_loss);
+        let counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
 
         assert_eq!(counters.delivered, 1);
         assert_eq!(counters.unstrippable, 0);
@@ -1503,7 +1737,8 @@ mod tests {
         let (packets_tx, packets_rx) = sync_channel(1);
         let (failed_tx, failed_rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let capture_loss = AtomicBool::new(false);
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
 
         // What a 64-bit `timeval` would make `caplen` read as: past the
         // snaplen, the canary `is_plausible_caplen` exists to catch.
@@ -1514,7 +1749,14 @@ mod tests {
         ));
         let handle = scripted_handle(wpcap, LinkStrip::Fixed(0));
 
-        let counters = capture_loop(handle, &packets_tx, &failed_tx, &stop, &capture_loss);
+        let counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
 
         assert_eq!(
             counters.delivered, 0,
@@ -1541,7 +1783,8 @@ mod tests {
         let (packets_tx, packets_rx) = sync_channel(1);
         let (failed_tx, failed_rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let capture_loss = AtomicBool::new(false);
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
 
         // Shorter than `LinkStrip::Fixed(4)`'s header: `ip_bytes` returns `None`.
         let short_frame = vec![0xAA, 0xBB];
@@ -1552,7 +1795,14 @@ mod tests {
         ));
         let handle = scripted_handle(wpcap, LinkStrip::Fixed(4));
 
-        let counters = capture_loop(handle, &packets_tx, &failed_tx, &stop, &capture_loss);
+        let counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
 
         assert_eq!(counters.delivered, 1, "the adapter did deliver a frame");
         assert_eq!(
@@ -1574,7 +1824,8 @@ mod tests {
         let (packets_tx, packets_rx) = sync_channel(2);
         let (failed_tx, failed_rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let capture_loss = AtomicBool::new(false);
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
 
         // If either branch were dereferenced instead of skipped, this test
         // segfaults rather than fails an assertion — that is the point.
@@ -1587,7 +1838,14 @@ mod tests {
         ));
         let handle = scripted_handle(wpcap, LinkStrip::Fixed(0));
 
-        let counters = capture_loop(handle, &packets_tx, &failed_tx, &stop, &capture_loss);
+        let counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
 
         assert_eq!(
             counters.delivered, 0,
@@ -1611,13 +1869,21 @@ mod tests {
         let (packets_tx, packets_rx) = sync_channel(1);
         let (failed_tx, failed_rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let capture_loss = AtomicBool::new(false);
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
 
         let wpcap = Arc::new(scripted_wpcap([ScriptedCall::error()], &stop));
         set_geterr_text("pcap_next_ex: the adapter vanished");
         let handle = scripted_handle(wpcap, LinkStrip::Fixed(0));
 
-        let counters = capture_loop(handle, &packets_tx, &failed_tx, &stop, &capture_loss);
+        let counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
 
         assert_eq!(counters.delivered, 0);
         assert!(packets_rx.try_recv().is_err());
@@ -1640,7 +1906,8 @@ mod tests {
         let (packets_tx, packets_rx) = sync_channel(1);
         let (failed_tx, failed_rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let capture_loss = AtomicBool::new(false);
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
 
         // `scripted_wpcap` resets the error text to empty, which is what a
         // libpcap that set no message looks like. Nothing calls
@@ -1648,7 +1915,14 @@ mod tests {
         let wpcap = Arc::new(scripted_wpcap([ScriptedCall::error_code(-2)], &stop));
         let handle = scripted_handle(wpcap, LinkStrip::Fixed(0));
 
-        let counters = capture_loop(handle, &packets_tx, &failed_tx, &stop, &capture_loss);
+        let counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
 
         assert_eq!(counters.delivered, 0);
         assert!(packets_rx.try_recv().is_err());
@@ -1685,7 +1959,8 @@ mod tests {
         let (packets_tx, packets_rx) = sync_channel(1);
         let (failed_tx, failed_rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let capture_loss = AtomicBool::new(false);
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
 
         let wpcap = Arc::new(scripted_wpcap(
             [
@@ -1697,7 +1972,14 @@ mod tests {
         ));
         let handle = scripted_handle(wpcap, LinkStrip::Fixed(0));
 
-        let counters = capture_loop(handle, &packets_tx, &failed_tx, &stop, &capture_loss);
+        let counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
 
         assert_eq!(counters.delivered, 0);
         assert_eq!(
@@ -1712,12 +1994,101 @@ mod tests {
         );
     }
 
+    /// Overrides the drop counter the fake `pcap_stats` reports. Call *after*
+    /// [`scripted_wpcap`], which resets it along with the rest of the fixture.
+    fn scripted_drops(ps_drop: c_uint) {
+        STATS_RESULT.with(|cell| {
+            let mut stat = cell.get();
+            stat.ps_drop = ps_drop;
+            cell.set(stat);
+        });
+    }
+
+    /// `open` opens *every* adapter and they all share one [`LossFlag`], so
+    /// without the `delivered` guard a VPN tap or a Hyper-V vSwitch that never
+    /// carried a game packet could force the game's own stream to re-anchor —
+    /// throwing away a half-received shop snapshot over a drop on a link the
+    /// game does not use. The read-timeout arm is the one that reaches this,
+    /// being the only moment a fully idle adapter looks at anything.
+    #[test]
+    fn an_idle_adapters_drops_do_not_resync_the_session() {
+        let (packets_tx, _packets_rx) = sync_channel(1);
+        let (failed_tx, _failed_rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
+
+        let wpcap = Arc::new(scripted_wpcap(
+            [ScriptedCall::timeout(), ScriptedCall::timeout().stopping()],
+            &stop,
+        ));
+        scripted_drops(4_000);
+        let handle = scripted_handle(wpcap, LinkStrip::Fixed(0));
+
+        let counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
+
+        assert_eq!(counters.delivered, 0, "the adapter carried nothing");
+        assert_eq!(
+            capture_loss.take(),
+            None,
+            "an adapter the game never used must not cost the session its anchor"
+        );
+    }
+
+    /// The other half of the same guard: once an adapter *has* delivered, it is
+    /// on the path the game's traffic takes, and its drops are the session's
+    /// problem. Nothing here may be suppressed.
+    #[test]
+    fn a_live_adapters_drops_still_resync_the_session() {
+        let (packets_tx, _packets_rx) = sync_channel(2);
+        let (failed_tx, _failed_rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
+
+        let frame = ethernet_frame_with_ip_payload(b"payload");
+        let caplen = u32::try_from(frame.len()).expect("fits in u32");
+        let wpcap = Arc::new(scripted_wpcap(
+            [
+                ScriptedCall::ok(pkthdr(caplen), frame),
+                ScriptedCall::timeout().stopping(),
+            ],
+            &stop,
+        ));
+        scripted_drops(4_000);
+        let handle = scripted_handle(wpcap, LinkStrip::Ethernet);
+
+        let counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
+
+        assert_eq!(counters.delivered, 1);
+        assert_eq!(
+            capture_loss.take(),
+            Some(CaptureLoss::DriverRing),
+            "a hole on the link the game is actually using is what the resync is for"
+        );
+    }
+
     #[test]
     fn the_stop_flag_ends_the_loop_between_packets() {
         let (packets_tx, packets_rx) = sync_channel(2);
         let (failed_tx, failed_rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let capture_loss = AtomicBool::new(false);
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
 
         let frame = ethernet_frame_with_ip_payload(b"payload");
         let caplen = u32::try_from(frame.len()).expect("fits in u32");
@@ -1730,7 +2101,14 @@ mod tests {
         ));
         let handle = scripted_handle(wpcap, LinkStrip::Ethernet);
 
-        let counters = capture_loop(handle, &packets_tx, &failed_tx, &stop, &capture_loss);
+        let counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
 
         assert_eq!(
             counters.delivered, 1,
@@ -1755,7 +2133,8 @@ mod tests {
         drop(packets_rx); // the funnel is gone before capture ever runs
         let (failed_tx, failed_rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let capture_loss = AtomicBool::new(false);
+        let capture_loss = LossFlag::new();
+        let funnel_bytes = FunnelBytes::new();
 
         let frame = ethernet_frame_with_ip_payload(b"payload");
         let caplen = u32::try_from(frame.len()).expect("fits in u32");
@@ -1765,7 +2144,14 @@ mod tests {
         ));
         let handle = scripted_handle(wpcap, LinkStrip::Ethernet);
 
-        let counters = capture_loop(handle, &packets_tx, &failed_tx, &stop, &capture_loss);
+        let counters = capture_loop(
+            handle,
+            &packets_tx,
+            &funnel_bytes,
+            &failed_tx,
+            &stop,
+            &capture_loss,
+        );
 
         assert_eq!(
             counters.delivered, 1,

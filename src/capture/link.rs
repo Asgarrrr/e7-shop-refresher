@@ -108,9 +108,22 @@ impl LinkStrip {
 /// ⚠ **Untested.** The measured machine has `VlanSupport=0`, so no tagged frame
 /// was ever observed; this exists so a player who does run tagged VLANs doesn't
 /// see a silent parse failure. Symptom if broken: `unparsed` climbing in
-/// lockstep with `delivered` — visible in the window's capture-health row
-/// (`ui::capture_health`) as "traffic is being captured, but none of it looks
-/// like the game's", without anyone needing a debug build to see it.
+/// lockstep with `delivered`, with `admitted` stuck at zero.
+///
+/// The window shows that state without anyone needing a debug build, but not
+/// as its headline, and that is not hedging. An idle game keeps its connection
+/// to `game_port` alive, and the kernel filter admits all of it, so its
+/// keepalive ACKs reach `parse_segment` and are refused for carrying no stream
+/// bytes. These counters therefore read identically for a broken strip and for
+/// a player who has simply not opened the shop yet — and the second is
+/// overwhelmingly the common case, so the row states only that no shop data has
+/// arrived. This failure mode is named in `ui::capture_health`'s `detail`,
+/// behind the collapsing header, which is where a player looking for a fault
+/// goes and a player walking to the shop never does.
+///
+/// Telling the two apart for certain would need `unparsed` split by *why* the
+/// frame was refused — no stream bytes, versus undecodable — which nothing
+/// records today.
 fn ethernet_payload_offset(frame: &[u8]) -> Option<usize> {
     let mut at = ETHERTYPE_OFFSET;
     // `<=` so `MAX_VLAN_TAGS` tags are accepted and the (MAX+1)-th falls
