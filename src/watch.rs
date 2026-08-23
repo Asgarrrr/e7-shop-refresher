@@ -87,25 +87,37 @@ impl WatchGate {
         self.inner.state.load(Ordering::Relaxed) & OFF == 0
     }
 
-    /// Projects ordinary controller state into the gate.
+    /// Projects ordinary controller state into the gate, reporting whether
+    /// **this** call is the one that opened it.
     ///
     /// A pending safety halt always wins over an attempt to re-arm: reading the
     /// mask and re-arming are one atomic update of one location, so no request
     /// can land between them.
-    pub fn set(&self, on: bool) {
+    ///
+    /// The `bool` is the arming edge, and it is resolved *inside* that same
+    /// read-modify-write rather than by a caller comparing two polls of
+    /// [`WatchGate::is_enabled`]. `app::session::SessionGate` hangs the capture
+    /// readout's per-run baseline on it: an edge derived from a separate poll
+    /// leaves a window in which the capture thread has already seen the gate
+    /// open and recorded a re-anchor, and a baseline taken after that window
+    /// subtracts the run's own first fault away. `set(false)` never opens
+    /// anything and always reports `false`.
+    pub fn set(&self, on: bool) -> bool {
         if !on {
             self.inner.state.fetch_or(OFF, Ordering::Relaxed);
-            return;
+            return false;
         }
 
         // `Err` is the ordinary "a cause is latched, stay shut" outcome, not a
         // failure: the closure declines the update rather than reporting one.
-        let _ = self
-            .inner
+        // On `Ok` the payload is the state this call replaced, so `OFF` in it is
+        // exactly "the gate was shut until now".
+        self.inner
             .state
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
                 (state & HALT_MASK == NO_HALT).then_some(state & !OFF)
-            });
+            })
+            .is_ok_and(|replaced| replaced & OFF != 0)
     }
 
     /// Forces the gate off and durably latches the cause alongside any other
@@ -240,6 +252,27 @@ mod tests {
         gate.request_halt(HaltSource::ActuatorFailed);
         gate.acknowledge_halt(HaltSource::PlayerStopped);
         assert_eq!(gate.next_halt().await, HaltSource::ActuatorFailed);
+    }
+
+    /// The arming edge is the gate's own transition, not the caller's intent:
+    /// re-projecting `Watching` on every dispatch must report it once, and a
+    /// projection the latched halt refuses must not report it at all. The
+    /// capture readout's per-run baseline is published on this `bool`, so a
+    /// spurious `true` wipes a running run's verdict and a missing one leaves it
+    /// counting the previous run's.
+    #[test]
+    fn only_the_call_that_opens_the_gate_reports_the_arming_edge() {
+        let gate = WatchGate::new(false);
+
+        assert!(gate.set(true), "shut -> armed is the edge");
+        assert!(!gate.set(true), "already armed is not");
+        assert!(!gate.set(false), "closing is never an arming edge");
+
+        gate.request_halt(HaltSource::PlayerStopped);
+        assert!(!gate.set(true), "a latched cause opens nothing");
+
+        gate.acknowledge_halt(HaltSource::PlayerStopped);
+        assert!(gate.set(true));
     }
 
     /// The only shape that can observe the halt/re-arm race, with the three roles

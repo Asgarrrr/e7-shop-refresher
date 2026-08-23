@@ -13,6 +13,7 @@ use crate::actuator::SnapshotEpoch;
 use crate::domain::control::{Limits, StopReason, past_rung};
 use crate::domain::filter::Filter;
 use crate::domain::shop::{CatalogId, Gold, ItemKind, PurchaseLimit, ShopItem, ShopSnapshot};
+use crate::stream::{PipelineBudget, ResyncCause};
 
 /// The sender drops immediately, which the loop reads as "no stop can ever
 /// arrive" and disables the branch — not as a stop.
@@ -80,7 +81,7 @@ fn cid(id: u32) -> CatalogId {
 /// purpose — their queue is what the test drains.
 struct Rig {
     controller: Mutex<Controller>,
-    gate: WatchGate,
+    gate: SessionGate,
     journal: EventLog,
     actuator: ActuatorHandle,
 }
@@ -91,7 +92,7 @@ impl Rig {
     fn idle(filter: Filter, limits: Limits) -> Self {
         Self {
             controller: Mutex::new(Controller::new(filter, limits)),
-            gate: WatchGate::new(false),
+            gate: SessionGate::for_test(false),
             journal: EventLog::default(),
             actuator: off(),
         }
@@ -118,7 +119,7 @@ impl Rig {
         (
             Self {
                 controller,
-                gate: WatchGate::new(true),
+                gate: SessionGate::for_test(true),
                 journal: EventLog::default(),
                 actuator,
             },
@@ -132,7 +133,7 @@ impl Rig {
     fn over_queue(controller: Mutex<Controller>, jobs: mpsc::Sender<plan::Job>) -> Self {
         Self {
             controller,
-            gate: WatchGate::new(true),
+            gate: SessionGate::for_test(true),
             journal: EventLog::default(),
             actuator: ActuatorHandle::new(
                 Mode::Live,
@@ -729,7 +730,7 @@ fn journal_receives_command_lines() {
 
 #[test]
 fn gate_follows_controller_status() {
-    let gate = WatchGate::new(false);
+    let gate = SessionGate::for_test(false);
     let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
     apply(&[], &ctrl, &gate, &off(), None, 0);
     assert!(!gate.is_enabled()); // Idle
@@ -755,6 +756,62 @@ fn gate_follows_controller_status() {
     let actions = ctrl.handle(Event::Stop);
     apply(&actions, &ctrl, &gate, &off(), None, 0);
     assert!(!gate.is_enabled()); // Stopped
+}
+
+/// The seam the capture readout's per-run baseline hangs on.
+///
+/// [`apply`] is the crate's only arming site, and it publishes the baseline
+/// inside the same read-modify-write that opens the gate. The window repaints at
+/// 4 Hz and is outranked by the capture thread (`THREAD_PRIORITY_HIGHEST`), so a
+/// re-anchor in the first fraction of a second of a run reliably beats the first
+/// frame that could have noticed the run at all — and the baseline used to be
+/// taken by that frame, which subtracted the run's own first fault away for
+/// good and left "capture looks healthy" over a stream that had re-anchored.
+#[test]
+fn arming_publishes_the_baseline_the_capture_readout_counts_from() {
+    let budget = PipelineBudget::new();
+    let run = RunBaselineCell::new(budget.clone());
+    let gate = SessionGate::new(WatchGate::new(false), run.clone());
+    let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
+    // What the process did before this run, which the run must not inherit.
+    budget.record_resync(ResyncCause::ReassemblyShared);
+
+    let _ = ctrl.handle(Event::Start { now_ms: 0 });
+    apply(&[], &ctrl, &gate, &off(), None, 0);
+    assert!(gate.is_enabled());
+    // The capture thread, inside the 250 ms before the next repaint.
+    budget.record_resync(ResyncCause::CaptureFunnel);
+
+    let this_run = budget.snapshot().since(run.baseline());
+    assert_eq!(this_run.resyncs, 1, "one of the two belongs to this run");
+    assert_eq!(
+        this_run.dominant_resync(),
+        Some(ResyncCause::CaptureFunnel),
+        "the run was charged for what the process did before it"
+    );
+}
+
+/// A projection that opens nothing publishes nothing: re-arming an armed gate
+/// happens on every dispatch, and each one would otherwise wipe the running
+/// run's verdict.
+#[test]
+fn re_projecting_a_running_watch_does_not_move_the_baseline() {
+    let budget = PipelineBudget::new();
+    let run = RunBaselineCell::new(budget.clone());
+    let gate = SessionGate::new(WatchGate::new(false), run.clone());
+    let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
+    let _ = ctrl.handle(Event::Start { now_ms: 0 });
+    apply(&[], &ctrl, &gate, &off(), None, 0);
+
+    budget.record_resync(ResyncCause::DriverRing);
+    // A tick, a server message, a retune: all of them re-project `Watching`.
+    for now_ms in 1..4 {
+        let actions = ctrl.handle(Event::Tick { now_ms });
+        apply(&actions, &ctrl, &gate, &off(), None, now_ms);
+    }
+
+    let this_run = budget.snapshot().since(run.baseline());
+    assert_eq!(this_run.dominant_resync(), Some(ResyncCause::DriverRing));
 }
 
 fn one_item_shop() -> ShopSnapshot {
@@ -865,7 +922,7 @@ fn purchase_line_omits_missing_gold() {
 
 #[test]
 fn match_hint_warns_when_some_matches_untracked() {
-    let gate = WatchGate::new(false);
+    let gate = SessionGate::for_test(false);
     let mut ctrl = Controller::new(Filter::matching_default_items(), Limits::default());
     let _ = ctrl.handle(Event::Start { now_ms: 0 });
     // Two matches, only one trackable: the id-0 slot would be refreshed over.
@@ -1361,7 +1418,7 @@ fn unresponsive_halt_reaches_the_journal() {
         rig.journal
             .to_entries()
             .iter()
-            .any(|line| line.text.contains("no response from the game"))
+            .any(|line| line.text.contains("the game stopped responding"))
     );
     // The whole ladder went out: refresh, confirm retry, re-issue.
     assert!(jobs.try_recv().is_ok());

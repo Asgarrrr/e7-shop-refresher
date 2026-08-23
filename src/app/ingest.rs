@@ -7,8 +7,8 @@
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, warn};
 
-use crate::capture::PacketSource;
-use crate::stream::PipelineBudget;
+use crate::capture::{CaptureLoss, PacketSource};
+use crate::stream::{PipelineBudget, ResyncCause};
 use crate::watch::WatchGate;
 
 use super::pressure::{CaptureEvent, PressureResync};
@@ -24,9 +24,10 @@ const CAPTURE_PROGRESS_EVERY: u64 = 1000;
 /// hot-body layout, not throughput.
 #[cold]
 #[inline(never)]
-fn report_backend_loss(budget: &PipelineBudget) {
+fn report_backend_loss(budget: &PipelineBudget, cause: ResyncCause) {
     let stats = budget.snapshot();
     warn!(
+        cause = cause.label(),
         dropped_segments = stats.dropped_segments,
         dropped_bytes = stats.dropped_bytes,
         resyncs = stats.resyncs,
@@ -68,6 +69,18 @@ fn report_metadata_queue_full(budget: &PipelineBudget) {
     );
 }
 
+/// Which re-anchor a backend-side loss is, in the pipeline's own vocabulary.
+///
+/// The two become one hole in one byte stream from here on, and this is the
+/// last line that can still tell them apart — so it is the line that has to, or
+/// the window is back to guessing which it was.
+const fn resync_cause(loss: CaptureLoss) -> ResyncCause {
+    match loss {
+        CaptureLoss::DriverRing => ResyncCause::DriverRing,
+        CaptureLoss::Funnel => ResyncCause::CaptureFunnel,
+    }
+}
+
 /// A recv error ends the loop AND is reported through `fatal`: tracing is inert
 /// in the windowed build, so only the session loop can show the player.
 pub(super) fn capture_loop_budgeted(
@@ -106,10 +119,39 @@ pub(super) fn capture_loop_budgeted(
         // Off -> on: the reassembler must re-anchor before the next byte or it
         // treats the jump as an unfillable gap. The marker retries rather than
         // block for space; parking here backs up the backend's callbacks.
-        if enabled && !was_enabled {
+        let arming = enabled && !was_enabled;
+        if arming {
             pending_player_resync = true;
         }
         was_enabled = enabled;
+
+        // Whatever the flag holds on this iteration predates the session being
+        // armed, so it is discarded rather than charged to it.
+        //
+        // The tap captures from launch, not from Start: `Session::run` builds
+        // the source — which opens every adapter and starts its threads —
+        // before the gate is ever armed, so the funnel behind this loop can
+        // overflow for as long as the session sits shut, and `LossFlag` keeps
+        // the first cause it was handed until someone takes it. Left unread
+        // here, that flag met the first segment after arming and billed a
+        // brand-new session for a hole that predated it — which is what put
+        // "this app fell behind its own capture queue" on screen at the very
+        // moment a player pressed Start.
+        //
+        // The arming iteration is the only place this has to happen, and
+        // draining while shut as well would be redundant: the gate starts shut
+        // (`app::setup`), `was_enabled` is seeded from it, and so every path
+        // from shut to armed passes through exactly one `arming` iteration.
+        // Clearing the flag earlier would change when it is cleared, never
+        // whether the session is charged.
+        //
+        // Discarding costs nothing: a shut gate forwards no bytes, so there is
+        // no continuity for the hole to break, and the transition above owes a
+        // re-anchor before any byte is forwarded — charging the loss would buy
+        // a second re-anchor for the hole the first already covers.
+        if arming {
+            let _ = source.take_capture_loss();
+        }
 
         if !enabled {
             continue;
@@ -132,9 +174,17 @@ pub(super) fn capture_loop_budgeted(
         }
 
         // A backend-side loss breaks continuity like byte pressure, so it
-        // reuses the same counted, lossless resync protocol.
-        if source.take_capture_loss() && pressure_resync.request(&budget) {
-            report_backend_loss(&budget);
+        // reuses the same counted, lossless resync protocol — carrying which
+        // loss it was, which is the one thing byte pressure cannot tell it.
+        //
+        // On an arming iteration this is the second take, and it still charges:
+        // what it finds was raised after the arming was seen, so it belongs to
+        // the session that just started, not to the idle stretch before it.
+        if let Some(loss) = source.take_capture_loss() {
+            let cause = resync_cause(loss);
+            if pressure_resync.request(&budget, cause) {
+                report_backend_loss(&budget, cause);
+            }
         }
         if pressure_resync.is_blocking_segments() {
             budget.record_drop(capacity);
@@ -146,7 +196,7 @@ pub(super) fn capture_loop_budgeted(
             Ok(segment) => segment,
             Err(segment) => {
                 budget.record_drop(segment.payload.capacity());
-                if pressure_resync.request(&budget) {
+                if pressure_resync.request(&budget, ResyncCause::ByteQuota) {
                     report_byte_pressure(&budget);
                 }
                 pressure_resync.try_enqueue(&tx);
@@ -173,7 +223,7 @@ pub(super) fn capture_loop_budgeted(
             // an impossibility. `capacity` is what `admit_capture` charged.
             Err(mpsc::error::TrySendError::Full(event)) => {
                 budget.record_drop(capacity);
-                if pressure_resync.request(&budget) {
+                if pressure_resync.request(&budget, ResyncCause::MetadataQueue) {
                     report_metadata_queue_full(&budget);
                 }
                 // The lease inside releases its bytes on drop, and must do so
@@ -229,21 +279,38 @@ mod tests {
         }
     }
 
-    /// Reports one backend-side packet loss, then delivers its only segment.
+    /// Reports one backend-side packet loss, then delivers `segments` copies of
+    /// one segment before running dry.
+    ///
+    /// `arms` is the gate it opens as the last of those goes out, which leaves
+    /// every segment before it crossing a shut gate — the tap `Session::run`
+    /// opens at launch, losing packets while the player has not pressed Start
+    /// yet. Left `None`, the gate stays as the caller set it.
     struct LosingSource {
-        segment: Option<Segment>,
-        lost: bool,
+        segment: Segment,
+        segments: usize,
+        lost: Option<CaptureLoss>,
+        arms: Option<WatchGate>,
     }
 
     impl PacketSource for LosingSource {
         fn next_segment(&mut self) -> Result<Segment> {
-            self.segment
-                .take()
-                .ok_or_else(|| crate::Error::Capture("characterization complete".to_owned()))
+            let Some(remaining) = self.segments.checked_sub(1) else {
+                return Err(crate::Error::Capture(
+                    "characterization complete".to_owned(),
+                ));
+            };
+            self.segments = remaining;
+            if remaining == 0
+                && let Some(gate) = self.arms.take()
+            {
+                gate.set(true);
+            }
+            Ok(self.segment.clone())
         }
 
-        fn take_capture_loss(&mut self) -> bool {
-            std::mem::take(&mut self.lost)
+        fn take_capture_loss(&mut self) -> Option<CaptureLoss> {
+            self.lost.take()
         }
     }
 
@@ -318,8 +385,10 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let budget = PipelineBudget::new();
         let source = LosingSource {
-            segment: Some(initial_anchor_segment(1000, b"AB")),
-            lost: true,
+            segment: initial_anchor_segment(1000, b"AB"),
+            segments: 1,
+            lost: Some(CaptureLoss::DriverRing),
+            arms: None,
         };
 
         capture_loop_budgeted(
@@ -340,10 +409,108 @@ mod tests {
         let stats = budget.snapshot();
         assert_eq!(stats.resyncs, 1);
         assert_eq!(stats.dropped_segments, 1);
+        assert_eq!(stats.dominant_resync(), Some(ResyncCause::DriverRing));
         // The only fatal is the source running out of characterization data.
         assert_eq!(
             fatal_rx.try_recv().unwrap(),
             "network capture: characterization complete"
         );
+    }
+
+    /// Runs one session whose backend reports `loss` before it delivers
+    /// anything, and hands back the budget it counted against.
+    ///
+    /// `arms_after` is how many segments cross the gate while it is still shut,
+    /// the gate opening as the one after them goes out. The three shapes are the
+    /// three moments a loss can reach the loop:
+    ///
+    /// - `None` — the gate is open from the first segment and never transitions,
+    ///   which is a loss reaching a session already running.
+    /// - `Some(0)` — the gate opens as the very first segment is delivered, so
+    ///   no shut iteration ever runs and the loss is first seen on the arming
+    ///   iteration itself.
+    /// - `Some(n)`, `n >= 1` — `n` segments cross the shut gate before it opens,
+    ///   so the loss is seen and discarded while the session is still idle.
+    ///
+    /// The budget rather than its snapshot: `PipelineStats` is not nameable
+    /// outside `stream` (see `BudgetLimits`' note there for why it is not
+    /// re-exported), and each caller wants different fields off it anyway.
+    fn budget_after_backend_loss(loss: CaptureLoss, arms_after: Option<usize>) -> PipelineBudget {
+        let (event_tx, _event_rx) = mpsc::channel(4);
+        let (fatal_tx, _fatal_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let budget = PipelineBudget::new();
+        let gate = WatchGate::new(arms_after.is_none());
+        capture_loop_budgeted(
+            Box::new(LosingSource {
+                segment: initial_anchor_segment(1000, b"AB"),
+                segments: arms_after.unwrap_or(0) + 1,
+                lost: Some(loss),
+                arms: arms_after.is_some().then(|| gate.clone()),
+            }),
+            event_tx,
+            gate,
+            shutdown_rx,
+            fatal_tx,
+            budget.clone(),
+            PressureResync::default(),
+        );
+        budget
+    }
+
+    /// The attribution the window's sentence rests on.
+    ///
+    /// A ring overflow and a full funnel are the same hole in the same byte
+    /// stream by the time reassembly sees them, and they must still arrive here
+    /// as different causes. While both landed in one `resyncs` total, the window
+    /// read that total as "a slow connection or a driver hiccup" — and told a
+    /// player whose machine was merely busy to go and look at their network.
+    #[test]
+    fn a_funnel_loss_and_a_driver_loss_are_counted_as_different_causes() {
+        for (loss, expected) in [
+            (CaptureLoss::DriverRing, ResyncCause::DriverRing),
+            (CaptureLoss::Funnel, ResyncCause::CaptureFunnel),
+        ] {
+            let stats = budget_after_backend_loss(loss, None).snapshot();
+            assert_eq!(stats.resyncs, 1, "one loss is one re-anchor, either way");
+            assert_eq!(stats.dominant_resync(), Some(expected));
+        }
+    }
+
+    /// The re-anchor a session was billed for before it existed.
+    ///
+    /// The tap runs from launch and `LossFlag` keeps its first cause until it is
+    /// taken, so a funnel overflow during the wait for Start stayed latched for
+    /// the whole of it. Taken for the first time past the gate, it landed on the
+    /// first segment after arming, and the window told a player who had just
+    /// pressed Start that this app had fallen behind its own capture queue.
+    #[test]
+    fn a_loss_from_before_the_gate_opened_is_not_charged_to_the_session() {
+        let stats = budget_after_backend_loss(CaptureLoss::Funnel, Some(1)).snapshot();
+        assert_eq!(stats.resyncs, 0, "the loss predates the armed session");
+        assert_eq!(stats.dominant_resync(), None);
+        // Nor is the armed session's own first segment collateral: it is
+        // admitted, not dropped behind a resync it never needed.
+        assert_eq!(stats.dropped_segments, 0);
+    }
+
+    /// The same loss, with no shut iteration in front of it.
+    ///
+    /// The flag is raised by the capture threads and only read here, so a
+    /// shut-era loss need not be visible on any shut iteration: it can first
+    /// appear on the one that detects the arming, which is why that iteration
+    /// is where the drain has to sit. `Some(0)` is exactly that shape — the
+    /// gate opens with the first segment this loop ever sees — and it is the
+    /// case a drain placed on the shut iterations alone would let through, on
+    /// the single packet the player's Start produces.
+    #[test]
+    fn a_loss_first_seen_on_the_arming_iteration_is_not_charged_either() {
+        let stats = budget_after_backend_loss(CaptureLoss::Funnel, Some(0)).snapshot();
+        assert_eq!(
+            stats.resyncs, 0,
+            "the loss still predates the armed session"
+        );
+        assert_eq!(stats.dominant_resync(), None);
+        assert_eq!(stats.dropped_segments, 0);
     }
 }

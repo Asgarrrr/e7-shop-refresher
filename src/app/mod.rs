@@ -28,7 +28,7 @@ use crate::domain::control::{Controller, Limits};
 use crate::domain::filter::Filter;
 use crate::journal::EventLog;
 use crate::render::print_controls;
-use crate::stream::{BudgetedChunk, PipelineBudget};
+use crate::stream::{BudgetedChunk, PipelineBudget, RunBaselineCell};
 use crate::uplink::UplinkEvent;
 use crate::watch::WatchGate;
 use crate::{Config, Result};
@@ -36,7 +36,7 @@ use crate::{Config, Result};
 use console::stdin_loop;
 use pressure::{CAPTURE_EVENT_QUEUE, CaptureEvent, PressureResync};
 use reassembly::reassemble_loop_with_pressure;
-use session::session_loop;
+use session::{SessionGate, session_loop};
 use workers::{SessionWorkers, spawn_capture_with_budget};
 
 /// Depth of both pipeline channels, which are backpressured differently.
@@ -96,6 +96,10 @@ pub struct SessionHandles {
     /// lock that never crosses a frame boundary, the same rule `controller`
     /// above already follows.
     pub(crate) budget: PipelineBudget,
+    /// The zero the capture readout counts the current run from. Written by the
+    /// session loop on the edge that opens the gate, never by the frame that
+    /// reads it — see `stream::RunBaselineCell` for the blind spot that costs.
+    pub(crate) run_baseline: RunBaselineCell,
     /// Live capture counters — see [`CaptureHealth`] for why a clone of this
     /// is safe to read from the egui thread while [`Session::run`]'s capture
     /// pump increments the same atomics on its own thread. Constructed here,
@@ -121,12 +125,14 @@ impl SessionHandles {
         gate: WatchGate,
         journal: EventLog,
     ) -> Self {
+        let budget = PipelineBudget::new();
         Self {
             controller,
             commands,
             gate,
             journal,
-            budget: PipelineBudget::new(),
+            run_baseline: RunBaselineCell::new(budget.clone()),
+            budget,
             capture_health: CaptureHealth::default(),
         }
     }
@@ -189,6 +195,7 @@ pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
         commands: command_tx,
         gate,
         journal,
+        run_baseline: RunBaselineCell::new(budget.clone()),
         budget,
         capture_health,
     };
@@ -296,6 +303,7 @@ impl Session {
             commands,
             gate,
             journal,
+            run_baseline,
             budget,
             capture_health,
         } = handles;
@@ -395,9 +403,14 @@ impl Session {
         );
         print_controls();
 
+        // The loop's own view of the gate: arming it and publishing the run
+        // baseline are one act, and only this loop performs it. The bare
+        // `WatchGate` stays in scope for the workers and the teardown, which only
+        // ever shut it.
+        let session_gate = SessionGate::new(gate.clone(), run_baseline);
         let loop_outcome = AssertUnwindSafe(session_loop(
             &controller,
-            &gate,
+            &session_gate,
             &journal,
             &actuator,
             command_rx,

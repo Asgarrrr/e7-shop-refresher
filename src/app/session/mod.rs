@@ -12,6 +12,7 @@ use crate::actuator::{ActuatorBackend, ActuatorHandle, Mode, SubmitError};
 use crate::domain::control::{Action, BuyTarget, Controller, Event, Recovery, Status};
 use crate::journal::EventLog;
 use crate::render::{format_item, refusal_label, render_shop, status_label, stop_reason_label};
+use crate::stream::RunBaselineCell;
 use crate::uplink::UplinkEvent;
 use crate::uplink::protocol::{PurchaseNotice, ServerMessage};
 use crate::watch::{HaltSource, WatchGate};
@@ -38,6 +39,77 @@ const FATAL_REPORT_GRACE: Duration = Duration::from_millis(150);
 /// state behind its guard.
 use crate::sync::lock_ignoring_poison as lock;
 
+/// The capture gate this loop projects the controller's status into, and the
+/// run baseline that has to move on the same edge.
+///
+/// One handle rather than two parameters. The baseline is published exactly when
+/// [`WatchGate::set`] reports that it opened the gate, and the defect it exists
+/// for is a baseline taken at any *other* moment — so "arm the gate and leave the
+/// baseline where it was" is not left spellable at the next call site added here.
+#[derive(Clone)]
+pub(super) struct SessionGate {
+    gate: WatchGate,
+    run: RunBaselineCell,
+}
+
+impl SessionGate {
+    pub(super) fn new(gate: WatchGate, run: RunBaselineCell) -> Self {
+        Self { gate, run }
+    }
+
+    /// Projects `armed` into the gate and, when that is what opens it, publishes
+    /// the zero this run's capture verdict counts from.
+    ///
+    /// The baseline is read *before* the store that opens the gate, and kept only
+    /// if that store was the arming edge. No packet crosses a shut gate, so
+    /// nothing this run does can land in between; taken after the gate opened,
+    /// the read could already include the re-anchor the capture thread records on
+    /// the first packet past it — the same fault as the 250 ms the window used to
+    /// take, only shorter. See `stream::RunBaselineCell::counters_now` for what
+    /// *can* land there, and why charging it here is the safe direction.
+    ///
+    /// Unconditional, and so is the read in front of it: which projection is the
+    /// arming edge is not knowable before [`WatchGate::set`] resolves it, and a
+    /// pre-check of [`WatchGate::is_enabled`] to skip the read would be a second,
+    /// racy answer to the question that store already answers exactly.
+    fn arm(&self, armed: bool) {
+        let baseline = self.run.counters_now();
+        if self.gate.set(armed) {
+            self.run.publish(baseline);
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.gate.is_enabled()
+    }
+
+    async fn next_halt(&self) -> HaltSource {
+        self.gate.next_halt().await
+    }
+
+    fn acknowledge_halt(&self, dispatched: HaltSource) {
+        self.gate.acknowledge_halt(dispatched);
+    }
+
+    /// Test-only, and only these two: the shipped safety producers (the GUI, the
+    /// actuator, `app::workers`) hold the [`WatchGate`] itself, because a halt
+    /// ends a run rather than starting one and owes no baseline.
+    #[cfg(test)]
+    pub(super) fn request_halt(&self, source: HaltSource) {
+        self.gate.request_halt(source);
+    }
+
+    /// A gate over a budget nothing else holds, for the suites whose subject is
+    /// arming rather than what a run counted.
+    #[cfg(test)]
+    pub(super) fn for_test(enabled: bool) -> Self {
+        Self::new(
+            WatchGate::new(enabled),
+            RunBaselineCell::new(crate::stream::PipelineBudget::new()),
+        )
+    }
+}
+
 /// Why the loop stopped. The teardown event and the fatal-report grace window
 /// are both read off it.
 enum Exit {
@@ -60,7 +132,7 @@ enum Exit {
 )]
 pub(super) async fn session_loop(
     controller: &Mutex<Controller>,
-    gate: &WatchGate,
+    gate: &SessionGate,
     journal: &EventLog,
     actuator: &ActuatorHandle,
     mut commands: mpsc::Receiver<Command>,
@@ -233,7 +305,7 @@ pub(super) async fn session_loop(
 /// the last two. Nothing is awaited, so the guard never crosses an await.
 fn heartbeat(
     controller: &Mutex<Controller>,
-    gate: &WatchGate,
+    gate: &SessionGate,
     now_ms: u64,
     last_shop_ms: Option<u64>,
     unknown_messages: u64,
@@ -256,7 +328,7 @@ fn heartbeat(
 /// A command is never silent, even when the controller ignores it.
 fn on_command(
     controller: &Mutex<Controller>,
-    gate: &WatchGate,
+    gate: &SessionGate,
     journal: &EventLog,
     actuator: &ActuatorHandle,
     command: Command,
@@ -270,7 +342,7 @@ fn on_command(
 /// current status.
 fn handle_command(
     controller: &Mutex<Controller>,
-    gate: &WatchGate,
+    gate: &SessionGate,
     actuator: &ActuatorHandle,
     command: Command,
     now_ms: u64,
@@ -366,7 +438,7 @@ fn handle_command(
 /// Acks and unknown messages produce no player-facing line.
 fn on_message(
     controller: &Mutex<Controller>,
-    gate: &WatchGate,
+    gate: &SessionGate,
     journal: &EventLog,
     actuator: &ActuatorHandle,
     message: ServerMessage,
@@ -404,9 +476,12 @@ fn on_message(
 
 /// One lock for the whole purchase: the bought line renders against the same
 /// state the event applies to, and comes first, before any auto-resume advice.
+/// The guard needs no explicit release the way `dispatch`'s does — its last
+/// read is the last statement, and returning drops it before the caller has
+/// journalled a line.
 fn handle_purchase(
     controller: &Mutex<Controller>,
-    gate: &WatchGate,
+    gate: &SessionGate,
     actuator: &ActuatorHandle,
     notice: &PurchaseNotice,
     now_ms: u64,
@@ -457,7 +532,7 @@ fn purchase_line(controller: &Controller, notice: &PurchaseNotice) -> String {
 /// purchase arrivals.
 fn dispatch(
     controller: &Mutex<Controller>,
-    gate: &WatchGate,
+    gate: &SessionGate,
     journal: &EventLog,
     actuator: &ActuatorHandle,
     event: Event,
@@ -475,11 +550,14 @@ fn dispatch(
 ///
 /// `trigger` names the animation the game plays when the actions land; paths
 /// that cannot advise a refresh or buy pass `None`. The gate follows the
-/// status, and off -> on retriggers the capture thread's existing resync.
+/// status, and off -> on retriggers the capture thread's existing resync — and,
+/// through [`SessionGate::arm`], starts the run the capture readout reports on.
+/// This projection is the crate's only arming site, and it is unconditional, so
+/// no run can begin anywhere else.
 fn apply(
     actions: &[Action],
     controller: &Controller,
-    gate: &WatchGate,
+    gate: &SessionGate,
     actuator: &ActuatorHandle,
     trigger: Option<Trigger>,
     now_ms: u64,
@@ -503,7 +581,7 @@ fn apply(
             }
         }
     }
-    gate.set(matches!(
+    gate.arm(matches!(
         controller.status(),
         Status::Watching | Status::Paused
     ));

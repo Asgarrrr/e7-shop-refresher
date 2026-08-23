@@ -10,7 +10,7 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
-use tracing::{Instrument as _, error};
+use tracing::{Instrument as _, error, warn};
 
 use crate::Result;
 use crate::actuator::ActuatorHandle;
@@ -166,6 +166,57 @@ fn report_join(
     }
 }
 
+/// Raises this thread's own scheduling priority above the process default.
+///
+/// The thread `spawn_capture_with_budget` spawns is the one that drains
+/// `capture::pcap`'s frame funnel. At `NORMAL` priority it competes for CPU
+/// time on equal footing with every other thread on the machine, including an
+/// unrelated process's video decode — lose that race for long enough and the
+/// funnel fills, a frame is dropped and `ResyncCause::CaptureFunnel` fires, on
+/// a machine whose network and driver are both fine. That is not hypothetical:
+/// it is the session `capture::pcap::FRAME_QUEUE_BYTES` cites, where a video
+/// was playing beside the game. `HIGHEST` is two steps above `NORMAL` within
+/// the process's own priority *class* (still `NORMAL_PRIORITY_CLASS`, not
+/// `REALTIME_PRIORITY_CLASS`), so it needs no privilege beyond what an
+/// unelevated process already has.
+///
+/// This and the size of the funnel are not alternatives, and neither is
+/// sufficient. Priority shortens the stall; the funnel's byte bound (4 MiB,
+/// roughly three thousand ordinary frames, against the sixteen slots that
+/// overflowed) survives the stall that happens anyway. Neither has been
+/// measured to remove `ResyncCause::CaptureFunnel` on its own — what was
+/// measured is the overflow both are aimed at.
+///
+/// This is a real trade, not a free win: Win32 scheduling preempts strictly by
+/// priority, so this thread now also outranks every other `NORMAL` thread in
+/// *this* process — the egui/winit UI thread and the tokio relay-workers that
+/// read what this one forwards downstream included. What keeps that
+/// acceptable is the loop this guards (`capture_loop_budgeted`): it blocks on
+/// `recv_timeout` between packets rather than spinning, so the windows where
+/// it actually holds a core are short, not sustained.
+#[cfg(windows)]
+fn raise_capture_thread_priority() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+    };
+
+    // SAFETY: a pseudo-handle valid for the calling thread's whole lifetime,
+    // never needing `CloseHandle`.
+    let this_thread = unsafe { GetCurrentThread() };
+    // SAFETY: `this_thread` is a valid handle to the thread making this call,
+    // so `SetThreadPriority` only affects the thread that owns it.
+    if unsafe { SetThreadPriority(this_thread, THREAD_PRIORITY_HIGHEST) } == 0 {
+        warn!("could not raise the capture thread's priority; scheduling stays default");
+    }
+}
+
+/// No thread-priority API is reached off Windows; this backend is Windows-only
+/// (see `pcap-backend`'s `libloading` dependency), so nothing here is ever
+/// exercised, but `spawn_capture_with_budget` still compiles for the dev
+/// lanes that build this module cross-platform.
+#[cfg(not(windows))]
+fn raise_capture_thread_priority() {}
+
 pub(super) fn spawn_capture_with_budget(
     source: CaptureSource,
     tx: mpsc::Sender<CaptureEvent>,
@@ -179,6 +230,7 @@ pub(super) fn spawn_capture_with_budget(
     let thread = std::thread::Builder::new()
         .name("capture".to_owned())
         .spawn(move || {
+            raise_capture_thread_priority();
             let panic_fatal = fatal.clone();
             let run = AssertUnwindSafe(|| {
                 capture_loop_budgeted(packets, tx, gate, shutdown, fatal, budget, pressure_resync)
@@ -252,6 +304,11 @@ mod tests {
                     .wait(state)
                     .expect("blocking capture mutex poisoned while waiting");
             }
+            // Released before `events` is taken: nothing past the wait reads
+            // the capture state, and holding it here would make this the one
+            // place that nests state-then-events — an order the four workers
+            // below, which only ever take `events` alone, never establish.
+            drop(state);
             if let Some(events) = &self.events {
                 events.lock().unwrap().push("capture");
             }
@@ -268,6 +325,12 @@ mod tests {
             let (lock, wake) = &*self.state;
             let mut state = lock.lock().expect("blocking capture mutex poisoned");
             state.stopped = true;
+            // Notified after the release, unlike the `entered` half above where
+            // the guard has to survive into the wait loop. No wakeup is lost
+            // either way: a waiter either still holds the lock, and will see the
+            // flag on its own re-check, or is already inside `wait` and cannot
+            // miss the notify.
+            drop(state);
             wake.notify_all();
         }
     }
@@ -375,6 +438,47 @@ mod tests {
         ));
     }
 
+    /// `raise_capture_thread_priority`'s effect is OS scheduler state, not a
+    /// value this crate owns — the only honest check is asking Windows what it
+    /// actually did, the way `install.rs`'s Windows-only unsafe surface is
+    /// verified elsewhere in this crate.
+    #[cfg(windows)]
+    #[test]
+    fn worker_capture_thread_runs_at_highest_priority() {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::System::Threading::{GetThreadPriority, THREAD_PRIORITY_HIGHEST};
+
+        let (source, state, _live) = blocking_capture(None);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (fatal_tx, _fatal_rx) = mpsc::channel(1);
+        let mut capture = spawn_capture(
+            source,
+            event_tx,
+            WatchGate::new(false),
+            shutdown_rx,
+            fatal_tx,
+        )
+        .unwrap();
+        // `entered` is only set once `next_segment` runs, which is ordered
+        // after `raise_capture_thread_priority` on the same thread — so
+        // observing it here means the priority call already landed.
+        wait_until_capture_blocks(&state);
+
+        let handle = capture.thread.as_ref().unwrap().as_raw_handle();
+        // SAFETY: `handle` names the capture thread this function's own
+        // `capture` variable is still joining on, so it is a live, valid
+        // thread handle for the whole call.
+        let priority = unsafe { GetThreadPriority(handle.cast()) };
+        assert_eq!(
+            priority, THREAD_PRIORITY_HIGHEST,
+            "capture thread must win scheduling races against unrelated CPU load"
+        );
+
+        capture.stop_and_join();
+    }
+
     #[test]
     fn worker_shutdown_capture_error_is_fatal_before_shutdown() {
         let source = CaptureSource::new(ImmediateErrorSource("receive failed"), NoopStop);
@@ -460,6 +564,11 @@ mod tests {
 
         workers.shutdown(&gate, actuator).await;
 
+        // One guard for the whole block: the three positions are compared
+        // against one another, so they have to index the same vector, and the
+        // `{events:?}` that reports the failure has to be that vector too.
+        // Nothing contends for it here — `shutdown` returned, so every task
+        // that pushes into it has already been joined.
         let events = events.lock().unwrap();
         let capture = events.iter().position(|event| *event == "capture").unwrap();
         let reassembly = events

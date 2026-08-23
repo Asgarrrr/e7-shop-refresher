@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::mpsc;
 use tracing::error;
 
-use crate::stream::{BudgetedSegment, PipelineBudget};
+use crate::stream::{BudgetedSegment, PipelineBudget, ResyncCause};
 
 /// `stream.rs` reasons about "a 512-slot channel" when it justifies its size
 /// canaries, so this number and those canaries move together.
@@ -101,7 +101,16 @@ fn report_unknown_resync(value: u8) {
 pub(super) struct PressureResync(Arc<AtomicU8>);
 
 impl PressureResync {
-    pub(super) fn request(&self, budget: &PipelineBudget) -> bool {
+    /// Opens a re-anchor episode, attributed to `cause`, and reports whether
+    /// this call is the one that opened it.
+    ///
+    /// `cause` is recorded only on the `true` branch, which is what keeps the
+    /// counters honest under a cascade: a ring overflow that then floods the
+    /// funnel is one hole in one byte stream, and counting the follow-on
+    /// symptoms as separate causes would let the loudest consequence outvote the
+    /// origin in `PipelineStats::dominant_resync`. One episode, one cause, the
+    /// first one to see it.
+    pub(super) fn request(&self, budget: &PipelineBudget, cause: ResyncCause) -> bool {
         if self
             .0
             .compare_exchange(
@@ -112,7 +121,7 @@ impl PressureResync {
             )
             .is_ok()
         {
-            budget.record_resync();
+            budget.record_resync(cause);
             true
         } else {
             false
@@ -192,16 +201,26 @@ mod tests {
             panic!("oversized segment unexpectedly admitted")
         };
         budget.record_drop(rejected.payload.capacity());
-        assert!(pressure.request(&budget));
+        assert!(pressure.request(&budget, ResyncCause::ByteQuota));
         assert!(!pressure.try_enqueue(&tx));
         assert!(pressure.is_blocking_segments());
         assert_eq!(budget.snapshot().dropped_segments, 1);
         assert_eq!(budget.snapshot().dropped_bytes, 16);
         assert_eq!(budget.snapshot().resyncs, 1);
+        assert_eq!(
+            budget.snapshot().dominant_resync(),
+            Some(ResyncCause::ByteQuota)
+        );
 
         assert!(matches!(rx.try_recv(), Ok(CaptureEvent::Resync)));
         assert!(pressure.try_enqueue(&tx));
-        assert!(!pressure.request(&budget));
+        // A second cause arriving inside the same episode is refused, and does
+        // not get counted: `dominant_resync` still names what started it.
+        assert!(!pressure.request(&budget, ResyncCause::DriverRing));
+        assert_eq!(
+            budget.snapshot().dominant_resync(),
+            Some(ResyncCause::ByteQuota)
+        );
         for _ in 0..511 {
             assert!(matches!(rx.try_recv(), Ok(CaptureEvent::Resync)));
         }

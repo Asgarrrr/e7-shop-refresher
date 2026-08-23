@@ -29,6 +29,8 @@ pub(super) fn initial_anchor_segment_in(
         flow,
         seq,
         syn,
+        fin: false,
+        rst: false,
         payload: Vec::from(payload),
     }
 }

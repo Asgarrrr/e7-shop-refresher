@@ -17,6 +17,10 @@ use std::time::Instant;
 pub struct LogLine {
     pub at_ms: u64,
     pub text: Arc<str>,
+    /// Kept for the window to color the line by severity; [`EventLog::push`]
+    /// stamps it directly, [`EventLog::emit_at`] forwards the level it was
+    /// given.
+    pub level: tracing::Level,
 }
 
 /// Oldest entries drop out first: a session left running for hours must not
@@ -67,7 +71,7 @@ impl EventLog {
     /// the file. Without it, narrowing `RUST_LOG` to `warn` would delete the
     /// lines that say what went wrong.
     pub fn emit_at(&self, level: tracing::Level, lines: &[String]) {
-        self.push(lines);
+        self.push(level, lines);
         for line in lines {
             // A callsite's level is static in `tracing`'s macros, so a runtime
             // level can't be passed to one macro — hence the three-way match.
@@ -88,7 +92,7 @@ impl EventLog {
     /// Ring only — no `tracing` event, no log file, no record once the process
     /// ends. For lines whose entire audience is the player watching right now;
     /// anything worth later triage needs [`EventLog::emit`] instead.
-    pub fn push(&self, lines: &[String]) {
+    pub fn push(&self, level: tracing::Level, lines: &[String]) {
         if lines.is_empty() {
             return;
         }
@@ -101,6 +105,7 @@ impl EventLog {
             entries.push_back(LogLine {
                 at_ms,
                 text: Arc::from(text.as_str()),
+                level,
             });
         }
         while entries.len() > JOURNAL_CAP {
@@ -136,7 +141,7 @@ mod tests {
     fn journal_caps_entries() {
         let journal = EventLog::default();
         for i in 0..(JOURNAL_CAP + 100) {
-            journal.push(&[format!("line {i}")]);
+            journal.push(tracing::Level::INFO, &[format!("line {i}")]);
         }
         let entries = journal.to_entries();
         assert_eq!(entries.len(), JOURNAL_CAP);
@@ -150,7 +155,7 @@ mod tests {
     #[test]
     fn empty_push_is_ignored() {
         let journal = EventLog::default();
-        journal.push(&[]);
+        journal.push(tracing::Level::INFO, &[]);
         assert!(journal.to_entries().is_empty());
         assert_eq!(journal.generation(), 0);
     }
@@ -158,9 +163,9 @@ mod tests {
     #[test]
     fn timestamps_track_elapsed_time() {
         let journal = EventLog::default();
-        journal.push(&["first".to_owned()]);
+        journal.push(tracing::Level::INFO, &["first".to_owned()]);
         std::thread::sleep(std::time::Duration::from_millis(30));
-        journal.push(&["second".to_owned()]);
+        journal.push(tracing::Level::INFO, &["second".to_owned()]);
         let entries = journal.to_entries();
         assert!(entries[0].at_ms < 5_000, "first stamp sits near the epoch");
         assert!(
@@ -181,19 +186,25 @@ mod tests {
         ] {
             journal.emit_at(level, &[format!("{level}")]);
         }
-        let texts: Vec<String> = journal
-            .to_entries()
-            .into_iter()
-            .map(|line| line.text.to_string())
-            .collect();
+        let entries = journal.to_entries();
+        let texts: Vec<String> = entries.iter().map(|line| line.text.to_string()).collect();
         assert_eq!(texts, ["ERROR", "WARN", "INFO"]);
+        let levels: Vec<tracing::Level> = entries.iter().map(|line| line.level).collect();
+        assert_eq!(
+            levels,
+            [
+                tracing::Level::ERROR,
+                tracing::Level::WARN,
+                tracing::Level::INFO
+            ]
+        );
     }
 
     #[test]
     fn generation_changes_on_push() {
         let journal = EventLog::default();
         let before = journal.generation();
-        journal.push(&["line".to_owned()]);
+        journal.push(tracing::Level::INFO, &["line".to_owned()]);
         assert_ne!(journal.generation(), before);
     }
 }
