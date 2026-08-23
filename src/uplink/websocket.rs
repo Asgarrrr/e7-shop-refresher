@@ -1259,7 +1259,16 @@ mod tests {
             () = tokio::time::sleep(Duration::from_millis(1)) => {}
         }
 
-        let frames = sent.lock().unwrap();
+        // Copied out rather than asserted through the guard: `pumping` is still
+        // alive, and `ScriptedLink::start_send` pushes under this very mutex
+        // (`sent()` hands out a clone of the same `Arc`). Anything below that
+        // polls `pumping` again — another `select!` on `&mut pumping`, say —
+        // would block this thread on a `std::sync::Mutex` the resumed future
+        // needs, on a single-threaded runtime, and the test would hang instead
+        // of failing. A bare `yield_now` would *not*: `pumping` is a local
+        // future, never spawned, so nothing drives it unless this code does.
+        // The clone is a handful of frames.
+        let frames = sent.lock().unwrap().clone();
         let [Message::Binary(payload)] = &frames[..] else {
             panic!("expected exactly one binary frame, got {frames:?}");
         };

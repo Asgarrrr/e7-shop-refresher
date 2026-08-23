@@ -776,7 +776,11 @@ mod tests {
 
         /// Called *before* `deny`, so a refused input still proves it was aimed
         /// at the right window.
-        fn saw(&mut self, window: &FakeWindow) {
+        ///
+        /// `&self`, unlike its `&mut self` neighbour `deny`: the history is
+        /// behind its own `Arc<Mutex<_>>` so a test can read it while the job
+        /// loop holds the surface mutably, leaving nothing here to mutate.
+        fn saw(&self, window: &FakeWindow) {
             self.windows.lock().unwrap().push(*window);
         }
     }
@@ -1051,7 +1055,9 @@ mod tests {
         let (mut surface, events) = FakeSurface::new(design_rect());
         let releases = surface.releases.clone();
         let gate = rig.gate.clone();
-        surface.on_input = Box::new(move || gate.set(false));
+        surface.on_input = Box::new(move || {
+            gate.set(false);
+        });
         rig.job_tx.send(refresh(1)).await.unwrap();
         let ran = rig.run(surface, live_mode()).await;
         // Two steps planned, only the first landed.
@@ -1448,7 +1454,9 @@ mod tests {
         let (mut surface, _events) = FakeSurface::new(design_rect());
         let releases = surface.releases.clone();
         let gate = rig.gate.clone();
-        surface.on_input = Box::new(move || gate.set(false));
+        surface.on_input = Box::new(move || {
+            gate.set(false);
+        });
         rig.job_tx.send(refresh(1)).await.unwrap();
         rig.job_tx.send(refresh(2)).await.unwrap();
         rig.run(surface, live_mode()).await;

@@ -147,6 +147,15 @@ pub(super) fn hide() {
 /// Current window, recreated when missing or dead (a window dies with its
 /// pump thread).
 fn handle() -> Result<Hwnd, String> {
+    // The lock deliberately spans the probe, the recreation *and* the store,
+    // even though `spawn_window` — a thread start plus a blocking `recv` — is
+    // by far the slowest thing under it. That width is the "at most one shield
+    // exists" invariant. Tightened around the probe alone, two callers can both
+    // read an empty slot, both spawn a window and a pump thread, and the second
+    // store overwrites the first handle; `hide` lowers only the handle it finds
+    // in `WINDOW`, so the orphan stays raised over the game and swallows the
+    // player's mouse for the rest of the process, with nothing left able to
+    // reach it. Only the tail below is outside the critical section.
     let mut window = lock(&WINDOW);
     if let Some(hwnd) = *window {
         // SAFETY: asking whether a possibly-dead handle is still a window is
@@ -159,6 +168,7 @@ fn handle() -> Result<Hwnd, String> {
     }
     let hwnd = spawn_window()?;
     *window = Some(hwnd);
+    drop(window);
     Ok(hwnd)
 }
 
