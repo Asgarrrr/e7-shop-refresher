@@ -61,7 +61,7 @@ fn segment_span(bytes: &[u8], game_port: NonZeroU16) -> Option<SegmentSpan> {
             // A header that declares no payload length hands length authority
             // to the *captured slice*: `Ipv6Slice::from_slice` takes the
             // `0 == header.payload_length() && slice.len() > Ipv6Header::LEN`
-            // branch at etherparse-0.20.3/src/net/ipv6_slice.rs:35 and records
+            // branch at etherparse-0.21.0/src/net/ipv6_slice.rs:35 and records
             // `LenSource::Slice`, so every byte after the 40-byte header comes
             // back as TCP payload — an Ethernet trailer, or the next segment's
             // headers inside a coalesced RSC/LRO superframe. IPv4's equivalent
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(seg.payload, b"AB");
     }
 
-    /// The escape hatch at `etherparse-0.20.3/src/net/ipv6_slice.rs:35`: with
+    /// The escape hatch at `etherparse-0.21.0/src/net/ipv6_slice.rs:35`: with
     /// `payload_length == 0` and anything at all behind the header, etherparse
     /// stops believing the header and takes the captured slice as the packet.
     /// Everything trailing then arrives as stream bytes, undetectably.
