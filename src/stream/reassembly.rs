@@ -11,13 +11,24 @@ use tracing::{error, warn};
 use super::budget::{
     BudgetedChunk, BudgetedSegment, PipelineBudget, fits_pending, pending_after_release,
 };
-use super::{INITIAL_ANCHOR_MAX_BYTES, INITIAL_ANCHOR_MAX_SEGMENTS};
+use super::{INITIAL_ANCHOR_MAX_BYTES, INITIAL_ANCHOR_MAX_SEGMENTS, ResyncCause};
 use crate::capture::FlowKey;
 #[cfg(test)]
 use crate::capture::Segment;
 
 /// Cap on tracked streams: reconnections or a port-wide flood could mint keys
 /// without bound, each buffering up to `MAX_PENDING_BYTES`. Stalest entry evicted once reached.
+///
+/// Left at 64 now that a flow is retired when its connection ends
+/// ([`Reassembler::push_budgeted`]). It was reconsidered, because until that
+/// landed this number *was* the steady state rather than a ceiling: the game
+/// opens a short connection every ~1.7 s, nothing ever removed the dead one, and
+/// 64 slots of its own clones filled inside two minutes, after which every new
+/// connection evicted one — 46 of them in ~90 s in the field. What the cap
+/// bounds now is the residue, flows whose end was never sent or never captured,
+/// plus whatever a forged-source-port flood mints. Nothing measures how large
+/// that residue is, so there is no number to move it *to*; the reading that
+/// would justify moving it is `ResyncCause::StreamReclaimed` climbing again.
 const MAX_STREAMS: usize = 64;
 
 /// Segments held during the one-shot initial anchor window.
@@ -78,6 +89,16 @@ impl InitialBurst {
     }
 
     pub(crate) fn into_ordered(self) -> Vec<BudgetedSegment> {
+        // The arrival order of the *flows*, taken before the per-flow sort below
+        // destroys it. The replay at the end reads it back to drop each flow's
+        // sorted segments into that flow's own original slots; without it,
+        // inter-flow cadence would be `HashMap` iteration order.
+        //
+        // The `collect` is load-bearing despite `clippy::needless_collect`: the
+        // loop below moves `self.segments`, so a lazy iterator borrowing it
+        // cannot still be alive at the replay. Taking the lint's advice is
+        // `E0505: cannot move out of self.segments because it is borrowed`
+        // (compiled, not guessed).
         let slots: Vec<_> = self.segments.iter().map(|segment| segment.flow).collect();
         // One flow is the ordinary case; several is the port-wide accident.
         let mut flows: HashMap<_, Vec<BudgetedSegment>> = HashMap::with_capacity(1);
@@ -131,10 +152,44 @@ impl Reassembler {
 
     /// Integrates a segment, returning the bytes that became contiguous.
     ///
-    /// FIN is not modelled: a segment reordered ahead of a gap keeps its
-    /// buffered payload until the gap fills, which is why `Pressure` obliges
-    /// the caller to re-anchor (`AnchorState::AwaitingFirst`) rather than wait
-    /// on a fill that can never arrive.
+    /// # Retiring a flow whose connection has ended
+    ///
+    /// A closed connection used to keep its slot until something else needed it:
+    /// `capture::parse_segment` refused every zero-payload non-SYN segment, so
+    /// FIN and RST never arrived here at all. The game opens a short connection
+    /// every ~1.7 s (~7 segments, ~6.6 KB each), so all [`MAX_STREAMS`] slots
+    /// held its own dead clones within about two minutes and every new
+    /// connection then evicted one — 46 evictions in ~90 s in the field, each
+    /// re-anchoring a flow that had nothing left to deliver. Both flags now reach
+    /// here, and a flow is dropped the moment its connection is over.
+    ///
+    /// The two ends are not the same event, so they are not handled alike:
+    ///
+    /// - **FIN** is orderly, and its guarantee is exactly what makes retirement
+    ///   safe: it is the last sequence number the server will use, so once
+    ///   delivery is contiguous through it there is nothing left to wait for.
+    ///   Until then the flow stays — a FIN that overtakes a gap must not be
+    ///   allowed to throw away the bytes buffered behind it, which is the one
+    ///   way this optimisation could silently cost a shop refresh.
+    /// - **RST** is an abort and carries no such promise; it can arrive with a
+    ///   gap still open, and nothing will ever fill it. The flow is dropped
+    ///   anyway — an aborted connection cannot deliver another byte, so holding
+    ///   its slot buys nothing — but if it was still holding a segment behind a
+    ///   gap those bytes are lost, and that is counted
+    ///   ([`ResyncCause::ConnectionReset`]).
+    ///
+    /// An RST is honoured only when it sits exactly at the next expected byte.
+    /// A passive tap can check nothing else about a segment, and an off-window
+    /// RST is precisely what an off-path attacker forges against a connection
+    /// they cannot read; RFC 5961 §3.2 tightened real receivers to that same
+    /// test for that same reason, and here it costs one comparison. An RST that
+    /// fails it is ignored and its flow ages out the ordinary way.
+    ///
+    /// An orderly close records no re-anchor at all. A flow that delivered
+    /// everything it received and then ended did not lose continuity — it
+    /// stopped — and counting one per connection would trade the 46 spurious
+    /// events this removes for about 35 a minute. An abort records one only when
+    /// it stranded bytes, which is a loss rather than an ending.
     pub(crate) fn push_budgeted(&mut self, segment: BudgetedSegment) -> ReassemblyOutcome {
         let key = segment.flow;
         let dropped_capacity = segment.capacity();
@@ -143,15 +198,43 @@ impl Reassembler {
         if segment.syn && self.syn_starts_new_incarnation(&segment) {
             self.streams.remove(&key);
         }
-        if self.streams.len() >= MAX_STREAMS && !self.streams.contains_key(&key) {
-            self.evict_stalest(&budget);
+        if !self.streams.contains_key(&key) {
+            // A close for a flow nothing is tracking has nothing to end, and
+            // admitting it would be worse than useless: it would anchor a
+            // baseline on a connection already over, and could evict a live flow
+            // to make room for one retired on the very next line. Nothing can
+            // follow it either — a FIN is the last sequence number the server
+            // will use, and an RST is the end of the connection outright — so
+            // the entry could only ever be retired empty.
+            if is_bare_close(&segment) {
+                return ReassemblyOutcome::Chunks(Vec::new());
+            }
+            if self.streams.len() >= MAX_STREAMS {
+                self.evict_stalest(&budget);
+            }
         }
         let clock = self.clock;
         let half = self.streams.entry(key).or_default();
         half.last_active = clock;
-        let outcome = half.push(segment.seq, segment.syn, segment.into_payload());
+        let outcome = half.push(
+            segment.seq,
+            segment.syn,
+            segment.fin,
+            segment.rst,
+            segment.into_payload(),
+        );
+        // Read while the borrow is alive, acted on after it ends: `retire` needs
+        // the map this `&mut` is holding. Read on the pressure path too and
+        // discarded there — that path drops the flow anyway, and one field
+        // comparison is cheaper than a second match to skip it.
+        let retirement = half.retirement();
         match outcome {
-            HalfOutcome::Chunks(chunks) => ReassemblyOutcome::Chunks(chunks),
+            HalfOutcome::Chunks(chunks) => {
+                if let Some(retirement) = retirement {
+                    self.retire(&key, retirement, &budget);
+                }
+                ReassemblyOutcome::Chunks(chunks)
+            }
             HalfOutcome::Pressure(cause) => {
                 // Sized to the failure. `MAX_PENDING_BYTES` is a *per-stream*
                 // cap and half of `REASSEMBLY_STAGE_BYTES`, so one stream fills
@@ -173,7 +256,7 @@ impl Reassembler {
                 // chunks discarded by the reset above — one stream's or every
                 // stream's — are collateral, not extra captures.
                 budget.record_drop(dropped_capacity);
-                budget.record_resync();
+                budget.record_resync(cause.resync_cause());
                 warn_reassembly_pressure(&budget, cause);
                 ReassemblyOutcome::Pressure
             }
@@ -214,12 +297,36 @@ impl Reassembler {
     /// Drops the least-recently-active stream, only when a new key would exceed
     /// `MAX_STREAMS`.
     ///
-    /// An eviction *is* an anchor loss, hence the budget: capture is port-wide,
-    /// so foreign flows past 64 keys evict by staleness, and between two shop
-    /// refreshes the quietest flow on that port is the game's own. It re-anchors
-    /// silently, so without `record_resync` the missing snapshot appears in no
-    /// counter. Same call as [`Self::push_budgeted`]'s pressure arm, and no
-    /// `record_drop`, for the reason stated there.
+    /// An eviction is counted only when it *cost* something, which [`EvictionLoss`]
+    /// decides once and both the counter and the warning below then read.
+    ///
+    /// # What this path is, and what it stopped being
+    ///
+    /// The rationale that used to stand here described neither the filter nor
+    /// what the code does. It claimed port-wide capture let foreign flows crowd
+    /// the table and that the stalest flow between two shop refreshes is the
+    /// game's own; the kernel filter admits one source port and `parse_segment`
+    /// admits only that server, so there are no foreign flows, and the stalest
+    /// entry is not the live flow gone quiet.
+    ///
+    /// What actually filled the table was that `parse_segment` discarded FIN and
+    /// RST, so a closed connection was never retired: the game opening a short
+    /// connection every ~1.7 s filled all 64 slots with its own dead clones
+    /// inside two minutes, after which every new connection evicted one. A
+    /// patched build logged 46 evictions in ~90 s, every one with
+    /// `buffered_bytes=0`, and counting them all as anchor losses made
+    /// `dominant_resync` name them and paint a healthy run amber — worse the
+    /// longer the run went.
+    ///
+    /// Both halves of that are now fixed, in the order they should be read:
+    /// [`EvictionLoss`] stopped calling a lossless eviction a fault, and
+    /// [`Self::push_budgeted`] stopped producing them, by dropping a flow when
+    /// its connection ends. This path is the backstop it was designed as again —
+    /// for flows whose end never arrives — and an eviction on a healthy run is
+    /// now rare enough to be worth reading rather than scrolling past.
+    ///
+    /// No `record_drop` in either case, for the reason [`Self::push_budgeted`]
+    /// states.
     fn evict_stalest(&mut self, budget: &PipelineBudget) {
         let Some(&key) = self
             .streams
@@ -237,8 +344,54 @@ impl Reassembler {
         // packets went by while the stream said nothing: the one number that
         // separates "crowded out" from "went quiet".
         let segments_since_active = self.clock.saturating_sub(evicted.last_active);
-        budget.record_resync();
-        warn_stream_evicted(budget, evicted, segments_since_active);
+        let loss = EvictionLoss::of(&evicted);
+        budget.record_resync(loss.cause);
+        warn_stream_evicted(
+            budget,
+            loss,
+            evicted,
+            key.client.port(),
+            segments_since_active,
+        );
+    }
+
+    /// Drops a flow whose connection has ended, freeing its slot.
+    ///
+    /// The mirror of [`Self::evict_stalest`] and deliberately quieter than it:
+    /// eviction takes a slot from a flow that had not asked to give it up, and
+    /// says so; this gives back a slot the connection no longer wants. The
+    /// silence is the point — an orderly close happens about every 1.7 s, and a
+    /// line per connection would bury the eviction warning that is now the
+    /// signal something is wrong.
+    ///
+    /// The one loud case is an abort that stranded bytes. Those were received
+    /// and charged, they are discarded here undelivered, and the gap in front of
+    /// them can never be filled: same shape as [`ResyncCause::StreamEvicted`],
+    /// different cause, because the stream table had nothing to do with it.
+    fn retire(&mut self, key: &FlowKey, retirement: Retirement, budget: &PipelineBudget) {
+        let retired = self
+            .streams
+            .remove(key)
+            .expect("the flow was just pushed into through this same key");
+        let delivered_bytes = retired.next_off;
+        let stranded_bytes = retired.pending_bytes;
+        // Before the snapshot below, so the pool total it prints is the one that
+        // already has these bytes back — the rule `warn_stream_evicted` follows.
+        drop(retired);
+        match retirement {
+            Retirement::Closed => {}
+            Retirement::Aborted => {
+                if stranded_bytes > 0 {
+                    budget.record_resync(ResyncCause::ConnectionReset);
+                    warn_connection_reset(
+                        budget,
+                        key.client.port(),
+                        delivered_bytes,
+                        stranded_bytes,
+                    );
+                }
+            }
+        }
     }
 
     /// Resets all state so each flow re-anchors on its next segment. Used
@@ -246,6 +399,27 @@ impl Reassembler {
     pub fn clear(&mut self) {
         self.streams.clear();
     }
+}
+
+/// Whether a segment is nothing but the end of a connection — no bytes, and no
+/// SYN to anchor with. The only shape [`Reassembler::push_budgeted`] refuses to
+/// create a stream entry for.
+fn is_bare_close(segment: &BudgetedSegment) -> bool {
+    (segment.fin || segment.rst) && !segment.syn && segment.payload().is_empty()
+}
+
+/// How a tracked flow's connection ended, once [`HalfStream`] can say the flow
+/// is safe to drop.
+#[derive(Clone, Copy)]
+enum Retirement {
+    /// FIN, with delivery contiguous through its sequence position and nothing
+    /// buffered: every byte the server sent has gone downstream in order, and no
+    /// later segment on this connection can exist.
+    Closed,
+    /// RST at the next expected byte. The connection is over whatever state the
+    /// flow was in, so it goes — but unlike a close this promises nothing about
+    /// what had been delivered.
+    Aborted,
 }
 
 /// The captured (server-to-client) half of a connection, in relative offsets.
@@ -261,10 +435,27 @@ struct HalfStream {
     /// Buffered future segments, keyed by offset (monotonic order, no wrap).
     pending: BTreeMap<i64, BudgetedChunk>,
     pending_bytes: usize,
+    /// Offset of the sequence number the FIN occupies — one past the server's
+    /// last byte — once one has been seen.
+    ///
+    /// First writer wins, as `syn_seq` does: a retransmitted FIN names the same
+    /// position, and a *different* one would mean a new incarnation, which only
+    /// a SYN is allowed to declare here.
+    fin_off: Option<i64>,
+    /// An in-sequence RST was seen. Not an offset, because unlike a FIN there is
+    /// nothing to wait to reach: an abort is effective where it lands.
+    reset: bool,
 }
 
 impl HalfStream {
-    fn push(&mut self, seq: u32, syn: bool, payload: BudgetedChunk) -> HalfOutcome {
+    fn push(
+        &mut self,
+        seq: u32,
+        syn: bool,
+        fin: bool,
+        rst: bool,
+        payload: BudgetedChunk,
+    ) -> HalfOutcome {
         // Before `baseline`: `syn_starts_new_incarnation` reads both to tell a
         // retransmitted SYN from a fresh incarnation.
         if syn {
@@ -279,6 +470,17 @@ impl HalfStream {
         let expected_seq = self.expected_seq();
         let offset = self.next_off + seq_diff(data_seq, expected_seq);
 
+        // Both read `offset` and `next_off` as they stand *before* the absorb
+        // below moves either. FIN sits one past this segment's own bytes,
+        // wherever those land; RST is accepted only where the stream is
+        // currently expecting a byte — see `Reassembler::push_budgeted` on RFC
+        // 5961 §3.2 and why a passive tap owes itself that test.
+        if fin {
+            self.fin_off
+                .get_or_insert(offset + payload.as_slice().len() as i64);
+        }
+        self.reset |= rst && offset == self.next_off;
+
         // `with_capacity(1)`: `Vec::new()`'s first `push` of a 48-byte element
         // jumps to capacity 4. `SmallVec` was declined — a dependency, plus 48
         // bytes inlined into two by-value returns per packet, for a malloc
@@ -291,6 +493,35 @@ impl HalfStream {
             return HalfOutcome::Pressure(cause);
         }
         HalfOutcome::Chunks(out)
+    }
+
+    /// Whether this flow can be dropped now, and on what grounds.
+    ///
+    /// The FIN arm insists on both halves of "nothing is left", and they cover
+    /// different failures.
+    ///
+    /// `next_off >= at` is the one that stops a FIN overtaking a gap: while a
+    /// hole in front of the FIN is still open, delivery has not reached the
+    /// FIN's position, and the flow keeps both its slot and the bytes buffered
+    /// past that hole. Tearing the half-stream down where the FIN *arrives*
+    /// would discard them silently, which is the one way retiring flows could
+    /// cost a shop refresh.
+    ///
+    /// `pending.is_empty()` covers what the first test cannot see — a segment
+    /// buffered *past* the FIN, which leaves delivery contiguous through the FIN
+    /// and bytes held all the same. No well-behaved server sends one, and this
+    /// module does not get to assume it is talking to one: capture is port-wide,
+    /// and a segment that parses is a segment that lands here.
+    ///
+    /// An abort answers before either test, and deliberately: it is true whether
+    /// or not the stream is whole, and [`Reassembler::retire`] is where what that
+    /// cost is decided.
+    fn retirement(&self) -> Option<Retirement> {
+        if self.reset {
+            return Some(Retirement::Aborted);
+        }
+        let closed = self.fin_off.is_some_and(|at| self.next_off >= at) && self.pending.is_empty();
+        closed.then_some(Retirement::Closed)
     }
 
     /// Integrates one segment: in order (append), future (buffer), or old (trim).
@@ -415,6 +646,7 @@ fn warn_reassembly_pressure(budget: &PipelineBudget, cause: PressureCause) {
     };
     warn!(
         scope,
+        cause = cause.resync_cause().label(),
         current_total = stats.current_total,
         capture_bytes = stats.current_capture,
         pending_bytes = stats.current_reassembly,
@@ -426,6 +658,61 @@ fn warn_reassembly_pressure(budget: &PipelineBudget, cause: PressureCause) {
     );
 }
 
+/// What one eviction cost: the [`ResyncCause`] the counters see, and the wording
+/// the warning prints.
+///
+/// One value with two readers, because they were two readings of one fact and
+/// the fact was decided twice. The cause was hard-coded at the call site and the
+/// wording derived from `pending_bytes` a line later inside the warning — so the
+/// log could say "nothing had been delivered from it" while the counter recorded
+/// the same fault a lost shop refresh records. Now the call site cannot name a
+/// cause the warning contradicts, because there is only one place that decides.
+struct EvictionLoss {
+    cause: ResyncCause,
+    detail: &'static str,
+}
+
+impl EvictionLoss {
+    /// Bytes lost, or only a position forgotten.
+    ///
+    /// `pending` is the only field of a [`HalfStream`] holding bytes. With it
+    /// empty, everything this flow ever received has already gone downstream in
+    /// order; what the eviction discards is `baseline` and `next_off`, which is
+    /// the ability to recognise a *future* arrival as history or as out of order.
+    /// That cost only lands if the flow speaks again, and when it does the result
+    /// is the immediate suffix that
+    /// `every_arrival_order_yields_the_immediate_suffix_of_the_stream` pins as
+    /// this reassembler's defined behaviour on any fresh anchor — not damage. So
+    /// `next_off > 0` with nothing pending is [`ResyncTier::Housekeeping`]: the
+    /// decoder re-anchors, and no byte was thrown away for it to re-anchor over.
+    ///
+    /// `pending_bytes > 0` is different in kind, not in degree. Those bytes were
+    /// received, charged against the reassembly quota, and are dropped here
+    /// undelivered; the gap in front of them is now permanent, and no later
+    /// segment can supply what was behind it.
+    ///
+    /// [`ResyncTier::Housekeeping`]: super::ResyncTier::Housekeeping
+    fn of(evicted: &HalfStream) -> Self {
+        if evicted.pending_bytes > 0 {
+            Self {
+                cause: ResyncCause::StreamEvicted,
+                detail: "a flow buffering behind a gap; its half-received message is gone",
+            }
+        } else if evicted.next_off > 0 {
+            Self {
+                cause: ResyncCause::StreamReclaimed,
+                detail: "a flow mid-stream with an empty buffer; its decoder re-anchors on the \
+                         next segment, having lost no byte",
+            }
+        } else {
+            Self {
+                cause: ResyncCause::StreamReclaimed,
+                detail: "a flow that had only anchored; nothing had been delivered from it",
+            }
+        }
+    }
+}
+
 /// The rare branch of [`Reassembler::evict_stalest`], out of line like
 /// [`warn_reassembly_pressure`].
 ///
@@ -435,32 +722,75 @@ fn warn_reassembly_pressure(budget: &PipelineBudget, cause: PressureCause) {
 /// and [`Reassembler::push_budgeted`] states the rule; counting the discarded
 /// gap buffer would make `dropped_segments` mean one thing under quota pressure
 /// and another under table pressure, so its bytes go in the warning instead.
+///
+/// Still `warn!` for the reclaimed case, which is not a fault: the counters stop
+/// calling it one, and this line is the only instrument that can tell whether the
+/// explanation for the churn is right.
+///
+/// `client_port` and not the client address, on `capture::pcap`'s precedent in
+/// the "first server-to-client segment admitted" line: on IPv6 the address is the
+/// player's globally routable one, in a file they may be asked to email. It is
+/// here to settle what `segments_since_active` means — it read 442 on all 46
+/// lines of the session [`Reassembler::evict_stalest`] describes, and
+/// steady-state churn of dead clones predicts
+/// exactly that, since one ~7-segment connection every ~1.7 s against 64 slots
+/// makes the stalest entry always the flow from 64 periods ago. Distinct ports
+/// across the lines confirm that reading; a port that repeats means something is
+/// minting the same key again and the explanation is wrong.
 #[cold]
 #[inline(never)]
-fn warn_stream_evicted(budget: &PipelineBudget, evicted: HalfStream, segments_since_active: u64) {
-    // In the counters, an eviction that cost a shop refresh and one that
-    // discarded a flow which never delivered a byte are the same event.
-    let loss = if evicted.pending_bytes > 0 {
-        "a flow buffering behind a gap; its half-received message is gone"
-    } else if evicted.next_off > 0 {
-        "a flow mid-stream; its decoder resyncs on the next segment"
-    } else {
-        "a flow that had only anchored; nothing had been delivered from it"
-    };
+fn warn_stream_evicted(
+    budget: &PipelineBudget,
+    loss: EvictionLoss,
+    evicted: HalfStream,
+    client_port: u16,
+    segments_since_active: u64,
+) {
     let delivered_bytes = evicted.next_off;
     let buffered_bytes = evicted.pending_bytes;
     drop(evicted);
     let stats = budget.snapshot();
     warn!(
-        loss,
+        loss = loss.detail,
+        cause = loss.cause.label(),
         stream_cap = MAX_STREAMS,
+        client_port,
         segments_since_active,
         delivered_bytes,
         buffered_bytes,
         pending_bytes = stats.current_reassembly,
         resyncs = stats.resyncs,
-        "stream table full: other flows on the capture port crowded out the stalest one, \
-         which must re-anchor"
+        "stream table full: the stalest flow lost its slot to a new connection and must re-anchor"
+    );
+}
+
+/// The rare branch of [`Reassembler::retire`] — the only one of the two
+/// retirements that costs anything — out of line like [`warn_stream_evicted`].
+///
+/// Takes the two byte counts rather than the stream, unlike that function: the
+/// flow is already dropped by the time this is called, which is what makes
+/// `pending_bytes` below the pool total *after* the stranded bytes came back.
+///
+/// `client_port` and not the client address, on the precedent both that function
+/// and `capture::pcap`'s "first server-to-client segment admitted" line set.
+#[cold]
+#[inline(never)]
+fn warn_connection_reset(
+    budget: &PipelineBudget,
+    client_port: u16,
+    delivered_bytes: i64,
+    stranded_bytes: usize,
+) {
+    let stats = budget.snapshot();
+    warn!(
+        cause = ResyncCause::ConnectionReset.label(),
+        client_port,
+        delivered_bytes,
+        stranded_bytes,
+        pending_bytes = stats.current_reassembly,
+        resyncs = stats.resyncs,
+        "the server aborted a connection that was still holding bytes behind a gap; \
+         nothing will retransmit them"
     );
 }
 
@@ -478,6 +808,23 @@ enum PressureCause {
     Stream,
     /// The reassembly stage's shared quota is full, whoever holds it.
     Shared,
+}
+
+impl PressureCause {
+    /// The same distinction in the counters' vocabulary.
+    ///
+    /// Two enums rather than one because they answer different questions:
+    /// this one sizes the *recovery* (reset one stream, or all of them), and
+    /// [`ResyncCause`] names the *reason* for a reader who will never see this
+    /// function. They happen to be parallel today; nothing requires them to
+    /// stay that way, and folding them together would make the recovery
+    /// policy hostage to the vocabulary a window renders.
+    const fn resync_cause(self) -> ResyncCause {
+        match self {
+            Self::Stream => ResyncCause::ReassemblyStream,
+            Self::Shared => ResyncCause::ReassemblyShared,
+        }
+    }
 }
 
 enum HalfOutcome {
@@ -531,6 +878,8 @@ mod tests {
             flow,
             seq,
             syn,
+            fin: false,
+            rst: false,
             payload: Vec::from(payload),
         }
     }
@@ -541,6 +890,23 @@ mod tests {
 
     fn seg_on(flow: FlowKey, seq: u32, payload: &[u8]) -> Segment {
         seg_in(flow, seq, false, payload)
+    }
+
+    /// The orderly close: the FIN sits at `seq`, optionally carrying the last
+    /// bytes of the stream ahead of it.
+    fn fin_on(flow: FlowKey, seq: u32, payload: &[u8]) -> Segment {
+        Segment {
+            fin: true,
+            ..seg_in(flow, seq, false, payload)
+        }
+    }
+
+    /// The abort.
+    fn rst_on(flow: FlowKey, seq: u32) -> Segment {
+        Segment {
+            rst: true,
+            ..seg_in(flow, seq, false, b"")
+        }
     }
 
     fn flatten_half(outcome: HalfOutcome) -> Vec<u8> {
@@ -1050,13 +1416,16 @@ mod tests {
             .admit_capture(seg(expected, false, b"AB"))
             .unwrap()
             .into_payload();
-        assert_eq!(flatten_half(half.push(expected, false, first)), b"AB");
+        assert_eq!(
+            flatten_half(half.push(expected, false, false, false, first)),
+            b"AB"
+        );
         let second = budget
             .admit_capture(seg(expected.wrapping_add(2), false, b"CD"))
             .unwrap()
             .into_payload();
         assert_eq!(
-            flatten_half(half.push(expected.wrapping_add(2), false, second)),
+            flatten_half(half.push(expected.wrapping_add(2), false, false, false, second)),
             b"CD"
         );
     }
@@ -1084,11 +1453,11 @@ mod tests {
         assert!(r.streams.contains_key(&hot));
     }
 
-    /// The eviction path end to end: the game's flow goes quiet mid-message, as
-    /// it does between shop refreshes, while foreign flows on the same port fill
-    /// the table, so staleness picks the game's own stream. It re-anchors either
-    /// way; the point is that the loss is *counted*, on the same `resyncs`
-    /// number the pressure arm uses.
+    /// The eviction path end to end, for the case that costs bytes: a flow is
+    /// mid-message with a segment buffered behind a gap when the table fills, so
+    /// those bytes are discarded undelivered. The point is that the loss is
+    /// *counted*, and counted as a fault, on the same `resyncs` number the
+    /// pressure arm uses.
     ///
     /// Uses `push_budgeted` against one shared budget: the `push` helper mints a
     /// throwaway `PipelineBudget` per call and would read zero counters.
@@ -1122,6 +1491,11 @@ mod tests {
             1,
             "an evicted stream lost its anchor and must be counted like every other anchor loss"
         );
+        assert_eq!(
+            budget.snapshot().dominant_resync(),
+            Some(ResyncCause::StreamEvicted),
+            "buffered bytes were discarded undelivered, so this is a fault and must name itself"
+        );
         // Pinned so it stays declined: nothing was *refused* here — the segment
         // that triggered the eviction was admitted — and `push_budgeted` rules
         // that chunks a recovery throws away are collateral, not extra
@@ -1132,6 +1506,341 @@ mod tests {
 
         assert_eq!(push(&mut reassembler, seg_on(game, 9000, b"ZZ")), b"ZZ");
         drop(reassembler);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// The defect, at the layer that decides it: an eviction that discarded no
+    /// byte must not reach the player's verdict.
+    ///
+    /// Both shapes of it, because both are the same cause and only one of them
+    /// is obvious. `delivered` has handed every byte it received downstream, in
+    /// order, with nothing buffered — it loses `baseline` and `next_off`, which
+    /// is a position, not data — and `anchored` never delivered anything at all.
+    /// This was the observed regime, back when `parse_segment` discarded FIN and
+    /// RST and the table filled with the game's own closed connections: a
+    /// patched build logged 46 evictions in ~90 s with `buffered_bytes=0` on
+    /// every line. Retiring a flow on its close took that source away
+    /// (`repeated_short_connections_leave_the_table_empty_instead_of_full`), so
+    /// what this pins is the classification and not a rate — the flows that
+    /// still reach eviction are the ones whose end never arrived, and they are
+    /// still not faults.
+    #[test]
+    fn evicting_a_flow_that_lost_no_byte_is_counted_but_is_not_a_fault() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let delivered = flow_from(50_000);
+        let anchored = flow_from(50_001);
+
+        assert_eq!(
+            push(&mut reassembler, seg_on(delivered, 1000, b"AB")),
+            b"AB"
+        );
+        assert!(push(&mut reassembler, seg_in(anchored, 999, true, b"")).is_empty());
+        assert_eq!(budget.snapshot().current_reassembly, 0);
+
+        // Newcomers fill the table; the two stalest entries are the two above.
+        for port in 1..=(MAX_STREAMS as u16) {
+            push(&mut reassembler, seg_on(flow_from(port), 1000, b"XY"));
+        }
+
+        assert_eq!(reassembler.streams.len(), MAX_STREAMS);
+        for evicted in [delivered, anchored] {
+            assert!(
+                !reassembler.streams.contains_key(&evicted),
+                "the two quiet flows are the stalest, so this test must be evicting them"
+            );
+        }
+
+        let stats = budget.snapshot();
+        assert_eq!(
+            stats.resyncs_by_cause[ResyncCause::StreamReclaimed.index()],
+            2,
+            "both are real events and both deserve a number"
+        );
+        assert_eq!(
+            stats.resyncs_by_cause[ResyncCause::StreamEvicted.index()],
+            0,
+            "neither discarded a byte, so neither may be counted as a loss"
+        );
+        assert_eq!(
+            stats.dominant_resync(),
+            None,
+            "nothing was lost, so the run has no fault to name"
+        );
+        assert_eq!(stats.dropped_segments, 0);
+
+        drop(reassembler);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// The orderly close, end to end: the flow gives its slot back the moment
+    /// the FIN's own sequence position has been delivered through, and does it
+    /// without recording a re-anchor — nothing re-anchored, the connection ended.
+    #[test]
+    fn a_flow_gives_its_slot_back_once_delivery_reaches_the_fin() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let game = flow();
+
+        assert_eq!(push(&mut reassembler, seg_on(game, 1000, b"AB")), b"AB");
+        assert_eq!(reassembler.streams.len(), 1);
+        // The last bytes and the FIN in one segment, which is the ordinary shape.
+        assert_eq!(push(&mut reassembler, fin_on(game, 1002, b"CD")), b"CD");
+
+        assert!(
+            reassembler.streams.is_empty(),
+            "a connection that has ended must not keep a slot in the table"
+        );
+        assert_eq!(
+            budget.snapshot().resyncs,
+            0,
+            "a flow that delivered everything and then closed did not re-anchor"
+        );
+        assert_eq!(budget.snapshot().dropped_segments, 0);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// The one way retiring flows could silently cost a shop refresh: a FIN that
+    /// overtakes a gap, with a segment already buffered behind it.
+    ///
+    /// It must not tear the half-stream down where it lands. The flow stays,
+    /// still holding those bytes and still charged for them, until the gap fills
+    /// — and *then* retires, having delivered every one of them in order.
+    #[test]
+    fn a_fin_that_overtakes_a_gap_does_not_discard_the_bytes_behind_it() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let game = flow();
+
+        assert_eq!(push(&mut reassembler, seg_on(game, 1000, b"AB")), b"AB");
+        assert!(push(&mut reassembler, seg_on(game, 1004, b"EF")).is_empty());
+        assert!(budget.snapshot().current_reassembly > 0, "EF is buffered");
+
+        // The close arrives while 1002..1004 is still missing.
+        assert!(push(&mut reassembler, fin_on(game, 1006, b"")).is_empty());
+        assert!(
+            reassembler.streams.contains_key(&game),
+            "the flow still owes bytes it received, so the FIN may not retire it"
+        );
+        assert!(
+            budget.snapshot().current_reassembly > 0,
+            "and those bytes must still be held, not quietly dropped"
+        );
+
+        // The gap fills, everything comes out in order, and only now is the flow
+        // over.
+        assert_eq!(push(&mut reassembler, seg_on(game, 1002, b"CD")), b"CDEF");
+        assert!(reassembler.streams.is_empty());
+        assert_eq!(budget.snapshot().resyncs, 0);
+        assert_eq!(budget.snapshot().dropped_segments, 0);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// The other half of the same rule, for the shape this code does not get to
+    /// rule out: a segment buffered *past* the FIN, which no well-behaved server
+    /// sends but the game's port is open to anyone.
+    ///
+    /// Delivery has reached the FIN, so the first half of the retirement test is
+    /// satisfied and only "nothing is buffered" holds the flow back. It must
+    /// hold it back: those bytes were received and charged, and a retirement is
+    /// not allowed to discard bytes silently — the eviction path exists to
+    /// account for that, and this one does not.
+    #[test]
+    fn a_fin_does_not_retire_a_flow_still_holding_bytes_past_it() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let game = flow();
+
+        assert_eq!(push(&mut reassembler, seg_on(game, 1000, b"AB")), b"AB");
+        assert!(push(&mut reassembler, seg_on(game, 1010, b"ZZ")).is_empty());
+        assert!(push(&mut reassembler, fin_on(game, 1002, b"")).is_empty());
+
+        assert!(
+            reassembler.streams.contains_key(&game),
+            "bytes this pipeline holds may not vanish with the flow that holds them"
+        );
+        assert!(budget.snapshot().current_reassembly > 0);
+        assert_eq!(budget.snapshot().resyncs, 0);
+        drop(reassembler);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// An abort is not a close. It retires the flow whatever state it was in —
+    /// an aborted connection can never deliver another byte, so its slot is dead
+    /// weight — and when that state included a segment behind a gap, those bytes
+    /// are gone and the run is told so.
+    #[test]
+    fn an_abort_retires_the_flow_and_counts_the_bytes_it_stranded() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let game = flow();
+
+        assert_eq!(push(&mut reassembler, seg_on(game, 1000, b"AB")), b"AB");
+        assert!(push(&mut reassembler, seg_on(game, 1004, b"EF")).is_empty());
+
+        assert!(push(&mut reassembler, rst_on(game, 1002)).is_empty());
+
+        assert!(reassembler.streams.is_empty());
+        let stats = budget.snapshot();
+        assert_eq!(
+            stats.resyncs_by_cause[ResyncCause::ConnectionReset.index()],
+            1
+        );
+        assert_eq!(
+            stats.dominant_resync(),
+            Some(ResyncCause::ConnectionReset),
+            "received bytes were discarded undelivered, so this is a fault and must name itself"
+        );
+        assert_eq!(
+            stats.resyncs_by_cause[ResyncCause::StreamEvicted.index()],
+            0,
+            "the stream table had nothing to do with this and must not be blamed for it"
+        );
+        // Nothing was *refused*, so the rule `push_budgeted` states holds here too.
+        assert_eq!(stats.dropped_segments, 0);
+        assert_eq!(stats.current_reassembly, 0, "the stranded lease came back");
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// The ordinary abort — one with nothing outstanding — costs the run
+    /// nothing, and is counted as nothing, exactly like an orderly close.
+    #[test]
+    fn an_abort_with_nothing_outstanding_is_counted_as_nothing() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+        let game = flow();
+
+        assert_eq!(push(&mut reassembler, seg_on(game, 1000, b"AB")), b"AB");
+        assert!(push(&mut reassembler, rst_on(game, 1002)).is_empty());
+
+        assert!(reassembler.streams.is_empty());
+        assert_eq!(budget.snapshot().resyncs, 0);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// An RST anywhere but the next expected byte is ignored, and the flow it
+    /// named carries on. A passive tap can check nothing else about a segment,
+    /// and an off-window RST is what an off-path attacker forges at a connection
+    /// they cannot read — the test RFC 5961 §3.2 tightened real receivers to.
+    #[test]
+    fn a_reset_away_from_the_next_expected_byte_is_ignored() {
+        let mut reassembler = Reassembler::new();
+        let game = flow();
+        assert_eq!(reassembler.push(&seg_on(game, 1000, b"AB")), b"AB");
+
+        // Ahead of the stream, then behind it. Neither is where the server
+        // could be aborting.
+        assert!(reassembler.push(&rst_on(game, 1010)).is_empty());
+        assert!(reassembler.push(&rst_on(game, 1000)).is_empty());
+
+        assert!(
+            reassembler.streams.contains_key(&game),
+            "an out-of-window reset must not tear down a live flow"
+        );
+        assert_eq!(
+            reassembler.push(&seg_on(game, 1002, b"CD")),
+            b"CD",
+            "and the flow must still know where it was"
+        );
+    }
+
+    /// A close for a flow nothing is tracking is not a reason to track one.
+    ///
+    /// Two failures it rules out: anchoring a baseline on a connection already
+    /// over, and — the expensive one — evicting a live flow to make room for an
+    /// entry that would be retired on the very next line.
+    #[test]
+    fn a_close_for_an_untracked_flow_neither_anchors_nor_evicts() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+
+        assert!(push(&mut reassembler, fin_on(flow(), 1000, b"")).is_empty());
+        assert!(push(&mut reassembler, rst_on(flow(), 1000)).is_empty());
+        assert!(reassembler.streams.is_empty());
+
+        // A full table of live flows, then a stranger's close.
+        for port in 1..=(MAX_STREAMS as u16) {
+            push(&mut reassembler, seg_on(flow_from(port), 1000, b"XY"));
+        }
+        assert_eq!(reassembler.streams.len(), MAX_STREAMS);
+        assert!(push(&mut reassembler, fin_on(flow_from(9000), 1000, b"")).is_empty());
+
+        assert_eq!(reassembler.streams.len(), MAX_STREAMS);
+        assert_eq!(
+            budget.snapshot().resyncs,
+            0,
+            "nothing may lose its anchor to a flow that was never going to exist"
+        );
+        drop(reassembler);
+        assert_eq!(budget.snapshot().current_total, 0);
+    }
+
+    /// The field scenario, which is the whole point of retiring flows: the game
+    /// opens a short connection roughly every 1.7 s — ~7 segments each — and
+    /// used to leave every one of them in the table. Sixty-four slots filled in
+    /// about two minutes, and from then on every new connection evicted one: 46
+    /// evictions in ~90 s, on a run in which nothing was wrong.
+    ///
+    /// Four times `MAX_STREAMS` connections here, so a table that still filled
+    /// would have overflowed three times over.
+    #[test]
+    fn repeated_short_connections_leave_the_table_empty_instead_of_full() {
+        let budget = PipelineBudget::new();
+        let mut reassembler = Reassembler::new();
+        let push = |reassembler: &mut Reassembler, segment: Segment| {
+            flatten_chunks(reassembler.push_budgeted(budget.admit_capture(segment).unwrap()))
+        };
+
+        for connection in 0..(MAX_STREAMS as u16 * 4) {
+            // A fresh ephemeral client port each time, as a real reconnection
+            // has: the same key would be reused rather than accumulate.
+            let flow = flow_from(51_000u16.wrapping_add(connection));
+            let base = 1_000_u32.wrapping_add(u32::from(connection) * 10_000);
+            // SYN-ACK, six data segments, FIN — the ~7 segments measured.
+            assert!(push(&mut reassembler, seg_in(flow, base, true, b"")).is_empty());
+            for index in 0..6u32 {
+                let seq = base.wrapping_add(1 + index * 2);
+                assert_eq!(push(&mut reassembler, seg_on(flow, seq, b"AB")), b"AB");
+            }
+            assert!(push(&mut reassembler, fin_on(flow, base.wrapping_add(13), b"")).is_empty());
+            assert!(
+                reassembler.streams.is_empty(),
+                "connection {connection} was closed and must not still hold a slot"
+            );
+        }
+
+        let stats = budget.snapshot();
+        assert_eq!(
+            stats.resyncs, 0,
+            "256 clean connections cost this run nothing; they used to cost it a re-anchor each"
+        );
+        assert_eq!(
+            stats.resyncs_by_cause[ResyncCause::StreamReclaimed.index()],
+            0,
+            "no flow was crowded out, because none of them was still there to crowd"
+        );
+        assert_eq!(stats.dominant_resync(), None);
         assert_eq!(budget.snapshot().current_total, 0);
     }
 
