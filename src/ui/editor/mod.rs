@@ -887,6 +887,163 @@ mod tests {
         assert!(icon < 56.0, "the icon chip should be chip-sized: {icon}");
     }
 
+    /// The gear sets a live `catalog` message carries, at their real lengths.
+    const LIVE_SETS: [&str; 24] = [
+        "Attack Set",
+        "Health Set",
+        "Defense Set",
+        "Critical Set",
+        "Hit Set",
+        "Resist Set",
+        "Speed Set",
+        "Destruction Set",
+        "Lifesteal Set",
+        "Counter Set",
+        "Unity Set",
+        "Immunity Set",
+        "Rage Set",
+        "Revenge Set",
+        "Injury Set",
+        "Penetration Set",
+        "Protection Set",
+        "Torrent Set",
+        "Reversal Set",
+        "Riposte Set",
+        "Warfare Set",
+        "Pursuit Set",
+        "Scar Set",
+        "Slaughter Set",
+    ];
+
+    /// The live set list as a vocabulary, given the field to put it in.
+    ///
+    /// No icons, which is the shape the window has before the server has
+    /// published a picture for any set — so every chip takes `choice_list`'s
+    /// text-checkbox branch, the one the reported screenshot was drawn from.
+    fn chip_row_editor(field: impl Fn(&mut FilterVocabulary, Vec<VocabularyEntry>)) -> EditorState {
+        let mut editor = EditorState::new(
+            Filter::default(),
+            Limits::default(),
+            Timings::default(),
+            ClickMode::default(),
+        );
+        let mut vocabulary = FilterVocabulary::default();
+        field(
+            &mut vocabulary,
+            LIVE_SETS
+                .iter()
+                .map(|label| entry(&label.to_lowercase().replace(' ', "_"), label))
+                .collect(),
+        );
+        let cell = VocabularyCell::new();
+        cell.set(vocabulary);
+        editor.sync_vocabulary(&cell);
+        editor
+    }
+
+    /// The labels a chip row laid out past the window's right edge.
+    fn overflowing_chips(harness: &Harness<'_>) -> Vec<String> {
+        LIVE_SETS
+            .iter()
+            .map(|label| (label, chip_right_edge(harness, label)))
+            .filter(|(_, right)| *right > f64::from(crate::ui::WINDOW_WIDTH))
+            .map(|(label, right)| format!("{label} ends at {right:.0}"))
+            .collect()
+    }
+
+    /// The whole set list has to fit the window's fixed width, and the only way
+    /// twenty-four chips do that is by wrapping.
+    ///
+    /// The assertion is the RIGHT EDGE of every chip and deliberately not the
+    /// row's height, which the bug it pins would satisfy: laid out on one line,
+    /// the fifth chip got the few pixels left before the edge and broke "Hit
+    /// Set" one letter per line, so the broken row measured 225px tall — MORE
+    /// than the six wrapped rows it should have been, and a "several lines high"
+    /// test would have passed on it. Measured before the fix, at
+    /// `WINDOW_WIDTH` = 440: chips ran unbroken to x=1070.
+    #[test]
+    fn every_set_chip_stays_inside_the_window() {
+        let mut editor = chip_row_editor(|vocabulary, sets| vocabulary.sets = sets);
+        let overflowing = overflowing_chips(&draw_setup(&mut editor));
+        assert!(
+            overflowing.is_empty(),
+            "the sets row laid out past the window instead of wrapping: {overflowing:?}"
+        );
+    }
+
+    /// `substat_chips` is the second reader of that layout and carried the same
+    /// defect, which is why the fix is not a one-liner in `choice_list`.
+    ///
+    /// The list is the SETS one because it is the only chip census taken off a
+    /// live catalog: what this asks is whether a wrapped chip row wraps, and
+    /// the answer must not depend on which criterion is drawing it. On the real
+    /// eleven substats the row was less spectacular and still wrong — measured
+    /// at x=608 against the window's 440.
+    #[test]
+    fn every_substat_chip_stays_inside_the_window() {
+        let mut editor = chip_row_editor(|vocabulary, sets| vocabulary.substats = sets);
+        let overflowing = overflowing_chips(&draw_setup(&mut editor));
+        assert!(
+            overflowing.is_empty(),
+            "the substats row laid out past the window instead of wrapping: {overflowing:?}"
+        );
+    }
+
+    /// Two criteria offering the very same value keep two controls, which is
+    /// what the id salt on each chip row is for — one shared id would collapse
+    /// them into a single node, leaving a criterion invisible and untickable.
+    ///
+    /// It is stated as behaviour rather than as ids because the guard moved:
+    /// the salt used to sit on each chip, where it cost the wrap above.
+    #[test]
+    fn two_rows_offering_the_same_value_keep_their_own_chips() {
+        let mut editor = EditorState::new(
+            Filter::default(),
+            Limits::default(),
+            Timings::default(),
+            ClickMode::default(),
+        );
+        let cell = VocabularyCell::new();
+        // Same id AND same label on both rows: the worst case for a chip keyed
+        // by what it offers.
+        cell.set(FilterVocabulary {
+            sets: vec![entry("speed", "Speed")],
+            slots: vec![entry("speed", "Speed")],
+            ..FilterVocabulary::default()
+        });
+        editor.sync_vocabulary(&cell);
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.run();
+        assert_eq!(
+            harness.get_all_by_label("Speed").count(),
+            2,
+            "each row should own its chip"
+        );
+        // And they are two controls and not one drawn twice: ticking the first
+        // writes the set criterion and leaves the slot one alone.
+        harness
+            .get_all_by_label("Speed")
+            .next()
+            .expect("the sets chip")
+            .click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.sets, vec!["speed".to_owned()]);
+        assert!(editor.filter.slots.is_empty());
+    }
+
+    /// The right-hand edge of the control a label names.
+    fn chip_right_edge(harness: &Harness<'_>, label: &str) -> f64 {
+        harness
+            .get_by_label(label)
+            .accesskit_node()
+            .bounding_box()
+            .expect("egui gives every node its bounds")
+            .x1
+    }
+
     /// The on-screen width of the control a label names.
     fn chip_width(harness: &Harness<'_>, label: &str) -> f64 {
         harness

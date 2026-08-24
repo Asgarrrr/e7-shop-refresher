@@ -14,9 +14,10 @@ use crate::uplink::protocol::{TokenEntry, VocabularyEntry};
 ///
 /// A width decision before a visual one: `main.rs` pins the window to
 /// [`crate::ui::WINDOW_WIDTH`] as both its minimum and its maximum inner size,
-/// so the twenty-two set chips have ~408px to wrap into and no player can widen
-/// them out of it. Labelled, they take eight rows; at this size, three. The wire
-/// icons are 44px, so this is a downscale and never an upscale.
+/// so the twenty-four set chips have ~408px to wrap into and no player can
+/// widen them out of it. Measured on the live list at that width, now that they
+/// wrap at all: labelled they take six rows, at this size three. The wire icons
+/// are 44px, so this is a downscale and never an upscale.
 const SET_ICON: f32 = 32.0;
 
 /// The floors the substat control offers, low to high.
@@ -145,7 +146,7 @@ fn remove_button(ui: &mut egui::Ui) -> egui::Response {
 ///
 /// It matches the `kinds` row `hunt_body` already draws, so a criterion the
 /// server can enumerate looks like every other closed choice in the section.
-/// Wrapped, because the sets list runs to twenty-two entries.
+/// Wrapped, because the sets list runs to twenty-four entries.
 ///
 /// `icons` is what turns a value into [`icon_chip`] instead: a picture where the
 /// server sent one, the checkbox everywhere else. It is a source and not a flag
@@ -161,27 +162,39 @@ pub(super) fn choice_list(
     icons: &SetIcons,
 ) {
     ui.label(label);
-    ui.horizontal_wrapped(|ui| {
-        for entry in choices {
-            let mut on = values.contains(&entry.id);
-            // Salted with `label`: two criteria can offer the same words, and
-            // `push_id` salts the parent `Ui`, which every list here shares.
-            let changed = ui
-                .push_id(egui::Id::new((label, &entry.id)), |ui| {
-                    match icons.get(&entry.id) {
-                        Some(texture) => icon_chip(ui, texture, &entry.label, &mut on),
-                        None => ui.checkbox(&mut on, &entry.label).changed(),
+    // The salt sits on the ROW and never on a chip, and that placement is the
+    // whole of this function's layout. `push_id` builds a child `Ui` off
+    // `available_rect_before_wrap` and closes it with `advance_cursor_after_rect`;
+    // neither reaches `Layout::next_frame`, which is where `main_wrap` lives, so
+    // a chip drawn inside one is invisible to the wrap and simply takes whatever
+    // the cursor has left. Measured on the live 24-set catalog at the window's
+    // fixed 440px, with the salt still per chip: all twenty-four laid out on ONE
+    // row out to x=1070, the fifth squeezed into the pixels before the edge with
+    // its label broken one letter per line, and nineteen off-screen.
+    //
+    // Chips are therefore added straight to the wrapping `Ui`, whose own auto-id
+    // counter makes them distinct by construction. What the salt still buys is a
+    // row named rather than counted: `offered_list` draws a chip row or a
+    // free-text list depending on what the server published, so the draw order
+    // the default `Ui` id folds in is not a constant, and two criteria can offer
+    // the same words.
+    ui.push_id(label, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for entry in choices {
+                let mut on = values.contains(&entry.id);
+                let changed = match icons.get(&entry.id) {
+                    Some(texture) => icon_chip(ui, texture, &entry.label, &mut on),
+                    None => ui.checkbox(&mut on, &entry.label).changed(),
+                };
+                if changed {
+                    if on {
+                        values.push(entry.id.clone());
+                    } else {
+                        values.retain(|kept| *kept != entry.id);
                     }
-                })
-                .inner;
-            if changed {
-                if on {
-                    values.push(entry.id.clone());
-                } else {
-                    values.retain(|kept| *kept != entry.id);
                 }
             }
-        }
+        });
     });
     unoffered_rows(ui, label, values, String::as_str, |id| {
         choices.iter().any(|entry| entry.id == id)
@@ -417,24 +430,31 @@ pub(super) fn substat_chips(
     }
     ui.label("required substats");
     let mut toggled = None;
-    ui.horizontal_wrapped(|ui| {
-        for entry in choices {
-            let held = reqs.iter().position(|req| req.name == entry.id);
-            let mut on = held.is_some();
-            let changed = ui
-                .push_id(egui::Id::new(("substat", &entry.id)), |ui| {
-                    ui.checkbox(&mut on, &entry.label).changed()
-                })
-                .inner;
-            if changed {
-                toggled = Some(entry.id.clone());
-            }
-            // The threshold belongs to the chip, so it appears beside the one
-            // it applies to and nowhere else.
-            if let Some(index) = held {
-                let req = &mut reqs[index];
-                let mut has_min = req.min.is_some();
-                ui.push_id(egui::Id::new(("min", &entry.id)), |ui| {
+    // Salted on the row and not per chip, for the reason `choice_list` states:
+    // a `push_id` child never reaches `Layout::next_frame`, so anything drawn
+    // inside one is invisible to `horizontal_wrapped`'s wrap. This row carried
+    // the same defect and was NOT merely at risk of it — eleven realistic
+    // substat labels reached x=608 at the window's fixed 440px, against 414 once
+    // the salt moved. It shows less than the sets row only because it is
+    // shorter; a ticked chip unfolding its `≥` box and stepper adds width again.
+    //
+    // Those two now sit directly in the row rather than in a `push_id` of their
+    // own, so a wrap can fall between them. That is the cost of the fix here and
+    // it is the cheap side of the trade: the pair is ~64px, and grouping them
+    // was what put the stepper past the edge in the first place.
+    ui.push_id("required substats", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for entry in choices {
+                let held = reqs.iter().position(|req| req.name == entry.id);
+                let mut on = held.is_some();
+                if ui.checkbox(&mut on, &entry.label).changed() {
+                    toggled = Some(entry.id.clone());
+                }
+                // The threshold belongs to the chip, so it appears beside the one
+                // it applies to and nowhere else.
+                if let Some(index) = held {
+                    let req = &mut reqs[index];
+                    let mut has_min = req.min.is_some();
                     ui.checkbox(&mut has_min, "≥");
                     if has_min {
                         let min = req.min.get_or_insert(seed_for(entry.percent));
@@ -442,9 +462,9 @@ pub(super) fn substat_chips(
                     } else {
                         req.min = None;
                     }
-                });
+                }
             }
-        }
+        });
     });
     if let Some(id) = toggled {
         if let Some(index) = reqs.iter().position(|req| req.name == id) {
