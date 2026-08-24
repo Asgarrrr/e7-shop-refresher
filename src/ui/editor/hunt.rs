@@ -4,8 +4,10 @@
 
 use eframe::egui;
 
+use super::super::theme;
 use super::{arm_optional, count_label, optional_field};
 use crate::domain::filter::{Filter, SubstatReq};
+use crate::domain::shop::Gold;
 use crate::render::kind_label;
 use crate::ui::icons::SetIcons;
 use crate::uplink::protocol::{TokenEntry, VocabularyEntry};
@@ -161,7 +163,7 @@ pub(super) fn choice_list(
     choices: &[VocabularyEntry],
     icons: &SetIcons,
 ) {
-    ui.label(label);
+    ui.label(theme::section(label));
     // The salt sits on the ROW and never on a chip, and that placement is the
     // whole of this function's layout. `push_id` builds a child `Ui` off
     // `available_rect_before_wrap` and closes it with `advance_cursor_after_rect`;
@@ -184,7 +186,7 @@ pub(super) fn choice_list(
                 let mut on = values.contains(&entry.id);
                 let changed = match icons.get(&entry.id) {
                     Some(texture) => icon_chip(ui, texture, &entry.label, &mut on),
-                    None => ui.checkbox(&mut on, &entry.label).changed(),
+                    None => text_chip(ui, &entry.label, &mut on),
                 };
                 if changed {
                     if on {
@@ -199,6 +201,32 @@ pub(super) fn choice_list(
     unoffered_rows(ui, label, values, String::as_str, |id| {
         choices.iter().any(|entry| entry.id == id)
     });
+}
+
+/// One offered value drawn as its name: a toggling pill.
+///
+/// It sits beside [`icon_chip`] because the two are one decision — a value the
+/// server sent a picture for draws the picture, every other draws this — and a
+/// reader comparing them has to see both the skin they share ([`theme::chip`])
+/// and the accessibility contract they each restate.
+///
+/// **The name is written back explicitly**, for the reason [`icon_chip`] gives
+/// at length: [`egui::Button`] states a `WidgetType::Button`, and this control
+/// toggles a value in a list, which is a checkbox. The stock `ui.checkbox` it
+/// replaces published exactly that, so restating it is what keeps the node it
+/// contributed identical — same role, same name, same selected flag — while
+/// only the paint changes.
+fn text_chip(ui: &mut egui::Ui, label: &str, on: &mut bool) -> bool {
+    let response = theme::chip(ui, egui::Button::new(label), *on);
+    if response.clicked() {
+        *on = !*on;
+    }
+    // After the toggle, so the node states the value the click produced rather
+    // than the one it replaced.
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label)
+    });
+    response.clicked()
 }
 
 /// One offered value drawn as its picture: a toggling image button.
@@ -222,9 +250,7 @@ pub(super) fn choice_list(
 fn icon_chip(ui: &mut egui::Ui, texture: &egui::TextureHandle, label: &str, on: &mut bool) -> bool {
     let picture = egui::Image::new(egui::load::SizedTexture::from_handle(texture))
         .fit_to_exact_size(egui::vec2(SET_ICON, SET_ICON));
-    let response = ui
-        .add(egui::Button::image(picture).selected(*on))
-        .on_hover_text(label);
+    let response = theme::chip(ui, egui::Button::image(picture), *on).on_hover_text(label);
     if response.clicked() {
         *on = !*on;
     }
@@ -289,24 +315,16 @@ fn unoffered_rows<T>(
 /// It writes `token.id`, the wire name [`Filter::matches`] compares against.
 /// The label is the game's words and never reaches the filter.
 pub(super) fn token_cards(ui: &mut egui::Ui, names: &mut Vec<String>, tokens: &[TokenEntry]) {
-    ui.label("tokens");
+    ui.label(theme::section("tokens"));
     for token in tokens {
         let mut on = names.contains(&token.id);
         // Salted per token for the reason `choice_list` is salted per value:
-        // `hunt_body` draws several checkbox groups on one `Ui`, and `push_id`
-        // salts that shared parent.
+        // `hunt_body` draws several groups on one `Ui`, and `push_id` salts that
+        // shared parent. Safe here where it was not on a chip row: the cards
+        // stack vertically, so no wrap can be blinded by the child `Ui`.
         let changed = ui
             .push_id(egui::Id::new(("token", &token.id)), |ui| {
-                ui.horizontal(|ui| {
-                    let changed = ui.checkbox(&mut on, &token.label).changed();
-                    if let Some(price) = token.price {
-                        // `Gold` groups itself, so it reads like the shop
-                        // table's price column.
-                        ui.weak(format!("{price} gold"));
-                    }
-                    changed
-                })
-                .inner
+                token_card(ui, &token.label, token.price, &mut on)
             })
             .inner;
         if changed {
@@ -322,17 +340,114 @@ pub(super) fn token_cards(ui: &mut egui::Ui, names: &mut Vec<String>, tokens: &[
     });
 }
 
-/// The substat floor, as one exclusive row of buttons.
+/// The height of a token card: a body line over a small one, plus the padding
+/// around them — `SP_SM` above, a 14px name, an 11px price, `SP_XS` below.
+///
+/// Spelled rather than derived from the two galleys, because the card is
+/// allocated before either is laid out, and a height that followed its text
+/// would step between tokens whose names measure differently.
+const CARD_HEIGHT: f32 = 46.0;
+
+/// One token as a bordered box: its name over its price, the whole box
+/// clickable, accent-filled once chosen.
+///
+/// **The name is PAINTED and the price is a real label, and that split is
+/// forced.** The card contributes one named node — its own, restated as the
+/// checkbox it behaves like — so drawing the name as a widget too would put a
+/// second node under the same name, and `get_by_label` answers a duplicate by
+/// panicking rather than by picking. The price is the mirror case: it has to
+/// stay findable and announced in its own right, and painted text publishes
+/// nothing at all, so it is the one thing here that stays a widget.
+///
+/// Nothing else may become one. A second label inside this rect is a second
+/// node, and if it ever carries the token's words it breaks the count.
+///
+/// The fill is read off [`theme::toggle_skin`] rather than picked here, so a
+/// card and a chip cannot disagree about what "chosen" looks like.
+fn token_card(ui: &mut egui::Ui, label: &str, price: Option<Gold>, on: &mut bool) -> bool {
+    let width = ui.available_width();
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, CARD_HEIGHT), egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+    }
+    // After the toggle, so the node states the value the click produced.
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label)
+    });
+
+    // `contains_pointer` and not `hovered`: the price label below is allocated
+    // after this rect and so hit-tests above it, which would drop the card's
+    // own hover for the width of the price. The question here is geometric —
+    // is the pointer on this card — and that is what this answers.
+    let (fill, edge) = theme::toggle_skin(*on, response.contains_pointer());
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(8),
+        fill,
+        edge,
+        egui::StrokeKind::Inside,
+    );
+
+    // Full ink on a chosen card, one level down otherwise — the ladder every
+    // other control in this section uses. The price sits a further step back on
+    // both, since the name is what is being chosen.
+    let (name_ink, price_ink) = if *on {
+        (theme::INK, theme::INK_MUTED)
+    } else {
+        (theme::INK_MUTED, theme::INK_FAINT)
+    };
+    // Resolved off `TextStyle::Body` rather than spelled 14.0, so a retune in
+    // `theme::apply` carries the name with it — the price below reads the same
+    // scale through `.small()`.
+    let name_rect = ui.painter().text(
+        egui::pos2(rect.left() + theme::SP_MD, rect.top() + theme::SP_SM),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::TextStyle::Body.resolve(ui.style()),
+        name_ink,
+    );
+    if let Some(price) = price {
+        // Off the name's own painted rect, not a measured offset: the second
+        // line follows the first wherever the body size puts it.
+        let line = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + theme::SP_MD, name_rect.bottom()),
+            egui::pos2(rect.right() - theme::SP_MD, rect.bottom() - theme::SP_XS),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(line)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                // `Gold` groups itself, so it reads like the shop table's price
+                // column.
+                ui.label(
+                    egui::RichText::new(format!("{price} gold"))
+                        .small()
+                        .color(price_ink),
+                );
+            },
+        );
+    }
+    response.clicked()
+}
+
+/// The substat floor, as one segmented control.
 ///
 /// Buttons rather than a `ComboBox` for the reason `choice_list` gives: a combo
 /// contributes no accessibility node. Clicking the active segment clears the
 /// floor, so every state the control can reach is reachable back out of.
 ///
+/// [`theme::segmented_strip`] and not a bare row, which is what these three
+/// were: loose `selectable_label`s read as unrelated buttons, where the choice
+/// is exclusive and the Click-timing mode row one section down already said so
+/// with a shared ground. One grammar for one kind of control.
+///
 /// It writes `min_substats` and never `min_grade`. On shop gear the two are one
 /// axis — measured at 59 of 59 on real captures — and the substat count is what
 /// a player reads off the piece.
 pub(super) fn segmented(ui: &mut egui::Ui, value: &mut Option<u8>, choices: &[(u8, &str)]) {
-    ui.horizontal(|ui| {
+    theme::segmented_strip(ui, |ui| {
         for (n, label) in choices {
             let on = *value == Some(*n);
             if ui.selectable_label(on, *label).clicked() {
@@ -356,7 +471,7 @@ pub(super) fn string_list(
     values: &mut Vec<String>,
     input: &mut String,
 ) {
-    ui.label(label);
+    ui.label(theme::section(label));
     let mut removed = None;
     for (index, value) in values.iter().enumerate() {
         // Content-keyed so focus survives a removal above the row, and salted
@@ -428,7 +543,7 @@ pub(super) fn substat_chips(
             req.min = Some(seed_for(percent));
         }
     }
-    ui.label("required substats");
+    ui.label(theme::section("required substats"));
     let mut toggled = None;
     // Salted on the row and not per chip, for the reason `choice_list` states:
     // a `push_id` child never reaches `Layout::next_frame`, so anything drawn
@@ -447,7 +562,7 @@ pub(super) fn substat_chips(
             for entry in choices {
                 let held = reqs.iter().position(|req| req.name == entry.id);
                 let mut on = held.is_some();
-                if ui.checkbox(&mut on, &entry.label).changed() {
+                if text_chip(ui, &entry.label, &mut on) {
                     toggled = Some(entry.id.clone());
                 }
                 // The threshold belongs to the chip, so it appears beside the one
@@ -455,7 +570,10 @@ pub(super) fn substat_chips(
                 if let Some(index) = held {
                     let req = &mut reqs[index];
                     let mut has_min = req.min.is_some();
-                    ui.checkbox(&mut has_min, "≥");
+                    // A chip and not a checkbox: it rides in the same wrapped
+                    // row as the values above, where it would otherwise be the
+                    // one tick box left among pills.
+                    text_chip(ui, "≥", &mut has_min);
                     if has_min {
                         let min = req.min.get_or_insert(seed_for(entry.percent));
                         threshold_field(ui, min, entry.percent);

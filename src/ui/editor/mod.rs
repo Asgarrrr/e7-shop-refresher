@@ -311,6 +311,7 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
         &editor.vocabulary.sets,
         icons,
     );
+    gear_rule(ui);
     // The catalog's icon table is keyed by set id and nothing else: there are no
     // gear-slot pictures on the wire and none planned. An empty source says that
     // in the one place it matters — inside `choice_list`, where every value then
@@ -323,13 +324,15 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
         &editor.vocabulary.slots,
         &SetIcons::default(),
     );
+    gear_rule(ui);
     substat_chips(
         ui,
         &mut editor.filter.required_substats,
         &editor.vocabulary.substats,
     );
+    gear_rule(ui);
+    ui.label(theme::section("substats"));
     ui.add_space(theme::SP_XS);
-    ui.label("substats");
     segmented(ui, &mut editor.filter.min_substats, &SUBSTAT_FLOORS);
     ui.add_space(theme::SP_XS);
     egui::Grid::new("hunt-numerics")
@@ -348,6 +351,18 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
     // gear one.
     ui.add_space(theme::SP_SM);
     ui.checkbox(&mut editor.filter.include_sold_out, "include sold out");
+}
+
+/// The divider between two gear criteria.
+///
+/// [`theme::HAIRLINE`] and not the undimmed rule, per [`theme::rule`]'s own
+/// split: these are rows of ONE block — everything below `— or gear —` is the
+/// gear branch of [`Filter::matches`] — and a full-strength rule between them
+/// would read as the same boundary that separates the branches.
+fn gear_rule(ui: &mut egui::Ui) {
+    ui.add_space(theme::SP_SM);
+    theme::rule(ui, theme::HAIRLINE);
+    ui.add_space(theme::SP_SM);
 }
 
 /// Stop: the run's safety rails, one ledger row each.
@@ -452,31 +467,22 @@ fn preset_row(ui: &mut egui::Ui, editor: &mut EditorState) -> Option<TimingPrese
     // a config-seeded custom timing lands there with bars ready.
     let custom = editor.fine_tune_open || detected.is_none();
     // Snug segments in one strip, so the presets read as a control rather than
-    // bare labels.
-    egui::Frame::new()
-        .fill(theme::STRIPE)
-        .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(3)
-        .show(ui, |ui| {
-            let visuals = &mut ui.style_mut().visuals;
-            visuals.widgets.inactive.fg_stroke.color = theme::INK_MUTED;
-            ui.spacing_mut().item_spacing.x = 0.0;
-            ui.horizontal(|ui| {
-                for preset in TimingPreset::ALL {
-                    let selected = !custom && detected == Some(preset);
-                    if ui.selectable_label(selected, preset.label()).clicked() {
-                        // `applied_to`, not `timings()`: the bare value carries
-                        // `min_ms = 0` on all eight actions, so assigning it
-                        // dropped every config-set floor on the next Apply.
-                        editor.timings = preset.applied_to(&editor.timings);
-                        editor.fine_tune_open = false;
-                    }
-                }
-                if ui.selectable_label(custom, "Custom").clicked() {
-                    editor.fine_tune_open = true;
-                }
-            });
-        });
+    // bare labels. Hunt's substat floor wears the same strip.
+    theme::segmented_strip(ui, |ui| {
+        for preset in TimingPreset::ALL {
+            let selected = !custom && detected == Some(preset);
+            if ui.selectable_label(selected, preset.label()).clicked() {
+                // `applied_to`, not `timings()`: the bare value carries
+                // `min_ms = 0` on all eight actions, so assigning it
+                // dropped every config-set floor on the next Apply.
+                editor.timings = preset.applied_to(&editor.timings);
+                editor.fine_tune_open = false;
+            }
+        }
+        if ui.selectable_label(custom, "Custom").clicked() {
+            editor.fine_tune_open = true;
+        }
+    });
     // The pre-click state, so the hint below matches the segment on screen.
     if custom { None } else { detected }
 }

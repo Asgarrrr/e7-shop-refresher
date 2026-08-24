@@ -204,6 +204,117 @@ pub(super) fn accent_checkbox(ui: &mut egui::Ui, on: &mut bool) -> egui::Respons
     .inner
 }
 
+/// A chip's corner, rounder than the global 6px so a value in a wrapped row
+/// reads as a pill rather than as a small button.
+const CHIP_RADIUS: u8 = 8;
+
+/// What a toggling *surface* looks like: the fill and the edge one takes for a
+/// given state.
+///
+/// One spelling, because two controls wear it and they sit on the same screen:
+/// [`chip`], and the token card that carries a price and so is too tall to be
+/// one. Written as a function rather than as two constants because the answer
+/// is a pair and the three states do not vary independently — an unchosen chip
+/// is edged and unfilled, a chosen one is both, and hover only moves the
+/// unchosen case.
+pub(super) fn toggle_skin(on: bool, hovered: bool) -> (Color32, Stroke) {
+    let fill = match (on, hovered) {
+        // `ACCENT` and not a tint: this is the theme's own selection fill, the
+        // same one `accent_checkbox` takes when it is ticked.
+        (true, _) => ACCENT,
+        (false, true) => STRIPE,
+        (false, false) => Color32::TRANSPARENT,
+    };
+    let edge = match (on, hovered) {
+        (true, _) => ACCENT,
+        (false, true) => SLAB_EDGE,
+        (false, false) => HAIRLINE,
+    };
+    (fill, Stroke::new(1.0, edge))
+}
+
+/// One toggling chip: a rounded outlined box, accent-filled and accent-edged
+/// once chosen.
+///
+/// Takes the [`egui::Button`] already built rather than a label, because its
+/// callers differ in what a chip HOLDS — a gear set the server sent a picture
+/// for draws the picture, every other value draws its name — while the skin is
+/// the one thing they must share.
+///
+/// **The caller owns the accessible name.** `Button::selected` states a
+/// `WidgetType::Button`, and a chip that toggles is a checkbox; a picture-only
+/// button states no name at all. Both callers restate the info, and
+/// `hunt::text_chip` / `hunt::icon_chip` carry the reasoning.
+///
+/// **It styles the caller's `Ui` in place and restores it, rather than adding
+/// the chip inside a `ui.scope`.** A scope builds a CHILD `Ui`, and a child
+/// never reaches `Layout::next_frame` — where `main_wrap` lives — so a chip
+/// drawn in one is invisible to `horizontal_wrapped` and simply takes whatever
+/// the cursor has left. That is the same defect the id salt on these rows was
+/// moved to fix, and styling through a scope reintroduced it exactly: measured
+/// on the live 24-set catalog at the window's fixed 440px, the row ran on one
+/// line out to x=1022 with every chip past the fifth squeezed to ~24px of
+/// unreadable text. Restoring the saved `Arc<Style>` is what keeps the chip in
+/// the caller's own `Ui`; the clone is a refcount bump, not a copy of the style.
+pub(super) fn chip(ui: &mut egui::Ui, button: egui::Button<'_>, on: bool) -> egui::Response {
+    let saved = ui.style().clone();
+    // Tighter than the theme's `SP_MD`/`SP_SM` button box, which is sized for a
+    // standalone command. The window is pinned at [`super::WINDOW_WIDTH`] and
+    // the sets row is twenty-four chips wide, so the padding a chip can afford
+    // is decided by that row and not by taste.
+    ui.spacing_mut().button_padding = egui::vec2(SP_SM, SP_XS);
+    let widgets = &mut ui.style_mut().visuals.widgets;
+    for (state, hovered) in [
+        (&mut widgets.inactive, false),
+        (&mut widgets.hovered, true),
+        (&mut widgets.active, true),
+    ] {
+        let (fill, edge) = toggle_skin(on, hovered);
+        state.corner_radius = CornerRadius::same(CHIP_RADIUS);
+        state.weak_bg_fill = fill;
+        state.bg_stroke = edge;
+        // A hovered egui widget grows by its `expansion`, and these wrap: two
+        // pixels under the pointer re-flow every chip after it, so the row
+        // twitches as the mouse crosses it.
+        state.expansion = 0.0;
+    }
+    // Unchosen chips sit one ink level down, the way the segmented strip dims
+    // its inactive cells — with twenty-four of them, full ink on every unchosen
+    // value is what stops the chosen ones reading as chosen. A chosen chip takes
+    // its text colour from `selection.stroke` and is unaffected.
+    widgets.inactive.fg_stroke.color = INK_MUTED;
+    // `selected` is what fills it: egui swaps `selection.bg_fill` and the
+    // matching text colour in, which is this theme's accent pair already.
+    let response = ui.add(button.selected(on));
+    ui.set_style(saved);
+    response
+}
+
+/// Several exclusive cells sharing one border: the active one filled, the strip
+/// reading as a single control rather than as loose buttons.
+///
+/// Snug by construction — the cells carry no spacing between them, which is
+/// what makes the shared ground visible between the rounded ends.
+///
+/// Two sections use it, which is why it lives here: the Click-timing mode row
+/// and Hunt's substat floor. A second copy of the recipe beside the second
+/// caller is how one control becomes two that drift.
+pub(super) fn segmented_strip<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Frame::new()
+        .fill(STRIPE)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(3)
+        .show(ui, |ui| {
+            ui.style_mut().visuals.widgets.inactive.fg_stroke.color = INK_MUTED;
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.horizontal(add_contents).inner
+        })
+        .inner
+}
+
 /// A full-width collapsible section header. Painted, not nested widgets, so
 /// nothing steals hover over the bar. Returns true on click.
 ///
