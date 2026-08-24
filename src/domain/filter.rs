@@ -10,8 +10,15 @@ use crate::domain::shop::{Gold, ItemKind, ShopItem, ShopSnapshot};
 /// closed domain). Rejected while deserializing, because a floor outside it
 /// fail-closes in `matches` (dropping every item) while `is_unrestricted`
 /// counts it as real: the loop arms and refreshes forever without matching.
+///
+/// The ceiling was 4 until the rarity ladder shipped, on a reading of 59
+/// captured pieces where grade and substat count moved together. That sample
+/// could not hold a grade 5: it drops at roughly 0.002% per entry. The game's
+/// `grade_rate` table maps `grade2`..`grade5` onto 2..5 with no offset and the
+/// shop's drop-rate payload lists all four, so Epic is stock the shop sells and
+/// `min_grade = 5` has to load.
 const GRADE_MIN: u8 = 2;
-const GRADE_MAX: u8 = 4;
+const GRADE_MAX: u8 = 5;
 
 /// Player criteria. An empty `Vec` or `None` field does not constrain, so a
 /// default `Filter` matches every available item; how the set ones combine is
@@ -57,6 +64,13 @@ pub struct Filter {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub slots: Vec<String>,
     /// Minimum substat count (raw list length).
+    ///
+    /// A different question from [`Self::min_grade`], and config-only since the
+    /// window offers the rarity ladder instead. The two coincide only BELOW
+    /// grade 5: Good/Rare/Heroic carry 2/3/4 substats, and Epic carries four as
+    /// well — measured on the game's own table, 150 grade-5 rows at
+    /// `sub_stat_count` 4..4. So "at least 4 substats" is Heroic-or-Epic, where
+    /// `min_grade = 5` is Epic alone, and neither can be spelled with the other.
     pub min_substats: Option<u8>,
     /// Substats that must all be present, each above its optional threshold.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -73,8 +87,9 @@ pub struct Filter {
     /// `#[serde(transparent)]` in both directions, so `config.toml` still
     /// spells this as a bare `max_price = 300000`.
     pub max_price: Option<Gold>,
-    /// Inclusive minimum gear grade (2, 3, or 4); an unknown grade fails it.
-    /// A floor outside that domain is refused at parse time — see `GRADE_MIN`.
+    /// Inclusive minimum gear grade — 2 Good, 3 Rare, 4 Heroic, 5 Epic; an
+    /// unknown grade fails it. A floor outside that domain is refused at parse
+    /// time — see `GRADE_MIN`.
     ///
     /// Gear branch, like [`Filter::max_price`], with the same consequence: it
     /// says nothing about an item a `names` criterion already accepted.
@@ -96,7 +111,7 @@ where
     };
     if !(GRADE_MIN..=GRADE_MAX).contains(&grade) {
         return Err(serde::de::Error::custom(format!(
-            "gear grade {grade} does not exist (expected {GRADE_MIN}, 3 or {GRADE_MAX})"
+            "gear grade {grade} does not exist (expected {GRADE_MIN} to {GRADE_MAX})"
         )));
     }
     Ok(Some(grade))
@@ -697,7 +712,7 @@ mod tests {
     fn min_grade_outside_the_game_domain_is_refused() {
         // A typo'd floor is fail-closed in `matches` yet counts as real in
         // `is_unrestricted` — an armed loop that never matches.
-        for grade in ["0", "1", "5", "44"] {
+        for grade in ["0", "1", "6", "44"] {
             let err = toml::from_str::<Filter>(&format!("min_grade = {grade}"))
                 .expect_err("out-of-domain grade should be refused");
             assert!(
@@ -705,7 +720,10 @@ mod tests {
                 "error should name the offending grade: {err}"
             );
         }
-        for grade in [2, 3, 4] {
+        // 5 is Epic. It carries four substats exactly as Heroic does, which is
+        // why a 59-piece sample of substat counts could not see it; the shop's
+        // own drop-rate payload lists it, at roughly 0.002% per entry.
+        for grade in [2, 3, 4, 5] {
             let filter: Filter =
                 toml::from_str(&format!("min_grade = {grade}")).expect("real grade parses");
             assert_eq!(filter.min_grade, Some(grade));

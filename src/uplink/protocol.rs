@@ -68,10 +68,6 @@ pub struct FilterVocabulary {
     /// The wearable slots, matching [`crate::domain::shop::ShopItem::gear_slot`].
     #[serde(deserialize_with = "lenient_entries")]
     pub slots: Vec<VocabularyEntry>,
-    /// The tokens the shop sells, with the game's own price — the hunt's
-    /// subject, offered as cards rather than as ids to type.
-    #[serde(deserialize_with = "lenient_tokens")]
-    pub tokens: Vec<TokenEntry>,
     /// Gear-set icons, keyed by the same id as [`Self::sets`]: base64 PNGs of
     /// 44x44, some 53 KB for the whole set.
     ///
@@ -104,17 +100,6 @@ pub struct VocabularyEntry {
     pub percent: bool,
 }
 
-/// One token card: what the shop sells it as, and what it costs.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct TokenEntry {
-    pub id: String,
-    pub label: String,
-    /// The game's list price. Tolerated absent per this module's convention;
-    /// [`Gold`], so it cannot be compared against a crystal budget.
-    #[serde(default)]
-    pub price: Option<Gold>,
-}
-
 /// Tolerant vocabulary list: an undecodable entry is dropped and a non-array
 /// degrades to empty, so one malformed row cannot cost the whole message.
 ///
@@ -141,31 +126,9 @@ where
         .collect())
 }
 
-/// [`lenient_entries`] for the token list — same tolerance, same reasoning, a
-/// second body only because the element type differs.
-fn lenient_tokens<'de, D>(de: D) -> Result<Vec<TokenEntry>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let serde_json::Value::Array(values) = serde_json::Value::deserialize(de)? else {
-        tracing::debug!("tolerated a non-array token list — degraded to empty");
-        return Ok(Vec::new());
-    };
-    Ok(values
-        .into_iter()
-        .filter_map(|value| match serde_json::from_value(value) {
-            Ok(parsed) => Some(parsed),
-            Err(error) => {
-                tracing::debug!(%error, "dropped an undecodable token entry");
-                None
-            }
-        })
-        .collect())
-}
-
 /// [`lenient_entries`] for the icon table — a non-object degrades to empty and a
 /// non-string value drops its entry, so a mistyped blob costs one picture rather
-/// than the whole vocabulary. Sharing a body with the two above would mean a
+/// than the whole vocabulary. Sharing a body with the one above would mean a
 /// generic over both the container and the element; the tolerance is the point
 /// and it is four lines.
 fn lenient_icons<'de, D>(de: D) -> Result<std::collections::HashMap<String, String>, D::Error>
@@ -411,7 +374,7 @@ mod tests {
         assert_eq!(received.sets[0].label, "Speed Set");
         // The "(%)" is the game's own wording, and it is only wording: what
         // says this substat arrives as a fraction is the `percent` flag, pinned
-        // by `catalog_tokens_and_percent_are_the_wire_contract` below.
+        // by `the_catalog_percent_flag_is_the_wire_contract` below.
         assert_eq!(received.substats[0].label, "Attack(%)");
         assert_eq!(received.slots[0].id, "helm");
         assert_eq!(received.slots[0].label, "Helmet");
@@ -435,19 +398,17 @@ mod tests {
         assert_eq!(received.sets[0].id, "set_speed");
     }
 
-    /// The token card's three fields and the substat `percent` flag are wire
-    /// contract, pinned here because nothing else decodes them.
+    /// The substat `percent` flag is wire contract, pinned here because nothing
+    /// else decodes it — and because it is the one thing that says a threshold
+    /// arrives as a fraction. The "(%)" in the label is a translation and
+    /// answers for nothing.
     #[test]
-    fn catalog_tokens_and_percent_are_the_wire_contract() {
+    fn the_catalog_percent_flag_is_the_wire_contract() {
         let received = vocabulary(
             r#"{"type":"catalog",
-                "tokens":[{"id":"ticketrare_name","label":"Covenant Bookmark","price":184000}],
                 "substats":[{"id":"att_rate","label":"Attack(%)","percent":true},
                             {"id":"speed","label":"Speed","percent":false}]}"#,
         );
-        assert_eq!(received.tokens[0].id, "ticketrare_name");
-        assert_eq!(received.tokens[0].label, "Covenant Bookmark");
-        assert_eq!(received.tokens[0].price, Some(Gold::new(184_000)));
         assert!(received.substats[0].percent);
         assert!(!received.substats[1].percent);
     }
@@ -459,24 +420,6 @@ mod tests {
         let received =
             vocabulary(r#"{"type":"catalog","substats":[{"id":"speed","label":"Speed"}]}"#);
         assert!(!received.substats[0].percent);
-    }
-
-    /// The token list gets its own tolerance, so the sets pin above cannot
-    /// stand in for it: a price that overflows [`Gold`] is a per-entry failure,
-    /// and the readable cards must outlive it.
-    #[test]
-    fn one_malformed_token_costs_its_card_and_not_the_message() {
-        let received = vocabulary(
-            r#"{"type":"catalog",
-                "sets":[{"id":"set_speed","label":"Speed Set"}],
-                "tokens":[{"id":"ticketrare_name","label":"Covenant Bookmark","price":184000},
-                          {"id":"ticketspecial_name"},
-                          {"id":"friendpoint_name","label":"Friendship Bookmark",
-                           "price":-1}]}"#,
-        );
-        assert_eq!(received.tokens.len(), 1);
-        assert_eq!(received.tokens[0].id, "ticketrare_name");
-        assert_eq!(received.sets.len(), 1, "the rest of the message survives");
     }
 
     /// The icon table's field name is wire contract, and this is the only place
@@ -525,12 +468,6 @@ mod tests {
         );
         assert!(mistyped.icons.is_empty());
         assert_eq!(mistyped.slots.len(), 1);
-    }
-
-    #[test]
-    fn a_mistyped_token_list_degrades_to_empty() {
-        let received = vocabulary(r#"{"type":"catalog","tokens":"corrupt"}"#);
-        assert!(received.tokens.is_empty());
     }
 
     #[test]

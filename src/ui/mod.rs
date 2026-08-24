@@ -205,6 +205,21 @@ impl eframe::App for ShopApp {
         // with, so the elapsed time the band shows and the duration limit the
         // controller enforces cannot drift apart.
         let now_ms = self.handles.journal.now_ms();
+        // Same generation-gated copy as the journal below, and here for the same
+        // reason: the Setup pickers read it every frame and it is written once.
+        //
+        // The icons ride that gate rather than getting one of their own: they
+        // come off the vocabulary the sync just copied, so "the catalog moved"
+        // is the same answer for both, and decoding twenty-two PNGs into
+        // twenty-two textures per frame would be the one per-frame cost this
+        // window cannot pay.
+        //
+        // Ahead of the projection because the projection now reads it: the idle
+        // band names the hunted tokens in the server's words, and syncing after
+        // would spend the frame a catalog lands on the raw wire ids.
+        if self.editor.sync_vocabulary(&self.handles.vocabulary) {
+            self.set_icons.load(ui.ctx(), self.editor.icons());
+        }
         let view = {
             let ctrl = lock_ignoring_poison(&self.handles.controller);
             self.slots.sync(&ctrl);
@@ -227,17 +242,6 @@ impl eframe::App for ShopApp {
         if generation != self.journal_generation {
             self.journal_cache = self.handles.journal.to_entries();
             self.journal_generation = generation;
-        }
-        // Same generation-gated copy as the journal above, and here for the same
-        // reason: the Setup pickers read it every frame and it is written once.
-        //
-        // The icons ride that gate rather than getting one of their own: they
-        // come off the vocabulary the sync just copied, so "the catalog moved"
-        // is the same answer for both, and decoding twenty-two PNGs into
-        // twenty-two textures per frame would be the one per-frame cost this
-        // window cannot pay.
-        if self.editor.sync_vocabulary(&self.handles.vocabulary) {
-            self.set_icons.load(ui.ctx(), self.editor.icons());
         }
         let outcome = lock_ignoring_poison(&self.error).clone();
         // A terminal outcome disables every control: the click would hit a dead

@@ -288,7 +288,11 @@ fn run_band(ui: &mut egui::Ui, view: &ViewState, session_alive: bool) -> Option<
     ui.add_space(theme::SP_SM);
     match &dial.against {
         Some(cap) => theme::gauge(ui, cap.ratio),
-        None => theme::rule(ui, theme::HAIRLINE),
+        // Braced because `rule` answers with the row it allocated, for a caller
+        // that paints on the line; this one only wants the line.
+        None => {
+            theme::rule(ui, theme::HAIRLINE);
+        }
     }
     clicked
 }
@@ -822,7 +826,7 @@ mod tests {
         };
         // Named criteria, not `matching_default_items`: that fixture hunts the
         // `Unknown` kind, whose label is "?" — which would assert nothing about
-        // the wire→label mapping the plan line goes through.
+        // the id→label mapping the plan line goes through.
         let filter = Filter {
             names: vec![
                 "ticketrare_name".to_owned(),
@@ -835,7 +839,7 @@ mod tests {
         let harness = Harness::new_ui(|ui| {
             let _ = render_status_bar(ui, &view, None, true, &Fetcher::new());
         });
-        harness.get_by_label("Hunting Covenant, Mystic — stops at 60 refreshes");
+        harness.get_by_label("Hunting Covenant Bookmarks, Mystic Medals — stops at 60 refreshes");
     }
 
     /// The dial follows the rail that will fire, not a fixed one: here the

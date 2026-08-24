@@ -31,6 +31,13 @@ pub(super) const HAIRLINE: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2a);
 /// [`STRIPE`], so a full-width control reads as a surface that can be pressed
 /// rather than as a saturated call to action.
 const SLAB_EDGE: Color32 = Color32::from_rgb(0x35, 0x35, 0x2f);
+/// The undimmed rule [`rule`]'s doc names: a boundary between two BLOCKS, one
+/// step up from the [`HAIRLINE`] that divides rows inside one.
+///
+/// Deliberately the same ink as [`SLAB_EDGE`] rather than a fourth value: an
+/// edge and a boundary rule are the same statement drawn two ways, and a screen
+/// carrying both wants them to agree.
+pub(super) const BLOCK_RULE: Color32 = SLAB_EDGE;
 const SLAB_HOVER: Color32 = Color32::from_rgb(0x2b, 0x2b, 0x29);
 /// The rule under a bare verb, and the same rule lifted while it is hovered.
 const VERB_RULE: Color32 = Color32::from_rgb(0x46, 0x45, 0x3f);
@@ -45,11 +52,77 @@ pub(super) const WANTED: Color32 = Color32::from_rgb(0x90, 0xee, 0x90);
 /// as the player-controlled part.
 pub(super) const METER_BASE: Color32 = Color32::from_rgb(0x2c, 0x42, 0x60);
 
+/// The gear rarities, in the game's own colours.
+///
+/// Taken from the localization's `ui_alchemist_equip_confirm_grade*` strings,
+/// which colour the rarity word in the equipment confirm dialog — so a player
+/// reading this ladder sees the blue, purple and red they already know from the
+/// game's own screens. Not eyeballed and not a palette of ours: these three are
+/// transcribed hex.
+const RARE: Color32 = Color32::from_rgb(0x3b, 0x7b, 0xef);
+const HEROIC: Color32 = Color32::from_rgb(0xca, 0x37, 0xd3);
+const EPIC: Color32 = Color32::from_rgb(0xff, 0x30, 0x1a);
+
+/// The gear rarities, low to high: the grade a filter floors on, the game's word
+/// for it, and the ink that word is written in.
+///
+/// **One row per rarity.** The words are `localization`'s `item_grade_2..5` and
+/// they are spelled here rather than fetched, because four names nobody
+/// mistypes are not worth a wire family, a tolerant decoder and a fallback for
+/// the session where the message never lands. Reading them off the server while
+/// hardcoding their colours on the line below was the split this closes: a
+/// rarity is now one row in one place.
+///
+/// Good is [`INK_MUTED`] because **the game gives it no colour**:
+/// `ui_alchemist_equip_confirm_grade*` has no coloured occurrence of it anywhere
+/// in the localization, so the neutral ink is the finding rather than a gap
+/// someone forgot to fill. Inventing a fourth hue here would be this file
+/// claiming a game fact it does not have.
+///
+/// A table and not a `match`, because it is also the ladder's known domain: the
+/// editor's twin test walks it to assert that every rarity the window can paint
+/// is a floor `config.toml` accepts, and that its ends are the ends of that
+/// domain.
+pub(super) const RARITIES: [(u8, &str, Color32); 4] = [
+    (2, "Good", INK_MUTED),
+    (3, "Rare", RARE),
+    (4, "Heroic", HEROIC),
+    (5, "Epic", EPIC),
+];
+
+/// The ink for one grade. A grade the table does not name — a rarity the game
+/// adds before this list moves — takes the neutral ink rather than no cell:
+/// the floor still filters, and the criterion is still named.
+pub(super) fn rarity_ink(grade: u8) -> Color32 {
+    RARITIES
+        .iter()
+        .find(|(known, _, _)| *known == grade)
+        .map_or(INK_MUTED, |(_, _, ink)| *ink)
+}
+
+/// The game's word for one grade, and `None` for a grade [`RARITIES`] does not
+/// name.
+///
+/// The `None` is not reachable from a config file — the loader takes `2..=5` and
+/// this table spells all four — so it exists for the criterion built in Rust,
+/// and the caller states the bare ordinal instead of a word this end would be
+/// inventing.
+pub(super) fn rarity_label(grade: u8) -> Option<&'static str> {
+    RARITIES
+        .iter()
+        .find(|(known, _, _)| *known == grade)
+        .map(|(_, label, _)| *label)
+}
+
 /// Spacing scale (4px grid). Every gap the layout inserts comes from here.
 pub(super) const SP_XS: f32 = 4.0;
 pub(super) const SP_SM: f32 = 8.0;
 /// Horizontal button padding, wider than the vertical rhythm on purpose.
 pub(super) const SP_MD: f32 = 12.0;
+/// The rung between the rhythm inside a block and the air around one: what a
+/// block boundary leaves under itself, so the header below the rule belongs to
+/// the block it opens rather than to the one it closes.
+pub(super) const SP_LG: f32 = 16.0;
 pub(super) const SP_XL: f32 = 24.0;
 
 /// Horizontal inset for tab content, while rules and hover fills bleed to the
@@ -130,8 +203,14 @@ pub(super) fn section(text: &str) -> egui::RichText {
 /// reaches the window edges like the tab strip's rule and the tables' own.
 ///
 /// Takes its colour because the two callers divide different things: a rule
-/// between rows of one block is dimmed, a rule between blocks is not.
-pub(super) fn rule(ui: &mut egui::Ui, color: Color32) {
+/// between rows of one block is dimmed ([`HAIRLINE`]), a rule between blocks is
+/// not ([`BLOCK_RULE`]).
+///
+/// Returns the row it allocated, for the one caller that draws ON the line
+/// rather than under it — Hunt's branch separator sits its word on the rule, and
+/// reading the y off this allocation is what keeps it from re-deriving the
+/// geometry from the cursor.
+pub(super) fn rule(ui: &mut egui::Ui, color: Color32) -> egui::Rect {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
     ui.painter().hline(
@@ -139,6 +218,7 @@ pub(super) fn rule(ui: &mut egui::Ui, color: Color32) {
         rect.center().y,
         Stroke::new(1.0, color),
     );
+    rect
 }
 
 /// One table cell: a truncating label placed in its column rect.

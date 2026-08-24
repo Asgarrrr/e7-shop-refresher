@@ -78,7 +78,6 @@ impl std::fmt::Debug for VocabularyCell {
             .field("sets", &vocabulary.sets.len())
             .field("substats", &vocabulary.substats.len())
             .field("slots", &vocabulary.slots.len())
-            .field("tokens", &vocabulary.tokens.len())
             .finish()
     }
 }
@@ -98,8 +97,8 @@ mod tests {
 
     /// Empty until a server sends one, and the editor's fallback to free-text
     /// entry hangs off exactly this: it tests the LIST it is about to draw
-    /// (`offered_list`, `token_cards`), never the cell as a whole, because a
-    /// catalog can name the sets and no tokens.
+    /// (`offered_list`), never the cell as a whole, because a catalog can name
+    /// the sets and no slots.
     #[test]
     fn starts_empty() {
         assert_eq!(VocabularyCell::new().get(), FilterVocabulary::default());

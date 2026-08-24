@@ -10,7 +10,34 @@ use crate::domain::filter::{Filter, SubstatReq};
 use crate::domain::shop::Gold;
 use crate::render::kind_label;
 use crate::ui::icons::SetIcons;
-use crate::uplink::protocol::{TokenEntry, VocabularyEntry};
+use crate::uplink::protocol::VocabularyEntry;
+
+/// The tokens the Secret Shop sells: the wire name [`Filter::names`] compares
+/// against, the game's own word for it, and its list price in gold.
+///
+/// **Spelled here rather than fetched.** Three names and three prices are what a
+/// developer writes without erring, where the sets are twenty-four the game keeps
+/// adding to and the substats hide `acc` behind "Effectiveness" — so those two
+/// families stay on the wire and this one does not.
+///
+/// The words are the game's own (`localization` keys of the same name). The
+/// prices were confirmed by the player, and two of the three are corroborated by
+/// real captures: `friendpoint_name` at 18,000 seen five times and
+/// `ticketrare_name` at 184,000 seen twice, while `ticketspecial_name` never came
+/// up in the seventeen rolls sampled.
+///
+/// **It is not [`crate::render::HAUL_HEADLINERS`], and folding the two together
+/// is the mistake to avoid.** That table is a display POLICY for the haul
+/// readout — *which* two tokens earn a counter of their own, under a label short
+/// enough for a tight row ("Covenant", not "Covenant Bookmarks") — and its length
+/// is load-bearing, since `view::ViewState` sizes its tile array off it. This one
+/// is the shop's catalogue: every token it sells, in full words, with the price a
+/// card shows. Two different questions about the same three wire ids.
+const HUNT_TOKENS: [(&str, &str, u32); 3] = [
+    ("ticketrare_name", "Covenant Bookmarks", 184_000),
+    ("ticketspecial_name", "Mystic Medals", 280_000),
+    ("friendpoint_name", "Friendship Points", 18_000),
+];
 
 /// The square a gear-set icon draws at.
 ///
@@ -21,14 +48,6 @@ use crate::uplink::protocol::{TokenEntry, VocabularyEntry};
 /// wrap at all: labelled they take six rows, at this size three. The wire icons
 /// are 44px, so this is a downscale and never an upscale.
 const SET_ICON: f32 = 32.0;
-
-/// The floors the substat control offers, low to high.
-///
-/// Three values and not an open field, because the shop sells only `+0` gear:
-/// its substat count is the gear grade, which the game defines on 2, 3 and 4.
-/// The top segment reads `4` rather than `4+` — 4 is the ceiling, so a `+`
-/// there would promise a fifth substat that does not exist.
-pub(super) const SUBSTAT_FLOORS: [(u8, &str); 3] = [(2, "2+"), (3, "3+"), (4, "4")];
 
 /// The threshold a freshly armed `≥` starts at, one per substat family.
 ///
@@ -63,16 +82,19 @@ const fn seed_for(percent: bool) -> f64 {
 /// arms, refreshes forever and buys nothing.
 /// Visible to the whole window, not just Setup: the idle status band reuses it
 /// to say what a run would hunt (`view::plan_summary`).
+///
+/// It takes the filter and nothing else. The two criteria that have words —
+/// the hunted tokens and the rarity floor — read them off [`HUNT_TOKENS`] and
+/// [`theme::RARITIES`], so both callers get one wording with nothing to thread:
+/// the Setup bar and the idle band cannot disagree, and neither can go quiet
+/// because a `catalog` message has not landed. The server's two vocabularies
+/// used to ride in as an argument for exactly that job — the third token
+/// otherwise reached the status line as `friendpoint_name` — and the constants
+/// answer for all three without one.
 pub(in crate::ui) fn hunt_summary(filter: &Filter) -> String {
     let mut parts: Vec<String> = Vec::new();
     for name in &filter.names {
-        // The haul's wire→label map, so a token reads "Covenant" and not
-        // "ticketrare_name"; an unknown id shows verbatim.
-        let label = crate::render::HAUL_HEADLINERS
-            .iter()
-            .find(|(wire, _)| name == wire)
-            .map_or(name.as_str(), |(_, headliner)| *headliner);
-        parts.push(label.to_owned());
+        parts.push(token_label(name).to_owned());
     }
     for kind in &filter.kinds {
         parts.push(kind_label(*kind).to_owned());
@@ -101,7 +123,7 @@ pub(in crate::ui) fn hunt_summary(filter: &Filter) -> String {
         parts.push(format!("≤{max} gold"));
     }
     if let Some(min) = filter.min_grade {
-        parts.push(format!("grade {min}+"));
+        parts.push(grade_label(min));
     }
     if parts.is_empty() {
         return "nothing selected".to_owned();
@@ -115,21 +137,33 @@ pub(in crate::ui) fn hunt_summary(filter: &Filter) -> String {
     }
 }
 
-/// One-click add for the two tokens ~90% of players hunt, spelling their
-/// internal ids so the player never types a `ticketrare_name`.
-pub(super) fn quick_add_names(ui: &mut egui::Ui, names: &mut Vec<String>) {
-    ui.horizontal(|ui| {
-        ui.weak("quick add");
-        for (wire, label) in crate::render::HAUL_HEADLINERS {
-            let present = names.iter().any(|name| name == wire);
-            if ui
-                .add_enabled(!present, egui::Button::new(format!("+ {label}")))
-                .clicked()
-            {
-                names.push(wire.to_owned());
-            }
-        }
-    });
+/// The words for one hunted name: [`HUNT_TOKENS`]', else the id itself.
+///
+/// The table names every token the shop sells, so it answers wherever there is
+/// an answer — the third token used to fall through the two-entry
+/// [`crate::render::HAUL_HEADLINERS`] to its raw `friendpoint_name`, and that
+/// table is not consulted here at all now (see [`HUNT_TOKENS`] on why the two
+/// stay apart).
+///
+/// A name it cannot place shows verbatim: `names` is an open field a player's
+/// `config.toml` can put anything in, and inventing words for such a criterion
+/// would hide which one it is.
+fn token_label(name: &str) -> &str {
+    HUNT_TOKENS
+        .iter()
+        .find(|(id, _, _)| *id == name)
+        .map_or(name, |(_, label, _)| *label)
+}
+
+/// The words for one rarity floor: [`theme::RARITIES`]', else the ordinal
+/// itself.
+///
+/// The table spells the whole of the loader's `2..=5` domain, so the fallback is
+/// unreachable from a config file and exists only to keep this total. A floor it
+/// cannot name reads as its own ordinal — the criterion is named and the floor
+/// is exact, with no word invented for a rarity the game has not published.
+fn grade_label(min: u8) -> String {
+    theme::rarity_label(min).map_or_else(|| format!("grade {min}+"), |label| format!("{label}+"))
 }
 
 /// Row remove control: a `✕` on a 24px-square target — `small_button`'s
@@ -312,31 +346,36 @@ fn unoffered_rows<T>(
 /// `ComboBox` contributes no accessibility node — and stacked one per row
 /// rather than wrapped, since the shop sells three.
 ///
-/// It writes `token.id`, the wire name [`Filter::matches`] compares against.
-/// The label is the game's words and never reaches the filter.
-pub(super) fn token_cards(ui: &mut egui::Ui, names: &mut Vec<String>, tokens: &[TokenEntry]) {
+/// It writes the wire id [`Filter::matches`] compares against. The label is the
+/// game's words and never reaches the filter.
+///
+/// **It draws in every session**, where it used to give way to a free-text list
+/// against a server with no Catalog: [`HUNT_TOKENS`] is this end's own, so there
+/// is no state in which the cards cannot be built. That is the whole of what the
+/// fallback bought, and it is why the name criterion no longer has one.
+pub(super) fn token_cards(ui: &mut egui::Ui, names: &mut Vec<String>) {
     ui.label(theme::section("tokens"));
-    for token in tokens {
-        let mut on = names.contains(&token.id);
+    for (id, label, price) in HUNT_TOKENS {
+        let mut on = names.iter().any(|name| name == id);
         // Salted per token for the reason `choice_list` is salted per value:
         // `hunt_body` draws several groups on one `Ui`, and `push_id` salts that
         // shared parent. Safe here where it was not on a chip row: the cards
         // stack vertically, so no wrap can be blinded by the child `Ui`.
         let changed = ui
-            .push_id(egui::Id::new(("token", &token.id)), |ui| {
-                token_card(ui, &token.label, token.price, &mut on)
+            .push_id(egui::Id::new(("token", id)), |ui| {
+                token_card(ui, label, Gold::new(price), &mut on)
             })
             .inner;
         if changed {
             if on {
-                names.push(token.id.clone());
+                names.push(id.to_owned());
             } else {
-                names.retain(|kept| *kept != token.id);
+                names.retain(|kept| kept != id);
             }
         }
     }
-    unoffered_rows(ui, "tokens", names, String::as_str, |id| {
-        tokens.iter().any(|token| token.id == id)
+    unoffered_rows(ui, "tokens", names, String::as_str, |name| {
+        HUNT_TOKENS.iter().any(|(id, _, _)| *id == name)
     });
 }
 
@@ -364,7 +403,10 @@ const CARD_HEIGHT: f32 = 46.0;
 ///
 /// The fill is read off [`theme::toggle_skin`] rather than picked here, so a
 /// card and a chip cannot disagree about what "chosen" looks like.
-fn token_card(ui: &mut egui::Ui, label: &str, price: Option<Gold>, on: &mut bool) -> bool {
+///
+/// The price is no longer optional: it came off a wire field that could be
+/// absent, and it now comes off [`HUNT_TOKENS`], where every row has one.
+fn token_card(ui: &mut egui::Ui, label: &str, price: Gold, on: &mut bool) -> bool {
     let width = ui.available_width();
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(width, CARD_HEIGHT), egui::Sense::click());
@@ -407,54 +449,89 @@ fn token_card(ui: &mut egui::Ui, label: &str, price: Option<Gold>, on: &mut bool
         egui::TextStyle::Body.resolve(ui.style()),
         name_ink,
     );
-    if let Some(price) = price {
-        // Off the name's own painted rect, not a measured offset: the second
-        // line follows the first wherever the body size puts it.
-        let line = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + theme::SP_MD, name_rect.bottom()),
-            egui::pos2(rect.right() - theme::SP_MD, rect.bottom() - theme::SP_XS),
-        );
-        ui.scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(line)
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            |ui| {
-                // `Gold` groups itself, so it reads like the shop table's price
-                // column.
-                ui.label(
-                    egui::RichText::new(format!("{price} gold"))
-                        .small()
-                        .color(price_ink),
-                );
-            },
-        );
-    }
+    // Off the name's own painted rect, not a measured offset: the second line
+    // follows the first wherever the body size puts it.
+    let line = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + theme::SP_MD, name_rect.bottom()),
+        egui::pos2(rect.right() - theme::SP_MD, rect.bottom() - theme::SP_XS),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(line)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            // `Gold` groups itself, so it reads like the shop table's price
+            // column.
+            ui.label(
+                egui::RichText::new(format!("{price} gold"))
+                    .small()
+                    .color(price_ink),
+            );
+        },
+    );
     response.clicked()
 }
 
-/// The substat floor, as one segmented control.
+/// The rarity floor, as one segmented control: the four grades of
+/// [`theme::RARITIES`], low to high, in the game's own words and the game's own
+/// colours.
 ///
 /// Buttons rather than a `ComboBox` for the reason `choice_list` gives: a combo
 /// contributes no accessibility node. Clicking the active segment clears the
 /// floor, so every state the control can reach is reachable back out of.
 ///
-/// [`theme::segmented_strip`] and not a bare row, which is what these three
-/// were: loose `selectable_label`s read as unrelated buttons, where the choice
-/// is exclusive and the Click-timing mode row one section down already said so
-/// with a shared ground. One grammar for one kind of control.
+/// [`theme::segmented_strip`] and not a bare row: the choice is exclusive, and
+/// the Click-timing mode row one section down already says so with a shared
+/// ground. One grammar for one kind of control.
 ///
-/// It writes `min_substats` and never `min_grade`. On shop gear the two are one
-/// axis — measured at 59 of 59 on real captures — and the substat count is what
-/// a player reads off the piece.
-pub(super) fn segmented(ui: &mut egui::Ui, value: &mut Option<u8>, choices: &[(u8, &str)]) {
+/// **It writes `min_grade`, where this control used to write `min_substats`.**
+/// The two were taken for one axis on shop gear, measured at 59 of 59 real
+/// pieces — and that sample could not hold the case that separates them.
+/// Heroic and Epic BOTH roll four substats (150 grade-5 rows at
+/// `sub_stat_count` 4..4), so a substat ladder tops out at "Heroic or better"
+/// and can never ask for Epic, which is what a player hunting purple-or-red
+/// actually wants. `min_substats` is a genuinely different question and stays
+/// loadable from `config.toml`; see its own doc.
+///
+/// **The cells are spelled at this end, and so the ladder draws in every
+/// session.** They used to come off the catalog's rarity family, which meant no
+/// control at all until a `catalog` message landed — a criterion whose four
+/// values are ordinals a player must not have to type, reachable only by editing
+/// `config.toml`. Four names and four ordinals are not worth that, and
+/// [`theme::RARITIES`] already held the colours beside them.
+pub(super) fn rarity_ladder(ui: &mut egui::Ui, value: &mut Option<u8>) {
     theme::segmented_strip(ui, |ui| {
-        for (n, label) in choices {
-            let on = *value == Some(*n);
-            if ui.selectable_label(on, *label).clicked() {
-                *value = if on { None } else { Some(*n) };
+        for (grade, label, _) in theme::RARITIES {
+            let on = *value == Some(grade);
+            if rarity_cell(ui, label, grade, on).clicked() {
+                *value = if on { None } else { Some(grade) };
             }
         }
     });
+}
+
+/// One rarity as a segment: its name in the game's ink for that grade.
+///
+/// The colour is dropped while the cell is CHOSEN, and that is not a detail. A
+/// chosen segment takes the strip's selection fill — this theme's accent — and
+/// an explicit `RichText` colour outlives that fill, so Epic's red would be
+/// painted over the blue instead of the fill's own legible ink. Unchosen is
+/// where the hue carries information anyway: it says which rarity a word names
+/// before the player has clicked anything.
+///
+/// The accessible name comes from the label like any `selectable_label`, so
+/// nothing has to be restated here — unlike [`icon_chip`], whose picture
+/// publishes none.
+fn rarity_cell(ui: &mut egui::Ui, label: &str, grade: u8, on: bool) -> egui::Response {
+    let text = egui::RichText::new(label);
+    ui.selectable_label(
+        on,
+        if on {
+            text
+        } else {
+            text.color(theme::rarity_ink(grade))
+        },
+    )
 }
 
 /// One editable any-of list entered as free text: entries with a remove cross
@@ -666,8 +743,31 @@ mod tests {
             names: vec!["ticketrare_name".to_owned()],
             ..Filter::default()
         };
-        assert_eq!(hunt_summary(&named), "Covenant");
+        assert_eq!(hunt_summary(&named), "Covenant Bookmarks");
         assert_eq!(hunt_summary(&Filter::default()), "nothing selected");
+    }
+
+    fn hunting(name: &str) -> Filter {
+        Filter {
+            names: vec![name.to_owned()],
+            ..Filter::default()
+        }
+    }
+
+    /// Every token the shop sells reads as words, the third one included.
+    ///
+    /// That third one is the defect the table closes: `HAUL_HEADLINERS` names
+    /// two, so `friendpoint_name` used to fall through it to its raw id — the
+    /// status line read `Hunting …, friendpoint_name` over a Hunt block that
+    /// said "Friendship Points" one panel down.
+    #[test]
+    fn every_token_the_shop_sells_reads_as_words() {
+        for (id, label, _) in HUNT_TOKENS {
+            assert_eq!(hunt_summary(&hunting(id)), label);
+        }
+        // A name nobody can place shows verbatim: it is a criterion the player
+        // typed, and words invented for it would hide which one it is.
+        assert_eq!(hunt_summary(&hunting("ecq4h_name")), "ecq4h_name");
     }
 
     /// One filter per criterion, each carrying that criterion and nothing else.
@@ -781,10 +881,10 @@ mod tests {
             min_substats: Some(3),
             ..Filter::default()
         };
-        assert_eq!(
-            hunt_summary(&filter),
-            "3+ substats, ≤300,000 gold, grade 4+"
-        );
+        // The rarity reads as the ladder two panels down spells it: the same
+        // criterion named twice on one screen used to read "grade 4+" here and
+        // "Heroic" there.
+        assert_eq!(hunt_summary(&filter), "3+ substats, ≤300,000 gold, Heroic+");
         // The converse: `min_substats = 0` restricts nothing, so the bar must
         // keep calling it an empty hunt.
         let inert = Filter {
@@ -795,24 +895,79 @@ mod tests {
         assert_eq!(hunt_summary(&inert), "nothing selected");
     }
 
-    /// The floors offered are the ones a `+0` piece can actually have, which is
-    /// the gear-grade domain — the axis [`segmented`]'s doc names. Widen the
-    /// loader's grades without widening this list and the control stops
-    /// offering a floor the game has.
+    /// The bar and the ladder name one criterion one way.
+    ///
+    /// The folded Hunt bar said `grade 5+` over a control spelling Good / Rare /
+    /// Heroic / Epic, so the same floor carried two names on one screen — and
+    /// the number was the one nobody sees anywhere else in the game.
     #[test]
-    fn the_offered_floors_are_the_grades_the_loader_accepts() {
-        for (floor, _) in SUBSTAT_FLOORS {
-            let filter: Filter = toml::from_str(&format!("min_grade = {floor}"))
-                .expect("a floor the control offers must be a grade the game has");
-            assert_eq!(filter.min_grade, Some(floor));
+    fn a_rarity_floor_reads_in_the_words_the_ladder_offers() {
+        for (id, label) in [(2, "Good+"), (3, "Rare+"), (4, "Heroic+"), (5, "Epic+")] {
+            let filter = Filter {
+                min_grade: Some(id),
+                ..Filter::default()
+            };
+            assert_eq!(hunt_summary(&filter), label);
         }
-        let lowest = SUBSTAT_FLOORS[0].0;
-        let highest = SUBSTAT_FLOORS[SUBSTAT_FLOORS.len() - 1].0;
+    }
+
+    /// A floor [`theme::RARITIES`] does not name still names its criterion, as
+    /// the ordinal `config.toml` would spell.
+    ///
+    /// Unreachable from a config file — the loader takes `2..=5` and the table
+    /// spells all four — so what this pins is that `grade_label` stays total
+    /// rather than guessing a word for a rarity the game has not published.
+    #[test]
+    fn a_rarity_the_table_cannot_name_still_names_its_criterion() {
+        let mythic = Filter {
+            min_grade: Some(9),
+            ..Filter::default()
+        };
+        assert_eq!(hunt_summary(&mythic), "grade 9+");
+        assert!(
+            toml::from_str::<Filter>("min_grade = 9").is_err(),
+            "and the loader is what keeps that branch off the config path"
+        );
+    }
+
+    /// The rarities the window can paint are exactly the floors the loader
+    /// accepts, and this is the UI half of that pairing — the domain half is
+    /// `min_grade_outside_the_game_domain_is_refused` in `domain::filter`.
+    ///
+    /// The two must move together in both directions. A grade the ladder offers
+    /// and the loader refuses is a click that writes a `config.toml` the app
+    /// cannot start from; a grade the loader accepts and the ladder cannot ink
+    /// is a rarity the player can only reach by editing the file.
+    /// [`theme::RARITIES`] is both the cells the ladder draws and the ink they
+    /// take, so walking it is walking the control itself.
+    #[test]
+    fn the_offered_rarities_are_the_grades_the_loader_accepts() {
+        for (grade, _, _) in theme::RARITIES {
+            let filter: Filter = toml::from_str(&format!("min_grade = {grade}"))
+                .expect("a rarity the ladder paints must be a grade the game has");
+            assert_eq!(filter.min_grade, Some(grade));
+        }
+        let lowest = theme::RARITIES[0].0;
+        let highest = theme::RARITIES[theme::RARITIES.len() - 1].0;
         for outside in [lowest - 1, highest + 1] {
             assert!(
                 toml::from_str::<Filter>(&format!("min_grade = {outside}")).is_err(),
-                "the list must not stop one short of the domain: {outside}"
+                "the ladder must not stop one short of the domain: {outside}"
             );
         }
+    }
+
+    /// Epic is what the reversal bought, so it gets its own line: the ladder's
+    /// top cell has to be a floor the file accepts, where the substat ladder it
+    /// replaced could only ever ask for four substats — which Heroic already
+    /// has.
+    #[test]
+    fn the_top_rarity_is_epic_and_it_loads() {
+        let (top, label, ink) = theme::RARITIES[theme::RARITIES.len() - 1];
+        assert_eq!(top, 5);
+        assert_eq!(label, "Epic");
+        assert_ne!(ink, theme::INK_MUTED, "Epic has a colour of its own");
+        let filter: Filter = toml::from_str("min_grade = 5").expect("Epic is a floor");
+        assert_eq!(filter.min_grade, Some(5));
     }
 }

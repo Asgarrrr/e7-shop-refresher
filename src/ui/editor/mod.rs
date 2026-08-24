@@ -13,10 +13,7 @@ mod timing;
 mod timing_meter;
 
 use clicking::{backend_row, clicking_summary, dry_run_row, timing_notice};
-use hunt::{
-    SUBSTAT_FLOORS, choice_list, optional_value, quick_add_names, segmented, string_list,
-    substat_chips, token_cards,
-};
+use hunt::{choice_list, optional_value, rarity_ladder, string_list, substat_chips, token_cards};
 use stop::{duration_row, limit_row};
 // Re-exported one level up: the idle status band describes the plan with the
 // same two summaries the folded Hunt and Stop bars use, so the window has one
@@ -62,7 +59,6 @@ pub(super) struct EditorState {
     /// one `Command` carries both — a single Apply must not land in halves.
     click_mode: ClickMode,
     applied_click_mode: ClickMode,
-    name_input: String,
     set_input: String,
     slot_input: String,
     /// What the server offered, cached off `VocabularyCell` so the pickers do
@@ -104,7 +100,6 @@ impl EditorState {
             limits,
             timings,
             click_mode,
-            name_input: String::new(),
             set_input: String::new(),
             slot_input: String::new(),
             vocabulary: FilterVocabulary::default(),
@@ -280,28 +275,14 @@ fn count_label(n: usize, singular: &str, plural: &str) -> String {
 /// yourself into a hunt that matches nothing.
 fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
     // `names` is an open field the filter matches literally, but the tokens the
-    // shop sells are a closed list the server can publish — and they are what a
-    // name criterion is nearly always for. Cards where it published them; the
-    // free-text list and its shortcut where it did not, because a config-set
-    // name has to stay enterable against a server with no Catalog.
-    if editor.vocabulary.tokens.is_empty() {
-        string_list(
-            ui,
-            "names (exact internal ids)",
-            &mut editor.filter.names,
-            &mut editor.name_input,
-        );
-        quick_add_names(ui, &mut editor.filter.names);
-    } else {
-        token_cards(ui, &mut editor.filter.names, &editor.vocabulary.tokens);
-    }
+    // shop sells are a closed list of three — and they are what a name criterion
+    // is nearly always for. It is the one criterion with NO free-text fallback,
+    // because the cards are built from `hunt::HUNT_TOKENS` and so cannot fail to
+    // be built; a name they do not offer keeps its own removable row, exactly as
+    // an unoffered set id does.
+    token_cards(ui, &mut editor.filter.names);
 
-    ui.add_space(theme::SP_SM);
-    ui.horizontal(|ui| {
-        ui.add_space(theme::SP_SM);
-        ui.weak("— or gear —");
-    });
-    ui.add_space(theme::SP_SM);
+    branch_separator(ui, "— or gear —", "or gear");
 
     offered_list(
         ui,
@@ -331,9 +312,16 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
         &editor.vocabulary.substats,
     );
     gear_rule(ui);
-    ui.label(theme::section("substats"));
-    ui.add_space(theme::SP_XS);
-    segmented(ui, &mut editor.filter.min_substats, &SUBSTAT_FLOORS);
+    // No space between the header and its control: the item spacing already
+    // puts one there, and the two blocks above take exactly that — a header
+    // that sits further from its own control than from the block before it
+    // is the reading this section had.
+    //
+    // Unconditional, where it used to wait on the catalog's rarity family: the
+    // cells are `theme::RARITIES` now, so there is no session in which the
+    // ladder cannot be drawn. See [`rarity_ladder`].
+    ui.label(theme::section("rarity"));
+    rarity_ladder(ui, &mut editor.filter.min_grade);
     ui.add_space(theme::SP_XS);
     egui::Grid::new("hunt-numerics")
         .num_columns(2)
@@ -353,16 +341,72 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
     ui.checkbox(&mut editor.filter.include_sold_out, "include sold out");
 }
 
+/// The boundary between the two branches of [`Filter::matches`] — what an item
+/// IS, and what a piece of gear LOOKS LIKE.
+///
+/// A full-width rule with the word sitting on it, breathing on both sides. It
+/// was a weak label fenced by two typed em-dashes, which is a caption
+/// impersonating a separation: the engine really does branch here, and the
+/// blocks either side are not rows of one list. The dashes are gone from the
+/// picture because the rule is the separation now — drawing both says it twice.
+///
+/// [`theme::BLOCK_RULE`] and not [`theme::HAIRLINE`], which is the one
+/// [`gear_rule`] takes: that doc already reserved the undimmed rule for exactly
+/// this boundary.
+///
+/// **The word is painted and its name restated**, the way
+/// [`theme::collapsing_section`] paints its title. Painted text publishes no
+/// accessibility node at all, and this one has to stay findable: it is the only
+/// thing on the surface saying the criteria above and below are an OR rather than
+/// an AND. `name` keeps the dashes the label always had, so the node a reader —
+/// and `the_hunt_body_separates_names_from_gear` — asks for is unchanged while
+/// the drawing is not.
+///
+/// The ground punched behind the word comes from `visuals.panel_fill`, the value
+/// [`theme::apply`] writes, so the hole cannot drift from the panel it is cut in.
+fn branch_separator(ui: &mut egui::Ui, name: &str, word: &str) {
+    ui.add_space(theme::SP_XL);
+    let line = theme::rule(ui, theme::BLOCK_RULE);
+    let galley = ui.painter().layout_no_wrap(
+        word.to_owned(),
+        egui::TextStyle::Small.resolve(ui.style()),
+        theme::INK_FAINT,
+    );
+    // Centred on the line as PAINTED — full-bleed to the clip edges — rather
+    // than on the content box the cursor allocates, or the word would sit off
+    // the middle of the rule it interrupts by the side margin's width.
+    let center = egui::pos2(ui.clip_rect().x_range().center(), line.center().y);
+    let text = egui::Align2::CENTER_CENTER.anchor_size(center, galley.size());
+    let ground = text.expand2(egui::vec2(theme::SP_SM, 0.0));
+    ui.painter()
+        .rect_filled(ground, egui::CornerRadius::ZERO, ui.visuals().panel_fill);
+    ui.painter().galley(text.min, galley, theme::INK_FAINT);
+    let response = ui.interact(
+        ground,
+        ui.id().with(("branch separator", name)),
+        egui::Sense::hover(),
+    );
+    let enabled = ui.is_enabled();
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, enabled, name));
+    ui.add_space(theme::SP_XL);
+}
+
 /// The divider between two gear criteria.
 ///
 /// [`theme::HAIRLINE`] and not the undimmed rule, per [`theme::rule`]'s own
 /// split: these are rows of ONE block — everything below `— or gear —` is the
 /// gear branch of [`Filter::matches`] — and a full-strength rule between them
 /// would read as the same boundary that separates the branches.
+///
+/// **Asymmetric, and that is the fix rather than the style.** With the same gap
+/// either side, a block's small-caps header sat as close to the rule above it as
+/// its own chips sat below — so the header read as a caption on the block it
+/// followed instead of a title for the one it opens. The air under the rule is
+/// what attaches it downwards.
 fn gear_rule(ui: &mut egui::Ui) {
     ui.add_space(theme::SP_SM);
     theme::rule(ui, theme::HAIRLINE);
-    ui.add_space(theme::SP_SM);
+    ui.add_space(theme::SP_LG);
 }
 
 /// Stop: the run's safety rails, one ledger row each.
@@ -706,11 +750,6 @@ mod tests {
                 percent_entry("att_rate", "Attack(%)"),
             ],
             slots: vec![entry("helm", "Helmet"), entry("boot", "Boots")],
-            tokens: vec![crate::uplink::protocol::TokenEntry {
-                id: "ticketrare_name".to_owned(),
-                label: "Covenant Bookmark".to_owned(),
-                price: Some(Gold::new(184_000)),
-            }],
             icons,
         });
         editor.sync_vocabulary(&cell);
@@ -763,9 +802,13 @@ mod tests {
         harness
     }
 
-    /// The checkbox row only exists once the server named something. Until
-    /// then the free-text lists keep their field, because the ids in a player's
-    /// config must stay enterable against a server with no Catalog.
+    /// The degradation contract, in one render: with no `catalog` message the
+    /// three wire-fed criteria fall back and the two constant-fed ones draw
+    /// anyway.
+    ///
+    /// The checkbox rows only exist once the server named something. Until then
+    /// the sets and gear-slot lists keep their field, because the ids in a
+    /// player's config must stay enterable against a server with no Catalog.
     ///
     /// Required substats are the exception, and it is a deliberate one: a chip
     /// row over an empty vocabulary draws nothing, so that criterion is
@@ -776,6 +819,11 @@ mod tests {
     /// bar from reading "nothing selected" over a hunt that restricts, and it is
     /// all it is: naming the id is the offered/unoffered rows' job, and they
     /// need the vocabulary this case does not have.
+    ///
+    /// The tokens and the rarities used to be the same story and are not any
+    /// more: their words are `hunt::HUNT_TOKENS` and `theme::RARITIES`, so both
+    /// controls are built from this end and neither has a state it cannot be
+    /// drawn in. That is the simplification, and this is where it is stated.
     #[test]
     fn the_lists_fall_back_to_free_text_with_no_vocabulary() {
         let mut editor = EditorState::new(
@@ -785,18 +833,23 @@ mod tests {
             ClickMode::default(),
         );
         let harness = draw_setup(&mut editor);
-        // One "add" button per free-text list: names, sets and gear slots.
+        // One "add" button per free-text list: sets and gear slots.
         assert_eq!(
             harness.get_all_by_label("add").count(),
-            3,
+            2,
             "every free-text list should offer its field"
         );
         assert_eq!(harness.query_all_by_label("Speed").count(), 0);
+        // While the two the relay spells itself are on screen regardless.
+        for rarity in ["Good", "Rare", "Heroic", "Epic"] {
+            assert_eq!(harness.get_all_by_label(rarity).count(), 1);
+        }
+        assert_eq!(harness.get_all_by_label("Covenant Bookmarks").count(), 1);
     }
 
     /// With a full vocabulary every criterion becomes a tick, `names` included:
-    /// it is an open field, but the tokens the shop sells are a closed list and
-    /// the server publishes them.
+    /// it is an open field, but the tokens the shop sells are a closed list of
+    /// three the relay spells itself.
     #[test]
     fn a_vocabulary_turns_the_enumerable_lists_into_choices() {
         let mut editor = stocked_editor();
@@ -815,7 +868,7 @@ mod tests {
             "Boots",
             "Speed",
             "Attack(%)",
-            "Covenant Bookmark",
+            "Covenant Bookmarks",
         ] {
             assert_eq!(
                 harness.get_all_by_label(label).count(),
@@ -1040,6 +1093,43 @@ mod tests {
         assert!(editor.filter.slots.is_empty());
     }
 
+    /// A gear block's header belongs to the block it OPENS, not to the one it
+    /// closes: the rule above it plus that rule's air has to outweigh the gap
+    /// down to its own first control.
+    ///
+    /// Measured in the theme's own rungs rather than in pixels, so it states the
+    /// rule instead of a screenshot — and it goes red on the layout this
+    /// replaced, where the same `SP_SM` sat either side of the rule and the
+    /// header read as a caption on the chips above it.
+    #[test]
+    fn a_gear_block_header_belongs_to_the_block_below_it() {
+        let mut editor = stocked_editor();
+        let harness = draw_setup(&mut editor);
+        // The gear-slot row above, the substats header, its own first chip.
+        let above = node_bounds(&harness, "Boots");
+        let header = node_bounds(&harness, "REQUIRED SUBSTATS");
+        let below = node_bounds(&harness, "Speed");
+        let over = header.y0 - above.y1;
+        let under = below.y0 - header.y1;
+        assert!(
+            over >= f64::from(theme::SP_SM + theme::SP_LG),
+            "the boundary above the header is thinner than its own rungs: {over}"
+        );
+        assert!(
+            over > under,
+            "the header sits closer to the block above than to its own: {over} vs {under}"
+        );
+    }
+
+    /// The accessibility box of the node a label names.
+    fn node_bounds(harness: &Harness<'_>, label: &str) -> egui::accesskit::Rect {
+        harness
+            .get_by_label(label)
+            .accesskit_node()
+            .bounding_box()
+            .expect("egui gives every node its bounds")
+    }
+
     /// The right-hand edge of the control a label names.
     fn chip_right_edge(harness: &Harness<'_>, label: &str) -> f64 {
         harness
@@ -1085,7 +1175,7 @@ mod tests {
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
-        harness.get_by_label("Covenant Bookmark").click();
+        harness.get_by_label("Covenant Bookmarks").click();
         harness.run();
         drop(harness);
         assert_eq!(editor.filter.names, vec!["ticketrare_name".to_owned()]);
@@ -1099,7 +1189,7 @@ mod tests {
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
-        harness.get_by_label("Covenant Bookmark").click();
+        harness.get_by_label("Covenant Bookmarks").click();
         harness.run();
         drop(harness);
         assert!(editor.filter.names.is_empty());
@@ -1114,35 +1204,21 @@ mod tests {
         harness.get_by_label("184,000 gold");
     }
 
-    /// With no vocabulary the cards cannot be drawn, and the free-text name
-    /// list is what remains — the same fallback every other list has.
-    #[test]
-    fn no_vocabulary_leaves_the_name_list_as_free_text() {
-        let mut editor = EditorState::new(
-            named_filter(),
-            Limits::default(),
-            Timings::default(),
-            ClickMode::default(),
-        );
-        let harness = draw_setup(&mut editor);
-        assert_eq!(harness.query_all_by_label("Covenant Bookmark").count(), 0);
-        assert!(harness.query_all_by_label("add").count() >= 1);
-    }
-
     /// A name no card offers keeps a row of its own, exactly as an unoffered set
     /// id does. Nothing constrains `names` to the shop's three tokens — a
-    /// player's `config.toml` can name anything, and once the cards replace the
-    /// free-text list a name with no card is a criterion that filters while
-    /// being invisible and unremovable.
+    /// player's `config.toml` can name anything, and the cards are the whole of
+    /// what that criterion offers, so a name with none is a criterion that
+    /// filters while being invisible and unremovable.
     #[test]
     fn an_unoffered_name_stays_visible_and_removable() {
         let mut editor = stocked_editor();
-        editor.filter.names = vec!["ticketspecial_name".to_owned()];
+        // Not one of the shop's three: those all have a card now.
+        editor.filter.names = vec!["ecq4h_name".to_owned()];
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
         harness.run();
-        assert_eq!(harness.get_all_by_label("ticketspecial_name").count(), 1);
+        assert_eq!(harness.get_all_by_label("ecq4h_name").count(), 1);
         // The only cross on the surface: every gear list is a choice row here,
         // and each offers what it holds.
         harness.get_by_label("✕").click();
@@ -1153,11 +1229,35 @@ mod tests {
 
     /// The screen states the OR where it acts: the name criteria and the gear
     /// criteria are two blocks, not one list.
+    ///
+    /// The word is painted on a rule now rather than laid out as a label, so
+    /// this also stands for the whole of what a screen reader gets from that
+    /// boundary — painted text publishes nothing, and the name is restated by
+    /// hand. It has to keep its old spelling, dashes included, or the node moves
+    /// under everyone who looks for it.
     #[test]
     fn the_hunt_body_separates_names_from_gear() {
         let mut editor = stocked_editor();
         let harness = draw_setup(&mut editor);
         assert_eq!(harness.query_all_by_label("— or gear —").count(), 1);
+        // And it sits on the rule it interrupts: inside the window, straddling
+        // its middle. Centring on the content box instead of the painted line
+        // is off by the side margin, which is invisible in a green test and
+        // obvious on screen.
+        let word = harness
+            .get_by_label("— or gear —")
+            .accesskit_node()
+            .bounding_box()
+            .expect("egui gives every node its bounds");
+        let middle = f64::from(crate::ui::WINDOW_WIDTH) / 2.0;
+        assert!(
+            word.x0 > 0.0 && word.x1 < f64::from(crate::ui::WINDOW_WIDTH),
+            "the word ran outside the window: {word:?}"
+        );
+        assert!(
+            word.x0 < middle && word.x1 > middle,
+            "the word should straddle the middle of the rule: {word:?}"
+        );
     }
 
     /// `kinds` leaves the window: picking a name says tokens, picking gear says
@@ -1293,33 +1393,92 @@ mod tests {
         assert!(editor.filter.required_substats.is_empty());
     }
 
-    /// The substat floor is one segmented control, not two numeric fields:
-    /// grade and substat count are the same axis on shop gear.
+    /// The quality control is a rarity ladder writing `min_grade`, and it
+    /// writes the ORDINAL the server sent beside the word — never the word.
     #[test]
-    fn the_substat_floor_is_segmented() {
+    fn the_rarity_ladder_writes_the_grade_behind_its_label() {
         let mut editor = stocked_editor();
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
-        harness.get_by_label("3+").click();
+        harness.get_by_label("Heroic").click();
         harness.run();
         drop(harness);
-        assert_eq!(editor.filter.min_substats, Some(3));
+        assert_eq!(editor.filter.min_grade, Some(4));
+        // And the criterion it replaced is left exactly as the file had it.
+        assert_eq!(editor.filter.min_substats, None);
+    }
+
+    /// Epic is the whole reason the axis moved: it carries four substats like
+    /// Heroic, so the ladder this replaced could not ask for it at all.
+    #[test]
+    fn the_ladder_can_ask_for_epic_alone() {
+        let mut editor = stocked_editor();
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Epic").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.min_grade, Some(5));
     }
 
     /// Clicking the active segment clears the floor — a criterion you can set
     /// and cannot unset is a trap.
     #[test]
-    fn clicking_the_active_segment_clears_the_floor() {
+    fn clicking_the_active_rarity_clears_the_floor() {
         let mut editor = stocked_editor();
-        editor.filter.min_substats = Some(3);
+        editor.filter.min_grade = Some(3);
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
-        harness.get_by_label("3+").click();
+        harness.get_by_label("Rare").click();
         harness.run();
         drop(harness);
-        assert_eq!(editor.filter.min_substats, None);
+        assert_eq!(editor.filter.min_grade, None);
+    }
+
+    /// Every rarity is a NAMED node, which is what a `ComboBox` here would not
+    /// be — and the four have to be findable one by one, since each writes a
+    /// different floor.
+    #[test]
+    fn every_rarity_is_named_and_stays_inside_the_window() {
+        let mut editor = stocked_editor();
+        let harness = draw_setup(&mut editor);
+        for label in ["Good", "Rare", "Heroic", "Epic"] {
+            assert_eq!(
+                harness.get_all_by_label(label).count(),
+                1,
+                "{label} should be one named cell"
+            );
+            // The window is pinned at `WINDOW_WIDTH` and cannot be widened, so
+            // a ladder that overflows is a ladder to make narrower.
+            let right = chip_right_edge(&harness, label);
+            assert!(
+                right <= f64::from(crate::ui::WINDOW_WIDTH),
+                "{label} ends at {right:.0}, past the window"
+            );
+        }
+    }
+
+    /// A `min_substats` a config file already carries survives a render: the
+    /// window has no control for it any more, so nothing in the window may drop
+    /// it either — the same rule `kinds` follows.
+    #[test]
+    fn a_config_set_substat_floor_survives_a_window_with_no_control_for_it() {
+        let mut editor = stocked_editor_with(Filter {
+            min_substats: Some(3),
+            ..named_filter()
+        });
+        let harness = draw_setup(&mut editor);
+        // Nothing offers the old ladder's segments any more.
+        for gone in ["2+", "3+", "4"] {
+            assert_eq!(harness.query_all_by_label(gone).count(), 0);
+        }
+        drop(harness);
+        assert_eq!(editor.filter.min_substats, Some(3));
+        // And Apply stays dark: a render that changed nothing is not an edit.
+        assert!(run_setup(&mut editor).is_empty());
     }
 
     /// An id the vocabulary cannot name has no box of its own, so it is drawn
@@ -1716,28 +1875,15 @@ mod tests {
         assert_eq!(button.rect(), rect);
     }
 
-    #[test]
-    fn quick_add_seeds_a_hunt_token() {
-        let mut editor = EditorState::new(
-            Filter::default(),
-            Limits::default(),
-            Timings::default(),
-            ClickMode::default(),
-        );
-        let mut harness = Harness::new_ui(|ui| {
-            edit_setup(ui, &mut editor);
-        });
-        harness.get_by_label("+ Covenant").click();
-        harness.run();
-        drop(harness);
-        assert_eq!(editor.filter.names, vec!["ticketrare_name".to_owned()]);
-    }
-
-    /// A config-set grade floor no longer has a control, so the folded Hunt bar
-    /// is the whole of what says it is there. It restricts — `matches` drops
-    /// every gradeless item — so a summary reading "nothing selected" over one
-    /// would be the lie `a_restricting_filter_is_never_summarized_as_nothing_selected`
-    /// exists to catch.
+    /// The folded Hunt bar names both criteria in the words their controls
+    /// spell, and it does so with no catalog behind it — the state a config-set
+    /// floor arrives in.
+    ///
+    /// A rarity floor restricts — `matches` drops every gradeless item — so a
+    /// summary reading "nothing selected" over one would be the lie
+    /// `a_restricting_filter_is_never_summarized_as_nothing_selected` exists to
+    /// catch. It must read `Good+` and never `grade 2+`: the ordinal is the one
+    /// number a player sees nowhere else in the game.
     #[test]
     fn a_config_set_grade_floor_still_names_itself_in_the_folded_bar() {
         let filter = Filter {
@@ -1752,9 +1898,7 @@ mod tests {
         );
         editor.hunt_open = false;
         let harness = draw_setup(&mut editor);
-        harness.get_by_label("Hunt · Covenant, grade 2+");
-        // And rendering leaves it exactly where config.toml put it: nothing in
-        // the window writes `min_grade` any more.
+        harness.get_by_label("Hunt · Covenant Bookmarks, Good+");
         drop(harness);
         assert_eq!(editor.filter.min_grade, Some(2));
     }
@@ -1899,7 +2043,7 @@ mod tests {
             edit_setup(ui, &mut editor);
         });
         harness.run();
-        let hunt = harness.get_by_label("Hunt · Covenant").rect();
+        let hunt = harness.get_by_label("Hunt · Covenant Bookmarks").rect();
         let stop = harness.get_by_label("Stop · no limits").rect();
         let click = harness.get_by_label("Click timing · Instant").rect();
         assert_eq!(hunt.max.y, stop.min.y, "Hunt and Stop must tile");
@@ -1970,7 +2114,7 @@ mod tests {
                 theme::apply(ui.ctx());
                 let bg = ui.visuals().panel_fill;
                 ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, bg);
-                edit_sections(ui, &mut editor);
+                edit_sections(ui, &mut editor, &SetIcons::default());
             });
         harness.run();
         let image = harness.render().expect("wgpu render");

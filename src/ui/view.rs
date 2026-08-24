@@ -178,6 +178,11 @@ pub(super) fn slot_detail(controller: &Controller, index: usize) -> String {
 /// session stamps domain events with — so the elapsed time here and the
 /// duration limit the controller enforces are measured against one clock and
 /// cannot disagree.
+///
+/// The controller and the clock are the whole of what it takes. It used to carry
+/// the server's vocabulary in as a third argument, purely so [`plan_summary`]
+/// could name a token and a rarity; those words are relay constants now, read
+/// where they are needed.
 pub(super) fn view_state(controller: &Controller, now_ms: u64) -> ViewState {
     let (status_word, status_hint) = status_summary(controller);
     let (haul, haul_others) = haul_tally(controller.haul());
@@ -453,6 +458,30 @@ mod tests {
         // A frame stamped before the `Start` the session just handled floors at
         // zero rather than wrapping into geological time.
         assert_eq!(view_state(&ctrl, 3_999).elapsed_ms, Some(0));
+    }
+
+    /// The idle band says what a run would hunt, and it says it in words.
+    ///
+    /// Both criteria that have any are checked: the token — `friendpoint_name`,
+    /// the one `render::HAUL_HEADLINERS` cannot name, which is how the raw id
+    /// used to reach the top bar — and the rarity floor, which must read `Epic+`
+    /// and never the ordinal. Asserted here rather than only in `hunt_summary`'s
+    /// own tests because this is the projection that has to reach for them.
+    #[test]
+    fn the_idle_plan_names_its_criteria_in_words() {
+        let hunting = Controller::new(
+            Filter {
+                names: vec!["friendpoint_name".to_owned()],
+                min_grade: Some(5),
+                ..Filter::default()
+            },
+            Limits::default(),
+        );
+        let plan = view_state(&hunting, 0)
+            .plan
+            .expect("an idle controller states its plan");
+        assert!(plan.contains("Friendship Points"), "{plan}");
+        assert!(plan.contains("Epic+"), "{plan}");
     }
 
     #[test]
