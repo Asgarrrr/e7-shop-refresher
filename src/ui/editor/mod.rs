@@ -263,9 +263,6 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     // Names have no vocabulary: the server publishes sets, substats and slots,
     // and an item name is not a closed list it can enumerate. `quick_add_names`
     // stays the shortcut for the two tokens nearly everyone hunts.
-    // Names have no vocabulary: the server publishes sets, substats and slots,
-    // and an item name is not a closed list it can enumerate. `quick_add_names`
-    // stays the shortcut for the two tokens nearly everyone hunts.
     string_list(
         ui,
         "names (exact internal ids)",
