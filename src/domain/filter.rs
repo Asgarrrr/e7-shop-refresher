@@ -13,8 +13,9 @@ use crate::domain::shop::{Gold, ItemKind, ShopItem, ShopSnapshot};
 const GRADE_MIN: u8 = 2;
 const GRADE_MAX: u8 = 4;
 
-/// Player criteria, combined with a logical AND; an empty `Vec` or `None` field
-/// does not constrain, so a default `Filter` matches every available item.
+/// Player criteria. An empty `Vec` or `None` field does not constrain, so a
+/// default `Filter` matches every available item; how the set ones combine is
+/// [`Self::matches`]' own question, and it is no longer one conjunction.
 ///
 /// Missing data is handled asymmetrically on purpose: `max_price` is
 /// fail-closed (an unknown price never satisfies a cap), sold-out is fail-open
@@ -62,12 +63,21 @@ pub struct Filter {
     pub required_substats: Vec<SubstatReq>,
     /// Inclusive gold cap; an unknown price fails it.
     ///
+    /// Belongs to the GEAR branch, so it is **not** a global cap: beside a
+    /// `names` criterion the named item is bought at any price, because the
+    /// name branch answers on its own and the gear side is never consulted.
+    /// Surprising and deliberate — cap a named hunt with the player's own
+    /// `[limits]`, not with this.
+    ///
     /// A [`Gold`], so a crystal budget cannot be written here by mistake.
     /// `#[serde(transparent)]` in both directions, so `config.toml` still
     /// spells this as a bare `max_price = 300000`.
     pub max_price: Option<Gold>,
     /// Inclusive minimum gear grade (2, 3, or 4); an unknown grade fails it.
     /// A floor outside that domain is refused at parse time — see `GRADE_MIN`.
+    ///
+    /// Gear branch, like [`Filter::max_price`], with the same consequence: it
+    /// says nothing about an item a `names` criterion already accepted.
     #[serde(deserialize_with = "grade_floor")]
     pub min_grade: Option<u8>,
     /// Keep sold-out items (default drops them).
@@ -150,6 +160,17 @@ pub struct SubstatReq {
 }
 
 impl Filter {
+    /// Whether this item is worth stopping for.
+    ///
+    /// The sold-out and `kinds` gates apply to everything. Past them the
+    /// criteria fall into two branches — what the item IS (its name) and what
+    /// a piece of gear LOOKS LIKE — and an item satisfying either is a hit.
+    ///
+    /// The OR is the point. A token carries no set and gear carries no token
+    /// name, so a single AND over the two branches made "stop on a Covenant
+    /// bookmark or a Speed helm" match nothing at all. A branch with no
+    /// criterion set does not constrain and does not match, so a filter using
+    /// only one branch behaves exactly as it did before this existed.
     pub fn matches(&self, item: &ShopItem) -> bool {
         if !self.include_sold_out && item.is_sold_out() {
             return false;
@@ -157,14 +178,66 @@ impl Filter {
         if !self.kinds.is_empty() && !self.kinds.contains(&item.kind) {
             return false;
         }
-        if !self.names.is_empty()
-            && !item
-                .name
-                .as_ref()
-                .is_some_and(|name| self.names.contains(name))
-        {
-            return false;
+        let named = !self.names.is_empty();
+        let geared = self.has_gear_criteria();
+        match (named, geared) {
+            (false, false) => true,
+            (true, false) => self.name_branch(item),
+            (false, true) => self.gear_branch(item),
+            (true, true) => self.name_branch(item) || self.gear_branch(item),
         }
+    }
+
+    /// Whether any gear-shaped criterion is set. Read by [`Self::matches`] to
+    /// tell "no gear constraint" from "gear constraint this item fails".
+    ///
+    /// The destructure is load-bearing. [`Self::gear_branch`] enumerates these
+    /// same criteria and nothing ties the two lists together, so a field
+    /// present in one and missing from the other fails silently in both
+    /// directions: a criterion nobody tests, or a branch armed on a test it
+    /// never runs. Both fail open, toward buying. Binding every field makes
+    /// the omission a compile error instead.
+    fn has_gear_criteria(&self) -> bool {
+        let Self {
+            sets,
+            slots,
+            required_substats,
+            min_substats,
+            max_price,
+            min_grade,
+            // Applied to every item by `matches` before either branch.
+            kinds: _,
+            include_sold_out: _,
+            // The other branch.
+            names: _,
+        } = self;
+        !sets.is_empty()
+            || !slots.is_empty()
+            || !required_substats.is_empty()
+            || Self::substat_floor_is_real(*min_substats)
+            || max_price.is_some()
+            || min_grade.is_some()
+    }
+
+    /// `Some(0)` is not a criterion — the GUI editor produces it in two clicks
+    /// and it constrains nothing. THE home for that rule: read positively here
+    /// to arm the gear branch, negated in [`Self::is_unrestricted`]. Spelled
+    /// twice, the two would drift into a filter that is unrestricted and yet
+    /// refuses every token.
+    fn substat_floor_is_real(floor: Option<u8>) -> bool {
+        floor.is_some_and(|min| min > 0)
+    }
+
+    /// The item IS one of the named things.
+    fn name_branch(&self, item: &ShopItem) -> bool {
+        item.name
+            .as_ref()
+            .is_some_and(|name| self.names.contains(name))
+    }
+
+    /// The item looks like the gear being hunted. Every set criterion holds,
+    /// each fail-closed on missing data.
+    fn gear_branch(&self, item: &ShopItem) -> bool {
         if let Some(min) = self.min_substats
             && item.substats.len() < usize::from(min)
         {
@@ -223,7 +296,7 @@ impl Filter {
             && self.names.is_empty()
             && self.sets.is_empty()
             && self.slots.is_empty()
-            && self.min_substats.is_none_or(|min| min == 0)
+            && !Self::substat_floor_is_real(self.min_substats)
             && self.required_substats.is_empty()
             && self.max_price.is_none()
             // Any grade floor constrains: `matches` is fail-closed, so it drops
@@ -286,6 +359,22 @@ mod tests {
                 substat("att", Some(40.0)),
             ],
             limit: None,
+        }
+    }
+
+    /// A real token: the kind, and none of the gear fields. Every gear
+    /// criterion can therefore only ever refuse it, which is what makes it the
+    /// item the OR was built for.
+    fn token(name: &str) -> ShopItem {
+        ShopItem {
+            kind: ItemKind::Token,
+            name: Some(name.to_owned()),
+            price: Some(Gold::new(184_000)),
+            set: None,
+            gear_slot: None,
+            grade: None,
+            substats: Vec::new(),
+            ..equip()
         }
     }
 
@@ -751,6 +840,107 @@ mod tests {
             ..speed_filter()
         };
         assert!(!filter.matches(&equip()));
+    }
+
+    /// A token and a gear criterion together used to match NOTHING: every
+    /// criterion was joined by AND, so the bookmark failed `sets` and the helm
+    /// failed `names`.
+    #[test]
+    fn a_token_and_a_gear_criterion_match_their_own_items() {
+        use crate::domain::shop::ShopSnapshot;
+
+        let roll: ShopSnapshot = serde_json::from_str(
+            r#"{"slots":[
+                 {"name":"ticketrare_name","kind":"token","price":184000},
+                 {"name":"ecq4h_name","kind":"equipment","set":"set_speed",
+                  "gear_slot":"helm","grade":4}
+               ]}"#,
+        )
+        .expect("fixture should parse");
+        let both = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            sets: vec!["set_speed".to_owned()],
+            ..Filter::default()
+        };
+        assert!(
+            both.matches(&roll.slots[0]),
+            "the token should match by name"
+        );
+        assert!(both.matches(&roll.slots[1]), "the helm should match by set");
+    }
+
+    /// A filter naming both branches. Its refusals are pinned separately, by
+    /// [`a_two_branch_filter_refuses_an_item_that_answers_neither`].
+    fn both_branches() -> Filter {
+        Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            sets: vec!["set_speed".to_owned()],
+            ..Filter::default()
+        }
+    }
+
+    /// The four cells of the OR. The first three are the compatibility claim:
+    /// a filter using at most one branch behaves exactly as it did before the
+    /// branches existed.
+    #[test]
+    fn the_two_branches_cover_their_truth_table() {
+        let bookmark = token("ticketrare_name");
+        let helm = equip();
+
+        let empty = Filter::default();
+        assert!(empty.matches(&bookmark), "no criterion keeps the token");
+        assert!(empty.matches(&helm), "no criterion keeps the helm");
+
+        let named = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            ..Filter::default()
+        };
+        assert!(named.matches(&bookmark), "the name branch keeps its token");
+        assert!(!named.matches(&helm), "a nameless helm answers no name");
+
+        let geared = Filter {
+            sets: vec!["set_speed".to_owned()],
+            ..Filter::default()
+        };
+        assert!(!geared.matches(&bookmark), "a setless token answers no set");
+        assert!(geared.matches(&helm), "the gear branch keeps its helm");
+
+        let both = both_branches();
+        assert!(both.matches(&bookmark), "the token still matches by name");
+        assert!(both.matches(&helm), "the helm still matches by set");
+    }
+
+    /// The refusing half of the OR, which the truth table's fourth cell cannot
+    /// reach — both its items hit, so an arm hardwired to `true` satisfies it.
+    /// Two branches widen what is bought; nothing else here pins what a widened
+    /// filter still says no to, and the miss direction spends the player's gold.
+    #[test]
+    fn a_two_branch_filter_refuses_an_item_that_answers_neither() {
+        let both = both_branches();
+        assert!(
+            !both.matches(&token("friendpoint_name")),
+            "the friendship bookmark answers neither branch"
+        );
+        let wrong_set = ShopItem {
+            set: Some("set_rage".to_owned()),
+            ..equip()
+        };
+        assert!(
+            !both.matches(&wrong_set),
+            "a nameless helm of the wrong set answers neither branch"
+        );
+    }
+
+    /// `min_substats = 0` constrains nothing, so it must not switch the gear
+    /// branch on — otherwise a name-only filter would start refusing tokens.
+    #[test]
+    fn a_zero_substat_floor_does_not_arm_the_gear_branch() {
+        let filter = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            min_substats: Some(0),
+            ..Filter::default()
+        };
+        assert!(filter.matches(&token("ticketrare_name")));
     }
 
     fn slot_filter(slots: &[&str]) -> Filter {

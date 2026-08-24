@@ -7,6 +7,7 @@
 
 mod capture_health;
 mod editor;
+mod icons;
 mod journal;
 mod shop;
 mod statusbar;
@@ -29,6 +30,7 @@ use crate::watch::HaltSource;
 
 use capture_health::{capture_view, render_capture_health};
 use editor::EditorState;
+use icons::SetIcons;
 use view::{SlotRow, SlotRows, ViewState, slot_detail, view_state};
 
 /// Where the session's terminal outcome lands (fatal error, crash, or clean
@@ -133,6 +135,11 @@ pub struct ShopApp {
     /// Journal snapshot re-cloned only when the generation changes.
     journal_cache: Vec<LogLine>,
     journal_generation: u64,
+    /// The gear-set pictures the Setup tab's set chips draw, uploaded once per
+    /// catalog under the same rule as the caches above. Held here and not in
+    /// [`EditorState`] because a texture belongs to an `egui::Context`, which
+    /// the drafts know nothing about.
+    set_icons: SetIcons,
     /// The slot table's rows, cached under the same rule. See [`SlotRows`].
     slots: SlotRows,
     /// Starts collapsed to its title bar so the shop table owns the height.
@@ -176,6 +183,8 @@ impl ShopApp {
             tab: Tab::Shop,
             journal_cache,
             journal_generation,
+            // Empty until a catalog lands, which is the every-chip-is-text case.
+            set_icons: SetIcons::default(),
             slots,
             journal_open: false,
             fetcher: crate::install::Fetcher::new(),
@@ -221,7 +230,15 @@ impl eframe::App for ShopApp {
         }
         // Same generation-gated copy as the journal above, and here for the same
         // reason: the Setup pickers read it every frame and it is written once.
-        self.editor.sync_vocabulary(&self.handles.vocabulary);
+        //
+        // The icons ride that gate rather than getting one of their own: they
+        // come off the vocabulary the sync just copied, so "the catalog moved"
+        // is the same answer for both, and decoding twenty-two PNGs into
+        // twenty-two textures per frame would be the one per-frame cost this
+        // window cannot pay.
+        if self.editor.sync_vocabulary(&self.handles.vocabulary) {
+            self.set_icons.load(ui.ctx(), self.editor.icons());
+        }
         let outcome = lock_ignoring_poison(&self.error).clone();
         // A terminal outcome disables every control: the click would hit a dead
         // channel.
@@ -333,7 +350,14 @@ impl eframe::App for ShopApp {
         let applied = egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::ZERO))
             .show(ui, |ui| {
-                render_tab_content(ui, &pane, self.tab, &mut self.editor, session_alive)
+                render_tab_content(
+                    ui,
+                    &pane,
+                    self.tab,
+                    &mut self.editor,
+                    &self.set_icons,
+                    session_alive,
+                )
             })
             .inner;
         self.commit(clicked.into_iter().chain(applied));
@@ -529,6 +553,7 @@ fn render_tab_content(
     pane: &ShopPane<'_>,
     tab: Tab,
     editor: &mut EditorState,
+    icons: &SetIcons,
     session_alive: bool,
 ) -> Vec<Command> {
     match tab {
@@ -542,7 +567,7 @@ fn render_tab_content(
                 });
             Vec::new()
         }
-        Tab::Setup => render_setup_tab(ui, editor, session_alive),
+        Tab::Setup => render_setup_tab(ui, editor, icons, session_alive),
     }
 }
 
@@ -552,6 +577,7 @@ fn render_tab_content(
 fn render_setup_tab(
     ui: &mut egui::Ui,
     editor: &mut EditorState,
+    icons: &SetIcons,
     session_alive: bool,
 ) -> Vec<Command> {
     let mut clicked = Vec::new();
@@ -568,7 +594,9 @@ fn render_setup_tab(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             content_inset(ui, |ui| {
-                ui.add_enabled_ui(session_alive, |ui| editor::edit_sections(ui, editor));
+                ui.add_enabled_ui(session_alive, |ui| {
+                    editor::edit_sections(ui, editor, icons);
+                });
             });
         });
     clicked
@@ -650,7 +678,9 @@ mod tests {
             rows,
             detail: &|_| String::new(),
         };
-        render_tab_content(ui, &pane, *tab, editor, session_alive)
+        // No icons: these tests drive the tab strip, and a set chip with no
+        // picture is the branch every other test in this file already reads.
+        render_tab_content(ui, &pane, *tab, editor, &SetIcons::default(), session_alive)
     }
 
     /// The one command that becomes two keys, and the reason `persisted_sections`

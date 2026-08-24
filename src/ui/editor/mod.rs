@@ -13,7 +13,10 @@ mod timing;
 mod timing_meter;
 
 use clicking::{backend_row, clicking_summary, dry_run_row, timing_notice};
-use hunt::{choice_list, grade_value, optional_value, quick_add_names, string_list, substat_reqs};
+use hunt::{
+    SUBSTAT_FLOORS, choice_list, optional_value, quick_add_names, segmented, string_list,
+    substat_chips, token_cards,
+};
 use stop::{duration_row, limit_row};
 // Re-exported one level up: the idle status band describes the plan with the
 // same two summaries the folded Hunt and Stop bars use, so the window has one
@@ -24,6 +27,7 @@ use timing::{fine_tune_body, mode_hint, pass_estimate, timing_summary};
 
 use eframe::egui;
 
+use super::icons::SetIcons;
 use super::theme;
 use crate::actuator::ClickMode;
 #[cfg(test)]
@@ -31,17 +35,17 @@ use crate::actuator::plan::DelayRange;
 use crate::actuator::plan::{TimingPreset, Timings};
 use crate::app::Command;
 use crate::domain::control::Limits;
+use crate::domain::filter::Filter;
 #[cfg(test)]
 use crate::domain::filter::SubstatReq;
-use crate::domain::filter::{Filter, HUNTABLE_KINDS};
 use crate::uplink::VocabularyCell;
 use crate::uplink::protocol::{FilterVocabulary, VocabularyEntry};
 // `currency_row` lends each cap its raw number for the frame the drag needs it.
 use crate::domain::shop::{Crystals, Gold};
-// Only the tests still name a kind directly; the checkbox row reads `HUNTABLE_KINDS`.
+// `kinds` has no control in the window any more, so only a test still names a
+// kind — the one pinning that a config-set one survives a render.
 #[cfg(test)]
 use crate::domain::shop::ItemKind;
-use crate::render::kind_label;
 
 /// Draft criteria owned by the window until Apply pushes them to the session.
 /// Apply retunes the live session and writes the changed sections back to
@@ -61,7 +65,6 @@ pub(super) struct EditorState {
     name_input: String,
     set_input: String,
     slot_input: String,
-    substat_input: String,
     /// What the server offered, cached off `VocabularyCell` so the pickers do
     /// not clone forty strings per frame. Empty until a `catalog` message
     /// arrives, and empty for good against a server with no Catalog — every
@@ -104,7 +107,6 @@ impl EditorState {
             name_input: String::new(),
             set_input: String::new(),
             slot_input: String::new(),
-            substat_input: String::new(),
             vocabulary: FilterVocabulary::default(),
             vocabulary_generation: 0,
             hunt_open: true,
@@ -117,18 +119,31 @@ impl EditorState {
         }
     }
 
-    /// Copies the server's vocabulary in, if it has moved since the last copy.
+    /// Copies the server's vocabulary in, if it has moved since the last copy,
+    /// and says whether it did.
     ///
     /// Gated on the generation rather than run unconditionally: the window
     /// redraws every frame and the vocabulary is written once per session, so
     /// an ungated clone would copy forty-odd strings sixty times a second to
     /// learn nothing. Called once per frame, before the pickers read it.
-    pub(super) fn sync_vocabulary(&mut self, cell: &VocabularyCell) {
+    ///
+    /// The answer is what the window's [`SetIcons`] hangs off: decoding
+    /// twenty-two PNGs and uploading twenty-two textures is a per-catalog cost,
+    /// and this is the one call that knows a catalog landed.
+    pub(super) fn sync_vocabulary(&mut self, cell: &VocabularyCell) -> bool {
         let generation = cell.generation();
-        if generation != self.vocabulary_generation {
-            self.vocabulary = cell.get();
-            self.vocabulary_generation = generation;
+        if generation == self.vocabulary_generation {
+            return false;
         }
+        self.vocabulary = cell.get();
+        self.vocabulary_generation = generation;
+        true
+    }
+
+    /// The wire icon table the last catalog carried, base64 as it arrived.
+    /// Decoding is [`SetIcons::load`]'s job, and the window owns the result.
+    pub(super) fn icons(&self) -> &std::collections::HashMap<String, String> {
+        &self.vocabulary.icons
     }
 
     /// Re-seeds the applied twins from the commands the session *actually*
@@ -149,9 +164,16 @@ impl EditorState {
 
 /// The whole Setup surface in one `ui` so a test can drive sections and Apply
 /// at once; the live window mounts them as separate panels.
+///
+/// It also decodes the set icons per frame, where the window loads them once per
+/// catalog: a test drives an `EditorState` and no `ShopApp`, so this is the only
+/// place the two can be held together. The fixtures carry one picture, so the
+/// cost is the test's and never the app's.
 #[cfg(test)]
 fn edit_setup(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
-    edit_sections(ui, editor);
+    let mut icons = SetIcons::default();
+    icons.load(ui.ctx(), editor.icons());
+    edit_sections(ui, editor, &icons);
     ui.add_space(theme::SP_XL);
     commit_row(ui, editor, true)
 }
@@ -163,13 +185,13 @@ fn edit_setup(ui: &mut egui::Ui, editor: &mut EditorState) -> Vec<Command> {
 /// no session running, since the file was the only place they landed.
 /// `08d67e9` made them a live retune, so all four sections now need somewhere
 /// to send a command and the caller gates them together again.
-pub(super) fn edit_sections(ui: &mut egui::Ui, editor: &mut EditorState) {
+pub(super) fn edit_sections(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
     // Summaries are built only while folded. No space between collapsed bars:
     // they tile on item spacing alone so hover strips meet with no dead seam.
     let hunt = (!editor.hunt_open).then(|| hunt_summary(&editor.filter));
     section(ui, "Hunt", hunt.as_deref(), &mut editor.hunt_open);
     if editor.hunt_open {
-        hunt_body(ui, editor);
+        hunt_body(ui, editor, icons);
         ui.add_space(theme::SP_SM);
     }
     let stop = (!editor.stop_open).then(|| stop_summary(&editor.limits));
@@ -220,11 +242,12 @@ fn offered_list(
     values: &mut Vec<String>,
     input: &mut String,
     choices: &[VocabularyEntry],
+    icons: &SetIcons,
 ) {
     if choices.is_empty() {
         string_list(ui, label, values, input);
     } else {
-        choice_list(ui, label, values, choices);
+        choice_list(ui, label, values, choices, icons);
     }
 }
 
@@ -244,62 +267,75 @@ fn count_label(n: usize, singular: &str, plural: &str) -> String {
 }
 
 /// Hunt: what the loop buys. Without a criterion the loop refuses to arm.
-fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
+///
+/// Two blocks, because [`Filter::matches`] has two branches: what an item IS,
+/// and what a piece of gear looks like. An item satisfying either is a hit, and
+/// the rule between them is what says so on screen — stacked as one list, the
+/// same controls read as a conjunction the engine stopped applying.
+///
+/// `kinds` is not here. It still gates both branches and still loads from
+/// `config.toml`; what it has no place doing is duplicating a statement the
+/// blocks below already make — a name criterion names tokens, a gear criterion
+/// names gear, and a third control saying the same is a way to contradict
+/// yourself into a hunt that matches nothing.
+fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
+    // `names` is an open field the filter matches literally, but the tokens the
+    // shop sells are a closed list the server can publish — and they are what a
+    // name criterion is nearly always for. Cards where it published them; the
+    // free-text list and its shortcut where it did not, because a config-set
+    // name has to stay enterable against a server with no Catalog.
+    if editor.vocabulary.tokens.is_empty() {
+        string_list(
+            ui,
+            "names (exact internal ids)",
+            &mut editor.filter.names,
+            &mut editor.name_input,
+        );
+        quick_add_names(ui, &mut editor.filter.names);
+    } else {
+        token_cards(ui, &mut editor.filter.names, &editor.vocabulary.tokens);
+    }
+
+    ui.add_space(theme::SP_SM);
     ui.horizontal(|ui| {
-        // Driven by `HUNTABLE_KINDS`: an "unknown" box wrote
-        // `kinds = ["unknown"]`, which the next launch refused to load.
-        for kind in HUNTABLE_KINDS {
-            let mut on = editor.filter.kinds.contains(&kind);
-            if ui.checkbox(&mut on, kind_label(kind)).changed() {
-                if on {
-                    editor.filter.kinds.push(kind);
-                } else {
-                    editor.filter.kinds.retain(|kept| *kept != kind);
-                }
-            }
-        }
+        ui.add_space(theme::SP_SM);
+        ui.weak("— or gear —");
     });
     ui.add_space(theme::SP_SM);
-    // Names have no vocabulary: the server publishes sets, substats and slots,
-    // and an item name is not a closed list it can enumerate. `quick_add_names`
-    // stays the shortcut for the two tokens nearly everyone hunts.
-    string_list(
-        ui,
-        "names (exact internal ids)",
-        &mut editor.filter.names,
-        &mut editor.name_input,
-    );
-    quick_add_names(ui, &mut editor.filter.names);
+
     offered_list(
         ui,
         "sets",
         &mut editor.filter.sets,
         &mut editor.set_input,
         &editor.vocabulary.sets,
+        icons,
     );
+    // The catalog's icon table is keyed by set id and nothing else: there are no
+    // gear-slot pictures on the wire and none planned. An empty source says that
+    // in the one place it matters — inside `choice_list`, where every value then
+    // takes the text branch.
     offered_list(
         ui,
         "gear slots",
         &mut editor.filter.slots,
         &mut editor.slot_input,
         &editor.vocabulary.slots,
+        &SetIcons::default(),
     );
-    substat_reqs(
+    substat_chips(
         ui,
         &mut editor.filter.required_substats,
-        &mut editor.substat_input,
         &editor.vocabulary.substats,
     );
+    ui.add_space(theme::SP_XS);
+    ui.label("substats");
+    segmented(ui, &mut editor.filter.min_substats, &SUBSTAT_FLOORS);
     ui.add_space(theme::SP_XS);
     egui::Grid::new("hunt-numerics")
         .num_columns(2)
         .spacing([theme::SP_SM, theme::SP_XS])
         .show(ui, |ui| {
-            optional_value(ui, "min substats", &mut editor.filter.min_substats, 1);
-            ui.end_row();
-            // See [`grade_value`] for why the floor is a twin of the above.
-            grade_value(ui, &mut editor.filter.min_grade);
-            ui.end_row();
             // Seeded above the covenant-bookmark price, so a fresh cap still
             // matches the default hunt targets.
             currency_row(&mut editor.filter.max_price, Gold::get, Gold::new, |cap| {
@@ -307,7 +343,10 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
             });
             ui.end_row();
         });
-    ui.add_space(theme::SP_XS);
+    // Outside both blocks, and last because of it: `matches` applies this
+    // before either branch, so it widens the name hunt exactly as it widens the
+    // gear one.
+    ui.add_space(theme::SP_SM);
     ui.checkbox(&mut editor.filter.include_sold_out, "include sold out");
 }
 
@@ -354,13 +393,15 @@ fn currency_row<T: Copy>(
 }
 
 /// The drag field for an armed optional criterion, floored at 1 and open
-/// above — the shape every criterion but the grade floor has.
+/// above — the shape every criterion still entered as a number has.
 fn optional_field<T: egui::emath::Numeric>(ui: &mut egui::Ui, value: &mut T) -> egui::Response {
     bounded_field(ui, value, T::from_f64(1.0)..=T::MAX)
 }
 
-/// The same field over an explicit range, for a criterion the game defines on
-/// a closed set of values ([`hunt::grade_value`] is the one).
+/// The same field over an explicit range. No caller passes a narrower one since
+/// the grade floor left the window — a criterion the game defines on a closed
+/// set is a [`hunt::segmented`] row now, which cannot express a value off it at
+/// all — so this exists for the pair below, which every field wants.
 ///
 /// `clamp_existing_to_range(false)` is exactly the pair a bounded criterion
 /// needs: existing values are not clamped — a seeded `max_refreshes = 0`
@@ -544,9 +585,17 @@ struct Dirty {
 
 impl Dirty {
     /// Bit-exact on purpose, `min`'s `f64` included: this is change detection,
-    /// not a numeric test, so an epsilon would make a real edit invisible. It
-    /// cannot survive a non-finite `min` (`NaN != NaN` lights Apply forever),
-    /// which is why neither the loader nor [`substat_reqs`] admits one.
+    /// not a numeric test, so an epsilon would make a real edit invisible. What
+    /// it cannot survive is a non-finite `min`: `NaN != NaN` lights Apply
+    /// forever, and [`EditorState::mark_applied`] cannot put it out, because the
+    /// twin it re-seeds is a clone of the value that fails to equal itself.
+    ///
+    /// The loader is no help there — TOML 1.0 has special floats and
+    /// `SubstatReq.min` is a plain `f64`, so `min = nan` in `config.toml` loads
+    /// and arrives here. The guarantee is the render's alone: [`substat_chips`]
+    /// snaps every non-finite threshold back before this reads them, over the
+    /// whole list rather than per chip, so a requirement no chip is drawn for is
+    /// covered too.
     fn of(editor: &EditorState) -> Self {
         Self {
             filter: editor.filter != editor.applied_filter,
@@ -602,8 +651,38 @@ mod tests {
     /// An editor already holding the server's vocabulary, as one looks once a
     /// `catalog` message has landed.
     fn stocked_editor() -> EditorState {
-        let mut editor = EditorState::new(
+        stocked_editor_with(named_filter())
+    }
+
+    /// The same, over a filter the config file is taken to have carried — so
+    /// `applied_filter` is seeded from it too, which is the shape a startup
+    /// draft has and the only one where "Apply is lit for no edit" means
+    /// anything.
+    fn stocked_editor_with(filter: Filter) -> EditorState {
+        // No icons: chips with no picture behind them are what every test in
+        // this file already reads.
+        stocked_editor_from(filter, std::collections::HashMap::new())
+    }
+
+    /// The stocked editor a `catalog` message carrying pictures leaves behind:
+    /// one set has an icon, the other has none, so a single fixture holds both
+    /// branches of the set chip.
+    fn stocked_editor_with_icons() -> EditorState {
+        stocked_editor_from(
             named_filter(),
+            std::collections::HashMap::from([(
+                "set_speed".to_owned(),
+                crate::ui::icons::red_dot_base64(),
+            )]),
+        )
+    }
+
+    fn stocked_editor_from(
+        filter: Filter,
+        icons: std::collections::HashMap<String, String>,
+    ) -> EditorState {
+        let mut editor = EditorState::new(
+            filter,
             Limits::default(),
             Timings::default(),
             ClickMode::default(),
@@ -614,8 +693,19 @@ mod tests {
                 entry("set_speed", "Speed Set"),
                 entry("set_cri", "Critical Set"),
             ],
-            substats: vec![entry("speed", "Speed"), entry("att_rate", "Attack(%)")],
+            // One of each family, because the threshold stepper reads them
+            // differently: `att_rate` is sent as a fraction, `speed` whole.
+            substats: vec![
+                entry("speed", "Speed"),
+                percent_entry("att_rate", "Attack(%)"),
+            ],
             slots: vec![entry("helm", "Helmet"), entry("boot", "Boots")],
+            tokens: vec![crate::uplink::protocol::TokenEntry {
+                id: "ticketrare_name".to_owned(),
+                label: "Covenant Bookmark".to_owned(),
+                price: Some(Gold::new(184_000)),
+            }],
+            icons,
         });
         editor.sync_vocabulary(&cell);
         editor
@@ -625,7 +715,37 @@ mod tests {
         VocabularyEntry {
             id: id.to_owned(),
             label: label.to_owned(),
+            percent: false,
         }
+    }
+
+    /// A substat the server flagged percent-bearing — the wire sends
+    /// `att_rate: 0.03` for 3%.
+    fn percent_entry(id: &str, label: &str) -> VocabularyEntry {
+        VocabularyEntry {
+            percent: true,
+            ..entry(id, label)
+        }
+    }
+
+    /// Tick `≥` on the one required substat the editor holds, and answer with
+    /// the threshold that armed. One `≥` on the surface by construction: the
+    /// stepper unfolds beside the chip it belongs to and nowhere else, which
+    /// `only_the_required_chip_unfolds_a_threshold` pins.
+    fn arm_threshold(editor: &mut EditorState, name: &str) -> f64 {
+        editor.filter.required_substats = vec![SubstatReq {
+            name: name.to_owned(),
+            min: None,
+        }];
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, editor);
+        });
+        harness.get_by_label("≥").click();
+        harness.run();
+        drop(harness);
+        editor.filter.required_substats[0]
+            .min
+            .expect("arming the threshold seeds it")
     }
 
     /// Draw Setup once, without committing anything.
@@ -638,8 +758,18 @@ mod tests {
     }
 
     /// The checkbox row only exists once the server named something. Until
-    /// then every list keeps its free-text field, because the ids in a player's
+    /// then the free-text lists keep their field, because the ids in a player's
     /// config must stay enterable against a server with no Catalog.
+    ///
+    /// Required substats are the exception, and it is a deliberate one: a chip
+    /// row over an empty vocabulary draws nothing, so that criterion is
+    /// unreachable from the window until a `catalog` message lands. What backs
+    /// it is that a config-set requirement still filters and is still counted in
+    /// the folded Hunt bar — as `1 substat`, see `hunt_summary`: a tally that
+    /// says a requirement is there and never which. That is enough to keep the
+    /// bar from reading "nothing selected" over a hunt that restricts, and it is
+    /// all it is: naming the id is the offered/unoffered rows' job, and they
+    /// need the vocabulary this case does not have.
     #[test]
     fn the_lists_fall_back_to_free_text_with_no_vocabulary() {
         let mut editor = EditorState::new(
@@ -649,39 +779,42 @@ mod tests {
             ClickMode::default(),
         );
         let harness = draw_setup(&mut editor);
-        // One "add" button per free-text list: names, sets, gear slots and
-        // required substats.
+        // One "add" button per free-text list: names, sets and gear slots.
         assert_eq!(
             harness.get_all_by_label("add").count(),
-            4,
-            "every list should offer its text field"
+            3,
+            "every free-text list should offer its field"
         );
+        assert_eq!(harness.query_all_by_label("Speed").count(), 0);
     }
 
-    /// With a vocabulary the three enumerable criteria become checkbox rows,
-    /// and only `names` — which is not a closed list — keeps its field.
+    /// With a full vocabulary every criterion becomes a tick, `names` included:
+    /// it is an open field, but the tokens the shop sells are a closed list and
+    /// the server publishes them.
     #[test]
     fn a_vocabulary_turns_the_enumerable_lists_into_choices() {
         let mut editor = stocked_editor();
         let harness = draw_setup(&mut editor);
         assert_eq!(
-            harness.get_all_by_label("add").count(),
-            1,
-            "only `names` has no vocabulary to offer"
+            harness.query_all_by_label("add").count(),
+            0,
+            "no criterion is left asking for a typed id"
         );
-        // Sets and slots draw a box each; substats draw an add button each.
-        for label in ["Speed Set", "Critical Set", "Helmet", "Boots"] {
+        // One box per offered value, substats and tokens included: a
+        // requirement is a tick now, not an add button.
+        for label in [
+            "Speed Set",
+            "Critical Set",
+            "Helmet",
+            "Boots",
+            "Speed",
+            "Attack(%)",
+            "Covenant Bookmark",
+        ] {
             assert_eq!(
                 harness.get_all_by_label(label).count(),
                 1,
                 "{label} should have a checkbox"
-            );
-        }
-        for label in ["+ Speed", "+ Attack(%)"] {
-            assert_eq!(
-                harness.get_all_by_label(label).count(),
-                1,
-                "{label} should be offered as a substat requirement"
             );
         }
     }
@@ -700,6 +833,70 @@ mod tests {
         assert_eq!(editor.filter.sets, vec!["set_speed".to_owned()]);
     }
 
+    /// With a texture the set chip is its icon alone — 22 labelled chips wrap
+    /// to eight rows at the window's fixed 440px, icons alone to three. The
+    /// name stays the accessible name, so the control is still findable and a
+    /// screen reader still announces it.
+    #[test]
+    fn a_set_with_an_icon_is_still_named() {
+        let mut editor = stocked_editor_with_icons();
+        let harness = draw_setup(&mut editor);
+        assert_eq!(harness.query_all_by_label("Speed Set").count(), 1);
+    }
+
+    /// Clicking it stores the id, exactly as the text chip does — the icon is
+    /// presentation, never what the filter matches on.
+    #[test]
+    fn ticking_an_icon_chip_stores_the_internal_id() {
+        let mut editor = stocked_editor_with_icons();
+        editor.filter.sets.clear();
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Speed Set").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.sets, vec!["set_speed".to_owned()]);
+    }
+
+    /// A set whose icon did not arrive keeps its text chip rather than becoming
+    /// an unclickable gap. The icons are decoration; the vocabulary is not.
+    #[test]
+    fn a_set_without_an_icon_keeps_its_text_chip() {
+        let mut editor = stocked_editor();
+        let harness = draw_setup(&mut editor);
+        assert_eq!(harness.query_all_by_label("Speed Set").count(), 1);
+    }
+
+    /// The three above hold before and after the icon branch exists — a text
+    /// chip is named, clickable and drawn too, which is the point of them. This
+    /// is the one that separates the two: the whole reason the branch exists is
+    /// width, and the window cannot be widened to absorb a chip that grew.
+    #[test]
+    fn an_icon_chip_is_narrower_than_the_name_it_replaces() {
+        let mut with = stocked_editor_with_icons();
+        let mut without = stocked_editor();
+        let icon = chip_width(&draw_setup(&mut with), "Speed Set");
+        let text = chip_width(&draw_setup(&mut without), "Speed Set");
+        assert!(
+            icon < text,
+            "the icon chip should be narrower than its label: {icon} vs {text}"
+        );
+        // Squarish, not merely smaller: a chip laid out around a 32px picture
+        // is what makes 22 of them wrap to three rows at `WINDOW_WIDTH`.
+        assert!(icon < 56.0, "the icon chip should be chip-sized: {icon}");
+    }
+
+    /// The on-screen width of the control a label names.
+    fn chip_width(harness: &Harness<'_>, label: &str) -> f64 {
+        harness
+            .get_by_label(label)
+            .accesskit_node()
+            .bounding_box()
+            .expect("egui gives every node its bounds")
+            .width()
+    }
+
     /// And unticking takes it back out, rather than leaving a box that lies.
     #[test]
     fn unticking_a_slot_drops_its_id() {
@@ -714,37 +911,252 @@ mod tests {
         assert!(editor.filter.slots.is_empty());
     }
 
-    /// Adding a substat requirement stores the id too, and the row it creates
-    /// carries the threshold control the checkbox lists have no room for.
+    /// A token card writes the wire NAME, which is what `Filter::names`
+    /// compares against — never the label the player reads.
     #[test]
-    fn adding_a_substat_requirement_stores_its_internal_id() {
+    fn a_token_card_writes_the_wire_name() {
         let mut editor = stocked_editor();
+        // The seeded filter already hunts that token, so its card arrives
+        // ticked; clearing is what makes the click below an add.
+        editor.filter.names.clear();
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
-        harness.get_by_label("+ Attack(%)").click();
+        harness.get_by_label("Covenant Bookmark").click();
         harness.run();
         drop(harness);
-        assert_eq!(editor.filter.required_substats.len(), 1);
-        assert_eq!(editor.filter.required_substats[0].name, "att_rate");
-        assert_eq!(editor.filter.required_substats[0].min, None);
+        assert_eq!(editor.filter.names, vec!["ticketrare_name".to_owned()]);
     }
 
-    /// An already-required substat leaves the offer row: `matches` walks the
-    /// requirements, so a second row for one name is a duplicate threshold on
-    /// a value that only has one.
+    /// And unticking takes it back out, rather than leaving a card that lies.
     #[test]
-    fn an_already_required_substat_is_not_offered_again() {
+    fn unticking_a_token_card_drops_its_name() {
+        let mut editor = stocked_editor();
+        editor.filter.names = vec!["ticketrare_name".to_owned()];
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Covenant Bookmark").click();
+        harness.run();
+        drop(harness);
+        assert!(editor.filter.names.is_empty());
+    }
+
+    /// The price rides on the card, because it is what decides whether a hit is
+    /// worth stopping for — a bare chip has nowhere to put one.
+    #[test]
+    fn a_token_card_states_its_price() {
+        let mut editor = stocked_editor();
+        let harness = draw_setup(&mut editor);
+        harness.get_by_label("184,000 gold");
+    }
+
+    /// With no vocabulary the cards cannot be drawn, and the free-text name
+    /// list is what remains — the same fallback every other list has.
+    #[test]
+    fn no_vocabulary_leaves_the_name_list_as_free_text() {
+        let mut editor = EditorState::new(
+            named_filter(),
+            Limits::default(),
+            Timings::default(),
+            ClickMode::default(),
+        );
+        let harness = draw_setup(&mut editor);
+        assert_eq!(harness.query_all_by_label("Covenant Bookmark").count(), 0);
+        assert!(harness.query_all_by_label("add").count() >= 1);
+    }
+
+    /// A name no card offers keeps a row of its own, exactly as an unoffered set
+    /// id does. Nothing constrains `names` to the shop's three tokens — a
+    /// player's `config.toml` can name anything, and once the cards replace the
+    /// free-text list a name with no card is a criterion that filters while
+    /// being invisible and unremovable.
+    #[test]
+    fn an_unoffered_name_stays_visible_and_removable() {
+        let mut editor = stocked_editor();
+        editor.filter.names = vec!["ticketspecial_name".to_owned()];
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.run();
+        assert_eq!(harness.get_all_by_label("ticketspecial_name").count(), 1);
+        // The only cross on the surface: every gear list is a choice row here,
+        // and each offers what it holds.
+        harness.get_by_label("✕").click();
+        harness.run();
+        drop(harness);
+        assert!(editor.filter.names.is_empty());
+    }
+
+    /// The screen states the OR where it acts: the name criteria and the gear
+    /// criteria are two blocks, not one list.
+    #[test]
+    fn the_hunt_body_separates_names_from_gear() {
+        let mut editor = stocked_editor();
+        let harness = draw_setup(&mut editor);
+        assert_eq!(harness.query_all_by_label("— or gear —").count(), 1);
+    }
+
+    /// `kinds` leaves the window: picking a name says tokens, picking gear says
+    /// gear, and a third control saying the same is a way to contradict
+    /// yourself. It stays loadable from config.toml.
+    #[test]
+    fn the_kind_checkboxes_are_gone_from_the_window() {
+        let mut editor = stocked_editor();
+        let harness = draw_setup(&mut editor);
+        for label in ["Equipment", "Hero", "Token"] {
+            assert_eq!(harness.query_all_by_label(label).count(), 0);
+        }
+    }
+
+    /// The threshold belongs to the chip that carries it: one required substat
+    /// unfolds one stepper, not a column of them down every offered chip.
+    #[test]
+    fn only_the_required_chip_unfolds_a_threshold() {
         let mut editor = stocked_editor();
         editor.filter.required_substats = vec![SubstatReq {
             name: "speed".to_owned(),
             min: None,
         }];
         let harness = draw_setup(&mut editor);
-        // `query_all_*`, not `get_all_*`: the getters panic on no match, and
-        // "no match" is exactly the assertion here.
-        assert_eq!(harness.query_all_by_label("+ Speed").count(), 0);
-        assert_eq!(harness.query_all_by_label("+ Attack(%)").count(), 1);
+        // `query_all_*`, not `get_all_*`: the getters panic on no match, and a
+        // count is what separates "beside its own chip" from "on all of them".
+        assert_eq!(harness.query_all_by_label("≥").count(), 1);
+    }
+
+    /// A percent-bearing substat is read in whole percent and STORED as the
+    /// fraction the wire and `Filter::matches` both speak.
+    ///
+    /// The seed used to be `1.0` for every family, which on this one is one
+    /// hundred percent — eight times the largest roll the game produces — so
+    /// ticking `≥` on Attack(%) armed a floor nothing could satisfy and the hunt
+    /// went quiet.
+    #[test]
+    fn arming_a_percent_threshold_stores_a_fraction() {
+        let mut editor = stocked_editor();
+        let min = arm_threshold(&mut editor, "att_rate");
+        assert!(
+            min < 1.0,
+            "a percent threshold is stored as the fraction, not as the number on screen: {min}"
+        );
+    }
+
+    /// The other family is its own unit and passes through untouched — the flag
+    /// decides, so the whole path must not pick up a hundredth.
+    #[test]
+    fn arming_a_whole_threshold_stores_the_whole_number() {
+        let mut editor = stocked_editor();
+        let min = arm_threshold(&mut editor, "speed");
+        assert!(
+            (min - 1.0).abs() < f64::EPSILON,
+            "a whole substat keeps the number it shows: {min}"
+        );
+    }
+
+    /// The seed a player is left with has to be one the game can actually
+    /// produce, or the first thing the control does is ask to be dragged away
+    /// from. Measured on 59 real gear pieces: a percent-bearing substat never
+    /// leaves `0.02..=0.12` on the wire, and a whole one runs `1..=472`.
+    #[test]
+    fn both_seeds_are_inside_the_range_the_game_rolls() {
+        let mut editor = stocked_editor();
+        let percent = arm_threshold(&mut editor, "att_rate");
+        assert!(
+            (0.02..=0.12).contains(&percent),
+            "a percent seed outside the measured wire domain: {percent}"
+        );
+        let whole = arm_threshold(&mut editor, "speed");
+        assert!(
+            (1.0..=472.0).contains(&whole),
+            "a whole seed outside the measured wire domain: {whole}"
+        );
+    }
+
+    /// The two halves of one threshold, side by side: the field reads `2` and
+    /// the filter stores `0.02`.
+    ///
+    /// It is also what says the unit out loud. Nothing else can — a `DragValue`
+    /// publishes its value and no label at all — so without the suffix `2` and
+    /// `2%` are the same three pixels over numbers a hundredfold apart.
+    #[test]
+    fn a_percent_threshold_reads_in_percent_and_stores_the_fraction() {
+        let mut editor = stocked_editor();
+        let min = arm_threshold(&mut editor, "att_rate");
+        let harness = draw_setup(&mut editor);
+        // By role: a `DragValue` has no accessible label to find it by, which
+        // is the same sentence as the one above.
+        let field = harness
+            .get_by_role(egui::accesskit::Role::SpinButton)
+            .accesskit_node();
+        assert_eq!(field.numeric_value(), Some(2.0), "what the player reads");
+        assert!(
+            field.value().is_some_and(|shown| shown.ends_with('%')),
+            "and the unit it is read in: {:?}",
+            field.value()
+        );
+        assert!((min - 0.02).abs() < f64::EPSILON, "what is stored: {min}");
+    }
+
+    /// A substat chip states its name; ticked it unfolds a threshold in place,
+    /// so the numeric control exists only where it applies.
+    #[test]
+    fn ticking_a_substat_chip_adds_a_requirement_with_no_threshold() {
+        let mut editor = stocked_editor();
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Speed").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.required_substats.len(), 1);
+        assert_eq!(editor.filter.required_substats[0].name, "speed");
+        assert_eq!(editor.filter.required_substats[0].min, None);
+    }
+
+    /// And unticking removes it, rather than leaving a chip that lies.
+    #[test]
+    fn unticking_a_substat_chip_removes_the_requirement() {
+        let mut editor = stocked_editor();
+        editor.filter.required_substats = vec![SubstatReq {
+            name: "speed".to_owned(),
+            min: None,
+        }];
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Speed").click();
+        harness.run();
+        drop(harness);
+        assert!(editor.filter.required_substats.is_empty());
+    }
+
+    /// The substat floor is one segmented control, not two numeric fields:
+    /// grade and substat count are the same axis on shop gear.
+    #[test]
+    fn the_substat_floor_is_segmented() {
+        let mut editor = stocked_editor();
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("3+").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.min_substats, Some(3));
+    }
+
+    /// Clicking the active segment clears the floor — a criterion you can set
+    /// and cannot unset is a trap.
+    #[test]
+    fn clicking_the_active_segment_clears_the_floor() {
+        let mut editor = stocked_editor();
+        editor.filter.min_substats = Some(3);
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("3+").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.min_substats, None);
     }
 
     /// An id the vocabulary cannot name has no box of its own, so it is drawn
@@ -823,9 +1235,15 @@ mod tests {
     /// why the height is generous rather than measured: anything added to Setup
     /// pushes the sections below it down, and a tight fit turns every such
     /// addition into three misleading failures somewhere else.
+    ///
+    /// The WIDTH is the opposite case and is pinned tight, at the window's own
+    /// [`crate::ui::WINDOW_WIDTH`] rather than a round 480: `main.rs` sets that
+    /// as both the minimum and the maximum inner size, so the player's frame
+    /// cannot be wider. A control laid out with 40px to spare would pass here
+    /// and wrap on their screen. Read off the constant so the two cannot drift.
     fn setup_harness<'a>(app: impl FnMut(&mut egui::Ui) + 'a) -> Harness<'a> {
         Harness::builder()
-            .with_size(egui::vec2(480.0, 2000.0))
+            .with_size(egui::vec2(crate::ui::WINDOW_WIDTH, 2000.0))
             .build_ui(app)
     }
 
@@ -962,26 +1380,74 @@ mod tests {
     fn a_non_finite_substat_threshold_cannot_survive_a_render() {
         // `DragValue` parses typed text with `f64::from_str`, which accepts
         // "nan"/"inf" — either lights Apply forever while matching nothing, so
-        // rendering the row must snap it back.
-        let filter = Filter {
-            required_substats: vec![SubstatReq {
-                name: "speed".to_owned(),
-                min: Some(f64::NAN),
-            }],
-            ..Filter::default()
-        };
-        let mut editor = EditorState::new(
-            filter,
-            Limits::default(),
-            Timings::default(),
-            ClickMode::default(),
-        );
-        let harness = Harness::new_ui(|ui| {
-            edit_sections(ui, &mut editor);
-        });
+        // rendering must snap it back.
+        //
+        // Over a stocked editor, because this is the offered half: the substat
+        // is one the server named, so it is drawn as a chip with a stepper.
+        let mut editor = stocked_editor();
+        editor.filter.required_substats = vec![SubstatReq {
+            name: "speed".to_owned(),
+            min: Some(f64::NAN),
+        }];
+        let harness = draw_setup(&mut editor);
         drop(harness);
         assert_eq!(editor.filter.required_substats[0].min, Some(1.0));
         assert_eq!(editor.filter, editor.filter.clone());
+    }
+
+    /// A required substat the vocabulary cannot name keeps a row of its own,
+    /// exactly as an unoffered set id or token name does. `substat_chips` walks
+    /// what the server OFFERED, so before this a requirement written in
+    /// `config.toml` against an id the catalog has since dropped filtered
+    /// fail-closed — silencing the whole gear branch — while drawing nothing in
+    /// the open Hunt body and offering no way out of the window.
+    #[test]
+    fn an_unoffered_requirement_stays_visible_and_removable() {
+        let mut editor = stocked_editor();
+        // No names: the click below has to be the only cross on the surface,
+        // and every other list here offers what it holds.
+        editor.filter.names.clear();
+        editor.filter.required_substats = vec![SubstatReq {
+            name: "speed_retired".to_owned(),
+            min: None,
+        }];
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.run();
+        assert_eq!(harness.get_all_by_label("speed_retired").count(), 1);
+        harness.get_by_label("✕").click();
+        harness.run();
+        drop(harness);
+        assert!(editor.filter.required_substats.is_empty());
+    }
+
+    /// The consequence that outlives the invisibility, and the reason the
+    /// snap-back had to leave the chip.
+    ///
+    /// `min = nan` loads: TOML 1.0 has special floats and `SubstatReq.min` is a
+    /// plain `f64`. On an id no chip is drawn for, the chip's snap-back never
+    /// ran, so [`Dirty::of`]'s bit-exact compare answered `NaN != NaN` — Apply
+    /// lit with no edit, and [`EditorState::mark_applied`] could not clear it,
+    /// because the twin it re-seeds is a clone of the value that fails to equal
+    /// itself. One full commit cycle is what states that: Apply, deliver
+    /// whatever it sent, and the button must be dark.
+    #[test]
+    fn a_non_finite_threshold_on_an_unoffered_requirement_cannot_jam_apply() {
+        let mut editor = stocked_editor_with(Filter {
+            required_substats: vec![SubstatReq {
+                name: "unoffered_stat".to_owned(),
+                min: Some(f64::NAN),
+            }],
+            ..named_filter()
+        });
+        let sent = run_setup(&mut editor);
+        editor.mark_applied(&sent);
+        assert!(
+            run_setup(&mut editor).is_empty(),
+            "a threshold nothing on screen can reach must not leave Apply lit for good"
+        );
+        assert_eq!(editor.filter.required_substats[0].min, Some(1.0));
     }
 
     #[test]
@@ -1104,10 +1570,13 @@ mod tests {
         assert_eq!(editor.filter.names, vec!["ticketrare_name".to_owned()]);
     }
 
+    /// A config-set grade floor no longer has a control, so the folded Hunt bar
+    /// is the whole of what says it is there. It restricts — `matches` drops
+    /// every gradeless item — so a summary reading "nothing selected" over one
+    /// would be the lie `a_restricting_filter_is_never_summarized_as_nothing_selected`
+    /// exists to catch.
     #[test]
-    fn a_config_set_grade_floor_can_be_seen_and_cleared() {
-        // With no widget for it, a config-set floor was the one criterion
-        // restricting the hunt and was invisible *and* uncorrectable.
+    fn a_config_set_grade_floor_still_names_itself_in_the_folded_bar() {
         let filter = Filter {
             min_grade: Some(2),
             ..named_filter()
@@ -1118,62 +1587,13 @@ mod tests {
             Timings::default(),
             ClickMode::default(),
         );
-        {
-            // Scoped so the assert below can read the draft: a first render
-            // alone must not move the value.
-            let mut harness = Harness::new_ui(|ui| {
-                edit_setup(ui, &mut editor);
-            });
-            harness.run();
-        }
+        editor.hunt_open = false;
+        let harness = draw_setup(&mut editor);
+        harness.get_by_label("Hunt · Covenant, grade 2+");
+        // And rendering leaves it exactly where config.toml put it: nothing in
+        // the window writes `min_grade` any more.
+        drop(harness);
         assert_eq!(editor.filter.min_grade, Some(2));
-        let mut harness = Harness::new_ui(|ui| {
-            edit_setup(ui, &mut editor);
-        });
-        harness.get_by_label("min grade").click();
-        harness.run();
-        drop(harness);
-        assert_eq!(editor.filter.min_grade, None);
-    }
-
-    #[test]
-    fn arming_the_grade_floor_seeds_the_epic_grade() {
-        // The seed must be a floor the game has: `hunt::GRADE_MAX`.
-        let mut editor = EditorState::new(
-            named_filter(),
-            Limits::default(),
-            Timings::default(),
-            ClickMode::default(),
-        );
-        let mut harness = Harness::new_ui(|ui| {
-            edit_setup(ui, &mut editor);
-        });
-        harness.get_by_label("min grade").click();
-        harness.run();
-        drop(harness);
-        assert_eq!(editor.filter.min_grade, Some(4));
-        let expected = Filter {
-            min_grade: Some(4),
-            ..named_filter()
-        };
-        assert_eq!(run_setup(&mut editor), vec![Command::SetFilter(expected)]);
-    }
-
-    #[test]
-    fn kind_checkbox_updates_the_draft() {
-        let mut editor = EditorState::new(
-            named_filter(),
-            Limits::default(),
-            Timings::default(),
-            ClickMode::default(),
-        );
-        let mut harness = Harness::new_ui(|ui| {
-            edit_setup(ui, &mut editor);
-        });
-        harness.get_by_label("Token").click();
-        harness.run();
-        drop(harness);
-        assert!(editor.filter.kinds.contains(&ItemKind::Token));
     }
 
     #[test]
@@ -1214,28 +1634,30 @@ mod tests {
         assert!(harness.query_by_label("OPEN & REFRESH").is_none());
     }
 
+    /// A `kinds` criterion the file already carries survives a render: nothing
+    /// in the window edits it now, so nothing in the window may drop it either.
+    /// The refusal of `kinds = ["unknown"]` moved back to where it always
+    /// belonged — `hunt_kinds`, pinned by
+    /// `a_kind_the_wire_would_tolerate_is_refused_in_a_config_file` in
+    /// `domain::filter`, which runs with no GUI feature at all.
     #[test]
-    fn hunt_kinds_exclude_the_unknown_bucket() {
-        // Do not re-add an "unknown" box: it wrote `kinds = ["unknown"]`, which
-        // the next launch refused to load (see `hunt_body`).
+    fn a_config_set_kind_survives_a_window_with_no_control_for_it() {
+        let filter = Filter {
+            kinds: vec![ItemKind::Token],
+            ..named_filter()
+        };
         let mut editor = EditorState::new(
-            named_filter(),
+            filter,
             Limits::default(),
             Timings::default(),
             ClickMode::default(),
         );
-        let harness = Harness::new_ui(|ui| {
-            edit_setup(ui, &mut editor);
-        });
-        assert_eq!(HUNTABLE_KINDS.len(), 3);
-        for kind in HUNTABLE_KINDS {
-            harness.get_by_label(kind_label(kind));
-        }
-        assert!(
-            harness
-                .query_by_label(kind_label(ItemKind::Unknown))
-                .is_none()
-        );
+        let harness = draw_setup(&mut editor);
+        drop(harness);
+        assert_eq!(editor.filter.kinds, vec![ItemKind::Token]);
+        // And Apply stays dark, because a render that changed nothing is not an
+        // edit — the draft would otherwise arrive at config.toml shorn of it.
+        assert!(run_setup(&mut editor).is_empty());
     }
 
     #[test]

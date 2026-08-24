@@ -15,7 +15,10 @@ default = ["pcap-backend", "gui", "actuator"]
 # and would kill the exe in the Windows loader on a machine without Npcap.
 pcap-backend = ["dep:libloading"]
 # egui window over the session. Disable for the console-only build.
-gui = ["dep:eframe"]
+# `png` rides along because the only pictures this app shows are the gear-set
+# icons the server pushes on the catalog message, and nothing outside the window
+# decodes one.
+gui = ["dep:eframe", "dep:png"]
 # Click emulation (SendInput / PostMessageW); elsewhere a job-draining stub.
 actuator = []
 # Off by default: it exists only for `ui::editor`'s PNG helper, which is
@@ -126,6 +129,12 @@ eframe = { version = "0.35", optional = true, default-features = false, features
     "glow",
     "default_fonts",
 ] }
+# The gear-set icons arrive as PNG bytes on the catalog message. Version left as
+# a caret so the lock decides: it already pinned 0.18.1 as a transitive
+# dependency, and re-stating a patch here is a second place to keep in step. Its
+# own feature set is empty by default (only `zlib-rs`, `unstable`, `benchmarks`
+# exist), so there is nothing to switch off.
+png = { version = "0.18", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # Runtime resolution of `wpcap.dll`, never a link-time dependency: see

@@ -48,8 +48,13 @@ max_ms = 30000
 # filter = "tcp and tcp.SrcPort == 3333"
 
 [filter]
-# Player interest criteria, all ANDed. At least one criterion is required:
-# with none, every item would match and the relay refuses to start.
+# Player interest criteria. An item is a hit when it answers EITHER branch: it
+# is one of the `names` below, or it satisfies every gear criterion that is set
+# (sets, slots, required_substats, min_substats, min_grade, max_price). A branch
+# with nothing set neither constrains nor matches, so naming only one of the two
+# behaves exactly as it always has. `kinds` and sold-out gate both branches.
+# At least one criterion is required: with none, every item would match and the
+# relay refuses to start.
 # Default hunt: covenant bookmarks + mystic medals.
 names = ["ticketrare_name", "ticketspecial_name"]
 # kinds = ["equipment"]                 # any-of: equipment, hero, token

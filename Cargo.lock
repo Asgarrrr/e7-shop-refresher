@@ -117,6 +117,7 @@ dependencies = [
  "etherparse",
  "futures-util",
  "libloading",
+ "png",
  "rustls",
  "serde",
  "serde_json",

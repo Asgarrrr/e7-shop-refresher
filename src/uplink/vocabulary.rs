@@ -59,14 +59,6 @@ impl VocabularyCell {
         self.lock().clone()
     }
 
-    /// `true` while nothing has been received — what the editor tests to fall
-    /// back to free-text entry.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        let vocabulary = self.lock();
-        vocabulary.sets.is_empty() && vocabulary.substats.is_empty() && vocabulary.slots.is_empty()
-    }
-
     /// A poisoned lock is recovered from rather than propagated: the guarded
     /// value is a plain list of words with no invariant to violate, and the one
     /// writer replaces it whole. Panicking here would take down a window over
@@ -86,6 +78,7 @@ impl std::fmt::Debug for VocabularyCell {
             .field("sets", &vocabulary.sets.len())
             .field("substats", &vocabulary.substats.len())
             .field("slots", &vocabulary.slots.len())
+            .field("tokens", &vocabulary.tokens.len())
             .finish()
     }
 }
@@ -99,12 +92,17 @@ mod tests {
         VocabularyEntry {
             id: id.to_owned(),
             label: id.to_owned(),
+            percent: false,
         }
     }
 
+    /// Empty until a server sends one, and the editor's fallback to free-text
+    /// entry hangs off exactly this: it tests the LIST it is about to draw
+    /// (`offered_list`, `token_cards`), never the cell as a whole, because a
+    /// catalog can name the sets and no tokens.
     #[test]
     fn starts_empty() {
-        assert!(VocabularyCell::new().is_empty());
+        assert_eq!(VocabularyCell::new().get(), FilterVocabulary::default());
     }
 
     #[test]
@@ -114,7 +112,6 @@ mod tests {
             sets: vec![entry("set_speed")],
             ..FilterVocabulary::default()
         });
-        assert!(!cell.is_empty());
         assert_eq!(cell.get().sets, vec![entry("set_speed")]);
     }
 
