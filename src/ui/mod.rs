@@ -219,6 +219,9 @@ impl eframe::App for ShopApp {
             self.journal_cache = self.handles.journal.to_entries();
             self.journal_generation = generation;
         }
+        // Same generation-gated copy as the journal above, and here for the same
+        // reason: the Setup pickers read it every frame and it is written once.
+        self.editor.sync_vocabulary(&self.handles.vocabulary);
         let outcome = lock_ignoring_poison(&self.error).clone();
         // A terminal outcome disables every control: the click would hit a dead
         // channel.

@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::domain::shop::{Gold, ItemKind, ShopItem};
+use crate::domain::shop::{Gold, ItemKind, ShopItem, ShopSnapshot};
 
 /// The gear grades the game ships (`config.example.toml` documents the same
 /// closed domain). Rejected while deserializing, because a floor outside it
@@ -42,6 +42,19 @@ pub struct Filter {
     /// Kept sets (any-of), by exact internal id; empty keeps all.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sets: Vec<String>,
+    /// Kept wearable slots (any-of), by exact internal id (`helm`, `boot`, ...);
+    /// empty keeps all.
+    ///
+    /// Fail-closed like [`Filter::sets`], and that has a sharper edge here: the
+    /// slot is resolved server-side, so a server that could not read its Catalog
+    /// sends every item with no [`ShopItem::gear_slot`] and this criterion then
+    /// matches nothing at all. The loop keeps refreshing until one of the
+    /// player's own stop limits fires. Fail-OPEN would be worse — it would buy
+    /// across every slot the moment the lookup went missing — but a session that
+    /// finds nothing while a slot is named deserves the journal line
+    /// [`Self::slots_unanswerable`] backs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<String>,
     /// Minimum substat count (raw list length).
     pub min_substats: Option<u8>,
     /// Substats that must all be present, each above its optional threshold.
@@ -172,9 +185,33 @@ impl Filter {
         if !self.sets.is_empty() && !item.set.as_ref().is_some_and(|set| self.sets.contains(set)) {
             return false;
         }
+        if !self.slots.is_empty()
+            && !item
+                .gear_slot
+                .as_ref()
+                .is_some_and(|slot| self.slots.contains(slot))
+        {
+            return false;
+        }
         self.required_substats
             .iter()
             .all(|req| req.satisfied_by(item))
+    }
+
+    /// `true` when this filter names a slot and the snapshot answered none —
+    /// the shape a Catalog-less server produces, in which [`Self::matches`]
+    /// cannot accept anything.
+    ///
+    /// A question about a whole roll rather than an item, because one gearless
+    /// slot proves nothing: a roll legitimately holds heroes and tokens, which
+    /// have no slot and never will. Only *every* slot being unanswered
+    /// separates "this roll had no gear" from "nobody can answer about gear",
+    /// and even then the first reading stays possible — hence a journal line
+    /// rather than a refusal to arm.
+    pub fn slots_unanswerable(&self, snapshot: &ShopSnapshot) -> bool {
+        !self.slots.is_empty()
+            && !snapshot.slots.is_empty()
+            && snapshot.slots.iter().all(|item| item.gear_slot.is_none())
     }
 
     /// `true` when no criterion is set — such a filter matches every available
@@ -185,6 +222,7 @@ impl Filter {
         self.kinds.is_empty()
             && self.names.is_empty()
             && self.sets.is_empty()
+            && self.slots.is_empty()
             && self.min_substats.is_none_or(|min| min == 0)
             && self.required_substats.is_empty()
             && self.max_price.is_none()
@@ -241,6 +279,7 @@ mod tests {
             price: Some(Gold::new(240_000)),
             grade: Some(3),
             set: Some("set_speed".to_owned()),
+            gear_slot: Some("helm".to_owned()),
             substats: vec![
                 substat("speed", Some(15.0)),
                 substat("cri", Some(0.03)),
@@ -712,5 +751,83 @@ mod tests {
             ..speed_filter()
         };
         assert!(!filter.matches(&equip()));
+    }
+
+    fn slot_filter(slots: &[&str]) -> Filter {
+        Filter {
+            slots: slots.iter().map(|s| (*s).to_owned()).collect(),
+            ..Filter::default()
+        }
+    }
+
+    #[test]
+    fn a_slot_criterion_is_any_of() {
+        // `equip()` is a helm.
+        assert!(slot_filter(&["helm"]).matches(&equip()));
+        assert!(slot_filter(&["boot", "helm"]).matches(&equip()));
+        assert!(!slot_filter(&["boot"]).matches(&equip()));
+    }
+
+    #[test]
+    fn an_empty_slot_list_does_not_constrain() {
+        assert!(slot_filter(&[]).matches(&equip()));
+    }
+
+    #[test]
+    fn an_unanswered_slot_fails_closed() {
+        // A hero, a token, or every item at all when the server had no Catalog.
+        // Fail-open would buy across every slot the moment the lookup vanished.
+        let slotless = ShopItem {
+            gear_slot: None,
+            ..equip()
+        };
+        assert!(!slot_filter(&["helm"]).matches(&slotless));
+    }
+
+    #[test]
+    fn naming_a_slot_is_a_criterion() {
+        assert!(!slot_filter(&["helm"]).is_unrestricted());
+        assert!(Filter::default().is_unrestricted());
+    }
+
+    /// The journal's cue for the fail-closed edge above. It asks about a ROLL
+    /// rather than an item, because one slotless item proves nothing — a roll
+    /// legitimately holds heroes and tokens, which never carry a slot.
+    ///
+    /// Built from JSON rather than from struct literals, so the wire spelling of
+    /// `gear_slot` is under test beside the predicate.
+    mod slots_unanswerable {
+        use super::*;
+        use crate::domain::shop::ShopSnapshot;
+
+        fn roll(json: &str) -> ShopSnapshot {
+            serde_json::from_str(json).expect("snapshot should parse")
+        }
+
+        #[test]
+        fn fires_when_the_whole_roll_came_back_slotless() {
+            let snapshot = roll(r#"{"slots":[{"name":"a"},{"name":"b"}]}"#);
+            assert!(slot_filter(&["helm"]).slots_unanswerable(&snapshot));
+        }
+
+        #[test]
+        fn stays_quiet_when_any_item_answered() {
+            // Five heroes and one helm is a normal roll, not a failure.
+            let snapshot = roll(r#"{"slots":[{"name":"a"},{"gear_slot":"helm"}]}"#);
+            assert!(!slot_filter(&["helm"]).slots_unanswerable(&snapshot));
+        }
+
+        #[test]
+        fn stays_quiet_when_no_slot_was_asked_for() {
+            let snapshot = roll(r#"{"slots":[{"name":"a"}]}"#);
+            assert!(!Filter::default().slots_unanswerable(&snapshot));
+        }
+
+        #[test]
+        fn stays_quiet_on_an_empty_roll() {
+            // Nothing to be unable to answer about; a slotless roll of nothing
+            // is a degraded snapshot and a different diagnosis.
+            assert!(!slot_filter(&["helm"]).slots_unanswerable(&roll(r#"{"slots":[]}"#)));
+        }
     }
 }

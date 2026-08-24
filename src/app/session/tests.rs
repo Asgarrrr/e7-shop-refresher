@@ -84,6 +84,9 @@ struct Rig {
     gate: SessionGate,
     journal: EventLog,
     actuator: ActuatorHandle,
+    /// Starts empty, like a session against a server that sent no catalog —
+    /// which is what every test here but the vocabulary ones is about.
+    vocabulary: VocabularyCell,
 }
 
 impl Rig {
@@ -95,6 +98,7 @@ impl Rig {
             gate: SessionGate::for_test(false),
             journal: EventLog::default(),
             actuator: off(),
+            vocabulary: VocabularyCell::new(),
         }
     }
 
@@ -122,6 +126,7 @@ impl Rig {
                 gate: SessionGate::for_test(true),
                 journal: EventLog::default(),
                 actuator,
+                vocabulary: VocabularyCell::new(),
             },
             jobs,
         )
@@ -142,6 +147,7 @@ impl Rig {
                 timings(),
                 click_mode(),
             ),
+            vocabulary: VocabularyCell::new(),
         }
     }
 
@@ -186,6 +192,7 @@ impl Rig {
             &self.gate,
             &self.journal,
             &self.actuator,
+            &self.vocabulary,
             message,
             now_ms,
         );
@@ -223,6 +230,7 @@ impl Rig {
             &self.gate,
             &self.journal,
             &self.actuator,
+            &self.vocabulary,
             command_rx,
             message_rx,
             error_rx,

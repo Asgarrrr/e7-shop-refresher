@@ -4,7 +4,9 @@
 mod websocket;
 
 pub mod protocol;
+pub mod vocabulary;
 
+pub use vocabulary::VocabularyCell;
 pub use websocket::run;
 
 /// What the uplink task reports to the session. The journal is the only surface

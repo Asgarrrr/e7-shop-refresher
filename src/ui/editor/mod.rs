@@ -13,7 +13,7 @@ mod timing;
 mod timing_meter;
 
 use clicking::{backend_row, clicking_summary, dry_run_row, timing_notice};
-use hunt::{grade_value, optional_value, quick_add_names, string_list, substat_reqs};
+use hunt::{choice_list, grade_value, optional_value, quick_add_names, string_list, substat_reqs};
 use stop::{duration_row, limit_row};
 // Re-exported one level up: the idle status band describes the plan with the
 // same two summaries the folded Hunt and Stop bars use, so the window has one
@@ -34,6 +34,8 @@ use crate::domain::control::Limits;
 #[cfg(test)]
 use crate::domain::filter::SubstatReq;
 use crate::domain::filter::{Filter, HUNTABLE_KINDS};
+use crate::uplink::VocabularyCell;
+use crate::uplink::protocol::{FilterVocabulary, VocabularyEntry};
 // `currency_row` lends each cap its raw number for the frame the drag needs it.
 use crate::domain::shop::{Crystals, Gold};
 // Only the tests still name a kind directly; the checkbox row reads `HUNTABLE_KINDS`.
@@ -58,7 +60,16 @@ pub(super) struct EditorState {
     applied_click_mode: ClickMode,
     name_input: String,
     set_input: String,
+    slot_input: String,
     substat_input: String,
+    /// What the server offered, cached off `VocabularyCell` so the pickers do
+    /// not clone forty strings per frame. Empty until a `catalog` message
+    /// arrives, and empty for good against a server with no Catalog — every
+    /// list then falls back to the free-text entry it had before.
+    vocabulary: FilterVocabulary,
+    /// The cell generation `vocabulary` was copied at. `0` is the pre-message
+    /// value and one no write can produce, so the first sync always copies.
+    vocabulary_generation: u64,
     /// One fold flag per section, five loose fields rather than a bitset or an
     /// array indexed by section. Each is only ever handed to [`section`] as
     /// `&mut editor.<name>_open`, named at every use and never passed
@@ -92,7 +103,10 @@ impl EditorState {
             click_mode,
             name_input: String::new(),
             set_input: String::new(),
+            slot_input: String::new(),
             substat_input: String::new(),
+            vocabulary: FilterVocabulary::default(),
+            vocabulary_generation: 0,
             hunt_open: true,
             stop_open: true,
             timing_open: false,
@@ -100,6 +114,20 @@ impl EditorState {
             // not how the clicks are sent. Hunt and Stop keep the two open slots.
             clicking_open: false,
             fine_tune_open: false,
+        }
+    }
+
+    /// Copies the server's vocabulary in, if it has moved since the last copy.
+    ///
+    /// Gated on the generation rather than run unconditionally: the window
+    /// redraws every frame and the vocabulary is written once per session, so
+    /// an ungated clone would copy forty-odd strings sixty times a second to
+    /// learn nothing. Called once per frame, before the pickers read it.
+    pub(super) fn sync_vocabulary(&mut self, cell: &VocabularyCell) {
+        let generation = cell.generation();
+        if generation != self.vocabulary_generation {
+            self.vocabulary = cell.get();
+            self.vocabulary_generation = generation;
         }
     }
 
@@ -179,6 +207,27 @@ fn clicking_body(ui: &mut egui::Ui, editor: &mut EditorState) {
     timing_notice(ui, editor.click_mode != editor.applied_click_mode);
 }
 
+/// A list the server normally enumerates: checkboxes over what it offered, or
+/// free text when it offered nothing.
+///
+/// The fallback is not a transition state. The relay talks to a server that may
+/// have no Catalog to read, and the ids already in a player's `config.toml`
+/// have to stay enterable then — a checkbox row over an empty list is a dead
+/// control, and drawing nothing withdraws a criterion that still filters.
+fn offered_list(
+    ui: &mut egui::Ui,
+    label: &str,
+    values: &mut Vec<String>,
+    input: &mut String,
+    choices: &[VocabularyEntry],
+) {
+    if choices.is_empty() {
+        string_list(ui, label, values, input);
+    } else {
+        choice_list(ui, label, values, choices);
+    }
+}
+
 /// One collapsible section bar plus the breathing room its open body needs.
 fn section(ui: &mut egui::Ui, title: &str, summary: Option<&str>, open: &mut bool) {
     if theme::collapsing_section(ui, title, summary, *open) {
@@ -211,6 +260,12 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
         }
     });
     ui.add_space(theme::SP_SM);
+    // Names have no vocabulary: the server publishes sets, substats and slots,
+    // and an item name is not a closed list it can enumerate. `quick_add_names`
+    // stays the shortcut for the two tokens nearly everyone hunts.
+    // Names have no vocabulary: the server publishes sets, substats and slots,
+    // and an item name is not a closed list it can enumerate. `quick_add_names`
+    // stays the shortcut for the two tokens nearly everyone hunts.
     string_list(
         ui,
         "names (exact internal ids)",
@@ -218,16 +273,25 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState) {
         &mut editor.name_input,
     );
     quick_add_names(ui, &mut editor.filter.names);
-    string_list(
+    offered_list(
         ui,
-        "sets (exact internal ids)",
+        "sets",
         &mut editor.filter.sets,
         &mut editor.set_input,
+        &editor.vocabulary.sets,
+    );
+    offered_list(
+        ui,
+        "gear slots",
+        &mut editor.filter.slots,
+        &mut editor.slot_input,
+        &editor.vocabulary.slots,
     );
     substat_reqs(
         ui,
         &mut editor.filter.required_substats,
         &mut editor.substat_input,
+        &editor.vocabulary.substats,
     );
     ui.add_space(theme::SP_XS);
     egui::Grid::new("hunt-numerics")
@@ -538,6 +602,201 @@ mod tests {
         }
     }
 
+    /// An editor already holding the server's vocabulary, as one looks once a
+    /// `catalog` message has landed.
+    fn stocked_editor() -> EditorState {
+        let mut editor = EditorState::new(
+            named_filter(),
+            Limits::default(),
+            Timings::default(),
+            ClickMode::default(),
+        );
+        let cell = VocabularyCell::new();
+        cell.set(FilterVocabulary {
+            sets: vec![
+                entry("set_speed", "Speed Set"),
+                entry("set_cri", "Critical Set"),
+            ],
+            substats: vec![entry("speed", "Speed"), entry("att_rate", "Attack(%)")],
+            slots: vec![entry("helm", "Helmet"), entry("boot", "Boots")],
+        });
+        editor.sync_vocabulary(&cell);
+        editor
+    }
+
+    fn entry(id: &str, label: &str) -> VocabularyEntry {
+        VocabularyEntry {
+            id: id.to_owned(),
+            label: label.to_owned(),
+        }
+    }
+
+    /// Draw Setup once, without committing anything.
+    fn draw_setup(editor: &mut EditorState) -> Harness<'_> {
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, editor);
+        });
+        harness.run();
+        harness
+    }
+
+    /// The checkbox row only exists once the server named something. Until
+    /// then every list keeps its free-text field, because the ids in a player's
+    /// config must stay enterable against a server with no Catalog.
+    #[test]
+    fn the_lists_fall_back_to_free_text_with_no_vocabulary() {
+        let mut editor = EditorState::new(
+            named_filter(),
+            Limits::default(),
+            Timings::default(),
+            ClickMode::default(),
+        );
+        let harness = draw_setup(&mut editor);
+        // One "add" button per free-text list: names, sets, gear slots and
+        // required substats.
+        assert_eq!(
+            harness.get_all_by_label("add").count(),
+            4,
+            "every list should offer its text field"
+        );
+    }
+
+    /// With a vocabulary the three enumerable criteria become checkbox rows,
+    /// and only `names` — which is not a closed list — keeps its field.
+    #[test]
+    fn a_vocabulary_turns_the_enumerable_lists_into_choices() {
+        let mut editor = stocked_editor();
+        let harness = draw_setup(&mut editor);
+        assert_eq!(
+            harness.get_all_by_label("add").count(),
+            1,
+            "only `names` has no vocabulary to offer"
+        );
+        // Sets and slots draw a box each; substats draw an add button each.
+        for label in ["Speed Set", "Critical Set", "Helmet", "Boots"] {
+            assert_eq!(
+                harness.get_all_by_label(label).count(),
+                1,
+                "{label} should have a checkbox"
+            );
+        }
+        for label in ["+ Speed", "+ Attack(%)"] {
+            assert_eq!(
+                harness.get_all_by_label(label).count(),
+                1,
+                "{label} should be offered as a substat requirement"
+            );
+        }
+    }
+
+    /// Ticking writes the ID and never the label: the label is the game's
+    /// words, the id is what `matches` compares and what config.toml stores.
+    #[test]
+    fn ticking_a_set_stores_its_internal_id() {
+        let mut editor = stocked_editor();
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Speed Set").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.sets, vec!["set_speed".to_owned()]);
+    }
+
+    /// And unticking takes it back out, rather than leaving a box that lies.
+    #[test]
+    fn unticking_a_slot_drops_its_id() {
+        let mut editor = stocked_editor();
+        editor.filter.slots = vec!["helm".to_owned()];
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Helmet").click();
+        harness.run();
+        drop(harness);
+        assert!(editor.filter.slots.is_empty());
+    }
+
+    /// Adding a substat requirement stores the id too, and the row it creates
+    /// carries the threshold control the checkbox lists have no room for.
+    #[test]
+    fn adding_a_substat_requirement_stores_its_internal_id() {
+        let mut editor = stocked_editor();
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("+ Attack(%)").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.required_substats.len(), 1);
+        assert_eq!(editor.filter.required_substats[0].name, "att_rate");
+        assert_eq!(editor.filter.required_substats[0].min, None);
+    }
+
+    /// An already-required substat leaves the offer row: `matches` walks the
+    /// requirements, so a second row for one name is a duplicate threshold on
+    /// a value that only has one.
+    #[test]
+    fn an_already_required_substat_is_not_offered_again() {
+        let mut editor = stocked_editor();
+        editor.filter.required_substats = vec![SubstatReq {
+            name: "speed".to_owned(),
+            min: None,
+        }];
+        let harness = draw_setup(&mut editor);
+        // `query_all_*`, not `get_all_*`: the getters panic on no match, and
+        // "no match" is exactly the assertion here.
+        assert_eq!(harness.query_all_by_label("+ Speed").count(), 0);
+        assert_eq!(harness.query_all_by_label("+ Attack(%)").count(), 1);
+    }
+
+    /// An id the vocabulary cannot name has no box of its own, so it is drawn
+    /// as its own removable row — otherwise a criterion written before the
+    /// catalog arrived would filter while being invisible and unremovable.
+    #[test]
+    fn an_unoffered_id_stays_visible_and_removable() {
+        let mut editor = stocked_editor();
+        // No names: `string_list` draws a remove cross per entry, and the click
+        // below has to be the only one on the surface.
+        editor.filter.names.clear();
+        editor.filter.sets = vec!["set_retired".to_owned()];
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.run();
+        assert_eq!(harness.get_all_by_label("set_retired").count(), 1);
+        harness.get_by_label("✕").click();
+        harness.run();
+        drop(harness);
+        assert!(editor.filter.sets.is_empty());
+    }
+
+    /// The cache is generation-gated, so a vocabulary that never moved must not
+    /// be re-read — and one that did must be.
+    #[test]
+    fn the_vocabulary_is_copied_only_when_it_moves() {
+        let mut editor = EditorState::new(
+            named_filter(),
+            Limits::default(),
+            Timings::default(),
+            ClickMode::default(),
+        );
+        let cell = VocabularyCell::new();
+        editor.sync_vocabulary(&cell);
+        assert!(editor.vocabulary.slots.is_empty());
+
+        cell.set(FilterVocabulary {
+            slots: vec![entry("helm", "Helmet")],
+            ..FilterVocabulary::default()
+        });
+        editor.sync_vocabulary(&cell);
+        assert_eq!(editor.vocabulary.slots.len(), 1);
+
+        // A sync against an unmoved cell keeps what it had.
+        editor.sync_vocabulary(&cell);
+        assert_eq!(editor.vocabulary.slots.len(), 1);
+    }
+
     /// Drive `edit_setup` once, capturing whatever Apply committed. Only a
     /// non-empty commit is latched, so the final quiet frame can't wipe it.
     fn run_setup(editor: &mut EditorState) -> Vec<Command> {
@@ -562,9 +821,14 @@ mod tests {
     /// fourth section pushed Apply past the default height and five tests began
     /// reporting an empty command list — a failure that reads like a broken
     /// dirty-check and is really a broken viewport.
+    ///
+    /// It happened again at 1400 when Hunt grew its gear-slot list, which is
+    /// why the height is generous rather than measured: anything added to Setup
+    /// pushes the sections below it down, and a tight fit turns every such
+    /// addition into three misleading failures somewhere else.
     fn setup_harness<'a>(app: impl FnMut(&mut egui::Ui) + 'a) -> Harness<'a> {
         Harness::builder()
-            .with_size(egui::vec2(480.0, 1400.0))
+            .with_size(egui::vec2(480.0, 2000.0))
             .build_ui(app)
     }
 
@@ -942,7 +1206,7 @@ mod tests {
             ClickMode::default(),
         );
         editor.timing_open = true;
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = setup_harness(|ui| {
             edit_setup(ui, &mut editor);
         });
         harness.get_by_label("Custom").click();
@@ -986,7 +1250,7 @@ mod tests {
             ClickMode::default(),
         );
         editor.timing_open = true;
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = setup_harness(|ui| {
             edit_setup(ui, &mut editor);
         });
         harness.get_by_label("Cautious").click();
@@ -1011,7 +1275,7 @@ mod tests {
             ClickMode::default(),
         );
         editor.timing_open = true;
-        let mut harness = Harness::new_ui(|ui| {
+        let mut harness = setup_harness(|ui| {
             edit_setup(ui, &mut editor);
         });
         harness.get_by_label("Human").click();

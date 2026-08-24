@@ -13,8 +13,8 @@ use crate::domain::control::{Action, BuyTarget, Controller, Event, Recovery, Sta
 use crate::journal::EventLog;
 use crate::render::{format_item, refusal_label, render_shop, status_label, stop_reason_label};
 use crate::stream::RunBaselineCell;
-use crate::uplink::UplinkEvent;
 use crate::uplink::protocol::{PurchaseNotice, ServerMessage};
+use crate::uplink::{UplinkEvent, VocabularyCell};
 use crate::watch::{HaltSource, WatchGate};
 
 use super::Command;
@@ -139,6 +139,7 @@ pub(super) async fn session_loop(
     gate: &SessionGate,
     journal: &EventLog,
     actuator: &ActuatorHandle,
+    vocabulary: &VocabularyCell,
     mut commands: mpsc::Receiver<Command>,
     mut messages: mpsc::Receiver<UplinkEvent>,
     mut fatal_errors: mpsc::Receiver<String>,
@@ -255,7 +256,7 @@ pub(super) async fn session_loop(
                     if matches!(message, ServerMessage::Unknown) {
                         unknown_messages = unknown_messages.wrapping_add(1);
                     }
-                    on_message(controller, gate, journal, actuator, message, now);
+                    on_message(controller, gate, journal, actuator, vocabulary, message, now);
                 }
                 // An armed watch with a dead link looks exactly like a closed
                 // shop: journaled at `warn` so the reason survives a narrowed
@@ -466,16 +467,42 @@ fn on_message(
     gate: &SessionGate,
     journal: &EventLog,
     actuator: &ActuatorHandle,
+    vocabulary: &VocabularyCell,
     message: ServerMessage,
     now_ms: u64,
 ) {
     match message {
         // Counted by `heartbeat`; just nothing player-facing to print here.
         ServerMessage::Ack | ServerMessage::Unknown => {}
+        // Stored, never acted on: a vocabulary changes what Setup can offer and
+        // nothing about the run in flight.
+        ServerMessage::Catalog(received) => {
+            journal.emit(&[format!(
+                ">> filter choices received — {} sets, {} substats, {} slots",
+                received.sets.len(),
+                received.substats.len(),
+                received.slots.len()
+            )]);
+            vocabulary.set(received);
+        }
         ServerMessage::Shop(snapshot) => {
             // Console-only: the GUI table shows the same snapshot, and the
             // journal carries only the decisions.
             render_shop(&snapshot);
+            // A slot criterion the server cannot answer accepts nothing, so the
+            // loop would refresh to a stop limit with no visible cause. Said
+            // once per roll, on the whole snapshot: one gearless item proves
+            // nothing, since heroes and tokens never carry a slot.
+            if lock(controller).filter().slots_unanswerable(&snapshot) {
+                journal.emit_at(
+                    tracing::Level::WARN,
+                    &[
+                        ">> this roll carried no gear slots — a slot criterion cannot match while \
+                       the server sends none"
+                            .to_owned(),
+                    ],
+                );
+            }
             // Every shop message bumps, duplicates included: a re-send means
             // the player touched the game, so in-flight clicks are aborted.
             actuator.epoch.bump();
@@ -879,6 +906,7 @@ mod player_stop_fatal_tests {
     #[tokio::test]
     async fn a_fatal_already_queued_is_reported_when_the_player_stops() {
         let (controller, gate, journal, actuator) = handles();
+        let vocabulary = VocabularyCell::new();
         let (_command_tx, command_rx) = mpsc::channel::<Command>(1);
         let (_message_tx, message_rx) = mpsc::channel::<UplinkEvent>(1);
         let (error_tx, error_rx) = mpsc::channel::<String>(1);
@@ -894,6 +922,7 @@ mod player_stop_fatal_tests {
             &gate,
             &journal,
             &actuator,
+            &vocabulary,
             command_rx,
             message_rx,
             error_rx,

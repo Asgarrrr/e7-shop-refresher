@@ -2,7 +2,7 @@
 //! stream and receives these structured replies; the shop payload is the
 //! domain model ([`crate::domain::shop`]), this module only the envelopes.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::domain::shop::{CatalogId, Gold, ShopSnapshot, optional_catalog_id};
 
@@ -25,11 +25,79 @@ pub enum ServerMessage {
     Ack,
     Shop(ShopSnapshot),
     Purchase(PurchaseNotice),
+    /// The values a [`crate::domain::filter::Filter`] may name, with the game's
+    /// own labels — pushed once when the connection opens.
+    ///
+    /// It comes from the server because only the server can read the game's
+    /// Catalog, and it is a *vocabulary* rather than state: nothing in it
+    /// decides anything, it lets the filter editor offer choices instead of a
+    /// text box. A server without a Catalog never sends it, so every field
+    /// defaults to empty and the editor falls back to free text.
+    Catalog(FilterVocabulary),
     /// Unknown type — tolerated (forward compatibility) but not silent:
     /// `websocket::forward` reports it once per connection, because otherwise a
     /// protocol skew reads exactly like a server that stopped talking.
     #[serde(other)]
     Unknown,
+}
+
+/// Payload of a `{type:"catalog"}` message: the pickable values, in the order
+/// the server sent them.
+///
+/// Every field is tolerant and defaults to empty. A vocabulary is a convenience
+/// for the editor and never an authority — [`crate::domain::filter::Filter`]
+/// matches on the raw ids the shop payload carries, so a missing or partial
+/// catalog costs a picker, never a verdict. That is also why nothing here is
+/// validated against the filter: an id the player already has in `config.toml`
+/// must keep working whether or not this list mentions it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct FilterVocabulary {
+    /// Wearable gear sets, in the game's own list order.
+    #[serde(deserialize_with = "lenient_entries")]
+    pub sets: Vec<VocabularyEntry>,
+    /// The substats a gear piece can roll. Percent-bearing ones are labelled
+    /// "(%)" by the game, which is load-bearing: the wire sends them as
+    /// fractions (`att_rate: 0.03` is 3%), so an editor collecting a threshold
+    /// for one of these must collect `0.03` and not `3`.
+    #[serde(deserialize_with = "lenient_entries")]
+    pub substats: Vec<VocabularyEntry>,
+    /// The wearable slots, matching [`crate::domain::shop::ShopItem::gear_slot`].
+    #[serde(deserialize_with = "lenient_entries")]
+    pub slots: Vec<VocabularyEntry>,
+}
+
+/// One pickable value: the id a filter matches on, and the words a player reads.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct VocabularyEntry {
+    pub id: String,
+    pub label: String,
+}
+
+/// Tolerant vocabulary list: an undecodable entry is dropped and a non-array
+/// degrades to empty, so one malformed row cannot cost the whole message.
+///
+/// Not shared with `shop::lenient_elements` on purpose — that one lives in the
+/// domain and this is an envelope concern; the duplication is four lines
+/// against an import that would tie the two modules' tolerance together.
+fn lenient_entries<'de, D>(de: D) -> Result<Vec<VocabularyEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let serde_json::Value::Array(values) = serde_json::Value::deserialize(de)? else {
+        tracing::debug!("tolerated a non-array vocabulary list — degraded to empty");
+        return Ok(Vec::new());
+    };
+    Ok(values
+        .into_iter()
+        .filter_map(|value| match serde_json::from_value(value) {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                tracing::debug!(%error, "dropped an undecodable vocabulary entry");
+                None
+            }
+        })
+        .collect())
 }
 
 /// Payload of a `{type:"purchase"}` message.
@@ -78,6 +146,7 @@ mod tests {
                  {"id":102,"slot":3,"kind":"equipment","name":"Covenant Bookmark",
                   "price":184000,"grade":4,"set":"set_speed",
                   "substats":[{"name":"speed","value":15.0}],
+                  "gear_slot":"helm",
                   "limit":{"remaining":1,"total":1}}],
                "refresh":{"crystal_balance":95,"cost":3}}"#,
         );
@@ -99,6 +168,7 @@ mod tests {
         assert_eq!(item.price, Some(Gold::new(184_000)));
         assert_eq!(item.grade, Some(4));
         assert_eq!(item.set.as_deref(), Some("set_speed"));
+        assert_eq!(item.gear_slot.as_deref(), Some("helm"));
         assert_eq!(item.substats.len(), 1);
         assert_eq!(item.substats[0].name, "speed");
         assert_eq!(item.substats[0].value, Some(15.0));
@@ -226,5 +296,59 @@ mod tests {
     fn unknown_type_still_falls_back() {
         let message = parse(r#"{"type":"telemetry","whatever":1}"#);
         assert!(matches!(message, ServerMessage::Unknown));
+    }
+
+    fn vocabulary(json: &str) -> FilterVocabulary {
+        let message = parse(json);
+        let ServerMessage::Catalog(received) = message else {
+            panic!("expected Catalog, got {message:?}");
+        };
+        received
+    }
+
+    /// The `catalog` tag and its three field names are the wire contract, and
+    /// this is the only place either side's spelling is checked: `#[serde(other)]`
+    /// turns a mismatched tag into `Unknown`, which compiles, passes every other
+    /// test, and leaves the editor permanently empty.
+    #[test]
+    fn catalog_tag_and_every_field_are_the_wire_contract() {
+        let received = vocabulary(
+            r#"{"type":"catalog",
+                "sets":[{"id":"set_speed","label":"Speed Set"}],
+                "substats":[{"id":"att_rate","label":"Attack(%)"}],
+                "slots":[{"id":"helm","label":"Helmet"}]}"#,
+        );
+
+        assert_eq!(received.sets[0].id, "set_speed");
+        assert_eq!(received.sets[0].label, "Speed Set");
+        // The "(%)" is the game's own wording and is load-bearing: this substat
+        // arrives on the wire as a fraction, so a threshold for it reads 0.03.
+        assert_eq!(received.substats[0].label, "Attack(%)");
+        assert_eq!(received.slots[0].id, "helm");
+        assert_eq!(received.slots[0].label, "Helmet");
+    }
+
+    #[test]
+    fn a_catalog_with_no_fields_is_empty_rather_than_an_error() {
+        // What a server with no Catalog would send, if it sent anything at all.
+        assert_eq!(
+            vocabulary(r#"{"type":"catalog"}"#),
+            FilterVocabulary::default()
+        );
+    }
+
+    #[test]
+    fn one_malformed_entry_does_not_cost_the_message() {
+        let received = vocabulary(
+            r#"{"type":"catalog","sets":[{"id":"set_speed","label":"Speed Set"},{"id":7}]}"#,
+        );
+        assert_eq!(received.sets.len(), 1);
+        assert_eq!(received.sets[0].id, "set_speed");
+    }
+
+    #[test]
+    fn a_mistyped_list_degrades_to_empty() {
+        let received = vocabulary(r#"{"type":"catalog","slots":"corrupt"}"#);
+        assert!(received.slots.is_empty());
     }
 }

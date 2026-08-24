@@ -479,6 +479,14 @@ pub struct ShopItem {
     /// Gear set, by internal id (`set_speed`, `set_immune`, ...).
     #[serde(default, deserialize_with = "sanitized_text")]
     pub set: Option<String>,
+    /// Wearable slot, by internal id (`helm`, `weapon`, ...). Resolved by the
+    /// server off the item's game id, which is the only place it exists — the
+    /// shop payload states no slot at all, and the id grammar does not encode
+    /// one either. `None` for every non-gear item, and for every item when the
+    /// server could not read its Catalog; the two are indistinguishable here
+    /// and mean the same thing to a criterion that names a slot.
+    #[serde(default, deserialize_with = "sanitized_text")]
+    pub gear_slot: Option<String>,
     /// Substats and their values, keyed by internal stat name. A nameless or
     /// mistyped entry is dropped: it could never match a name-keyed criterion.
     #[serde(default, deserialize_with = "lenient_elements")]

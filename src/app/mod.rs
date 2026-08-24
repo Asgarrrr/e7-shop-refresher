@@ -29,7 +29,7 @@ use crate::domain::filter::Filter;
 use crate::journal::EventLog;
 use crate::render::print_controls;
 use crate::stream::{BudgetedChunk, PipelineBudget, RunBaselineCell};
-use crate::uplink::UplinkEvent;
+use crate::uplink::{UplinkEvent, VocabularyCell};
 use crate::watch::WatchGate;
 use crate::{Config, Result};
 
@@ -106,6 +106,11 @@ pub struct SessionHandles {
     /// before the backend that will increment it exists, precisely so a
     /// clone can ride in this struct from the very first frame.
     pub(crate) capture_health: CaptureHealth,
+    /// The filter choices the server pushed, for Setup to offer. Empty until a
+    /// `catalog` message arrives, and empty for good against a server with no
+    /// Catalog to read — the editor falls back to free text, which is what every
+    /// build did before this existed.
+    pub vocabulary: VocabularyCell,
 }
 
 impl SessionHandles {
@@ -134,6 +139,7 @@ impl SessionHandles {
             run_baseline: RunBaselineCell::new(budget.clone()),
             budget,
             capture_health: CaptureHealth::default(),
+            vocabulary: VocabularyCell::new(),
         }
     }
 }
@@ -198,6 +204,7 @@ pub fn setup(config: Config) -> (Session, SessionHandles, ShutdownSignal) {
         run_baseline: RunBaselineCell::new(budget.clone()),
         budget,
         capture_health,
+        vocabulary: VocabularyCell::new(),
     };
     let (job_tx, job_rx) = mpsc::channel::<plan::Job>(JOB_QUEUE);
     let timings = Arc::new(Mutex::new(config.actuator.timings));
@@ -306,6 +313,7 @@ impl Session {
             run_baseline,
             budget,
             capture_health,
+            vocabulary,
         } = handles;
         let pressure_resync = PressureResync::default();
         let (segment_tx, segment_rx) = mpsc::channel::<CaptureEvent>(CAPTURE_EVENT_QUEUE);
@@ -413,6 +421,7 @@ impl Session {
             &session_gate,
             &journal,
             &actuator,
+            &vocabulary,
             command_rx,
             message_rx,
             fatal_rx,
