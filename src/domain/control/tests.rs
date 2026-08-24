@@ -1901,6 +1901,56 @@ fn haul_counts_a_repeated_echo_once_per_roll() {
     assert_eq!(ctrl.haul().count("ticketrare_name"), 1);
 }
 
+/// [`named_shop`] with slot 2 redrawn as a second copy of slot 1 — the same
+/// catalog id, the same wire name, in two slots of one roll. Nothing in the
+/// protocol forbids this, and nothing in the repo establishes it never happens,
+/// so the controller is specified for it rather than against it.
+fn duplicated_id_shop() -> ShopSnapshot {
+    let mut snapshot = named_shop();
+    snapshot.slots[1] = snapshot.slots[0].clone();
+    snapshot
+}
+
+#[test]
+fn a_roll_holding_one_id_twice_counts_both_buys_before_calling_a_replay() {
+    let mut ctrl = controller(Limits::default());
+    let _ = ctrl.handle(snap(duplicated_id_shop(), 0));
+    let _ = ctrl.handle(buy(100, 1));
+    let _ = ctrl.handle(buy(100, 2));
+    // Two slots bore the id, so the second echo is the second slot being
+    // bought, not the first one echoed twice.
+    assert_eq!(ctrl.haul().count("ticketrare_name"), 2);
+    // The third has no slot left it could have come from.
+    let _ = ctrl.handle(buy(100, 3));
+    assert_eq!(ctrl.haul().count("ticketrare_name"), 2);
+}
+
+#[test]
+fn a_duplicated_id_retires_one_slot_per_buy_instead_of_all_of_them() {
+    let mut ctrl = started(Limits::default());
+    let mut snapshot = with_ids(shop(
+        &[Equipment, Equipment, Token, Token, Token, Token],
+        None,
+    ));
+    // Both matching slots now carry slot 1's id.
+    snapshot.slots[1].id = Some(cid(100));
+
+    let ids = |ctrl: &Controller| -> (Vec<Option<CatalogId>>, bool) {
+        let (targets, buyable) = ctrl.plan_targets(&snapshot);
+        (targets.iter().map(|target| target.id).collect(), buyable)
+    };
+
+    assert_eq!(ids(&ctrl), (vec![Some(cid(100)), Some(cid(100))], true));
+
+    // One buy echoed: the first copy is spent, the second is still on sale.
+    // The set-membership guard this replaced retired both here.
+    ctrl.bought.push(cid(100));
+    assert_eq!(ids(&ctrl), (vec![None, Some(cid(100))], true));
+
+    ctrl.bought.push(cid(100));
+    assert_eq!(ids(&ctrl), (vec![None, None], false));
+}
+
 #[test]
 fn haul_resets_on_start() {
     let mut ctrl = controller(Limits::default());

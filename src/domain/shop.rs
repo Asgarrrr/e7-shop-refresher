@@ -203,11 +203,30 @@ where
 }
 
 impl ShopSnapshot {
-    /// The slot bearing this catalog id, if any. Ids are unique within a
-    /// snapshot, so at most one matches; an item whose id the server omitted
-    /// cannot be matched by accident, since it has no id to compare.
+    /// The **first** slot bearing this catalog id, if any. An item whose id the
+    /// server omitted cannot be matched by accident, since it has no id to
+    /// compare.
+    ///
+    /// First, not the only one: nothing in the wire protocol or in this repo
+    /// establishes that an id appears at most once in a roll, and [`CatalogId`]
+    /// is documented as global and stable per item *type* — which is what a
+    /// roll offering the same item in two slots would reuse. Callers that must
+    /// not misattribute such a pair count them with [`Self::slots_with_id`]
+    /// instead of assuming this answer is unique.
     pub fn slot_by_id(&self, id: CatalogId) -> Option<&ShopItem> {
         self.slots.iter().find(|item| item.id == Some(id))
+    }
+
+    /// How many slots bear this catalog id — the ceiling on how many buys of it
+    /// one roll can legitimately echo, since a slot is spent once.
+    ///
+    /// Exists because a purchase notice carries an id and nothing else (no slot
+    /// index, no sequence number, see `uplink::protocol::PurchaseNotice`): with
+    /// duplicated ids the id alone cannot separate "the second copy was bought"
+    /// from "the first echo arrived twice", and this count is the only bound
+    /// that can.
+    pub fn slots_with_id(&self, id: CatalogId) -> usize {
+        self.slots.iter().filter(|item| item.id == Some(id)).count()
     }
 }
 
@@ -673,6 +692,27 @@ mod tests {
                 .slot_by_id(CatalogId::new(999).expect("999 is not zero"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn slots_with_id_counts_every_copy_and_never_the_absent_ids() {
+        let snapshot = parse(
+            r#"{"slots":[{"id":102,"slot":1},{"id":0,"slot":2},{"id":102,"slot":3},{"slot":4}]}"#,
+        );
+        let id = CatalogId::new(102).expect("102 is not zero");
+        assert_eq!(snapshot.slots_with_id(id), 2, "the ceiling on buys of 102");
+        // `slot_by_id` answers only the first of the two — the reason callers
+        // that must not misattribute a copy need this count instead.
+        assert_eq!(
+            snapshot
+                .slot_by_id(id)
+                .expect("the first slot bearing 102")
+                .slot,
+            1
+        );
+        // Two slots have no id at all; neither may be counted under any id.
+        let absent = CatalogId::new(999).expect("999 is not zero");
+        assert_eq!(snapshot.slots_with_id(absent), 0);
     }
 
     /// Both payloads are shapes the server can emit — a slot past `u8::MAX`, a

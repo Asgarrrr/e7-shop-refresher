@@ -292,6 +292,11 @@ pub struct Controller {
     /// re-buying a bought slot. Survives `Start`, which clears
     /// `acted_fingerprint`: keying the clear off that alone would let a
     /// same-roll re-open wrongly forget the buys.
+    ///
+    /// A **multiset**, not a set: an id repeated across two slots is bought
+    /// twice, and collapsing the two would strand the second slot as
+    /// already-bought forever. Every read goes through [`Self::bought_count`]
+    /// against `ShopSnapshot::slots_with_id`, never through `contains`.
     bought: Vec<CatalogId>,
     /// The roll `bought` is scoped to; a different identity is fresh stock and
     /// empties the set. Shares the `Arc` with `acted_fingerprint` rather than
@@ -588,7 +593,18 @@ impl Controller {
                 (Some(balance), Some(price)) => price <= balance,
                 _ => true,
             };
-            let already_bought = item.id.is_some_and(|id| self.bought.contains(&id));
+            // Occurrence-counted, not set membership: this slot is spent only
+            // once the buys echoed for its id outnumber the slots ahead of it
+            // carrying that same id. With unique ids `earlier` is 0 and this is
+            // the old `contains`; with a duplicated id it stops the first buy
+            // from retiring the second slot, which no later event could undo.
+            let already_bought = item.id.is_some_and(|id| {
+                let earlier = snapshot.slots[..index]
+                    .iter()
+                    .filter(|ahead| ahead.id == Some(id))
+                    .count();
+                self.bought_count(id) > earlier
+            });
             let in_reach = !item.is_sold_out() && affordable && !already_bought;
             if in_reach && let (Some(balance), Some(price)) = (gold, item.price) {
                 // Saturating: `price <= balance` holds only through
@@ -607,6 +623,27 @@ impl Controller {
         (targets, buyable)
     }
 
+    /// How many buys of `id` this roll has already counted.
+    fn bought_count(&self, id: CatalogId) -> usize {
+        self.bought.iter().filter(|&&bought| bought == id).count()
+    }
+
+    /// How many echoes of `id` may still be counted as buys — one per slot
+    /// bearing it, since a slot is spent once. Past that ceiling an echo is the
+    /// replay it can only be.
+    ///
+    /// One, not zero, when no snapshot holds the id: an echo whose roll has
+    /// already rotated out, or one arriving before the first snapshot, must
+    /// still count once. A zero ceiling would drop it silently and let a later
+    /// replay of the same echo through, since `bought` would stay empty.
+    fn buyable_copies(&self, id: CatalogId) -> usize {
+        self.last_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.slots_with_id(id))
+            .filter(|&slots| slots > 0)
+            .unwrap_or(1)
+    }
+
     /// A server-confirmed buy: records the echoed gold balance, then — only
     /// while `Paused` — checks the item off the checklist. The buy clearing
     /// the last entry resumes the hunt through the limits gate.
@@ -621,10 +658,13 @@ impl Controller {
             self.gold_balance = gold;
         }
         // Also truth whatever the status — the slot is spent for the rest of
-        // the roll. The `bought` guard doubles as replay dedup, so a buy counts
-        // at most once per roll; a re-buy in a fresh roll counts again.
+        // the roll. The ceiling doubles as replay dedup: a buy counts once per
+        // slot carrying the id, so a roll holding one copy behaves exactly as
+        // the old `contains` guard did, a roll holding two counts both, and the
+        // echo after that is a replay whichever it was. A re-buy in a fresh
+        // roll counts again, `bought` having been cleared with the roll.
         if let Some(item) = item
-            && !self.bought.contains(&item)
+            && self.bought_count(item) < self.buyable_copies(item)
         {
             self.bought.push(item);
             // The haul is narrower than `bought`: the *run's* take. Hence only
