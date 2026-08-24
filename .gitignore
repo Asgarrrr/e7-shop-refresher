@@ -58,3 +58,4 @@ crash.log
 *.etl
 *.pcap
 *.pcapng
+.superpowers/
