@@ -487,8 +487,27 @@ pub struct ShopItem {
     /// and mean the same thing to a criterion that names a slot.
     #[serde(default, deserialize_with = "sanitized_text")]
     pub gear_slot: Option<String>,
-    /// Substats and their values, keyed by internal stat name. A nameless or
-    /// mistyped entry is dropped: it could never match a name-keyed criterion.
+    /// The piece's MAIN stat, the one its part decides rather than rolls.
+    ///
+    /// A separate field because it is a separate question: a main stat is not a
+    /// roll and cannot be judged like one. Its value is fixed by the part and
+    /// the item level — a weapon's attack reads 66, 88 or 100 and nothing else,
+    /// a speed boot's speed reads 6, 7 or 8 — where a rolled substat spans a
+    /// range. Measured on 7,941 captured shop items.
+    ///
+    /// `None` for every non-gear item, and against a server that has not
+    /// learned to split it: an older one folds the main stat into
+    /// [`Self::substats`] as the first entry, which is where it rode until the
+    /// server named it. That fallback is why [`crate::domain::filter::SubstatReq`]
+    /// still answers off both fields.
+    #[serde(default, deserialize_with = "object_or_none")]
+    pub main_stat: Option<Substat>,
+    /// The ROLLED substats and their values, keyed by internal stat name. A
+    /// nameless or mistyped entry is dropped: it could never match a name-keyed
+    /// criterion.
+    ///
+    /// The count is the gear's grade minus one, exactly — 7,941 captured items,
+    /// no exception — since the grade counts the main stat with them.
     #[serde(default, deserialize_with = "lenient_elements")]
     pub substats: Vec<Substat>,
     /// Fail-open like an absent field: a partial or mistyped limit degrades
@@ -683,6 +702,44 @@ mod tests {
         let substats = &snapshot.slots[0].substats;
         assert_eq!(substats.len(), 1);
         assert_eq!(substats[0].name, "speed");
+    }
+
+    /// The main stat is its own field and is not counted among the rolls.
+    ///
+    /// The count is what makes this more than a spelling: `min_substats`
+    /// compares against it, and a grade rolls exactly `grade - 1` substats, so
+    /// one entry too many turns "at least three rolls" into a criterion Heroic
+    /// satisfies as well as Epic.
+    #[test]
+    fn the_main_stat_is_read_apart_from_the_rolls() {
+        let snapshot = parse(
+            r#"{"slots":[{"grade":4,"main_stat":{"name":"speed","value":8.0},
+                 "substats":[{"name":"att","value":31.0},{"name":"cri","value":0.03},
+                             {"name":"max_hp_rate","value":0.05}]}]}"#,
+        );
+        let item = &snapshot.slots[0];
+        let main = item.main_stat.as_ref().expect("the wire sent a main stat");
+        assert_eq!(main.name, "speed");
+        assert_eq!(main.value, Some(8.0));
+        assert_eq!(item.substats.len(), 3, "grade 4 rolls three");
+    }
+
+    /// A server that has not learned the split sends no `main_stat`, and the
+    /// snapshot still decodes — the main stat simply rides on as the first
+    /// substat, which is where it was until the server named it.
+    #[test]
+    fn a_snapshot_without_a_main_stat_still_decodes() {
+        let snapshot = parse(r#"{"slots":[{"substats":[{"name":"speed","value":8.0}]}]}"#);
+        assert_eq!(snapshot.slots[0].main_stat, None);
+        assert_eq!(snapshot.slots[0].substats.len(), 1);
+    }
+
+    /// A mistyped main stat degrades to absent rather than killing the
+    /// snapshot, the way every other object-shaped field here does.
+    #[test]
+    fn a_mistyped_main_stat_degrades_to_none() {
+        let snapshot = parse(r#"{"slots":[{"main_stat":"speed","substats":[]}]}"#);
+        assert_eq!(snapshot.slots[0].main_stat, None);
     }
 
     #[test]

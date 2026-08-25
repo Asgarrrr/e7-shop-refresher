@@ -206,6 +206,15 @@ pub(crate) fn format_item(item: &ShopItem, index: usize) -> String {
     if let Some(price) = item.price {
         let _ = write!(line, " · {price} gold");
     }
+    // Ahead of the rolls and named, because it is the piece's own stat rather
+    // than one of its rolls: a `speed 8` inside the bracket read as a roll no
+    // gear can produce.
+    if let Some(main) = &item.main_stat {
+        let _ = write!(line, " · main {}", main.name);
+        if let Some(value) = main.value {
+            let _ = write!(line, " {value}");
+        }
+    }
     if !item.substats.is_empty() {
         line.push_str(" · [");
         for (position, stat) in item.substats.iter().enumerate() {
@@ -276,6 +285,29 @@ mod tests {
         let item = ShopItem::default();
         assert_eq!(item.slot, 0);
         assert!(format_item(&item, 1).starts_with("slot 2 · "));
+    }
+
+    /// The main stat reads as one, outside the bracket of rolls.
+    ///
+    /// Inside it, `speed 8` was a line claiming a roll the game cannot produce
+    /// — rolled speed stops at 4 — which is exactly the confusion the split
+    /// exists to end.
+    #[test]
+    fn format_item_names_the_main_stat_apart_from_the_rolls() {
+        let item = ShopItem {
+            main_stat: Some(crate::domain::shop::Substat {
+                name: "speed".to_owned(),
+                value: Some(8.0),
+            }),
+            substats: vec![crate::domain::shop::Substat {
+                name: "cri".to_owned(),
+                value: Some(0.03),
+            }],
+            ..ShopItem::default()
+        };
+        let line = format_item(&item, 0);
+        assert!(line.contains("· main speed 8"), "{line}");
+        assert!(line.contains("· [cri 0.03]"), "{line}");
     }
 
     /// Capturing stdout in a Rust test needs a dependency this crate does not

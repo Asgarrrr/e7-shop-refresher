@@ -63,14 +63,19 @@ pub struct Filter {
     /// [`Self::slots_unanswerable`] backs.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub slots: Vec<String>,
-    /// Minimum substat count (raw list length).
+    /// Minimum count of ROLLED substats, [`ShopItem::substats`]' length.
     ///
-    /// A different question from [`Self::min_grade`], and config-only since the
-    /// window offers the rarity ladder instead. The two coincide only BELOW
-    /// grade 5: Good/Rare/Heroic carry 2/3/4 substats, and Epic carries four as
-    /// well — measured on the game's own table, 150 grade-5 rows at
-    /// `sub_stat_count` 4..4. So "at least 4 substats" is Heroic-or-Epic, where
-    /// `min_grade = 5` is Epic alone, and neither can be spelled with the other.
+    /// Config-only: the window offers the rarity ladder instead, and on shop
+    /// gear the two say the same thing. A grade rolls exactly `grade - 1`
+    /// substats — 7,941 captured items, no exception, and the game's own table
+    /// agrees (`db_equip_item.sub_stat_count` is 4 on its 858 grade-5 rows and 3
+    /// on its grade-4 ones) — so `min_substats = n` is `min_grade = n + 1` on
+    /// anything the shop sells.
+    ///
+    /// It used to be the wider criterion, on a count that included the main
+    /// stat: Heroic and Epic looked alike at four, and the ladder was said to be
+    /// the only way to ask for Epic. Both readings came from counting the main
+    /// stat as a roll.
     pub min_substats: Option<u8>,
     /// Substats the item must carry, each above its optional threshold. How
     /// several of them combine is [`Self::substat_match`].
@@ -403,22 +408,31 @@ impl SubstatReq {
     /// Scans *all* substats of the matching name: an item may list the same
     /// stat twice (a blank entry, then the rolled value).
     ///
-    /// **The list's first entry is the piece's MAIN stat**, so a requirement is
-    /// satisfied by either — measured on 7,941 captured shop items, where the
-    /// wire's `op[0]` is the part's own stat every time and takes one of three
-    /// fixed values per part (a weapon's attack reads 66, 88 or 100, one per
-    /// item level). Deliberately not separated: `speed ≥ 6` is a hunt for speed
-    /// BOOTS, whose speed is a main stat and never a roll, and it is the hunt
-    /// this window exists for. `ui::editor::hunt::SUBSTAT_RANGE` sizes its
-    /// threshold field off the same whole list, for the same reason.
+    /// **The piece's MAIN stat answers this too**, and that is deliberate:
+    /// `speed ≥ 6` is a hunt for speed BOOTS, whose speed is a main stat and
+    /// never a roll, and it is the hunt this window exists for. A criterion that
+    /// read only [`ShopItem::substats`] would have gone quiet on it the day the
+    /// server learned to split the two — the value is unreachable by a roll,
+    /// which tops out at 4. `ui::editor::hunt::SUBSTAT_RANGE` sizes its
+    /// threshold field over both, for the same reason.
+    ///
+    /// It is also what keeps an older server working: one that has not learned
+    /// the split sends the main stat as `substats[0]`, and either shape answers
+    /// the same question here.
+    ///
+    /// Asking for the two apart is a criterion this does not have yet — see the
+    /// `main` a gear rule will carry.
     fn satisfied_by(&self, item: &ShopItem) -> bool {
-        item.substats.iter().any(|stat| {
-            stat.name == self.name
-                && match self.min {
-                    None => true,
-                    Some(min) => stat.value.is_some_and(|value| value >= min),
-                }
-        })
+        item.main_stat
+            .iter()
+            .chain(item.substats.iter())
+            .any(|stat| {
+                stat.name == self.name
+                    && match self.min {
+                        None => true,
+                        Some(min) => stat.value.is_some_and(|value| value >= min),
+                    }
+            })
     }
 }
 
@@ -444,6 +458,8 @@ mod tests {
             grade: Some(3),
             set: Some("set_speed".to_owned()),
             gear_slot: Some("helm".to_owned()),
+            // A helm's own stat, which is health and never a roll.
+            main_stat: Some(substat("max_hp", Some(472.0))),
             substats: vec![
                 substat("speed", Some(15.0)),
                 substat("cri", Some(0.03)),
@@ -738,6 +754,37 @@ mod tests {
         let mut item = equip();
         item.substats.retain(|stat| stat.name != "cri");
         assert!(!filter.matches(&item));
+    }
+
+    /// The hunt this window exists for: speed boots, where the speed is the
+    /// piece's MAIN stat and no roll can reach the value.
+    ///
+    /// A criterion reading only the rolls would answer `false` here and say
+    /// nothing about it — the shop's speed rolls stop at 4, so `speed ≥ 6`
+    /// would have gone silently empty the day the server split the two fields.
+    #[test]
+    fn a_threshold_no_roll_can_reach_is_answered_by_the_main_stat() {
+        let hunt = Filter {
+            required_substats: vec![SubstatReq {
+                name: "speed".to_owned(),
+                min: Some(6.0),
+            }],
+            ..Filter::default()
+        };
+        let boots = ShopItem {
+            gear_slot: Some("boot".to_owned()),
+            main_stat: Some(substat("speed", Some(8.0))),
+            substats: vec![substat("cri", Some(0.03))],
+            ..equip()
+        };
+        assert!(hunt.matches(&boots));
+        // And a piece whose speed is only a roll still fails it, so the
+        // criterion is not widened into "carries speed at all".
+        let rolled = ShopItem {
+            substats: vec![substat("speed", Some(4.0))],
+            ..equip()
+        };
+        assert!(!hunt.matches(&rolled));
     }
 
     #[test]
