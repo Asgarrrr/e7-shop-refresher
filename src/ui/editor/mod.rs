@@ -32,9 +32,9 @@ use crate::actuator::plan::DelayRange;
 use crate::actuator::plan::{TimingPreset, Timings};
 use crate::app::Command;
 use crate::domain::control::Limits;
-use crate::domain::filter::Filter;
 #[cfg(test)]
 use crate::domain::filter::SubstatReq;
+use crate::domain::filter::{Filter, GearRule};
 use crate::uplink::VocabularyCell;
 use crate::uplink::protocol::{FilterVocabulary, VocabularyEntry};
 // `currency_row` lends each cap its raw number for the frame the drag needs it.
@@ -61,6 +61,16 @@ pub(super) struct EditorState {
     applied_click_mode: ClickMode,
     set_input: String,
     slot_input: String,
+    /// Which gear rule the Hunt body is editing.
+    ///
+    /// It may point one PAST the last rule, and that is the whole trick behind
+    /// the `+` cell: a rule with nothing set does not restrict, so materializing
+    /// one the moment a tab is added would put an inert `[[filter.gear]]` in the
+    /// player's file and — worse — light Apply over an edit nobody made. The
+    /// index alone says the tab is there; [`with_rule`] writes the rule into the
+    /// filter on the first criterion that restricts, and takes it back out when
+    /// the last one is cleared.
+    gear_index: usize,
     /// What the server offered, cached off `VocabularyCell` so the pickers do
     /// not clone forty strings per frame. Empty until a `catalog` message
     /// arrives, and empty for good against a server with no Catalog — every
@@ -102,6 +112,7 @@ impl EditorState {
             click_mode,
             set_input: String::new(),
             slot_input: String::new(),
+            gear_index: 0,
             vocabulary: FilterVocabulary::default(),
             vocabulary_generation: 0,
             hunt_open: true,
@@ -284,62 +295,149 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
 
     branch_separator(ui, "— or gear —", "or gear");
 
-    offered_list(
-        ui,
-        "sets",
-        &mut editor.filter.sets,
-        &mut editor.set_input,
-        &editor.vocabulary.sets,
-        icons,
-    );
-    gear_rule(ui);
-    // The catalog's icon table is keyed by set id and nothing else: there are no
-    // gear-slot pictures on the wire and none planned. An empty source says that
-    // in the one place it matters — inside `choice_list`, where every value then
-    // takes the text branch.
-    offered_list(
-        ui,
-        "gear slots",
-        &mut editor.filter.slots,
-        &mut editor.slot_input,
-        &editor.vocabulary.slots,
-        &SetIcons::default(),
-    );
-    gear_rule(ui);
-    substat_chips(
-        ui,
-        &mut editor.filter.required_substats,
-        &mut editor.filter.substat_match,
-        &editor.vocabulary.substats,
-    );
-    gear_rule(ui);
-    // No space between the header and its control: the item spacing already
-    // puts one there, and the two blocks above take exactly that — a header
-    // that sits further from its own control than from the block before it
-    // is the reading this section had.
-    //
-    // Unconditional, where it used to wait on the catalog's rarity family: the
-    // cells are `theme::RARITIES` now, so there is no session in which the
-    // ladder cannot be drawn. See [`rarity_ladder`].
-    ui.label(theme::section("rarity"));
-    rarity_ladder(ui, &mut editor.filter.min_grade);
-    ui.add_space(theme::SP_XS);
-    egui::Grid::new("hunt-numerics")
-        .num_columns(2)
-        .spacing([theme::SP_SM, theme::SP_XS])
-        .show(ui, |ui| {
-            // Seeded above the covenant-bookmark price, so a fresh cap still
-            // matches the default hunt targets.
-            currency_row(&mut editor.filter.max_price, Gold::get, Gold::new, |cap| {
-                optional_value(ui, "max price (gold)", cap, 300_000)
+    piece_strip(ui, &mut editor.filter.gear, &mut editor.gear_index);
+    with_rule(&mut editor.filter.gear, editor.gear_index, |rule| {
+        offered_list(
+            ui,
+            "sets",
+            &mut rule.sets,
+            &mut editor.set_input,
+            &editor.vocabulary.sets,
+            icons,
+        );
+        gear_rule(ui);
+        // The catalog's icon table is keyed by set id and nothing else: there
+        // are no gear-slot pictures on the wire and none planned. An empty
+        // source says that in the one place it matters — inside `choice_list`,
+        // where every value then takes the text branch.
+        offered_list(
+            ui,
+            "gear slots",
+            &mut rule.slots,
+            &mut editor.slot_input,
+            &editor.vocabulary.slots,
+            &SetIcons::default(),
+        );
+        gear_rule(ui);
+        substat_chips(
+            ui,
+            &mut rule.required_substats,
+            &mut rule.substat_match,
+            &editor.vocabulary.substats,
+        );
+        gear_rule(ui);
+        // No space between the header and its control: the item spacing already
+        // puts one there, and the two blocks above take exactly that — a header
+        // that sits further from its own control than from the block before it
+        // is the reading this section had.
+        //
+        // Unconditional, where it used to wait on the catalog's rarity family:
+        // the cells are `theme::RARITIES` now, so there is no session in which
+        // the ladder cannot be drawn. See [`rarity_ladder`].
+        ui.label(theme::section("rarity"));
+        rarity_ladder(ui, &mut rule.min_grade);
+        ui.add_space(theme::SP_XS);
+        egui::Grid::new("hunt-numerics")
+            .num_columns(2)
+            .spacing([theme::SP_SM, theme::SP_XS])
+            .show(ui, |ui| {
+                // Seeded above the covenant-bookmark price, so a fresh cap still
+                // matches the default hunt targets.
+                currency_row(&mut rule.max_price, Gold::get, Gold::new, |cap| {
+                    optional_value(ui, "max price (gold)", cap, 300_000)
+                });
+                ui.end_row();
             });
-            ui.end_row();
-        });
+    });
     // Outside both blocks, and last because of it: `matches` applies this
     // before either branch, so it widens the name hunt exactly as it widens the
     // gear one.
     ui.add_space(theme::SP_SM);
     ui.checkbox(&mut editor.filter.include_sold_out, "include sold out");
+}
+
+/// The pieces being hunted, as one segmented strip: a cell per rule, a `+` to
+/// add one, and a `✕` to drop the one on screen.
+///
+/// A strip and not a stack of cards, because the window is pinned at
+/// [`crate::ui::WINDOW_WIDTH`] and one rule's criteria already fill a panel:
+/// three rules unfolded at once would be three screens of scrolling to compare
+/// two chips. The strip is the same grammar the rarity ladder and the timing
+/// presets wear, so an exclusive choice looks like every other one here.
+///
+/// The `+` cell only moves the index past the last rule — see
+/// [`EditorState::gear_index`] — and the `✕` is a [`theme::bare_verb`] rather
+/// than a cell, because it acts on the selection instead of being one.
+fn piece_strip(ui: &mut egui::Ui, rules: &mut Vec<GearRule>, index: &mut usize) {
+    // A rule a config file holds and the window cannot reach would filter while
+    // being invisible and unremovable — the defect `unoffered_rows` exists to
+    // close for a value the vocabulary cannot name. Clamped rather than
+    // asserted: the count changes under the index whenever a rule is removed.
+    *index = (*index).min(rules.len());
+    ui.horizontal(|ui| {
+        ui.label(theme::section("pieces"));
+        theme::segmented_strip(ui, |ui| {
+            for cell in 0..=rules.len() {
+                // The cell past the last rule is the one being drafted, and it
+                // is drawn as a `+` until a criterion makes it real.
+                let label = if cell == rules.len() {
+                    "+".to_owned()
+                } else {
+                    (cell + 1).to_string()
+                };
+                if ui
+                    .selectable_label(*index == cell, egui::RichText::new(label).small())
+                    .clicked()
+                {
+                    *index = cell;
+                }
+            }
+        });
+        // Only over a rule that exists: the draft cell has nothing to remove,
+        // and a disabled verb beside it would be a control that never acts.
+        if *index < rules.len() && theme::bare_verb(ui, "remove").clicked() {
+            rules.remove(*index);
+            *index = (*index).min(rules.len());
+        }
+    });
+    ui.add_space(theme::SP_SM);
+}
+
+/// Lends the Hunt body the rule at `index`, and puts it back only if it says
+/// something.
+///
+/// **A rule with nothing set never reaches the filter**, which is what keeps the
+/// `+` cell honest. `GearRule::restricts` is false for a fresh one, so storing
+/// it would write an inert `[[filter.gear]]` into the player's file and light
+/// Apply over an edit nobody made — and `mark_applied` could never put it out,
+/// since the applied twin would keep coming back without it.
+///
+/// The same test in reverse takes a rule out: clearing the last criterion of an
+/// existing rule removes it rather than leaving a card that filters nothing.
+///
+/// `mem::take` and not a clone: this runs every frame, and the rule holds three
+/// `Vec`s of `String`.
+fn with_rule<R>(
+    rules: &mut Vec<GearRule>,
+    index: usize,
+    edit: impl FnOnce(&mut GearRule) -> R,
+) -> R {
+    let held = index < rules.len();
+    let mut rule = if held {
+        std::mem::take(&mut rules[index])
+    } else {
+        GearRule::default()
+    };
+    let out = edit(&mut rule);
+    match (rule.restricts(), held) {
+        (true, true) => rules[index] = rule,
+        (true, false) => rules.push(rule),
+        (false, true) => {
+            rules.remove(index);
+        }
+        (false, false) => {}
+    }
+    out
 }
 
 /// The boundary between the two branches of [`Filter::matches`] — what an item
@@ -757,6 +855,18 @@ mod tests {
         editor
     }
 
+    /// The rule the Hunt body edits, created on demand.
+    ///
+    /// A test writing a gear criterion is a test about the ONE rule the window
+    /// draws, and `with_rule` would otherwise take it back out before the
+    /// assertion — a fresh rule is empty until something restricts.
+    fn rule_of(editor: &mut EditorState) -> &mut GearRule {
+        if editor.filter.gear.is_empty() {
+            editor.filter.gear.push(GearRule::default());
+        }
+        &mut editor.filter.gear[0]
+    }
+
     fn entry(id: &str, label: &str) -> VocabularyEntry {
         VocabularyEntry {
             id: id.to_owned(),
@@ -779,7 +889,7 @@ mod tests {
     /// stepper unfolds beside the chip it belongs to and nowhere else, which
     /// `only_the_required_chip_unfolds_a_threshold` pins.
     fn arm_threshold(editor: &mut EditorState, name: &str) -> f64 {
-        editor.filter.required_substats = vec![SubstatReq {
+        rule_of(editor).required_substats = vec![SubstatReq {
             name: name.to_owned(),
             min: None,
         }];
@@ -789,7 +899,7 @@ mod tests {
         harness.get_by_label("≥").click();
         harness.run();
         drop(harness);
-        editor.filter.required_substats[0]
+        editor.filter.only_rule().required_substats[0]
             .min
             .expect("arming the threshold seeds it")
     }
@@ -890,7 +1000,7 @@ mod tests {
         harness.get_by_label("Speed Set").click();
         harness.run();
         drop(harness);
-        assert_eq!(editor.filter.sets, vec!["set_speed".to_owned()]);
+        assert_eq!(editor.filter.only_rule().sets, vec!["set_speed".to_owned()]);
     }
 
     /// With a texture the set chip is its icon alone — 22 labelled chips wrap
@@ -909,14 +1019,14 @@ mod tests {
     #[test]
     fn ticking_an_icon_chip_stores_the_internal_id() {
         let mut editor = stocked_editor_with_icons();
-        editor.filter.sets.clear();
+        rule_of(&mut editor).sets.clear();
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
         harness.get_by_label("Speed Set").click();
         harness.run();
         drop(harness);
-        assert_eq!(editor.filter.sets, vec!["set_speed".to_owned()]);
+        assert_eq!(editor.filter.only_rule().sets, vec!["set_speed".to_owned()]);
     }
 
     /// A set whose icon did not arrive keeps its text chip rather than becoming
@@ -1090,8 +1200,8 @@ mod tests {
             .click();
         harness.run();
         drop(harness);
-        assert_eq!(editor.filter.sets, vec!["speed".to_owned()]);
-        assert!(editor.filter.slots.is_empty());
+        assert_eq!(editor.filter.only_rule().sets, vec!["speed".to_owned()]);
+        assert!(editor.filter.only_rule().slots.is_empty());
     }
 
     /// A gear block's header belongs to the block it OPENS, not to the one it
@@ -1151,18 +1261,80 @@ mod tests {
             .width()
     }
 
+    /// A second piece is a second rule, and each keeps its own criteria.
+    ///
+    /// The whole point of the list: flat, ticking a set while boots were
+    /// selected added the set to the SAME conjunction, and the hunt became
+    /// "a boot that is also of that set" rather than two pieces.
+    #[test]
+    fn a_second_piece_is_a_rule_of_its_own() {
+        let mut editor = stocked_editor();
+        rule_of(&mut editor).slots = vec!["boot".to_owned()];
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("+").click();
+        harness.run();
+        harness.get_by_label("Speed Set").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.gear.len(), 2);
+        assert_eq!(editor.filter.gear[0].slots, vec!["boot".to_owned()]);
+        assert!(
+            editor.filter.gear[0].sets.is_empty(),
+            "the first is untouched"
+        );
+        assert_eq!(editor.filter.gear[1].sets, vec!["set_speed".to_owned()]);
+    }
+
+    /// Opening a piece and setting nothing writes no rule — and, because it
+    /// writes none, leaves Apply dark.
+    ///
+    /// An empty rule in the draft would differ from the applied twin forever:
+    /// `mark_applied` re-seeds that twin from what the session took, and what
+    /// it took would never carry the empty rule back.
+    #[test]
+    fn opening_a_piece_and_setting_nothing_writes_no_rule() {
+        let mut editor = stocked_editor();
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("+").click();
+        harness.run();
+        drop(harness);
+        assert!(editor.filter.gear.is_empty());
+        assert!(run_setup(&mut editor).is_empty(), "and Apply stays dark");
+    }
+
+    /// A piece can be taken back out, which is what keeps a rule from a config
+    /// file reachable: it is drawn, and it can be dropped.
+    #[test]
+    fn removing_a_piece_drops_its_rule() {
+        let mut editor = stocked_editor();
+        rule_of(&mut editor).slots = vec!["boot".to_owned()];
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("remove").click();
+        harness.run();
+        drop(harness);
+        assert!(editor.filter.gear.is_empty());
+    }
+
     /// And unticking takes it back out, rather than leaving a box that lies.
     #[test]
     fn unticking_a_slot_drops_its_id() {
         let mut editor = stocked_editor();
-        editor.filter.slots = vec!["helm".to_owned()];
+        rule_of(&mut editor).slots = vec!["helm".to_owned()];
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
         harness.get_by_label("Helmet").click();
         harness.run();
         drop(harness);
-        assert!(editor.filter.slots.is_empty());
+        // The rule went with its last criterion: a card that constrains
+        // nothing is not a piece being hunted.
+        assert!(editor.filter.gear.is_empty());
     }
 
     /// A token card writes the wire NAME, which is what `Filter::names`
@@ -1278,7 +1450,7 @@ mod tests {
     #[test]
     fn only_the_required_chip_unfolds_a_threshold() {
         let mut editor = stocked_editor();
-        editor.filter.required_substats = vec![SubstatReq {
+        rule_of(&mut editor).required_substats = vec![SubstatReq {
             name: "speed".to_owned(),
             min: None,
         }];
@@ -1376,9 +1548,9 @@ mod tests {
         harness.get_by_label("Speed").click();
         harness.run();
         drop(harness);
-        assert_eq!(editor.filter.required_substats.len(), 1);
-        assert_eq!(editor.filter.required_substats[0].name, "speed");
-        assert_eq!(editor.filter.required_substats[0].min, None);
+        assert_eq!(editor.filter.only_rule().required_substats.len(), 1);
+        assert_eq!(editor.filter.only_rule().required_substats[0].name, "speed");
+        assert_eq!(editor.filter.only_rule().required_substats[0].min, None);
     }
 
     /// The Hunt body wires the mode strip to the filter's own field, and a
@@ -1391,7 +1563,7 @@ mod tests {
     #[test]
     fn the_substat_mode_reaches_the_filter_from_the_hunt_body() {
         let mut editor = stocked_editor();
-        editor.filter.required_substats = vec![SubstatReq {
+        rule_of(&mut editor).required_substats = vec![SubstatReq {
             name: "speed".to_owned(),
             min: Some(8.0),
         }];
@@ -1402,11 +1574,11 @@ mod tests {
         harness.run();
         drop(harness);
         assert_eq!(
-            editor.filter.substat_match,
+            editor.filter.only_rule().substat_match,
             crate::domain::filter::SubstatMatch::Any
         );
         assert_eq!(
-            editor.filter.required_substats[0].min,
+            editor.filter.only_rule().required_substats[0].min,
             Some(8.0),
             "switching how requirements combine must not touch one"
         );
@@ -1416,7 +1588,7 @@ mod tests {
     #[test]
     fn unticking_a_substat_chip_removes_the_requirement() {
         let mut editor = stocked_editor();
-        editor.filter.required_substats = vec![SubstatReq {
+        rule_of(&mut editor).required_substats = vec![SubstatReq {
             name: "speed".to_owned(),
             min: None,
         }];
@@ -1426,7 +1598,7 @@ mod tests {
         harness.get_by_label("Speed").click();
         harness.run();
         drop(harness);
-        assert!(editor.filter.required_substats.is_empty());
+        assert!(editor.filter.gear.is_empty(), "and the rule with it");
     }
 
     /// The quality control is a rarity ladder writing `min_grade`, and it
@@ -1440,9 +1612,9 @@ mod tests {
         harness.get_by_label("Heroic").click();
         harness.run();
         drop(harness);
-        assert_eq!(editor.filter.min_grade, Some(4));
+        assert_eq!(editor.filter.only_rule().min_grade, Some(4));
         // And the criterion it replaced is left exactly as the file had it.
-        assert_eq!(editor.filter.min_substats, None);
+        assert_eq!(editor.filter.only_rule().min_substats, None);
     }
 
     /// Epic is the whole reason the axis moved: it carries four substats like
@@ -1456,7 +1628,7 @@ mod tests {
         harness.get_by_label("Epic").click();
         harness.run();
         drop(harness);
-        assert_eq!(editor.filter.min_grade, Some(5));
+        assert_eq!(editor.filter.only_rule().min_grade, Some(5));
     }
 
     /// Clicking the active segment clears the floor — a criterion you can set
@@ -1464,14 +1636,14 @@ mod tests {
     #[test]
     fn clicking_the_active_rarity_clears_the_floor() {
         let mut editor = stocked_editor();
-        editor.filter.min_grade = Some(4);
+        rule_of(&mut editor).min_grade = Some(4);
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
         harness.get_by_label("Heroic").click();
         harness.run();
         drop(harness);
-        assert_eq!(editor.filter.min_grade, None);
+        assert!(editor.filter.gear.is_empty(), "and the rule with it");
     }
 
     /// Every rung is a NAMED node, which is what a `ComboBox` here would not be
@@ -1524,7 +1696,10 @@ mod tests {
     #[test]
     fn a_config_set_substat_floor_survives_a_window_with_no_control_for_it() {
         let mut editor = stocked_editor_with(Filter {
-            min_substats: Some(3),
+            gear: vec![GearRule {
+                min_substats: Some(3),
+                ..GearRule::default()
+            }],
             ..named_filter()
         });
         let harness = draw_setup(&mut editor);
@@ -1533,7 +1708,7 @@ mod tests {
             assert_eq!(harness.query_all_by_label(gone).count(), 0);
         }
         drop(harness);
-        assert_eq!(editor.filter.min_substats, Some(3));
+        assert_eq!(editor.filter.only_rule().min_substats, Some(3));
         // And Apply stays dark: a render that changed nothing is not an edit.
         assert!(run_setup(&mut editor).is_empty());
     }
@@ -1547,7 +1722,7 @@ mod tests {
         // No names: `string_list` draws a remove cross per entry, and the click
         // below has to be the only one on the surface.
         editor.filter.names.clear();
-        editor.filter.sets = vec!["set_retired".to_owned()];
+        rule_of(&mut editor).sets = vec!["set_retired".to_owned()];
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
@@ -1556,7 +1731,7 @@ mod tests {
         harness.get_by_label("✕").click();
         harness.run();
         drop(harness);
-        assert!(editor.filter.sets.is_empty());
+        assert!(editor.filter.gear.is_empty(), "and the rule with it");
     }
 
     /// The cache is generation-gated, so a vocabulary that never moved must not
@@ -1764,13 +1939,16 @@ mod tests {
         // Over a stocked editor, because this is the offered half: the substat
         // is one the server named, so it is drawn as a chip with a stepper.
         let mut editor = stocked_editor();
-        editor.filter.required_substats = vec![SubstatReq {
+        rule_of(&mut editor).required_substats = vec![SubstatReq {
             name: "speed".to_owned(),
             min: Some(f64::NAN),
         }];
         let harness = draw_setup(&mut editor);
         drop(harness);
-        assert_eq!(editor.filter.required_substats[0].min, Some(1.0));
+        assert_eq!(
+            editor.filter.only_rule().required_substats[0].min,
+            Some(1.0)
+        );
         assert_eq!(editor.filter, editor.filter.clone());
     }
 
@@ -1786,7 +1964,7 @@ mod tests {
         // No names: the click below has to be the only cross on the surface,
         // and every other list here offers what it holds.
         editor.filter.names.clear();
-        editor.filter.required_substats = vec![SubstatReq {
+        rule_of(&mut editor).required_substats = vec![SubstatReq {
             name: "speed_retired".to_owned(),
             min: None,
         }];
@@ -1798,7 +1976,7 @@ mod tests {
         harness.get_by_label("✕").click();
         harness.run();
         drop(harness);
-        assert!(editor.filter.required_substats.is_empty());
+        assert!(editor.filter.gear.is_empty(), "and the rule with it");
     }
 
     /// The consequence that outlives the invisibility, and the reason the
@@ -1814,9 +1992,12 @@ mod tests {
     #[test]
     fn a_non_finite_threshold_on_an_unoffered_requirement_cannot_jam_apply() {
         let mut editor = stocked_editor_with(Filter {
-            required_substats: vec![SubstatReq {
-                name: "unoffered_stat".to_owned(),
-                min: Some(f64::NAN),
+            gear: vec![GearRule {
+                required_substats: vec![SubstatReq {
+                    name: "unoffered_stat".to_owned(),
+                    min: Some(f64::NAN),
+                }],
+                ..GearRule::default()
             }],
             ..named_filter()
         });
@@ -1826,7 +2007,10 @@ mod tests {
             run_setup(&mut editor).is_empty(),
             "a threshold nothing on screen can reach must not leave Apply lit for good"
         );
-        assert_eq!(editor.filter.required_substats[0].min, Some(1.0));
+        assert_eq!(
+            editor.filter.only_rule().required_substats[0].min,
+            Some(1.0)
+        );
     }
 
     #[test]
@@ -1944,7 +2128,10 @@ mod tests {
     #[test]
     fn a_config_set_grade_floor_still_names_itself_in_the_folded_bar() {
         let filter = Filter {
-            min_grade: Some(2),
+            gear: vec![GearRule {
+                min_grade: Some(2),
+                ..GearRule::default()
+            }],
             ..named_filter()
         };
         let mut editor = EditorState::new(
@@ -1957,7 +2144,7 @@ mod tests {
         let harness = draw_setup(&mut editor);
         harness.get_by_label("Hunt · Covenant Bookmarks, Good+");
         drop(harness);
-        assert_eq!(editor.filter.min_grade, Some(2));
+        assert_eq!(editor.filter.only_rule().min_grade, Some(2));
     }
 
     #[test]
@@ -2233,6 +2420,61 @@ mod tests {
         let path = std::env::var_os("ARKYVE_RENDER_DIR")
             .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
             .join("substats.png");
+        image.save(&path).expect("save png");
+        eprintln!("rendered {}", path.display());
+    }
+
+    /// The piece strip over the top of one rule's criteria: two pieces hunted,
+    /// the second on screen, the `+` waiting past it.
+    #[test]
+    #[cfg(feature = "render-png")]
+    #[ignore = "renders the piece strip to a PNG for visual iteration; run with --ignored"]
+    fn render_piece_strip_png() {
+        let mut editor = stocked_editor_with(Filter {
+            names: Vec::new(),
+            gear: vec![
+                GearRule {
+                    slots: vec!["boot".to_owned()],
+                    ..GearRule::default()
+                },
+                GearRule {
+                    slots: vec!["helm".to_owned()],
+                    min_grade: Some(5),
+                    ..GearRule::default()
+                },
+            ],
+            ..Filter::default()
+        });
+        editor.gear_index = 1;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(430.0, 200.0))
+            .with_pixels_per_point(2.0)
+            .wgpu()
+            .build_ui(move |ui| {
+                theme::apply(ui.ctx());
+                let bg = ui.visuals().panel_fill;
+                ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, bg);
+                ui.add_space(theme::SP_SM);
+                piece_strip(ui, &mut editor.filter.gear, &mut editor.gear_index);
+                with_rule(&mut editor.filter.gear, editor.gear_index, |rule| {
+                    offered_list(
+                        ui,
+                        "gear slots",
+                        &mut rule.slots,
+                        &mut editor.slot_input,
+                        &editor.vocabulary.slots,
+                        &SetIcons::default(),
+                    );
+                    gear_rule(ui);
+                    ui.label(theme::section("rarity"));
+                    rarity_ladder(ui, &mut rule.min_grade);
+                });
+            });
+        harness.run();
+        let image = harness.render().expect("wgpu render");
+        let path = std::env::var_os("ARKYVE_RENDER_DIR")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
+            .join("pieces.png");
         image.save(&path).expect("save png");
         eprintln!("rendered {}", path.display());
     }

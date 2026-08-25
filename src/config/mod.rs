@@ -296,11 +296,16 @@ impl Config {
         // reports it restricted. `NaN` adds a second symptom: `Filter`'s
         // derived `PartialEq` is the Setup tab's dirty check, so `NaN != NaN`
         // leaves Apply lit forever, rewriting `config.toml` on every click.
-        for req in &self.filter.required_substats {
+        for req in self
+            .filter
+            .gear
+            .iter()
+            .flat_map(|rule| &rule.required_substats)
+        {
             if req.min.is_some_and(|min| !min.is_finite()) {
                 return Err(crate::Error::Config(format!(
-                    "filter.required_substats \"{}\" has a non-finite min — no substat value can \
-                     ever satisfy it, so the filter would match nothing",
+                    "filter.gear required_substats \"{}\" has a non-finite min — no substat value \
+                     can ever satisfy it, so the rule would match nothing",
                     req.name
                 )));
             }

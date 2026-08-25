@@ -24,20 +24,17 @@ const GRADE_MAX: u8 = 5;
 /// default `Filter` matches every available item; how the set ones combine is
 /// [`Self::matches`]' own question, and it is no longer one conjunction.
 ///
-/// Missing data is handled asymmetrically on purpose: `max_price` is
-/// fail-closed (an unknown price never satisfies a cap), sold-out is fail-open
-/// (a missing `limit` counts as buyable).
-///
 /// Deserialized from the config file's `[filter]` section. Unlike the wire
 /// models, unknown keys are rejected: a typo here silently loosens the criteria
-/// the refresh loop spends crystals against.
+/// the refresh loop spends crystals against. The gear criteria a flat `[filter]`
+/// used to hold are still read and become one rule — see [`RawFilter`].
 ///
-/// The four never-`None` fields skip when empty because `config/persist.rs`
-/// replaces the whole `[filter]` section on Apply — without the skips one edit
-/// would write four inert lines into a file meant to stay as the player wrote
-/// it. The container `#[serde(default)]` makes every omission round-trip.
+/// The never-`None` fields skip when empty because `config/persist.rs` replaces
+/// the whole `[filter]` section on Apply — without the skips one edit would
+/// write inert lines into a file meant to stay as the player wrote it. The
+/// container `#[serde(default)]` makes every omission round-trip.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, try_from = "RawFilter")]
 pub struct Filter {
     /// Kept item kinds (any-of); empty keeps all, `Unknown` items included.
     /// Deliberately not a narrower hunt-only enum — see [`hunt_kinds`].
@@ -47,20 +44,43 @@ pub struct Filter {
     /// empty keeps all.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<String>,
+    /// The pieces of gear being hunted, one rule each. An item satisfying ANY
+    /// of them answers the gear branch.
+    ///
+    /// **A list, because a hunt is a list.** These were flat fields, one set of
+    /// gear criteria joined by AND, which could only ever describe one kind of
+    /// piece — and described it as a product rather than a piece: "boots or
+    /// necklace" beside "speed or crit damage" bought a necklace that rolled
+    /// speed. A player hunts particular pieces, and each is its own conjunction.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gear: Vec<GearRule>,
+    /// Keep sold-out items (default drops them).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub include_sold_out: bool,
+}
+
+/// One piece of gear worth stopping for: every criterion set here has to hold,
+/// and an item holding all of them is a hit whatever the other rules say.
+///
+/// Missing data is fail-closed throughout — an unknown price never satisfies a
+/// cap, an unknown grade never clears a floor, an unanswered slot matches no
+/// slot criterion. Fail-OPEN would buy across every slot the moment a lookup
+/// went missing.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GearRule {
     /// Kept sets (any-of), by exact internal id; empty keeps all.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sets: Vec<String>,
     /// Kept wearable slots (any-of), by exact internal id (`helm`, `boot`, ...);
     /// empty keeps all.
     ///
-    /// Fail-closed like [`Filter::sets`], and that has a sharper edge here: the
+    /// Fail-closed like [`Self::sets`], and that has a sharper edge here: the
     /// slot is resolved server-side, so a server that could not read its Catalog
     /// sends every item with no [`ShopItem::gear_slot`] and this criterion then
     /// matches nothing at all. The loop keeps refreshing until one of the
-    /// player's own stop limits fires. Fail-OPEN would be worse — it would buy
-    /// across every slot the moment the lookup went missing — but a session that
-    /// finds nothing while a slot is named deserves the journal line
-    /// [`Self::slots_unanswerable`] backs.
+    /// player's own stop limits fires — hence the journal line
+    /// [`Filter::slots_unanswerable`] backs.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub slots: Vec<String>,
     /// Minimum count of ROLLED substats, [`ShopItem::substats`]' length.
@@ -84,9 +104,8 @@ pub struct Filter {
     /// Whether [`Self::required_substats`] must ALL hold or any ONE of them.
     ///
     /// A mode and not a criterion: it says how a list combines and cannot
-    /// restrict on its own, which is why [`Self::has_gear_criteria`] does not
-    /// read it and [`Self::is_unrestricted`] does not count it. `include_sold_out`
-    /// is the other field of that shape.
+    /// restrict on its own, which is why [`Self::restricts`] does not read it.
+    /// `Filter::include_sold_out` is the other field of that shape.
     ///
     /// Defaults to [`SubstatMatch::All`], which is what every filter did before
     /// the mode existed, and is skipped when it holds — so a `config.toml`
@@ -96,11 +115,10 @@ pub struct Filter {
     pub substat_match: SubstatMatch,
     /// Inclusive gold cap; an unknown price fails it.
     ///
-    /// Belongs to the GEAR branch, so it is **not** a global cap: beside a
-    /// `names` criterion the named item is bought at any price, because the
-    /// name branch answers on its own and the gear side is never consulted.
-    /// Surprising and deliberate — cap a named hunt with the player's own
-    /// `[limits]`, not with this.
+    /// Belongs to the rule, so it is **not** a global cap: beside a `names`
+    /// criterion the named item is bought at any price, because the name branch
+    /// answers on its own and no rule is consulted. Surprising and deliberate —
+    /// cap a named hunt with the player's own `[limits]`, not with this.
     ///
     /// A [`Gold`], so a crystal budget cannot be written here by mistake.
     /// `#[serde(transparent)]` in both directions, so `config.toml` still
@@ -109,14 +127,76 @@ pub struct Filter {
     /// Inclusive minimum gear grade — 2 Good, 3 Rare, 4 Heroic, 5 Epic; an
     /// unknown grade fails it. A floor outside that domain is refused at parse
     /// time — see `GRADE_MIN`.
-    ///
-    /// Gear branch, like [`Filter::max_price`], with the same consequence: it
-    /// says nothing about an item a `names` criterion already accepted.
     #[serde(deserialize_with = "grade_floor")]
     pub min_grade: Option<u8>,
-    /// Keep sold-out items (default drops them).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub include_sold_out: bool,
+}
+
+/// The shape a `config.toml` may spell, which is wider than [`Filter`]'s own:
+/// the gear criteria were flat keys of `[filter]` before they were a list of
+/// rules, and a file that predates the change has to keep loading.
+///
+/// **Folded, not ignored.** A retired key here still decides what the loop
+/// buys, so it cannot go the way of `capture.filter` — dropping it would empty
+/// a hunt in silence. The flat keys become one [`GearRule`], which is exactly
+/// what they always were, and the next Apply rewrites the section in the new
+/// shape (`config/persist.rs` replaces `[filter]` whole).
+///
+/// Setting both spellings is refused rather than merged: two gear criteria in
+/// one file are two hunts, and picking one of them silently is how a player
+/// ends up buying against a rule they cannot see.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawFilter {
+    #[serde(deserialize_with = "hunt_kinds")]
+    kinds: Vec<ItemKind>,
+    names: Vec<String>,
+    gear: Vec<GearRule>,
+    include_sold_out: bool,
+    // The retired flat gear keys, in the spelling `[filter]` used to hold.
+    sets: Vec<String>,
+    slots: Vec<String>,
+    min_substats: Option<u8>,
+    required_substats: Vec<SubstatReq>,
+    substat_match: SubstatMatch,
+    max_price: Option<Gold>,
+    #[serde(deserialize_with = "grade_floor")]
+    min_grade: Option<u8>,
+}
+
+impl TryFrom<RawFilter> for Filter {
+    type Error = String;
+
+    fn try_from(raw: RawFilter) -> Result<Self, Self::Error> {
+        let flat = GearRule {
+            sets: raw.sets,
+            slots: raw.slots,
+            min_substats: raw.min_substats,
+            required_substats: raw.required_substats,
+            substat_match: raw.substat_match,
+            max_price: raw.max_price,
+            min_grade: raw.min_grade,
+        };
+        // `restricts` and not `!= default`: `min_substats = 0` and
+        // `substat_match = "all"` say nothing, and a file setting only those has
+        // no gear criteria to fold.
+        let gear = match (flat.restricts(), raw.gear.is_empty()) {
+            (true, true) => vec![flat],
+            (true, false) => {
+                return Err(
+                    "[filter] holds gear criteria of its own beside [[filter.gear]] — move them \
+                     into a rule, or delete them"
+                        .to_owned(),
+                );
+            }
+            (false, _) => raw.gear,
+        };
+        Ok(Self {
+            kinds: raw.kinds,
+            names: raw.names,
+            gear,
+            include_sold_out: raw.include_sold_out,
+        })
+    }
 }
 
 /// Parses `min_grade`, refusing a floor the game has no grade for. The error
@@ -248,7 +328,7 @@ impl Filter {
             return false;
         }
         let named = !self.names.is_empty();
-        let geared = self.has_gear_criteria();
+        let geared = self.hunts_gear();
         match (named, geared) {
             (false, false) => true,
             (true, false) => self.name_branch(item),
@@ -257,48 +337,12 @@ impl Filter {
         }
     }
 
-    /// Whether any gear-shaped criterion is set. Read by [`Self::matches`] to
-    /// tell "no gear constraint" from "gear constraint this item fails".
-    ///
-    /// The destructure is load-bearing. [`Self::gear_branch`] enumerates these
-    /// same criteria and nothing ties the two lists together, so a field
-    /// present in one and missing from the other fails silently in both
-    /// directions: a criterion nobody tests, or a branch armed on a test it
-    /// never runs. Both fail open, toward buying. Binding every field makes
-    /// the omission a compile error instead.
-    fn has_gear_criteria(&self) -> bool {
-        let Self {
-            sets,
-            slots,
-            required_substats,
-            min_substats,
-            max_price,
-            min_grade,
-            // Applied to every item by `matches` before either branch.
-            kinds: _,
-            include_sold_out: _,
-            // A mode, not a criterion: it says how `required_substats`
-            // combine, so an empty list stays an empty list under either
-            // value and cannot arm this branch. See its own doc.
-            substat_match: _,
-            // The other branch.
-            names: _,
-        } = self;
-        !sets.is_empty()
-            || !slots.is_empty()
-            || !required_substats.is_empty()
-            || Self::substat_floor_is_real(*min_substats)
-            || max_price.is_some()
-            || min_grade.is_some()
-    }
-
-    /// `Some(0)` is not a criterion — the GUI editor produces it in two clicks
-    /// and it constrains nothing. THE home for that rule: read positively here
-    /// to arm the gear branch, negated in [`Self::is_unrestricted`]. Spelled
-    /// twice, the two would drift into a filter that is unrestricted and yet
-    /// refuses every token.
-    fn substat_floor_is_real(floor: Option<u8>) -> bool {
-        floor.is_some_and(|min| min > 0)
+    /// Whether any rule restricts. A rule with nothing set matches every piece
+    /// of gear, so it must not arm the branch — the GUI adds one the moment the
+    /// player opens a card, and an armed branch on an empty rule would buy the
+    /// first item of any roll.
+    fn hunts_gear(&self) -> bool {
+        self.gear.iter().any(GearRule::restricts)
     }
 
     /// The item IS one of the named things.
@@ -308,9 +352,77 @@ impl Filter {
             .is_some_and(|name| self.names.contains(name))
     }
 
-    /// The item looks like the gear being hunted. Every set criterion holds,
-    /// each fail-closed on missing data.
+    /// The item is one of the pieces being hunted — ANY rule that restricts
+    /// accepts it.
     fn gear_branch(&self, item: &ShopItem) -> bool {
+        self.gear
+            .iter()
+            .filter(|rule| rule.restricts())
+            .any(|rule| rule.matches(item))
+    }
+
+    /// `true` when a rule names a slot and the snapshot answered none — the
+    /// shape a Catalog-less server produces, in which [`Self::matches`] cannot
+    /// accept anything through that rule.
+    ///
+    /// A question about a whole roll rather than an item, because one gearless
+    /// slot proves nothing: a roll legitimately holds heroes and tokens, which
+    /// have no slot and never will. Only *every* slot being unanswered
+    /// separates "this roll had no gear" from "nobody can answer about gear",
+    /// and even then the first reading stays possible — hence a journal line
+    /// rather than a refusal to arm.
+    pub fn slots_unanswerable(&self, snapshot: &ShopSnapshot) -> bool {
+        self.gear.iter().any(|rule| !rule.slots.is_empty())
+            && !snapshot.slots.is_empty()
+            && snapshot.slots.iter().all(|item| item.gear_slot.is_none())
+    }
+
+    /// `true` when no criterion is set — such a filter matches every available
+    /// item, which the relay treats as a configuration error. `include_sold_out`
+    /// widens rather than restricts, and a rule with nothing set constrains
+    /// nothing; neither counts as a criterion.
+    pub fn is_unrestricted(&self) -> bool {
+        self.kinds.is_empty() && self.names.is_empty() && !self.hunts_gear()
+    }
+}
+
+impl GearRule {
+    /// Whether this rule constrains at all. Read by [`Filter::matches`] to tell
+    /// "no gear constraint" from "a gear constraint this item fails".
+    ///
+    /// The destructure is load-bearing. [`Self::matches`] enumerates these same
+    /// criteria and nothing ties the two lists together, so a field present in
+    /// one and missing from the other fails silently in both directions: a
+    /// criterion nobody tests, or a rule armed on a test it never runs. Both
+    /// fail open, toward buying. Binding every field makes the omission a
+    /// compile error instead.
+    #[must_use]
+    pub fn restricts(&self) -> bool {
+        let Self {
+            sets,
+            slots,
+            required_substats,
+            min_substats,
+            max_price,
+            min_grade,
+            // A mode, not a criterion: it says how `required_substats` combine,
+            // so an empty list stays an empty list under either value and
+            // cannot arm this rule. See its own doc.
+            substat_match: _,
+        } = self;
+        !sets.is_empty()
+            || !slots.is_empty()
+            || !required_substats.is_empty()
+            || substat_floor_is_real(*min_substats)
+            || max_price.is_some()
+            // Any grade floor constrains: `matches` is fail-closed, so it drops
+            // every gradeless item (tokens, heroes) even at `min_grade = 2`.
+            || min_grade.is_some()
+    }
+
+    /// The item looks like this piece. Every criterion set here holds, each
+    /// fail-closed on missing data.
+    fn matches(&self, item: &ShopItem) -> bool {
         if let Some(min) = self.min_substats
             && item.substats.len() < usize::from(min)
         {
@@ -357,43 +469,28 @@ impl Filter {
             }
         }
     }
+}
 
-    /// `true` when this filter names a slot and the snapshot answered none —
-    /// the shape a Catalog-less server produces, in which [`Self::matches`]
-    /// cannot accept anything.
-    ///
-    /// A question about a whole roll rather than an item, because one gearless
-    /// slot proves nothing: a roll legitimately holds heroes and tokens, which
-    /// have no slot and never will. Only *every* slot being unanswered
-    /// separates "this roll had no gear" from "nobody can answer about gear",
-    /// and even then the first reading stays possible — hence a journal line
-    /// rather than a refusal to arm.
-    pub fn slots_unanswerable(&self, snapshot: &ShopSnapshot) -> bool {
-        !self.slots.is_empty()
-            && !snapshot.slots.is_empty()
-            && snapshot.slots.iter().all(|item| item.gear_slot.is_none())
-    }
-
-    /// `true` when no criterion is set — such a filter matches every available
-    /// item, which the relay treats as a configuration error. `include_sold_out`
-    /// widens rather than restricts, and `min_substats: 0` constrains nothing;
-    /// neither counts as a criterion.
-    pub fn is_unrestricted(&self) -> bool {
-        self.kinds.is_empty()
-            && self.names.is_empty()
-            && self.sets.is_empty()
-            && self.slots.is_empty()
-            && !Self::substat_floor_is_real(self.min_substats)
-            && self.required_substats.is_empty()
-            && self.max_price.is_none()
-            // Any grade floor constrains: `matches` is fail-closed, so it drops
-            // every gradeless item (tokens, heroes) even at `min_grade = 2`.
-            && self.min_grade.is_none()
-    }
+/// `Some(0)` is not a criterion — the GUI editor produces it in two clicks and
+/// it constrains nothing. THE home for that rule, read by [`GearRule::restricts`]
+/// and through it by [`Filter::is_unrestricted`]. Spelled twice, the two would
+/// drift into a filter that is unrestricted and yet refuses every token.
+fn substat_floor_is_real(floor: Option<u8>) -> bool {
+    floor.is_some_and(|min| min > 0)
 }
 
 #[cfg(test)]
 impl Filter {
+    /// The single rule this filter holds. Panics on any other count, which is
+    /// the point: every caller is asserting about a `[filter]` that folded its
+    /// flat gear keys into exactly one, and two would mean the fold split.
+    pub(crate) fn only_rule(&self) -> &GearRule {
+        match self.gear.as_slice() {
+            [rule] => rule,
+            other => panic!("expected exactly one gear rule, found {}", other.len()),
+        }
+    }
+
     /// Restricted (passes the arming invariant) yet still matching
     /// `ShopItem::default()`, whose kind is `Unknown`.
     pub(crate) fn matching_default_items() -> Self {
@@ -488,10 +585,13 @@ mod tests {
     fn speed_filter() -> Filter {
         Filter {
             kinds: vec![ItemKind::Equipment],
-            min_substats: Some(3),
-            required_substats: vec![SubstatReq {
-                name: "speed".to_owned(),
-                min: Some(15.0),
+            gear: vec![GearRule {
+                min_substats: Some(3),
+                required_substats: vec![SubstatReq {
+                    name: "speed".to_owned(),
+                    min: Some(15.0),
+                }],
+                ..GearRule::default()
             }],
             ..Filter::default()
         }
@@ -525,12 +625,18 @@ mod tests {
     fn min_substats_zero_counts_as_unrestricted() {
         // The GUI editor can produce `Some(0)` in two clicks.
         let noop = Filter {
-            min_substats: Some(0),
+            gear: vec![GearRule {
+                min_substats: Some(0),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(noop.is_unrestricted());
         let real = Filter {
-            min_substats: Some(1),
+            gear: vec![GearRule {
+                min_substats: Some(1),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(!real.is_unrestricted());
@@ -633,7 +739,10 @@ mod tests {
     #[test]
     fn sets_any_of_matches() {
         let filter = Filter {
-            sets: vec!["set_speed".to_owned(), "set_counter".to_owned()],
+            gear: vec![GearRule {
+                sets: vec!["set_speed".to_owned(), "set_counter".to_owned()],
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(filter.matches(&equip()));
@@ -642,7 +751,10 @@ mod tests {
     #[test]
     fn set_none_fails_when_set_filter_active() {
         let filter = Filter {
-            sets: vec!["set_speed".to_owned()],
+            gear: vec![GearRule {
+                sets: vec!["set_speed".to_owned()],
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         let mut item = equip();
@@ -653,7 +765,10 @@ mod tests {
     #[test]
     fn set_case_sensitive_no_match() {
         let filter = Filter {
-            sets: vec!["Set_Speed".to_owned()],
+            gear: vec![GearRule {
+                sets: vec!["Set_Speed".to_owned()],
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(!filter.matches(&equip()));
@@ -662,7 +777,10 @@ mod tests {
     #[test]
     fn max_price_inclusive_boundary() {
         let filter = Filter {
-            max_price: Some(Gold::new(240_000)),
+            gear: vec![GearRule {
+                max_price: Some(Gold::new(240_000)),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(filter.matches(&equip()));
@@ -671,7 +789,10 @@ mod tests {
     #[test]
     fn max_price_above_fails() {
         let filter = Filter {
-            max_price: Some(Gold::new(239_999)),
+            gear: vec![GearRule {
+                max_price: Some(Gold::new(239_999)),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(!filter.matches(&equip()));
@@ -680,7 +801,10 @@ mod tests {
     #[test]
     fn max_price_missing_price_fails() {
         let filter = Filter {
-            max_price: Some(Gold::new(240_000)),
+            gear: vec![GearRule {
+                max_price: Some(Gold::new(240_000)),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         let mut item = equip();
@@ -691,7 +815,10 @@ mod tests {
     #[test]
     fn min_grade_accepts_equal_and_above() {
         let filter = Filter {
-            min_grade: Some(3),
+            gear: vec![GearRule {
+                min_grade: Some(3),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(filter.matches(&equip())); // grade 3, equal to floor
@@ -703,7 +830,10 @@ mod tests {
     #[test]
     fn min_grade_rejects_below() {
         let filter = Filter {
-            min_grade: Some(4),
+            gear: vec![GearRule {
+                min_grade: Some(4),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(!filter.matches(&equip())); // grade 3, below floor
@@ -712,7 +842,10 @@ mod tests {
     #[test]
     fn min_grade_unknown_fails() {
         let filter = Filter {
-            min_grade: Some(3),
+            gear: vec![GearRule {
+                min_grade: Some(3),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         let mut item = equip();
@@ -723,19 +856,28 @@ mod tests {
     #[test]
     fn min_grade_is_a_real_constraint() {
         let real = Filter {
-            min_grade: Some(4),
+            gear: vec![GearRule {
+                min_grade: Some(4),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(!real.is_unrestricted());
         // Real even at the floor: `matches` fail-closes on a gradeless item, so
         // `min_grade = 2` still drops every token/hero.
         let floor_two = Filter {
-            min_grade: Some(2),
+            gear: vec![GearRule {
+                min_grade: Some(2),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(!floor_two.is_unrestricted());
         let floor_zero = Filter {
-            min_grade: Some(0),
+            gear: vec![GearRule {
+                min_grade: Some(0),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(!floor_zero.is_unrestricted());
@@ -744,9 +886,12 @@ mod tests {
     #[test]
     fn substat_req_presence_only_min_none() {
         let filter = Filter {
-            required_substats: vec![SubstatReq {
-                name: "cri".to_owned(),
-                min: None,
+            gear: vec![GearRule {
+                required_substats: vec![SubstatReq {
+                    name: "cri".to_owned(),
+                    min: None,
+                }],
+                ..GearRule::default()
             }],
             ..Filter::default()
         };
@@ -765,9 +910,12 @@ mod tests {
     #[test]
     fn a_threshold_no_roll_can_reach_is_answered_by_the_main_stat() {
         let hunt = Filter {
-            required_substats: vec![SubstatReq {
-                name: "speed".to_owned(),
-                min: Some(6.0),
+            gear: vec![GearRule {
+                required_substats: vec![SubstatReq {
+                    name: "speed".to_owned(),
+                    min: Some(6.0),
+                }],
+                ..GearRule::default()
             }],
             ..Filter::default()
         };
@@ -790,9 +938,12 @@ mod tests {
     #[test]
     fn substat_req_min_requires_present_value() {
         let filter = Filter {
-            required_substats: vec![SubstatReq {
-                name: "speed".to_owned(),
-                min: Some(15.0),
+            gear: vec![GearRule {
+                required_substats: vec![SubstatReq {
+                    name: "speed".to_owned(),
+                    min: Some(15.0),
+                }],
+                ..GearRule::default()
             }],
             ..Filter::default()
         };
@@ -805,9 +956,12 @@ mod tests {
     fn substat_req_scans_all_not_first() {
         // A first-match check would grab the blank entry and wrongly reject.
         let filter = Filter {
-            required_substats: vec![SubstatReq {
-                name: "speed".to_owned(),
-                min: Some(15.0),
+            gear: vec![GearRule {
+                required_substats: vec![SubstatReq {
+                    name: "speed".to_owned(),
+                    min: Some(15.0),
+                }],
+                ..GearRule::default()
             }],
             ..Filter::default()
         };
@@ -835,14 +989,24 @@ mod tests {
         ];
         // `equip()` carries speed and cri, never cri_dmg.
         let all = Filter {
-            required_substats: speed_and_crit.clone(),
+            gear: vec![GearRule {
+                required_substats: speed_and_crit.clone(),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
-        assert_eq!(all.substat_match, SubstatMatch::All, "the default");
+        assert_eq!(
+            all.only_rule().substat_match,
+            SubstatMatch::All,
+            "the default"
+        );
         assert!(!all.matches(&equip()), "one of two is not both");
         let any = Filter {
-            substat_match: SubstatMatch::Any,
-            required_substats: speed_and_crit,
+            gear: vec![GearRule {
+                substat_match: SubstatMatch::Any,
+                required_substats: speed_and_crit,
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(any.matches(&equip()), "one of two is enough");
@@ -860,10 +1024,13 @@ mod tests {
     #[test]
     fn the_any_mode_still_applies_each_threshold() {
         let filter = Filter {
-            substat_match: SubstatMatch::Any,
-            required_substats: vec![SubstatReq {
-                name: "speed".to_owned(),
-                min: Some(20.0),
+            gear: vec![GearRule {
+                substat_match: SubstatMatch::Any,
+                required_substats: vec![SubstatReq {
+                    name: "speed".to_owned(),
+                    min: Some(20.0),
+                }],
+                ..GearRule::default()
             }],
             ..Filter::default()
         };
@@ -877,15 +1044,21 @@ mod tests {
     #[test]
     fn switching_the_mode_with_no_requirement_refuses_nothing() {
         let any = Filter {
-            substat_match: SubstatMatch::Any,
-            sets: vec!["set_speed".to_owned()],
+            gear: vec![GearRule {
+                substat_match: SubstatMatch::Any,
+                sets: vec!["set_speed".to_owned()],
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(any.matches(&equip()));
         // And it is not a criterion of its own: alone it still matches
         // everything, so the loop must keep refusing to arm on it.
         let alone = Filter {
-            substat_match: SubstatMatch::Any,
+            gear: vec![GearRule {
+                substat_match: SubstatMatch::Any,
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(alone.is_unrestricted());
@@ -897,18 +1070,24 @@ mod tests {
     #[test]
     fn the_substat_mode_is_a_closed_spelling_that_defaults_to_all() {
         assert_eq!(
-            toml::from_str::<Filter>("")
-                .expect("empty parses")
-                .substat_match,
-            SubstatMatch::All
+            GearRule::default().substat_match,
+            SubstatMatch::All,
+            "a rule that never mentions it"
         );
         for (text, mode) in [("all", SubstatMatch::All), ("any", SubstatMatch::Any)] {
-            let filter: Filter = toml::from_str(&format!("substat_match = {text:?}"))
-                .expect("a spelled mode parses");
-            assert_eq!(filter.substat_match, mode);
+            // Beside a real criterion: a mode is not one, so a rule holding
+            // only this would fold away before it could be read back.
+            let filter: Filter = toml::from_str(&format!(
+                "[[gear]]
+slots = [\"boot\"]
+substat_match = {text:?}
+"
+            ))
+            .expect("a spelled mode parses");
+            assert_eq!(filter.only_rule().substat_match, mode);
             let back: Filter =
                 toml::from_str(&toml::to_string(&filter).expect("serialize")).expect("deserialize");
-            assert_eq!(back.substat_match, mode);
+            assert_eq!(back.only_rule().substat_match, mode);
         }
         assert!(
             toml::from_str::<Filter>("substat_match = \"either\"").is_err(),
@@ -917,9 +1096,12 @@ mod tests {
         // The default writes no key: an older `config.toml` must not grow a
         // line on the first Apply saying what was already true.
         let text = toml::to_string(&Filter {
-            required_substats: vec![SubstatReq {
-                name: "speed".to_owned(),
-                min: None,
+            gear: vec![GearRule {
+                required_substats: vec![SubstatReq {
+                    name: "speed".to_owned(),
+                    min: None,
+                }],
+                ..GearRule::default()
             }],
             ..Filter::default()
         })
@@ -930,7 +1112,10 @@ mod tests {
     #[test]
     fn min_substats_counts_duplicates() {
         let filter = Filter {
-            min_substats: Some(3),
+            gear: vec![GearRule {
+                min_substats: Some(3),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         let mut item = equip();
@@ -960,14 +1145,14 @@ mod tests {
         for grade in [2, 3, 4, 5] {
             let filter: Filter =
                 toml::from_str(&format!("min_grade = {grade}")).expect("real grade parses");
-            assert_eq!(filter.min_grade, Some(grade));
+            assert_eq!(filter.only_rule().min_grade, Some(grade));
         }
-        // Absent stays absent — the container default, not the check.
-        assert_eq!(
+        // Absent stays absent — no key, no rule at all.
+        assert!(
             toml::from_str::<Filter>("")
                 .expect("empty parses")
-                .min_grade,
-            None
+                .gear
+                .is_empty()
         );
     }
 
@@ -1029,12 +1214,15 @@ mod tests {
     fn filter_round_trips_through_toml() {
         let filter = Filter {
             names: vec!["ticketrare_name".to_owned()],
-            min_substats: Some(3),
-            max_price: Some(Gold::new(300_000)),
-            min_grade: Some(4),
-            required_substats: vec![SubstatReq {
-                name: "speed".to_owned(),
-                min: Some(8.0),
+            gear: vec![GearRule {
+                min_substats: Some(3),
+                max_price: Some(Gold::new(300_000)),
+                min_grade: Some(4),
+                required_substats: vec![SubstatReq {
+                    name: "speed".to_owned(),
+                    min: Some(8.0),
+                }],
+                ..GearRule::default()
             }],
             ..Filter::default()
         };
@@ -1088,7 +1276,10 @@ mod tests {
     #[test]
     fn one_failing_criterion_fails_whole() {
         let filter = Filter {
-            max_price: Some(Gold::new(1_000)),
+            gear: vec![GearRule {
+                max_price: Some(Gold::new(1_000)),
+                ..GearRule::default()
+            }],
             ..speed_filter()
         };
         assert!(!filter.matches(&equip()));
@@ -1111,7 +1302,10 @@ mod tests {
         .expect("fixture should parse");
         let both = Filter {
             names: vec!["ticketrare_name".to_owned()],
-            sets: vec!["set_speed".to_owned()],
+            gear: vec![GearRule {
+                sets: vec!["set_speed".to_owned()],
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(
@@ -1121,12 +1315,112 @@ mod tests {
         assert!(both.matches(&roll.slots[1]), "the helm should match by set");
     }
 
+    /// Two rules hunt two pieces — and not their product, which is the whole
+    /// reason the gear branch became a list.
+    ///
+    /// Flat, this was one conjunction: slots `[boot, neck]` AND substats
+    /// any-of `[speed, cri_dmg]`, which buys a necklace that happened to roll
+    /// speed. There was no way to spell "a speed boot or a crit-damage
+    /// necklace" at all, and the miss direction spends the player's gold.
+    #[test]
+    fn two_rules_hunt_two_pieces_rather_than_their_product() {
+        let piece = |slot: &str, stat: &str| GearRule {
+            slots: vec![slot.to_owned()],
+            required_substats: vec![SubstatReq {
+                name: stat.to_owned(),
+                min: None,
+            }],
+            ..GearRule::default()
+        };
+        let filter = Filter {
+            gear: vec![piece("boot", "speed"), piece("neck", "cri_dmg")],
+            ..Filter::default()
+        };
+        let gear = |slot: &str, stat: &str| ShopItem {
+            gear_slot: Some(slot.to_owned()),
+            main_stat: None,
+            substats: vec![substat(stat, Some(4.0))],
+            ..equip()
+        };
+        assert!(filter.matches(&gear("boot", "speed")), "the first piece");
+        assert!(filter.matches(&gear("neck", "cri_dmg")), "the second");
+        // The two cells the product used to buy.
+        assert!(!filter.matches(&gear("neck", "speed")));
+        assert!(!filter.matches(&gear("boot", "cri_dmg")));
+    }
+
+    /// A rule with nothing set arms nothing. The window adds one the moment a
+    /// player opens the `+` card, and an armed branch over it would accept the
+    /// first item of any roll.
+    #[test]
+    fn an_empty_rule_neither_arms_nor_matches() {
+        let filter = Filter {
+            gear: vec![GearRule::default()],
+            ..Filter::default()
+        };
+        assert!(filter.is_unrestricted());
+        // Beside a real criterion it must not widen it either: the branch asks
+        // every rule that restricts, and this one is not asked at all.
+        let named = Filter {
+            names: vec!["ticketrare_name".to_owned()],
+            gear: vec![GearRule::default()],
+            ..Filter::default()
+        };
+        assert!(!named.matches(&equip()), "a nameless helm answers no name");
+        assert!(named.matches(&token("ticketrare_name")));
+    }
+
+    /// The gear criteria a flat `[filter]` used to hold still load, as the one
+    /// rule they always described — and the file is rewritten in the new shape
+    /// the next time it is written.
+    #[test]
+    fn a_flat_filter_folds_into_one_rule() {
+        let filter: Filter = toml::from_str(
+            "names = [\"ticketrare_name\"]\nsets = [\"set_speed\"]\nmin_grade = 4\n",
+        )
+        .expect("a file written before the rules must keep loading");
+        assert_eq!(filter.names, vec!["ticketrare_name".to_owned()]);
+        let rule = filter.only_rule();
+        assert_eq!(rule.sets, vec!["set_speed".to_owned()]);
+        assert_eq!(rule.min_grade, Some(4));
+        let text = toml::to_string(&filter).expect("serialize");
+        assert!(text.contains("[[gear]]"), "{text}");
+        let back: Filter = toml::from_str(&text).expect("the new shape reloads");
+        assert_eq!(back, filter);
+    }
+
+    /// Both spellings at once is refused rather than merged: two gear criteria
+    /// in one file are two hunts, and silently picking one is how a player buys
+    /// against a rule they cannot see.
+    #[test]
+    fn a_file_holding_both_spellings_is_refused() {
+        let error =
+            toml::from_str::<Filter>("sets = [\"set_speed\"]\n\n[[gear]]\nslots = [\"boot\"]\n")
+                .expect_err("two gear criteria in one file are ambiguous");
+        assert!(error.to_string().contains("gear criteria"), "{error}");
+    }
+
+    /// A mode is not a criterion, so a file setting only one folds to no rule
+    /// at all — otherwise every such file would grow an inert `[[gear]]` on its
+    /// next Apply.
+    #[test]
+    fn a_mode_alone_does_not_make_a_rule() {
+        for text in ["substat_match = \"any\"", "min_substats = 0"] {
+            let filter: Filter = toml::from_str(text).expect("parses");
+            assert!(filter.gear.is_empty(), "{text} made a rule");
+            assert!(filter.is_unrestricted());
+        }
+    }
+
     /// A filter naming both branches. Its refusals are pinned separately, by
     /// [`a_two_branch_filter_refuses_an_item_that_answers_neither`].
     fn both_branches() -> Filter {
         Filter {
             names: vec!["ticketrare_name".to_owned()],
-            sets: vec!["set_speed".to_owned()],
+            gear: vec![GearRule {
+                sets: vec!["set_speed".to_owned()],
+                ..GearRule::default()
+            }],
             ..Filter::default()
         }
     }
@@ -1151,7 +1445,10 @@ mod tests {
         assert!(!named.matches(&helm), "a nameless helm answers no name");
 
         let geared = Filter {
-            sets: vec!["set_speed".to_owned()],
+            gear: vec![GearRule {
+                sets: vec!["set_speed".to_owned()],
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(!geared.matches(&bookmark), "a setless token answers no set");
@@ -1189,7 +1486,10 @@ mod tests {
     fn a_zero_substat_floor_does_not_arm_the_gear_branch() {
         let filter = Filter {
             names: vec!["ticketrare_name".to_owned()],
-            min_substats: Some(0),
+            gear: vec![GearRule {
+                min_substats: Some(0),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(filter.matches(&token("ticketrare_name")));
@@ -1197,7 +1497,10 @@ mod tests {
 
     fn slot_filter(slots: &[&str]) -> Filter {
         Filter {
-            slots: slots.iter().map(|s| (*s).to_owned()).collect(),
+            gear: vec![GearRule {
+                slots: slots.iter().map(|s| (*s).to_owned()).collect(),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         }
     }

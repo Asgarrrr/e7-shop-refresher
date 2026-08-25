@@ -218,15 +218,17 @@ fn full_filter_and_limits_sections_parse() {
         config.filter.kinds,
         vec![ItemKind::Equipment, ItemKind::Hero]
     );
-    assert_eq!(config.filter.sets, vec!["set_speed", "set_counter"]);
-    assert_eq!(config.filter.min_substats, Some(3));
-    assert_eq!(config.filter.max_price, Some(Gold::new(300_000)));
     assert!(config.filter.include_sold_out);
-    assert_eq!(config.filter.required_substats.len(), 2);
-    assert_eq!(config.filter.required_substats[0].name, "speed");
-    assert_eq!(config.filter.required_substats[0].min, Some(8.0));
-    assert_eq!(config.filter.required_substats[1].name, "cri");
-    assert_eq!(config.filter.required_substats[1].min, None);
+    // The flat gear keys fold into one rule — the shape they always described.
+    let rule = config.filter.only_rule();
+    assert_eq!(rule.sets, vec!["set_speed", "set_counter"]);
+    assert_eq!(rule.min_substats, Some(3));
+    assert_eq!(rule.max_price, Some(Gold::new(300_000)));
+    assert_eq!(rule.required_substats.len(), 2);
+    assert_eq!(rule.required_substats[0].name, "speed");
+    assert_eq!(rule.required_substats[0].min, Some(8.0));
+    assert_eq!(rule.required_substats[1].name, "cri");
+    assert_eq!(rule.required_substats[1].min, None);
 
     assert_eq!(config.limits.max_refreshes, Some(100));
     assert_eq!(config.limits.max_spend, Some(Crystals::new(300)));
@@ -257,8 +259,7 @@ fn a_zero_game_port_is_rejected_by_the_type() {
 fn missing_filter_and_limits_sections_default() {
     let config: Config = toml::from_str("game_port = 3333").expect("config should parse");
     assert!(config.filter.kinds.is_empty());
-    assert!(config.filter.required_substats.is_empty());
-    assert_eq!(config.filter.max_price, None);
+    assert!(config.filter.gear.is_empty());
     assert_eq!(config.limits.max_refreshes, None);
     assert_eq!(config.limits.max_spend, None);
 }
@@ -275,7 +276,7 @@ fn partial_sections_leave_other_fields_default() {
             "#,
     )
     .expect("config should parse");
-    assert_eq!(config.filter.min_substats, Some(4));
+    assert_eq!(config.filter.only_rule().min_substats, Some(4));
     assert!(config.filter.kinds.is_empty());
     assert_eq!(config.limits.max_spend, Some(Crystals::new(50)));
     assert_eq!(config.limits.max_refreshes, None);
@@ -1012,8 +1013,8 @@ fn a_finite_substat_threshold_including_zero_and_negative_is_accepted() {
              [[filter.required_substats]]\nname = \"atk\"\n",
     )
     .expect("finite thresholds are legal");
-    assert_eq!(config.filter.required_substats.len(), 3);
-    assert_eq!(config.filter.required_substats[2].min, None);
+    assert_eq!(config.filter.only_rule().required_substats.len(), 3);
+    assert_eq!(config.filter.only_rule().required_substats[2].min, None);
 }
 
 #[test]

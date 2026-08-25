@@ -6,7 +6,7 @@ use eframe::egui;
 
 use super::super::theme;
 use super::{arm_optional, count_label, optional_field};
-use crate::domain::filter::{Filter, SubstatMatch, SubstatReq};
+use crate::domain::filter::{Filter, GearRule, SubstatMatch, SubstatReq};
 use crate::domain::shop::Gold;
 use crate::render::kind_label;
 use crate::ui::icons::SetIcons;
@@ -190,37 +190,13 @@ pub(in crate::ui) fn hunt_summary(filter: &Filter) -> String {
     for kind in &filter.kinds {
         parts.push(kind_label(*kind).to_owned());
     }
-    if !filter.sets.is_empty() {
-        parts.push(count_label(filter.sets.len(), "set", "sets"));
-    }
-    if !filter.slots.is_empty() {
-        parts.push(count_label(filter.slots.len(), "slot", "slots"));
-    }
-    if !filter.required_substats.is_empty() {
-        let tally = count_label(filter.required_substats.len(), "substat", "substats");
-        // The mode is named only where it changes the predicate. Over one
-        // requirement `all` and `any` are the same question, and "any of 1
-        // substat" would be a distinction the engine does not make.
-        parts.push(
-            if filter.substat_match == SubstatMatch::Any && filter.required_substats.len() > 1 {
-                format!("any of {tally}")
-            } else {
-                tally
-            },
-        );
-    }
-    // `Some(0)` constrains nothing and `is_unrestricted` refuses to count it,
-    // so naming it would be the mirror-image lie.
-    if let Some(min) = filter.min_substats.filter(|min| *min > 0) {
-        parts.push(format!("{min}+ substats"));
-    }
-    if let Some(max) = filter.max_price {
-        // `Gold` groups itself, so this reads like the shop table's price
-        // column rather than a bare seven-digit number.
-        parts.push(format!("≤{max} gold"));
-    }
-    if let Some(min) = filter.min_grade {
-        parts.push(grade_label(min));
+    // One rule reads as itself, several as a tally: three pieces' worth of
+    // criteria spelled out would crowd every other part off the bar, and the
+    // body is one click away.
+    match filter.gear.as_slice() {
+        [] => {}
+        [only] => parts.extend(rule_parts(only)),
+        several => parts.push(count_label(several.len(), "piece", "pieces")),
     }
     if parts.is_empty() {
         return "nothing selected".to_owned();
@@ -232,6 +208,48 @@ pub(in crate::ui) fn hunt_summary(filter: &Filter) -> String {
     } else {
         format!("{} +{}", parts[..cap].join(", "), parts.len() - cap)
     }
+}
+
+/// One gear rule's criteria, in the words the folded bar uses.
+///
+/// Every criterion [`GearRule::restricts`] counts has to appear, or a rule that
+/// arms the loop can fold up as nothing — the defect `min_grade` and `slots`
+/// each shipped once, and `every_criterion_has_a_case_here` is the tripwire.
+fn rule_parts(rule: &GearRule) -> Vec<String> {
+    let mut parts = Vec::new();
+    if !rule.sets.is_empty() {
+        parts.push(count_label(rule.sets.len(), "set", "sets"));
+    }
+    if !rule.slots.is_empty() {
+        parts.push(count_label(rule.slots.len(), "slot", "slots"));
+    }
+    if !rule.required_substats.is_empty() {
+        let tally = count_label(rule.required_substats.len(), "substat", "substats");
+        // The mode is named only where it changes the predicate. Over one
+        // requirement `all` and `any` are the same question, and "any of 1
+        // substat" would be a distinction the engine does not make.
+        parts.push(
+            if rule.substat_match == SubstatMatch::Any && rule.required_substats.len() > 1 {
+                format!("any of {tally}")
+            } else {
+                tally
+            },
+        );
+    }
+    // `Some(0)` constrains nothing and `restricts` refuses to count it, so
+    // naming it would be the mirror-image lie.
+    if let Some(min) = rule.min_substats.filter(|min| *min > 0) {
+        parts.push(format!("{min}+ substats"));
+    }
+    if let Some(max) = rule.max_price {
+        // `Gold` groups itself, so this reads like the shop table's price
+        // column rather than a bare seven-digit number.
+        parts.push(format!("≤{max} gold"));
+    }
+    if let Some(min) = rule.min_grade {
+        parts.push(grade_label(min));
+    }
+    parts
 }
 
 /// The words for one hunted name: [`HUNT_TOKENS`]', else the id itself.
@@ -1439,24 +1457,58 @@ mod tests {
             },
         ];
         let all = Filter {
-            required_substats: two.clone(),
+            gear: vec![GearRule {
+                required_substats: two.clone(),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert_eq!(hunt_summary(&all), "2 substats");
         let any = Filter {
-            substat_match: SubstatMatch::Any,
-            ..all
+            gear: vec![GearRule {
+                substat_match: SubstatMatch::Any,
+                required_substats: two.clone(),
+                ..GearRule::default()
+            }],
+            ..Filter::default()
         };
         assert_eq!(hunt_summary(&any), "any of 2 substats");
         // Over one requirement the two modes are the same predicate, so the bar
         // states the tally alone rather than a distinction the engine does not
         // make.
         let lone = Filter {
-            substat_match: SubstatMatch::Any,
-            required_substats: two[..1].to_vec(),
+            gear: vec![GearRule {
+                substat_match: SubstatMatch::Any,
+                required_substats: two[..1].to_vec(),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert_eq!(hunt_summary(&lone), "1 substat");
+    }
+
+    /// Several pieces fold up as a tally, one folds up as itself.
+    ///
+    /// Three pieces' worth of criteria spelled out would crowd every other part
+    /// off a bar that already caps at three, and the tally still says the hunt
+    /// restricts — which is the one thing the bar must never get wrong.
+    #[test]
+    fn several_pieces_fold_up_as_a_tally() {
+        let piece = |slot: &str| GearRule {
+            slots: vec![slot.to_owned()],
+            ..GearRule::default()
+        };
+        let one = Filter {
+            gear: vec![piece("boot")],
+            ..Filter::default()
+        };
+        assert_eq!(hunt_summary(&one), "1 slot");
+        let two = Filter {
+            gear: vec![piece("boot"), piece("neck")],
+            ..Filter::default()
+        };
+        assert_eq!(hunt_summary(&two), "2 pieces");
+        assert!(!two.is_unrestricted());
     }
 
     #[test]
@@ -1510,30 +1562,48 @@ mod tests {
                 ..Filter::default()
             },
             Filter {
-                sets: vec!["set_speed".to_owned()],
-                ..Filter::default()
-            },
-            Filter {
-                slots: vec!["helm".to_owned()],
-                ..Filter::default()
-            },
-            Filter {
-                required_substats: vec![SubstatReq {
-                    name: "speed".to_owned(),
-                    min: None,
+                gear: vec![GearRule {
+                    sets: vec!["set_speed".to_owned()],
+                    ..GearRule::default()
                 }],
                 ..Filter::default()
             },
             Filter {
-                min_substats: Some(3),
+                gear: vec![GearRule {
+                    slots: vec!["helm".to_owned()],
+                    ..GearRule::default()
+                }],
                 ..Filter::default()
             },
             Filter {
-                max_price: Some(Gold::new(300_000)),
+                gear: vec![GearRule {
+                    required_substats: vec![SubstatReq {
+                        name: "speed".to_owned(),
+                        min: None,
+                    }],
+                    ..GearRule::default()
+                }],
                 ..Filter::default()
             },
             Filter {
-                min_grade: Some(4),
+                gear: vec![GearRule {
+                    min_substats: Some(3),
+                    ..GearRule::default()
+                }],
+                ..Filter::default()
+            },
+            Filter {
+                gear: vec![GearRule {
+                    max_price: Some(Gold::new(300_000)),
+                    ..GearRule::default()
+                }],
+                ..Filter::default()
+            },
+            Filter {
+                gear: vec![GearRule {
+                    min_grade: Some(4),
+                    ..GearRule::default()
+                }],
                 ..Filter::default()
             },
         ]
@@ -1563,48 +1633,68 @@ mod tests {
     /// count and lands the author in the list above before the summary can
     /// silently omit it.
     ///
+    /// It counts across BOTH structs, since a criterion may be added to either:
+    /// `Filter`'s own keys less the `gear` container, plus the keys of the one
+    /// rule inside it. A criterion added to `GearRule` and left out of
+    /// [`rule_parts`] is the same defect as one added to `Filter`, and the
+    /// container itself is not a criterion — it is where they live.
+    ///
     /// Two fields have no case, and both are MODES rather than criteria:
     /// `include_sold_out` widens rather than restricts, and `substat_match` says
-    /// how a list combines. `is_unrestricted` ignores both, and so must the
-    /// summary — neither can turn an empty hunt into a real one. Each is skipped
-    /// at its default, so a filter carrying neither writes no key and the count
-    /// below still enumerates exactly the criteria.
+    /// how a list combines. `Filter::is_unrestricted` ignores both, and so must
+    /// the summary — neither can turn an empty hunt into a real one. Each is
+    /// skipped at its default, so a filter carrying neither writes no key and
+    /// the count below still enumerates exactly the criteria.
     #[test]
     fn every_criterion_has_a_case_here() {
         let all = Filter {
-            substat_match: SubstatMatch::All,
             kinds: vec![ItemKind::Equipment],
             names: vec!["ticketrare_name".to_owned()],
-            sets: vec!["set_speed".to_owned()],
-            slots: vec!["helm".to_owned()],
-            required_substats: vec![SubstatReq {
-                name: "speed".to_owned(),
-                min: None,
-            }],
-            min_substats: Some(3),
-            max_price: Some(Gold::new(300_000)),
-            min_grade: Some(4),
             include_sold_out: false,
+            gear: vec![GearRule {
+                substat_match: SubstatMatch::All,
+                sets: vec!["set_speed".to_owned()],
+                slots: vec!["helm".to_owned()],
+                required_substats: vec![SubstatReq {
+                    name: "speed".to_owned(),
+                    min: None,
+                }],
+                min_substats: Some(3),
+                max_price: Some(Gold::new(300_000)),
+                min_grade: Some(4),
+                // Both literals are exhaustive on purpose — no `..default()`.
+                // A field added to either struct fails to compile HERE, which
+                // lands the author in this test before the count can drift.
+            }],
         };
         // Counted off the TABLE, not off the text: `required_substats` writes a
         // `[[required_substats]]` array-of-tables whose own `name =` line would
-        // be counted as a ninth key by anything reading the serialized string.
+        // be counted as one more key by anything reading the serialized string.
         let written = toml::Value::try_from(&all).expect("a filter should serialize");
-        let keys = written.as_table().expect("a filter is a table").len();
+        let table = written.as_table().expect("a filter is a table");
+        let rule = table["gear"].as_array().expect("gear is an array")[0]
+            .as_table()
+            .expect("a rule is a table");
+        // Less one for `gear` itself: the container is where criteria live, not
+        // a criterion.
+        let keys = table.len() - 1 + rule.len();
         assert_eq!(
             keys,
             one_per_criterion().len(),
-            "`Filter` grew or lost a criterion — add or drop its case in \
-             `one_per_criterion`, and name it in `hunt_summary`:\n{written:?}"
+            "a criterion was added to `Filter` or `GearRule` — add or drop its \
+             case in `one_per_criterion`, and name it in `hunt_summary`:\n{written:?}"
         );
     }
 
     #[test]
     fn the_numeric_criteria_read_in_the_shop_table_s_terms() {
         let filter = Filter {
-            min_grade: Some(4),
-            max_price: Some(Gold::new(300_000)),
-            min_substats: Some(3),
+            gear: vec![GearRule {
+                min_grade: Some(4),
+                max_price: Some(Gold::new(300_000)),
+                min_substats: Some(3),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         // The rarity reads as the ladder two panels down spells it: the same
@@ -1614,7 +1704,10 @@ mod tests {
         // The converse: `min_substats = 0` restricts nothing, so the bar must
         // keep calling it an empty hunt.
         let inert = Filter {
-            min_substats: Some(0),
+            gear: vec![GearRule {
+                min_substats: Some(0),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert!(inert.is_unrestricted());
@@ -1635,7 +1728,10 @@ mod tests {
     fn a_rarity_floor_reads_in_the_words_the_ladder_offers() {
         for (id, label) in [(2, "Good+"), (3, "Rare+"), (4, "Heroic+"), (5, "Epic+")] {
             let filter = Filter {
-                min_grade: Some(id),
+                gear: vec![GearRule {
+                    min_grade: Some(id),
+                    ..GearRule::default()
+                }],
                 ..Filter::default()
             };
             assert_eq!(hunt_summary(&filter), label);
@@ -1651,7 +1747,10 @@ mod tests {
     #[test]
     fn a_rarity_the_table_cannot_name_still_names_its_criterion() {
         let mythic = Filter {
-            min_grade: Some(9),
+            gear: vec![GearRule {
+                min_grade: Some(9),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         assert_eq!(hunt_summary(&mythic), "grade 9+");
@@ -1674,7 +1773,7 @@ mod tests {
         for (grade, _) in theme::RARITIES {
             let filter: Filter = toml::from_str(&format!("min_grade = {grade}"))
                 .expect("a rarity the window names must be a grade the game has");
-            assert_eq!(filter.min_grade, Some(grade));
+            assert_eq!(filter.only_rule().min_grade, Some(grade));
         }
         let lowest = theme::RARITIES[0].0;
         let highest = theme::RARITIES[theme::RARITIES.len() - 1].0;
@@ -1713,7 +1812,7 @@ mod tests {
         for dropped in [2, 3] {
             let filter: Filter = toml::from_str(&format!("min_grade = {dropped}"))
                 .expect("a floor the ladder stopped offering is still a floor");
-            assert_eq!(filter.min_grade, Some(dropped));
+            assert_eq!(filter.only_rule().min_grade, Some(dropped));
         }
     }
 
@@ -1727,7 +1826,7 @@ mod tests {
         assert_eq!(top, 5);
         assert_eq!(label, "Epic");
         let filter: Filter = toml::from_str("min_grade = 5").expect("Epic is a floor");
-        assert_eq!(filter.min_grade, Some(5));
+        assert_eq!(filter.only_rule().min_grade, Some(5));
     }
 
     /// Heroic is a FLOOR and not a bucket: it admits Epic pieces too, which is
@@ -1740,7 +1839,10 @@ mod tests {
     fn the_lower_rung_admits_the_higher_ones_pieces() {
         use crate::domain::shop::ShopItem;
         let heroic_or_better = Filter {
-            min_grade: Some(HUNTED_FLOOR),
+            gear: vec![GearRule {
+                min_grade: Some(HUNTED_FLOOR),
+                ..GearRule::default()
+            }],
             ..Filter::default()
         };
         let epic = ShopItem {

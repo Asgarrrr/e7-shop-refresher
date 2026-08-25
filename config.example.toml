@@ -49,37 +49,49 @@ max_ms = 30000
 
 [filter]
 # Player interest criteria. An item is a hit when it answers EITHER branch: it
-# is one of the `names` below, or it satisfies every gear criterion that is set
-# (sets, slots, required_substats, min_substats, min_grade, max_price). A branch
-# with nothing set neither constrains nor matches, so naming only one of the two
-# behaves exactly as it always has. `kinds` and sold-out gate both branches.
+# is one of the `names` below, or it is one of the PIECES of gear named by the
+# `[[filter.gear]]` rules further down. A branch with nothing set neither
+# constrains nor matches, so naming only one of the two behaves exactly as it
+# always has. `kinds` and sold-out gate both branches.
 # At least one criterion is required: with none, every item would match and the
 # relay refuses to start.
 # Default hunt: covenant bookmarks + mystic medals.
 names = ["ticketrare_name", "ticketspecial_name"]
 # kinds = ["equipment"]                 # any-of: equipment, hero, token
-# sets = ["set_speed", "set_counter"]   # any-of, exact internal set ids
-# min_substats = 3                      # minimum substat count, at any rarity — the window
-#                                       # has no control for it: Heroic and Epic both roll 4
-# max_price = 300000                    # inclusive gold cap; unknown price fails it
-# min_grade = 4                         # rarity floor: 2 Good, 3 Rare, 4 Heroic, 5 Epic; unknown grade fails it
 # include_sold_out = false              # keep sold-out items (default drops them)
 
-# Substats the piece must carry; `min` is an inclusive threshold, omit it for
-# presence alone. Thresholds are in the unit the WIRE sends: whole numbers for
-# speed / att / def / max_hp, fractions for the percent-bearing ones (`0.03` is
-# the 3% the game shows). The game rolls whole values in the unit it shows, so
-# `0.035` is a threshold no piece can be told apart by.
+# One rule per piece of gear worth stopping for. Every criterion inside a rule
+# has to hold; an item satisfying ANY rule is a hit. Two rules are how "a speed
+# boot OR a crit-damage necklace" is spelled — one rule listing both slots and
+# both stats would also buy a necklace that merely rolled speed.
 #
-# What the shop was measured to sell, low to high (7,941 pieces of gear over
+# The gear keys used to sit loose in [filter]. A file that still spells them
+# there keeps loading — they are read as one rule — and the next Apply rewrites
+# the section in this shape. Setting both is refused rather than merged.
+#
+# [[filter.gear]]
+# slots = ["boot"]                      # any-of: weapon, helm, armor, neck, ring, boot
+# sets = ["set_speed", "set_counter"]   # any-of, exact internal set ids
+# min_grade = 4                         # rarity floor: 2 Good, 3 Rare, 4 Heroic, 5 Epic; unknown grade fails it
+# max_price = 300000                    # inclusive gold cap; unknown price fails it
+# min_substats = 3                      # minimum count of ROLLED substats — the window has no
+#                                       # control for it, and it says what min_grade says: a
+#                                       # grade rolls exactly grade - 1 substats
+# substat_match = "all"                 # "all": every requirement below holds.
+#                                       # "any": one of them is enough.
+# required_substats = [{ name = "speed", min = 8.0 }]
+#
+# `min` is an inclusive threshold, omitted for presence alone, and it is in the
+# unit the WIRE sends: whole numbers for speed / att / def / max_hp, fractions
+# for the percent-bearing ones (`0.03` is the 3% the game shows). The game rolls
+# whole values in the unit it shows, so `0.035` tells no two pieces apart.
+#
+# A requirement is answered by the piece's MAIN stat as well as its rolls, which
+# is what makes `{ name = "speed", min = 6 }` a hunt for speed boots — no roll
+# reaches 6. What the shop was measured to sell, low to high (7,941 pieces over
 # 2,428 captured rolls at shop level 13): speed 1-8, att 18-100, def 15-60,
 # max_hp 88-540, cri 2-11%, cri_dmg 3-13%, every other percent 3-12%. A `min`
 # above its top matches nothing; the window's own control stops there.
-# substat_match = "all"                 # "all": every requirement below holds.
-#                                       # "any": one of them is enough.
-# [[filter.required_substats]]
-# name = "speed"
-# min = 8.0
 
 [limits]
 # Refresh-loop stop limits. Every key is optional; absent means no limit.

@@ -664,9 +664,12 @@ backend = \"input\"
         // array-of-tables `config.example.toml` documents. Both are the same
         // document to any parser: a house-style divergence, not a defect.
         let filter = Filter {
-            required_substats: vec![crate::domain::filter::SubstatReq {
-                name: "speed".to_owned(),
-                min: Some(8.0),
+            gear: vec![crate::domain::filter::GearRule {
+                required_substats: vec![crate::domain::filter::SubstatReq {
+                    name: "speed".to_owned(),
+                    min: Some(8.0),
+                }],
+                ..crate::domain::filter::GearRule::default()
             }],
             ..Filter::default()
         };

@@ -472,7 +472,10 @@ mod tests {
         let hunting = Controller::new(
             Filter {
                 names: vec!["friendpoint_name".to_owned()],
-                min_grade: Some(5),
+                gear: vec![crate::domain::filter::GearRule {
+                    min_grade: Some(5),
+                    ..crate::domain::filter::GearRule::default()
+                }],
                 ..Filter::default()
             },
             Limits::default(),
