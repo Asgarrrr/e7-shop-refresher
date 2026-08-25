@@ -359,9 +359,23 @@ pub(super) fn chip(ui: &mut egui::Ui, button: egui::Button<'_>, on: bool) -> egu
 /// Snug by construction — the cells carry no spacing between them, which is
 /// what makes the shared ground visible between the rounded ends.
 ///
-/// Two sections use it, which is why it lives here: the Click-timing mode row
-/// and Hunt's rarity ladder. A second copy of the recipe beside the second
-/// caller is how one control becomes two that drift.
+/// Several sections use it, which is why it lives here: the Click-timing mode
+/// row, Hunt's rarity ladder, its substat mode, its gear slot and its piece
+/// strip. A second copy of the recipe beside the second caller is how one
+/// control becomes two that drift.
+///
+/// **The cells wrap INSIDE the frame, and that is not the trap this file warns
+/// about twice.** What a strip must never do is sit inside a caller's
+/// `horizontal_wrapped` — the frame builds a child `Ui`, and a child never
+/// reaches the parent's [`egui::Layout::next_frame`], so the strip runs off that
+/// row instead of wrapping (see [`chip`] and [`joined_run`]). Wrapping the
+/// child against its OWN width is the supported half of the same fact, and it
+/// is what stops a strip whose cell count is unbounded from leaving a window
+/// that cannot be widened: `editor::hunt::piece_strip` draws one cell per piece
+/// hunted, and eight pieces wearing the longest part name the game has
+/// ("Necklace") measured 447px against [`super::WINDOW_WIDTH`]'s 440. The four
+/// fixed-length strips never reach their own width, so for them this is the
+/// same layout it always was.
 pub(super) fn segmented_strip<R>(
     ui: &mut egui::Ui,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
@@ -373,7 +387,7 @@ pub(super) fn segmented_strip<R>(
         .show(ui, |ui| {
             ui.style_mut().visuals.widgets.inactive.fg_stroke.color = INK_MUTED;
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.horizontal(add_contents).inner
+            ui.horizontal_wrapped(add_contents).inner
         })
         .inner
 }

@@ -13,7 +13,10 @@ mod timing;
 mod timing_meter;
 
 use clicking::{backend_row, clicking_summary, dry_run_row, timing_notice};
-use hunt::{choice_list, optional_value, rarity_ladder, string_list, substat_chips, token_cards};
+use hunt::{
+    choice_list, optional_value, piece_strip, rarity_ladder, slot_ladder, string_list,
+    substat_chips, token_cards,
+};
 use stop::{duration_row, limit_row};
 // Re-exported one level up: the idle status band describes the plan with the
 // same two summaries the folded Hunt and Stop bars use, so the window has one
@@ -59,8 +62,10 @@ pub(super) struct EditorState {
     /// one `Command` carries both — a single Apply must not land in halves.
     click_mode: ClickMode,
     applied_click_mode: ClickMode,
+    /// The typed-id buffer the sets list falls back to against a server with no
+    /// Catalog. The gear slot had one until it became a single value: a
+    /// [`slot_ladder`] cell answers for the id a fallback used to have to type.
     set_input: String,
-    slot_input: String,
     /// Which gear rule the Hunt body is editing.
     ///
     /// It may point one PAST the last rule, and that is the whole trick behind
@@ -111,7 +116,6 @@ impl EditorState {
             timings,
             click_mode,
             set_input: String::new(),
-            slot_input: String::new(),
             gear_index: 0,
             vocabulary: FilterVocabulary::default(),
             vocabulary_generation: 0,
@@ -298,7 +302,12 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
 
     branch_separator(ui, "— or gear —", "or gear");
 
-    piece_strip(ui, &mut editor.filter.gear, &mut editor.gear_index);
+    piece_strip(
+        ui,
+        &mut editor.filter.gear,
+        &mut editor.gear_index,
+        &editor.vocabulary.slots,
+    );
     with_rule(&mut editor.filter.gear, editor.gear_index, |rule| {
         offered_list(
             ui,
@@ -309,18 +318,14 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
             icons,
         );
         gear_rule(ui);
-        // The catalog's icon table is keyed by set id and nothing else: there
-        // are no gear-slot pictures on the wire and none planned. An empty
-        // source says that in the one place it matters — inside `choice_list`,
-        // where every value then takes the text branch.
-        offered_list(
-            ui,
-            "gear slots",
-            &mut rule.slots,
-            &mut editor.slot_input,
-            &editor.vocabulary.slots,
-            &SetIcons::default(),
-        );
+        // No icons and no free-text fallback, unlike the sets above: the
+        // catalog's icon table is keyed by set id and carries no gear-slot
+        // picture, and a criterion holding ONE value has no `Vec` for
+        // `string_list` to edit. `slot_ladder` carries what the fallback used to
+        // buy — a part the vocabulary cannot name still gets a cell, and
+        // clearing it is the way out.
+        ui.label(theme::section("gear slot"));
+        slot_ladder(ui, &mut rule.slot, &editor.vocabulary.slots);
         gear_rule(ui);
         // Directly under the slot, and above the rolls, because that is the
         // order the criteria are read in: the slot and the main stat together
@@ -397,53 +402,6 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
     // gear one.
     ui.add_space(theme::SP_SM);
     ui.checkbox(&mut editor.filter.include_sold_out, "include sold out");
-}
-
-/// The pieces being hunted, as one segmented strip: a cell per rule, a `+` to
-/// add one, and a `✕` to drop the one on screen.
-///
-/// A strip and not a stack of cards, because the window is pinned at
-/// [`crate::ui::WINDOW_WIDTH`] and one rule's criteria already fill a panel:
-/// three rules unfolded at once would be three screens of scrolling to compare
-/// two chips. The strip is the same grammar the rarity ladder and the timing
-/// presets wear, so an exclusive choice looks like every other one here.
-///
-/// The `+` cell only moves the index past the last rule — see
-/// [`EditorState::gear_index`] — and the `✕` is a [`theme::bare_verb`] rather
-/// than a cell, because it acts on the selection instead of being one.
-fn piece_strip(ui: &mut egui::Ui, rules: &mut Vec<GearRule>, index: &mut usize) {
-    // A rule a config file holds and the window cannot reach would filter while
-    // being invisible and unremovable — the defect `unoffered_rows` exists to
-    // close for a value the vocabulary cannot name. Clamped rather than
-    // asserted: the count changes under the index whenever a rule is removed.
-    *index = (*index).min(rules.len());
-    ui.horizontal(|ui| {
-        ui.label(theme::section("pieces"));
-        theme::segmented_strip(ui, |ui| {
-            for cell in 0..=rules.len() {
-                // The cell past the last rule is the one being drafted, and it
-                // is drawn as a `+` until a criterion makes it real.
-                let label = if cell == rules.len() {
-                    "+".to_owned()
-                } else {
-                    (cell + 1).to_string()
-                };
-                if ui
-                    .selectable_label(*index == cell, egui::RichText::new(label).small())
-                    .clicked()
-                {
-                    *index = cell;
-                }
-            }
-        });
-        // Only over a rule that exists: the draft cell has nothing to remove,
-        // and a disabled verb beside it would be a control that never acts.
-        if *index < rules.len() && theme::bare_verb(ui, "remove").clicked() {
-            rules.remove(*index);
-            *index = (*index).min(rules.len());
-        }
-    });
-    ui.add_space(theme::SP_SM);
 }
 
 /// Lends the Hunt body the rule at `index`, and puts it back only if it says
@@ -957,12 +915,12 @@ mod tests {
     }
 
     /// The degradation contract, in one render: with no `catalog` message the
-    /// three wire-fed criteria fall back and the two constant-fed ones draw
-    /// anyway.
+    /// wire-fed criteria fall back or stand down, and the two constant-fed ones
+    /// draw anyway.
     ///
-    /// The checkbox rows only exist once the server named something. Until then
-    /// the sets and gear-slot lists keep their field, because the ids in a
-    /// player's config must stay enterable against a server with no Catalog.
+    /// The checkbox row only exists once the server named something. Until then
+    /// the sets list keeps its field, because the ids in a player's config must
+    /// stay enterable against a server with no Catalog.
     ///
     /// The two criteria drawn from the substat vocabulary — the main stat and
     /// the required substats — are the exception, and it is a deliberate one: a
@@ -974,6 +932,15 @@ mod tests {
     /// bar from reading "nothing selected" over a hunt that restricts, and it is
     /// all it is: naming the id is the offered/unoffered rows' job, and they
     /// need the vocabulary this case does not have.
+    ///
+    /// **The gear slot joined that exception when it became one value**, and it
+    /// is the better-off case of the three: `string_list` edits a `Vec` and this
+    /// criterion is a single part, so there is no field to fall back to — but a
+    /// part a config file already holds keeps a cell on the ladder AND a named
+    /// cell on the piece strip, both spelled as the raw id
+    /// (`a_config_set_part_is_still_named_and_clearable_with_no_vocabulary`).
+    /// What is lost is typing a part id blind, against a server that could not
+    /// answer about parts anyway.
     ///
     /// The tokens and the rarities used to be the same story and are not any
     /// more: their words are `hunt::HUNT_TOKENS` and `theme::RARITIES`, so both
@@ -988,10 +955,10 @@ mod tests {
             ClickMode::default(),
         );
         let harness = draw_setup(&mut editor);
-        // One "add" button per free-text list: sets and gear slots.
+        // One "add" button, for the one free-text list left: the sets.
         assert_eq!(
             harness.get_all_by_label("add").count(),
-            2,
+            1,
             "every free-text list should offer its field"
         );
         assert_eq!(harness.query_all_by_label("Speed").count(), 0);
@@ -1275,7 +1242,7 @@ mod tests {
         harness.run();
         drop(harness);
         assert_eq!(editor.filter.only_rule().sets, vec!["speed".to_owned()]);
-        assert!(editor.filter.only_rule().slots.is_empty());
+        assert!(editor.filter.only_rule().slot.is_none());
     }
 
     /// A main stat is picked by its ID and never by the words beside it: the
@@ -1408,17 +1375,17 @@ mod tests {
     #[test]
     fn a_second_piece_is_a_rule_of_its_own() {
         let mut editor = stocked_editor();
-        rule_of(&mut editor).slots = vec!["boot".to_owned()];
+        rule_of(&mut editor).slot = Some("boot".to_owned());
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
-        harness.get_by_label("+").click();
+        harness.get_by_label("+ add").click();
         harness.run();
         harness.get_by_label("Speed Set").click();
         harness.run();
         drop(harness);
         assert_eq!(editor.filter.gear.len(), 2);
-        assert_eq!(editor.filter.gear[0].slots, vec!["boot".to_owned()]);
+        assert_eq!(editor.filter.gear[0].slot.as_deref(), Some("boot"));
         assert!(
             editor.filter.gear[0].sets.is_empty(),
             "the first is untouched"
@@ -1438,7 +1405,7 @@ mod tests {
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
-        harness.get_by_label("+").click();
+        harness.get_by_label("+ add").click();
         harness.run();
         drop(harness);
         assert!(editor.filter.gear.is_empty());
@@ -1450,7 +1417,7 @@ mod tests {
     #[test]
     fn removing_a_piece_drops_its_rule() {
         let mut editor = stocked_editor();
-        rule_of(&mut editor).slots = vec!["boot".to_owned()];
+        rule_of(&mut editor).slot = Some("boot".to_owned());
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
@@ -1464,7 +1431,7 @@ mod tests {
     #[test]
     fn unticking_a_slot_drops_its_id() {
         let mut editor = stocked_editor();
-        rule_of(&mut editor).slots = vec!["helm".to_owned()];
+        rule_of(&mut editor).slot = Some("helm".to_owned());
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
@@ -1474,6 +1441,72 @@ mod tests {
         // The rule went with its last criterion: a card that constrains
         // nothing is not a piece being hunted.
         assert!(editor.filter.gear.is_empty());
+    }
+
+    /// Picking a part writes it into the rule the strip has open, and the strip
+    /// renames its own cell in the same frame — which is the whole reason the
+    /// cells wear words.
+    #[test]
+    fn picking_a_part_names_the_piece_it_belongs_to() {
+        let mut editor = stocked_editor();
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.run();
+        // Before: nothing but the draft cell, since a rule with nothing set is
+        // never written into the filter.
+        assert_eq!(harness.query_all_by_label("Any part piece 1").count(), 0);
+        harness.get_by_label("Boots").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.only_rule().slot.as_deref(), Some("boot"));
+        let harness = draw_setup(&mut editor);
+        assert_eq!(harness.get_all_by_label("Boots piece 1").count(), 1);
+    }
+
+    /// A part a config file already carries stays named and clearable with no
+    /// `catalog` message behind it — as its raw id, in both places.
+    ///
+    /// The gear slot lost its free-text fallback when it became one value:
+    /// `string_list` edits a `Vec`. What replaces it is that the id itself is a
+    /// cell on the ladder and the word on the strip, so the criterion is
+    /// visible and there are two ways out of it. Without that, a part written
+    /// before the catalog arrived would filter fail-closed — silencing the whole
+    /// gear branch — while drawing nothing.
+    #[test]
+    fn a_config_set_part_is_still_named_and_clearable_with_no_vocabulary() {
+        let mut editor = EditorState::new(
+            Filter {
+                gear: vec![GearRule {
+                    slot: Some("boot".to_owned()),
+                    ..GearRule::default()
+                }],
+                ..named_filter()
+            },
+            Limits::default(),
+            Timings::default(),
+            ClickMode::default(),
+        );
+        let harness = draw_setup(&mut editor);
+        assert_eq!(
+            harness.get_all_by_label("boot piece 1").count(),
+            1,
+            "the strip names it"
+        );
+        assert_eq!(
+            harness.get_all_by_label("boot").count(),
+            1,
+            "and the ladder offers exactly one cell, the one it holds"
+        );
+        drop(harness);
+        // And that cell is the way out.
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("boot").click();
+        harness.run();
+        drop(harness);
+        assert!(editor.filter.gear.is_empty(), "and the rule with it");
     }
 
     /// A token card writes the wire NAME, which is what `Filter::names`
@@ -2563,8 +2596,9 @@ mod tests {
         eprintln!("rendered {}", path.display());
     }
 
-    /// The piece strip over the top of one rule's criteria: two pieces hunted,
-    /// the second on screen, the `+` waiting past it.
+    /// The piece strip over the top of one rule's criteria: two pieces hunted
+    /// under the names of their parts, the second on screen, the draft cell
+    /// waiting past it.
     #[test]
     #[cfg(feature = "render-png")]
     #[ignore = "renders the piece strip to a PNG for visual iteration; run with --ignored"]
@@ -2573,11 +2607,11 @@ mod tests {
             names: Vec::new(),
             gear: vec![
                 GearRule {
-                    slots: vec!["boot".to_owned()],
+                    slot: Some("boot".to_owned()),
                     ..GearRule::default()
                 },
                 GearRule {
-                    slots: vec!["helm".to_owned()],
+                    slot: Some("helm".to_owned()),
                     min_grade: Some(5),
                     ..GearRule::default()
                 },
@@ -2594,16 +2628,15 @@ mod tests {
                 let bg = ui.visuals().panel_fill;
                 ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, bg);
                 ui.add_space(theme::SP_SM);
-                piece_strip(ui, &mut editor.filter.gear, &mut editor.gear_index);
+                piece_strip(
+                    ui,
+                    &mut editor.filter.gear,
+                    &mut editor.gear_index,
+                    &editor.vocabulary.slots,
+                );
                 with_rule(&mut editor.filter.gear, editor.gear_index, |rule| {
-                    offered_list(
-                        ui,
-                        "gear slots",
-                        &mut rule.slots,
-                        &mut editor.slot_input,
-                        &editor.vocabulary.slots,
-                        &SetIcons::default(),
-                    );
+                    ui.label(theme::section("gear slot"));
+                    slot_ladder(ui, &mut rule.slot, &editor.vocabulary.slots);
                     gear_rule(ui);
                     ui.label(theme::section("rarity"));
                     rarity_ladder(ui, &mut rule.min_grade);
