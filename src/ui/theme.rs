@@ -52,53 +52,34 @@ pub(super) const WANTED: Color32 = Color32::from_rgb(0x90, 0xee, 0x90);
 /// as the player-controlled part.
 pub(super) const METER_BASE: Color32 = Color32::from_rgb(0x2c, 0x42, 0x60);
 
-/// The gear rarities, in the game's own colours.
+/// The gear rarities, low to high: the grade a filter floors on and the game's
+/// word for it.
 ///
-/// Taken from the localization's `ui_alchemist_equip_confirm_grade*` strings,
-/// which colour the rarity word in the equipment confirm dialog — so a player
-/// reading this ladder sees the blue, purple and red they already know from the
-/// game's own screens. Not eyeballed and not a palette of ours: these three are
-/// transcribed hex.
-const RARE: Color32 = Color32::from_rgb(0x3b, 0x7b, 0xef);
-const HEROIC: Color32 = Color32::from_rgb(0xca, 0x37, 0xd3);
-const EPIC: Color32 = Color32::from_rgb(0xff, 0x30, 0x1a);
-
-/// The gear rarities, low to high: the grade a filter floors on, the game's word
-/// for it, and the ink that word is written in.
+/// **One row per rarity, and every row is a NAME rather than a cell.** The
+/// words are `localization`'s `item_grade_2..5` and they are spelled here rather
+/// than fetched, because four names nobody mistypes are not worth a wire family,
+/// a tolerant decoder and a fallback for the session where the message never
+/// lands. Which of them the Hunt ladder actually OFFERS is a separate and
+/// narrower question, answered by `hunt::HUNTED_FLOOR` — a player can floor on
+/// Good from `config.toml` and the folded bar has to name it, whether or not a
+/// control here can produce it.
 ///
-/// **One row per rarity.** The words are `localization`'s `item_grade_2..5` and
-/// they are spelled here rather than fetched, because four names nobody
-/// mistypes are not worth a wire family, a tolerant decoder and a fallback for
-/// the session where the message never lands. Reading them off the server while
-/// hardcoding their colours on the line below was the split this closes: a
-/// rarity is now one row in one place.
+/// A table and not a `match`, because it is also the loader's domain written
+/// out: the editor's twin test walks it to assert that every rarity the window
+/// can name is a floor `config.toml` accepts, and that its ends are the ends of
+/// that domain.
 ///
-/// Good is [`INK_MUTED`] because **the game gives it no colour**:
-/// `ui_alchemist_equip_confirm_grade*` has no coloured occurrence of it anywhere
-/// in the localization, so the neutral ink is the finding rather than a gap
-/// someone forgot to fill. Inventing a fourth hue here would be this file
-/// claiming a game fact it does not have.
-///
-/// A table and not a `match`, because it is also the ladder's known domain: the
-/// editor's twin test walks it to assert that every rarity the window can paint
-/// is a floor `config.toml` accepts, and that its ends are the ends of that
-/// domain.
-pub(super) const RARITIES: [(u8, &str, Color32); 4] = [
-    (2, "Good", INK_MUTED),
-    (3, "Rare", RARE),
-    (4, "Heroic", HEROIC),
-    (5, "Epic", EPIC),
-];
-
-/// The ink for one grade. A grade the table does not name — a rarity the game
-/// adds before this list moves — takes the neutral ink rather than no cell:
-/// the floor still filters, and the criterion is still named.
-pub(super) fn rarity_ink(grade: u8) -> Color32 {
-    RARITIES
-        .iter()
-        .find(|(known, _, _)| *known == grade)
-        .map_or(INK_MUTED, |(_, _, ink)| *ink)
-}
+/// **The ink column is gone and the research behind it is not.** The game
+/// colours the rarity word in its equipment confirm dialog —
+/// `ui_alchemist_equip_confirm_grade*` — at `#3B7BEF` Rare, `#CA37D3` Heroic and
+/// `#FF301A` Epic, with **no coloured occurrence of Good anywhere in the
+/// localization**, which is a finding and not a gap. Those three were
+/// transcribed here and painted the ladder's labels until the Hunt section
+/// dropped to two rungs: three hues on two words, on a screen where every other
+/// control is one ink, were noise rather than information. The colours are kept
+/// as this sentence because a constant nothing reads is dead code — if a surface
+/// ever needs them again, they are above and they are measured.
+pub(super) const RARITIES: [(u8, &str); 4] = [(2, "Good"), (3, "Rare"), (4, "Heroic"), (5, "Epic")];
 
 /// The game's word for one grade, and `None` for a grade [`RARITIES`] does not
 /// name.
@@ -106,12 +87,14 @@ pub(super) fn rarity_ink(grade: u8) -> Color32 {
 /// The `None` is not reachable from a config file — the loader takes `2..=5` and
 /// this table spells all four — so it exists for the criterion built in Rust,
 /// and the caller states the bare ordinal instead of a word this end would be
-/// inventing.
+/// inventing. It is deliberately answered off the whole table and not off the
+/// ladder's two rungs: a floor the ladder cannot offer still has a name, and the
+/// folded Hunt bar has to say it.
 pub(super) fn rarity_label(grade: u8) -> Option<&'static str> {
     RARITIES
         .iter()
-        .find(|(known, _, _)| *known == grade)
-        .map(|(_, label, _)| *label)
+        .find(|(known, _)| *known == grade)
+        .map(|(_, label)| *label)
 }
 
 /// Spacing scale (4px grid). Every gap the layout inserts comes from here.

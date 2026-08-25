@@ -162,6 +162,14 @@ fn token_label(name: &str) -> &str {
 /// unreachable from a config file and exists only to keep this total. A floor it
 /// cannot name reads as its own ordinal — the criterion is named and the floor
 /// is exact, with no word invented for a rarity the game has not published.
+///
+/// **It answers for the floors the ladder does not offer, and that is the point
+/// of naming being wider than offering.** `min_grade = 2` still loads (see
+/// [`HUNTED_FLOOR`]) and still drops every gradeless item, so the folded bar has
+/// to say `Good+` — the game's own word — rather than `grade 2+`, which is a
+/// number a player sees nowhere in the game, or worse "nothing selected" over a
+/// hunt that restricts. Narrowing [`theme::RARITIES`] to the two rungs on
+/// screen would have bought exactly that regression.
 fn grade_label(min: u8) -> String {
     theme::rarity_label(min).map_or_else(|| format!("grade {min}+"), |label| format!("{label}+"))
 }
@@ -472,9 +480,23 @@ fn token_card(ui: &mut egui::Ui, label: &str, price: Gold, on: &mut bool) -> boo
     response.clicked()
 }
 
-/// The rarity floor, as one segmented control: the four grades of
-/// [`theme::RARITIES`], low to high, in the game's own words and the game's own
-/// colours.
+/// The lowest rarity the ladder offers.
+///
+/// **The two rungs are Heroic and Epic, and `min_grade` is a FLOOR.** Heroic
+/// writes 4 and Epic writes 5, so Heroic already admits every Epic piece — the
+/// ladder is "this good or better" and never "exactly this". The rungs are not
+/// a pair of buckets and nothing here is missing a third one for "either".
+///
+/// Good (2) and Rare (3) are dropped because nobody hunts them out of the refresh
+/// shop: a paid re-roll spent on a blue piece is a re-roll wasted, so a control
+/// offering that floor invites a hunt the player did not mean. They are still
+/// FLOORS the loader takes and [`theme::RARITIES`] still names them — a
+/// `config.toml` carrying one keeps filtering and keeps being named in the folded
+/// bar, see [`grade_label`]. What went is the control, not the criterion.
+const HUNTED_FLOOR: u8 = 4;
+
+/// The rarity floor, as one segmented control: the rungs of [`theme::RARITIES`]
+/// worth hunting, low to high, in the game's own words.
 ///
 /// Buttons rather than a `ComboBox` for the reason `choice_list` gives: a combo
 /// contributes no accessibility node. Clicking the active segment clears the
@@ -483,6 +505,14 @@ fn token_card(ui: &mut egui::Ui, label: &str, price: Gold, on: &mut bool) -> boo
 /// [`theme::segmented_strip`] and not a bare row: the choice is exclusive, and
 /// the Click-timing mode row one section down already says so with a shared
 /// ground. One grammar for one kind of control.
+///
+/// **Plain text, no per-rarity ink.** The words used to be painted in the
+/// game's own blue, purple and red (see [`theme::RARITIES`], which records the
+/// measured values and where they came from). Two rungs do not need three hues
+/// to be told apart, and every other control on this screen is one ink — a
+/// coloured word here read as an alarm rather than as a rarity. The chosen cell
+/// takes the strip's own selection fill, which is the only colour the control
+/// carries and the same one every chip in the section uses.
 ///
 /// **It writes `min_grade`, where this control used to write `min_substats`.**
 /// The two were taken for one axis on shop gear, measured at 59 of 59 real
@@ -495,43 +525,24 @@ fn token_card(ui: &mut egui::Ui, label: &str, price: Gold, on: &mut bool) -> boo
 ///
 /// **The cells are spelled at this end, and so the ladder draws in every
 /// session.** They used to come off the catalog's rarity family, which meant no
-/// control at all until a `catalog` message landed — a criterion whose four
-/// values are ordinals a player must not have to type, reachable only by editing
-/// `config.toml`. Four names and four ordinals are not worth that, and
-/// [`theme::RARITIES`] already held the colours beside them.
+/// control at all until a `catalog` message landed — a criterion whose values
+/// are ordinals a player must not have to type, reachable only by editing
+/// `config.toml`.
 pub(super) fn rarity_ladder(ui: &mut egui::Ui, value: &mut Option<u8>) {
     theme::segmented_strip(ui, |ui| {
-        for (grade, label, _) in theme::RARITIES {
+        for (grade, label) in theme::RARITIES {
+            if grade < HUNTED_FLOOR {
+                continue;
+            }
             let on = *value == Some(grade);
-            if rarity_cell(ui, label, grade, on).clicked() {
+            // The accessible name comes from the label like any
+            // `selectable_label`, so nothing has to be restated — unlike
+            // [`icon_chip`], whose picture publishes none.
+            if ui.selectable_label(on, label).clicked() {
                 *value = if on { None } else { Some(grade) };
             }
         }
     });
-}
-
-/// One rarity as a segment: its name in the game's ink for that grade.
-///
-/// The colour is dropped while the cell is CHOSEN, and that is not a detail. A
-/// chosen segment takes the strip's selection fill — this theme's accent — and
-/// an explicit `RichText` colour outlives that fill, so Epic's red would be
-/// painted over the blue instead of the fill's own legible ink. Unchosen is
-/// where the hue carries information anyway: it says which rarity a word names
-/// before the player has clicked anything.
-///
-/// The accessible name comes from the label like any `selectable_label`, so
-/// nothing has to be restated here — unlike [`icon_chip`], whose picture
-/// publishes none.
-fn rarity_cell(ui: &mut egui::Ui, label: &str, grade: u8, on: bool) -> egui::Response {
-    let text = egui::RichText::new(label);
-    ui.selectable_label(
-        on,
-        if on {
-            text
-        } else {
-            text.color(theme::rarity_ink(grade))
-        },
-    )
 }
 
 /// One editable any-of list entered as free text: entries with a remove cross
@@ -900,6 +911,11 @@ mod tests {
     /// The folded Hunt bar said `grade 5+` over a control spelling Good / Rare /
     /// Heroic / Epic, so the same floor carried two names on one screen — and
     /// the number was the one nobody sees anywhere else in the game.
+    ///
+    /// All four, though the ladder offers two: `Good+` and `Rare+` are what a
+    /// `config.toml` floor below [`HUNTED_FLOOR`] reads as, and they are the
+    /// case that would have gone back to an ordinal if the naming table had been
+    /// cut down to the control.
     #[test]
     fn a_rarity_floor_reads_in_the_words_the_ladder_offers() {
         for (id, label) in [(2, "Good+"), (3, "Rare+"), (4, "Heroic+"), (5, "Epic+")] {
@@ -930,21 +946,19 @@ mod tests {
         );
     }
 
-    /// The rarities the window can paint are exactly the floors the loader
+    /// The rarities the window can NAME are exactly the floors the loader
     /// accepts, and this is the UI half of that pairing — the domain half is
     /// `min_grade_outside_the_game_domain_is_refused` in `domain::filter`.
     ///
-    /// The two must move together in both directions. A grade the ladder offers
-    /// and the loader refuses is a click that writes a `config.toml` the app
-    /// cannot start from; a grade the loader accepts and the ladder cannot ink
-    /// is a rarity the player can only reach by editing the file.
-    /// [`theme::RARITIES`] is both the cells the ladder draws and the ink they
-    /// take, so walking it is walking the control itself.
+    /// The two must move together in both directions. A grade the window names
+    /// and the loader refuses is a word for a `config.toml` the app cannot start
+    /// from; a grade the loader accepts and the table cannot name is a floor the
+    /// folded bar can only spell as an ordinal.
     #[test]
-    fn the_offered_rarities_are_the_grades_the_loader_accepts() {
-        for (grade, _, _) in theme::RARITIES {
+    fn the_named_rarities_are_the_grades_the_loader_accepts() {
+        for (grade, _) in theme::RARITIES {
             let filter: Filter = toml::from_str(&format!("min_grade = {grade}"))
-                .expect("a rarity the ladder paints must be a grade the game has");
+                .expect("a rarity the window names must be a grade the game has");
             assert_eq!(filter.min_grade, Some(grade));
         }
         let lowest = theme::RARITIES[0].0;
@@ -952,8 +966,39 @@ mod tests {
         for outside in [lowest - 1, highest + 1] {
             assert!(
                 toml::from_str::<Filter>(&format!("min_grade = {outside}")).is_err(),
-                "the ladder must not stop one short of the domain: {outside}"
+                "the table must not stop one short of the domain: {outside}"
             );
+        }
+    }
+
+    /// The ladder offers the top of that domain and stops short of its bottom,
+    /// on purpose — and the floors it drops are still floors.
+    ///
+    /// Offering is narrower than naming, which is the whole shape of this
+    /// change: a rung the ladder draws has to be a grade the file accepts, while
+    /// a grade the file accepts need not be a rung. What must NOT drift is the
+    /// top — a rarity the game publishes above Epic that the ladder cannot ask
+    /// for is a hunt only reachable by editing the file, which is what put this
+    /// control on screen in the first place.
+    #[test]
+    fn the_ladder_offers_the_top_of_the_domain_and_stops_short_of_its_bottom() {
+        let offered: Vec<(u8, &str)> = theme::RARITIES
+            .into_iter()
+            .filter(|(grade, _)| *grade >= HUNTED_FLOOR)
+            .collect();
+        assert_eq!(offered, vec![(4, "Heroic"), (5, "Epic")]);
+        let highest = theme::RARITIES[theme::RARITIES.len() - 1].0;
+        assert_eq!(
+            offered[offered.len() - 1].0,
+            highest,
+            "the ladder must reach the top rarity the game has"
+        );
+        // And the two rungs it dropped still load, so the criterion survives the
+        // control leaving.
+        for dropped in [2, 3] {
+            let filter: Filter = toml::from_str(&format!("min_grade = {dropped}"))
+                .expect("a floor the ladder stopped offering is still a floor");
+            assert_eq!(filter.min_grade, Some(dropped));
         }
     }
 
@@ -963,11 +1008,31 @@ mod tests {
     /// has.
     #[test]
     fn the_top_rarity_is_epic_and_it_loads() {
-        let (top, label, ink) = theme::RARITIES[theme::RARITIES.len() - 1];
+        let (top, label) = theme::RARITIES[theme::RARITIES.len() - 1];
         assert_eq!(top, 5);
         assert_eq!(label, "Epic");
-        assert_ne!(ink, theme::INK_MUTED, "Epic has a colour of its own");
         let filter: Filter = toml::from_str("min_grade = 5").expect("Epic is a floor");
         assert_eq!(filter.min_grade, Some(5));
+    }
+
+    /// Heroic is a FLOOR and not a bucket: it admits Epic pieces too, which is
+    /// why two rungs need no third cell for "either".
+    ///
+    /// Stated here because the ladder writes the ordinal and nothing on screen
+    /// says what the ordinal means — a reader looking at two cells could take
+    /// them for two disjoint choices and "fix" the inclusion.
+    #[test]
+    fn the_lower_rung_admits_the_higher_ones_pieces() {
+        use crate::domain::shop::ShopItem;
+        let heroic_or_better = Filter {
+            min_grade: Some(HUNTED_FLOOR),
+            ..Filter::default()
+        };
+        let epic = ShopItem {
+            kind: ItemKind::Equipment,
+            grade: Some(5),
+            ..ShopItem::default()
+        };
+        assert!(heroic_or_better.matches(&epic));
     }
 }
