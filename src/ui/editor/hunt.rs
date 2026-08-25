@@ -319,12 +319,25 @@ fn remove_button(ui: &mut egui::Ui) -> egui::Response {
 /// picture for it — and the criteria with no pictures at all hand in an empty
 /// one rather than calling a second function whose only difference is the
 /// branch it never takes.
+///
+/// `qualifier` is what a row adds to its chips' accessible names, and it exists
+/// because two rows on this surface read the SAME vocabulary: the main stat and
+/// the required substats are both picked out of `FilterVocabulary::substats`.
+/// Left unqualified they publish eleven pairs of identically named checkboxes —
+/// a screen reader announces "Speed" twice with nothing between them saying
+/// which is the piece and which is the roll, and `get_by_label` answers a
+/// duplicate by panicking rather than by picking (see [`token_card`], which
+/// carries the same rule for the opposite reason). It qualifies the NAME and
+/// never the chip's own words: the window is pinned at
+/// [`crate::ui::WINDOW_WIDTH`] and eleven chips wearing "Speed main stat" would
+/// not fit the row.
 pub(super) fn choice_list(
     ui: &mut egui::Ui,
     label: &str,
     values: &mut Vec<String>,
     choices: &[VocabularyEntry],
     icons: &SetIcons,
+    qualifier: Option<&str>,
 ) {
     ui.label(theme::section(label));
     // The salt sits on the ROW and never on a chip, and that placement is the
@@ -348,8 +361,8 @@ pub(super) fn choice_list(
             for entry in choices {
                 let mut on = values.contains(&entry.id);
                 let changed = match icons.get(&entry.id) {
-                    Some(texture) => icon_chip(ui, texture, &entry.label, &mut on),
-                    None => text_chip(ui, &entry.label, &mut on),
+                    Some(texture) => icon_chip(ui, texture, &entry.label, qualifier, &mut on),
+                    None => text_chip(ui, &entry.label, qualifier, &mut on),
                 };
                 if changed {
                     if on {
@@ -379,7 +392,7 @@ pub(super) fn choice_list(
 /// replaces published exactly that, so restating it is what keeps the node it
 /// contributed identical — same role, same name, same selected flag — while
 /// only the paint changes.
-fn text_chip(ui: &mut egui::Ui, label: &str, on: &mut bool) -> bool {
+fn text_chip(ui: &mut egui::Ui, label: &str, qualifier: Option<&str>, on: &mut bool) -> bool {
     let response = theme::chip(ui, egui::Button::new(label), *on);
     if response.clicked() {
         *on = !*on;
@@ -387,7 +400,12 @@ fn text_chip(ui: &mut egui::Ui, label: &str, on: &mut bool) -> bool {
     // After the toggle, so the node states the value the click produced rather
     // than the one it replaced.
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label)
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            ui.is_enabled(),
+            *on,
+            chip_name(label, qualifier),
+        )
     });
     response.clicked()
 }
@@ -410,7 +428,13 @@ fn text_chip(ui: &mut egui::Ui, label: &str, on: &mut bool) -> bool {
 ///
 /// The hover text is the sighted half of the same problem: 44px of armour art
 /// does not say "Speed Set" to someone who has not memorised the game's sets.
-fn icon_chip(ui: &mut egui::Ui, texture: &egui::TextureHandle, label: &str, on: &mut bool) -> bool {
+fn icon_chip(
+    ui: &mut egui::Ui,
+    texture: &egui::TextureHandle,
+    label: &str,
+    qualifier: Option<&str>,
+    on: &mut bool,
+) -> bool {
     let picture = egui::Image::new(egui::load::SizedTexture::from_handle(texture))
         .fit_to_exact_size(egui::vec2(SET_ICON, SET_ICON));
     let response = theme::chip(ui, egui::Button::image(picture), *on).on_hover_text(label);
@@ -420,9 +444,33 @@ fn icon_chip(ui: &mut egui::Ui, texture: &egui::TextureHandle, label: &str, on: 
     // After the toggle above, so the node states the value the click produced
     // rather than the one it replaced.
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label)
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            ui.is_enabled(),
+            *on,
+            chip_name(label, qualifier),
+        )
     });
     response.clicked()
+}
+
+/// One chip's accessible name: its own words, plus the criterion's where two
+/// rows offer the same ones ([`choice_list`]'s `qualifier`).
+///
+/// Built inside the [`egui::Response::widget_info`] closure at both call sites,
+/// which is what makes the allocation free: egui runs that closure only while
+/// AccessKit is live, a harness is reading, or the widget was just clicked —
+/// never on the sixty frames a second nobody is listening to.
+///
+/// The value's own words LEAD, so the name opens with the label the chip paints.
+/// A name starting with the criterion would announce eleven chips as "main stat
+/// …" before saying which one, and would stop carrying its visible label as a
+/// prefix.
+fn chip_name(label: &str, qualifier: Option<&str>) -> String {
+    qualifier.map_or_else(
+        || label.to_owned(),
+        |qualifier| format!("{label} {qualifier}"),
+    )
 }
 
 /// The values a picker cannot draw a control for, each as its own removable row.
@@ -777,7 +825,14 @@ pub(super) fn substat_chips(
                     // value on this screen.
                     None => {
                         let mut on = false;
-                        if text_chip(ui, &entry.label, &mut on) {
+                        // Unqualified, and the main-stat row above is the one
+                        // that names its chips after its criterion. One of the
+                        // two sharing this vocabulary has to, and it is not
+                        // this one: a value here is drawn two ways — a bare
+                        // pill, or [`required_substat`]'s three-cell run — so
+                        // qualifying it means qualifying two names plus the
+                        // `≥` beside them, where the main stat has one shape.
+                        if text_chip(ui, &entry.label, None, &mut on) {
                             toggled = Some(entry.id.clone());
                         }
                     }
