@@ -253,7 +253,10 @@ fn offered_list(
     if choices.is_empty() {
         string_list(ui, label, values, input);
     } else {
-        choice_list(ui, label, values, choices, icons);
+        // Unqualified: both lists this draws offer words no other row on the
+        // surface does. The main stat is the one that has to say which
+        // criterion it is, and it calls `choice_list` directly.
+        choice_list(ui, label, values, choices, icons, None);
     }
 }
 
@@ -317,6 +320,46 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
             &mut editor.slot_input,
             &editor.vocabulary.slots,
             &SetIcons::default(),
+        );
+        gear_rule(ui);
+        // Directly under the slot, and above the rolls, because that is the
+        // order the criteria are read in: the slot and the main stat together
+        // are what piece this IS — "a speed boot" — while the substats below
+        // are what it happens to have ROLLED. `GearRule` declares its fields in
+        // the same order, and `filter.rs` states the same split on `mains`.
+        //
+        // **The whole substat vocabulary, unfiltered by slot**, though the
+        // game's own pool is per part: read off `equip_item.main_stat` →
+        // `equip_stat.stat_type`, a weapon offers `att` alone, a helm `max_hp`
+        // or `def`, and only neck (8), ring (9) and boot (7) hold a real
+        // choice — the union is exactly the eleven the wire already sends.
+        // Narrowing to the ticked slots would put that table on the wire, three
+        // repositories of work for a choice the criterion already refuses on
+        // its own: `GearRule::matches` is fail-closed on `main_stat`, so a crit
+        // damage main on a boots hunt matches nothing. The cost of not
+        // narrowing is real and is this — on a boots hunt, "Critical Hit
+        // Damage" is offered and can only ever match nothing.
+        //
+        // `choice_list` and not `offered_list`: this criterion shares its
+        // vocabulary with the required substats, and that row has no free-text
+        // fallback either. A main stat the catalog cannot name is still drawn,
+        // and still removable, by `choice_list`'s own unoffered rows — what a
+        // fallback would add is TYPING a stat id against a server with no
+        // Catalog, which is the one thing a closed eleven-value vocabulary does
+        // not need. `SetIcons::default()` for the reason the gear slots hand in
+        // one: the wire's icon table is keyed by set id and holds no stats.
+        //
+        // The qualifier repeats the header's word by coincidence, not by
+        // derivation. It is spelled out because it is the name a screen reader
+        // says, where the header is a `theme::section` this row uppercases; a
+        // layout rewording of one must not silently move the other.
+        choice_list(
+            ui,
+            "main stat",
+            &mut rule.mains,
+            &editor.vocabulary.substats,
+            &SetIcons::default(),
+            Some("main stat"),
         );
         gear_rule(ui);
         substat_chips(
@@ -921,12 +964,13 @@ mod tests {
     /// the sets and gear-slot lists keep their field, because the ids in a
     /// player's config must stay enterable against a server with no Catalog.
     ///
-    /// Required substats are the exception, and it is a deliberate one: a chip
-    /// row over an empty vocabulary draws nothing, so that criterion is
-    /// unreachable from the window until a `catalog` message lands. What backs
-    /// it is that a config-set requirement still filters and is still counted in
-    /// the folded Hunt bar — as `1 substat`, see `hunt_summary`: a tally that
-    /// says a requirement is there and never which. That is enough to keep the
+    /// The two criteria drawn from the substat vocabulary — the main stat and
+    /// the required substats — are the exception, and it is a deliberate one: a
+    /// chip row over an empty vocabulary draws nothing, so both are unreachable
+    /// from the window until a `catalog` message lands. What backs it is that a
+    /// config-set one still filters and is still counted in the folded Hunt
+    /// bar — as `1 substat` or `1 main stat`, see `hunt_summary`: a tally that
+    /// says a criterion is there and never which. That is enough to keep the
     /// bar from reading "nothing selected" over a hunt that restricts, and it is
     /// all it is: naming the id is the offered/unoffered rows' job, and they
     /// need the vocabulary this case does not have.
@@ -951,6 +995,7 @@ mod tests {
             "every free-text list should offer its field"
         );
         assert_eq!(harness.query_all_by_label("Speed").count(), 0);
+        assert_eq!(harness.query_all_by_label("Speed main stat").count(), 0);
         // While the two the relay spells itself are on screen regardless.
         for rarity in ["Heroic", "Epic"] {
             assert_eq!(harness.get_all_by_label(rarity).count(), 1);
@@ -977,6 +1022,7 @@ mod tests {
             "Critical Set",
             "Helmet",
             "Boots",
+            "Speed main stat",
             "Speed",
             "Attack(%)",
             "Covenant Bookmarks",
@@ -1112,10 +1158,17 @@ mod tests {
     }
 
     /// The labels a chip row laid out past the window's right edge.
-    fn overflowing_chips(harness: &Harness<'_>) -> Vec<String> {
+    ///
+    /// `name` maps a value's words onto the accessible name its row publishes,
+    /// because one row qualifies its chips: the main stat and the required
+    /// substats read the same vocabulary, so the first names its chips
+    /// `"<value> main stat"` (see `hunt::choice_list`). Without that hop the
+    /// lookup below would be `get_by_label` over two identically named nodes,
+    /// which panics rather than picking.
+    fn overflowing_chips(harness: &Harness<'_>, name: impl Fn(&str) -> String) -> Vec<String> {
         LIVE_SETS
             .iter()
-            .map(|label| (label, chip_right_edge(harness, label)))
+            .map(|label| (label, chip_right_edge(harness, &name(label))))
             .filter(|(_, right)| *right > f64::from(crate::ui::WINDOW_WIDTH))
             .map(|(label, right)| format!("{label} ends at {right:.0}"))
             .collect()
@@ -1134,7 +1187,7 @@ mod tests {
     #[test]
     fn every_set_chip_stays_inside_the_window() {
         let mut editor = chip_row_editor(|vocabulary, sets| vocabulary.sets = sets);
-        let overflowing = overflowing_chips(&draw_setup(&mut editor));
+        let overflowing = overflowing_chips(&draw_setup(&mut editor), str::to_owned);
         assert!(
             overflowing.is_empty(),
             "the sets row laid out past the window instead of wrapping: {overflowing:?}"
@@ -1152,10 +1205,31 @@ mod tests {
     #[test]
     fn every_substat_chip_stays_inside_the_window() {
         let mut editor = chip_row_editor(|vocabulary, sets| vocabulary.substats = sets);
-        let overflowing = overflowing_chips(&draw_setup(&mut editor));
+        let overflowing = overflowing_chips(&draw_setup(&mut editor), str::to_owned);
         assert!(
             overflowing.is_empty(),
             "the substats row laid out past the window instead of wrapping: {overflowing:?}"
+        );
+    }
+
+    /// And the third reader of that layout is the main stat, which draws the
+    /// same vocabulary one block up.
+    ///
+    /// The row is the SETS one for the reason its neighbour above gives: it is
+    /// the only chip census taken off a live catalog, and what this asks is
+    /// whether a wrapped chip row wraps. The live main-stat row is the eleven
+    /// substats — measured at `WINDOW_WIDTH` = 440, they wrap to three lines,
+    /// which is the whole reason a criterion offering eleven values gets a
+    /// wrapped row rather than a strip.
+    #[test]
+    fn every_main_stat_chip_stays_inside_the_window() {
+        let mut editor = chip_row_editor(|vocabulary, sets| vocabulary.substats = sets);
+        let overflowing = overflowing_chips(&draw_setup(&mut editor), |label| {
+            format!("{label} main stat")
+        });
+        assert!(
+            overflowing.is_empty(),
+            "the main stat row laid out past the window instead of wrapping: {overflowing:?}"
         );
     }
 
@@ -1204,6 +1278,69 @@ mod tests {
         assert!(editor.filter.only_rule().slots.is_empty());
     }
 
+    /// A main stat is picked by its ID and never by the words beside it: the
+    /// label is the server's translation (`acc` reads "Effectiveness"), the id
+    /// is what `GearRule::matches` compares `ShopItem::main_stat` against.
+    ///
+    /// The twin of `ticking_a_set_stores_its_internal_id`, and it earns its own
+    /// case because this row is the one whose accessible name is not its value:
+    /// a picker that stored what it was found by would write `"Speed main
+    /// stat"` into the filter.
+    #[test]
+    fn ticking_a_main_stat_stores_its_wire_name() {
+        let mut editor = stocked_editor();
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Speed main stat").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(editor.filter.only_rule().mains, vec!["speed".to_owned()]);
+    }
+
+    /// And unticking takes it back out, rather than leaving a chip that lies.
+    #[test]
+    fn unticking_a_main_stat_drops_its_id() {
+        let mut editor = stocked_editor();
+        rule_of(&mut editor).mains = vec!["speed".to_owned()];
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("Speed main stat").click();
+        harness.run();
+        drop(harness);
+        assert!(editor.filter.gear.is_empty(), "and the rule with it");
+    }
+
+    /// The two rows reading `FilterVocabulary::substats` publish one name each.
+    ///
+    /// "The piece IS a speed boot" and "it ROLLED some speed" are different
+    /// criteria drawn from one vocabulary, so without the qualifier the surface
+    /// carries eleven pairs of identically named checkboxes — announced the
+    /// same by a screen reader, and answered by a panic rather than a pick when
+    /// anything looks one up. Verified against a dump of the whole tree: the
+    /// main-stat row is the only one that qualifies, and the required substats
+    /// keep the bare words their threshold hangs off.
+    #[test]
+    fn the_two_rows_over_one_vocabulary_name_their_chips_apart() {
+        let mut editor = stocked_editor();
+        let harness = draw_setup(&mut editor);
+        for label in ["Speed", "Attack(%)"] {
+            assert_eq!(
+                harness.get_all_by_label(label).count(),
+                1,
+                "{label} should name the roll and nothing else"
+            );
+            assert_eq!(
+                harness
+                    .get_all_by_label(&format!("{label} main stat"))
+                    .count(),
+                1,
+                "and the main stat should name itself"
+            );
+        }
+    }
+
     /// A gear block's header belongs to the block it OPENS, not to the one it
     /// closes: the rule above it plus that rule's air has to outweigh the gap
     /// down to its own first control.
@@ -1216,8 +1353,10 @@ mod tests {
     fn a_gear_block_header_belongs_to_the_block_below_it() {
         let mut editor = stocked_editor();
         let harness = draw_setup(&mut editor);
-        // The gear-slot row above, the substats header, its own first chip.
-        let above = node_bounds(&harness, "Boots");
+        // The main-stat row above — its last chip, so the measurement takes the
+        // bottom of that row whatever it wrapped to — then the substats header,
+        // then its own first chip.
+        let above = node_bounds(&harness, "Attack(%) main stat");
         let header = node_bounds(&harness, "REQUIRED SUBSTATS");
         let below = node_bounds(&harness, "Speed");
         let over = header.y0 - above.y1;
