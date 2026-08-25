@@ -83,6 +83,23 @@ pub struct GearRule {
     /// [`Filter::slots_unanswerable`] backs.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub slots: Vec<String>,
+    /// Kept MAIN stats (any-of), by exact internal stat id (`speed`, `cri_dmg`,
+    /// ...); empty keeps all. Fail-closed: a piece whose main stat the server
+    /// did not name answers no criterion here.
+    ///
+    /// **A type and not a threshold**, which is the whole difference between
+    /// this and [`Self::required_substats`]. A main stat's value is decided by
+    /// the part and the item level — a weapon's attack reads 66, 88 or 100 and
+    /// nothing else — so a `≥` on it would be a three-notch control meaning
+    /// "level 55, 70 or 85". What a player picks is WHICH stat.
+    ///
+    /// It carries the slot with it, in practice: the game fixes the main stat
+    /// of a weapon, an armor and a helm, so a choice only exists on boots,
+    /// necklaces and rings — and `speed` is a boot, `cri`/`cri_dmg` a necklace,
+    /// `acc`/`res` a ring. Nothing here enforces that; the criterion is just
+    /// satisfied by nothing else.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mains: Vec<String>,
     /// Minimum count of ROLLED substats, [`ShopItem::substats`]' length.
     ///
     /// Config-only: the window offers the rarity ladder instead, and on shop
@@ -170,6 +187,8 @@ impl TryFrom<RawFilter> for Filter {
         let flat = GearRule {
             sets: raw.sets,
             slots: raw.slots,
+            // Never spelled flat: the criterion arrived with the rules.
+            mains: Vec::new(),
             min_substats: raw.min_substats,
             required_substats: raw.required_substats,
             substat_match: raw.substat_match,
@@ -401,6 +420,7 @@ impl GearRule {
         let Self {
             sets,
             slots,
+            mains,
             required_substats,
             min_substats,
             max_price,
@@ -412,6 +432,7 @@ impl GearRule {
         } = self;
         !sets.is_empty()
             || !slots.is_empty()
+            || !mains.is_empty()
             || !required_substats.is_empty()
             || substat_floor_is_real(*min_substats)
             || max_price.is_some()
@@ -448,6 +469,14 @@ impl GearRule {
                 .gear_slot
                 .as_ref()
                 .is_some_and(|slot| self.slots.contains(slot))
+        {
+            return false;
+        }
+        if !self.mains.is_empty()
+            && !item
+                .main_stat
+                .as_ref()
+                .is_some_and(|main| self.mains.contains(&main.name))
         {
             return false;
         }
@@ -505,31 +534,24 @@ impl SubstatReq {
     /// Scans *all* substats of the matching name: an item may list the same
     /// stat twice (a blank entry, then the rolled value).
     ///
-    /// **The piece's MAIN stat answers this too**, and that is deliberate:
-    /// `speed ≥ 6` is a hunt for speed BOOTS, whose speed is a main stat and
-    /// never a roll, and it is the hunt this window exists for. A criterion that
-    /// read only [`ShopItem::substats`] would have gone quiet on it the day the
-    /// server learned to split the two — the value is unreachable by a roll,
-    /// which tops out at 4. `ui::editor::hunt::SUBSTAT_RANGE` sizes its
-    /// threshold field over both, for the same reason.
+    /// **Rolls only — the piece's MAIN stat does not answer this.** It is the
+    /// criterion that separates them: `speed ≥ 4` asks for a good speed ROLL,
+    /// and every speed boot in the shop carries 6, 7 or 8 as its main stat, so
+    /// reading both would make that requirement match every speed boot on the
+    /// board. "The piece IS a speed boot" is [`GearRule::mains`].
     ///
-    /// It is also what keeps an older server working: one that has not learned
-    /// the split sends the main stat as `substats[0]`, and either shape answers
-    /// the same question here.
-    ///
-    /// Asking for the two apart is a criterion this does not have yet — see the
-    /// `main` a gear rule will carry.
+    /// Against a server that has not learned to split the two, the main stat
+    /// arrives as `substats[0]` and does answer this — the same reading the
+    /// criterion had before the split, and the direction that keeps an old
+    /// server buying what it always bought rather than nothing.
     fn satisfied_by(&self, item: &ShopItem) -> bool {
-        item.main_stat
-            .iter()
-            .chain(item.substats.iter())
-            .any(|stat| {
-                stat.name == self.name
-                    && match self.min {
-                        None => true,
-                        Some(min) => stat.value.is_some_and(|value| value >= min),
-                    }
-            })
+        item.substats.iter().any(|stat| {
+            stat.name == self.name
+                && match self.min {
+                    None => true,
+                    Some(min) => stat.value.is_some_and(|value| value >= min),
+                }
+        })
     }
 }
 
@@ -901,38 +923,72 @@ mod tests {
         assert!(!filter.matches(&item));
     }
 
-    /// The hunt this window exists for: speed boots, where the speed is the
-    /// piece's MAIN stat and no roll can reach the value.
+    /// The two speed criteria are different questions, and each answers only
+    /// its own.
     ///
-    /// A criterion reading only the rolls would answer `false` here and say
-    /// nothing about it — the shop's speed rolls stop at 4, so `speed ≥ 6`
-    /// would have gone silently empty the day the server split the two fields.
+    /// "The piece IS a speed boot" is `mains`; "it ROLLED some speed" is a
+    /// requirement. Reading the main stat into the requirement would make
+    /// `speed ≥ 4` — a good roll, the top one the shop produces — match every
+    /// speed boot on the board, since their main stat reads 6, 7 or 8.
     #[test]
-    fn a_threshold_no_roll_can_reach_is_answered_by_the_main_stat() {
-        let hunt = Filter {
-            gear: vec![GearRule {
-                required_substats: vec![SubstatReq {
-                    name: "speed".to_owned(),
-                    min: Some(6.0),
-                }],
-                ..GearRule::default()
-            }],
-            ..Filter::default()
-        };
+    fn a_main_stat_and_a_roll_are_asked_for_separately() {
         let boots = ShopItem {
             gear_slot: Some("boot".to_owned()),
             main_stat: Some(substat("speed", Some(8.0))),
             substats: vec![substat("cri", Some(0.03))],
             ..equip()
         };
-        assert!(hunt.matches(&boots));
-        // And a piece whose speed is only a roll still fails it, so the
-        // criterion is not widened into "carries speed at all".
+        let by_main = Filter {
+            gear: vec![GearRule {
+                mains: vec!["speed".to_owned()],
+                ..GearRule::default()
+            }],
+            ..Filter::default()
+        };
+        assert!(by_main.matches(&boots), "the piece is a speed boot");
+
+        let by_roll = Filter {
+            gear: vec![GearRule {
+                required_substats: vec![SubstatReq {
+                    name: "speed".to_owned(),
+                    min: Some(4.0),
+                }],
+                ..GearRule::default()
+            }],
+            ..Filter::default()
+        };
+        assert!(
+            !by_roll.matches(&boots),
+            "its main stat is not a roll, however large"
+        );
         let rolled = ShopItem {
+            main_stat: Some(substat("max_hp", Some(472.0))),
             substats: vec![substat("speed", Some(4.0))],
             ..equip()
         };
-        assert!(!hunt.matches(&rolled));
+        assert!(by_roll.matches(&rolled), "this one rolled it");
+        assert!(!by_main.matches(&rolled), "and is not a speed boot");
+    }
+
+    /// A main-stat criterion is fail-closed on a piece nobody named one for —
+    /// a hero, a token, or every item against a server that has not learned to
+    /// split the two. Fail-OPEN would buy across every part the moment the
+    /// field went missing.
+    #[test]
+    fn an_unnamed_main_stat_answers_no_main_criterion() {
+        let filter = Filter {
+            gear: vec![GearRule {
+                mains: vec!["speed".to_owned()],
+                ..GearRule::default()
+            }],
+            ..Filter::default()
+        };
+        let old_server = ShopItem {
+            main_stat: None,
+            substats: vec![substat("speed", Some(8.0))],
+            ..equip()
+        };
+        assert!(!filter.matches(&old_server));
     }
 
     #[test]

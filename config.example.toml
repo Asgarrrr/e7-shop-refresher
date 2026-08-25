@@ -71,6 +71,11 @@ names = ["ticketrare_name", "ticketspecial_name"]
 #
 # [[filter.gear]]
 # slots = ["boot"]                      # any-of: weapon, helm, armor, neck, ring, boot
+# mains = ["speed"]                     # any-of, by stat id: the piece's MAIN stat, the one its
+#                                       # part decides. A type and never a threshold — its value
+#                                       # is fixed by the part and the item level. It implies the
+#                                       # slot: speed is a boot, cri/cri_dmg a necklace, acc/res
+#                                       # a ring; a weapon, an armor and a helm have no choice.
 # sets = ["set_speed", "set_counter"]   # any-of, exact internal set ids
 # min_grade = 4                         # rarity floor: 2 Good, 3 Rare, 4 Heroic, 5 Epic; unknown grade fails it
 # max_price = 300000                    # inclusive gold cap; unknown price fails it
@@ -86,12 +91,11 @@ names = ["ticketrare_name", "ticketspecial_name"]
 # for the percent-bearing ones (`0.03` is the 3% the game shows). The game rolls
 # whole values in the unit it shows, so `0.035` tells no two pieces apart.
 #
-# A requirement is answered by the piece's MAIN stat as well as its rolls, which
-# is what makes `{ name = "speed", min = 6 }` a hunt for speed boots — no roll
-# reaches 6. What the shop was measured to sell, low to high (7,941 pieces over
-# 2,428 captured rolls at shop level 13): speed 1-8, att 18-100, def 15-60,
-# max_hp 88-540, cri 2-11%, cri_dmg 3-13%, every other percent 3-12%. A `min`
-# above its top matches nothing; the window's own control stops there.
+# A requirement asks about the ROLLS and never the main stat — `mains` above is
+# that question. What the shop was measured to roll, low to high (7,941 pieces
+# over 2,428 captured rolls at shop level 13): speed 1-4, att 18-45, def 15-32,
+# max_hp 88-190, cri 2-5%, cri_dmg 3-7%, every other percent 3-8%. A `min` above
+# its top matches nothing; the window's own control stops there.
 
 [limits]
 # Refresh-loop stop limits. Every key is optional; absent means no limit.

@@ -96,17 +96,17 @@ const SET_ICON: f32 = 32.0;
 /// [`VocabularyEntry::percent`] is a flag on the wire rather than a "(%)" read
 /// off the words.
 const SUBSTAT_RANGE: [(&str, f64, f64); 11] = [
-    ("att", 18.0, 100.0),
-    ("att_rate", 0.03, 0.12),
-    ("def", 15.0, 60.0),
-    ("def_rate", 0.03, 0.12),
-    ("max_hp", 88.0, 540.0),
-    ("max_hp_rate", 0.03, 0.12),
-    ("speed", 1.0, 8.0),
-    ("cri", 0.02, 0.11),
-    ("cri_dmg", 0.03, 0.13),
-    ("acc", 0.03, 0.12),
-    ("res", 0.03, 0.12),
+    ("att", 18.0, 45.0),
+    ("att_rate", 0.03, 0.08),
+    ("def", 15.0, 32.0),
+    ("def_rate", 0.03, 0.08),
+    ("max_hp", 88.0, 190.0),
+    ("max_hp_rate", 0.03, 0.08),
+    ("speed", 1.0, 4.0),
+    ("cri", 0.02, 0.05),
+    ("cri_dmg", 0.03, 0.07),
+    ("acc", 0.03, 0.08),
+    ("res", 0.03, 0.08),
 ];
 
 /// The range for a substat [`SUBSTAT_RANGE`] does not name: one unit up from
@@ -222,6 +222,12 @@ fn rule_parts(rule: &GearRule) -> Vec<String> {
     }
     if !rule.slots.is_empty() {
         parts.push(count_label(rule.slots.len(), "slot", "slots"));
+    }
+    if !rule.mains.is_empty() {
+        // Counted and not named, like the sets and slots above it: the words
+        // for a stat are the server's (`acc` reads "Effectiveness"), and this
+        // takes the filter and nothing else.
+        parts.push(count_label(rule.mains.len(), "main stat", "main stats"));
     }
     if !rule.required_substats.is_empty() {
         let tally = count_label(rule.required_substats.len(), "substat", "substats");
@@ -1359,8 +1365,10 @@ mod tests {
     #[test]
     fn the_field_stops_at_one_and_at_the_highest_roll_the_shop_sells() {
         let choices = live_choices();
-        // In the unit the field SHOWS: 13 for a 13% ceiling, 540 for 540 health.
-        for (id, ceiling) in [("speed", 8.0), ("max_hp", 540.0), ("cri_dmg", 13.0)] {
+        // In the unit the field SHOWS: 7 for a 7% ceiling, 190 for 190 health.
+        // These are the ROLL tops — a speed boot's own 8 is a main stat, and a
+        // field reaching it would offer four notches no roll can land in.
+        for (id, ceiling) in [("speed", 4.0), ("max_hp", 190.0), ("cri_dmg", 7.0)] {
             let percent = LIVE_SUBSTATS
                 .into_iter()
                 .find_map(|(name, _, percent)| (name == id).then_some(percent))
@@ -1587,6 +1595,13 @@ mod tests {
             },
             Filter {
                 gear: vec![GearRule {
+                    mains: vec!["speed".to_owned()],
+                    ..GearRule::default()
+                }],
+                ..Filter::default()
+            },
+            Filter {
+                gear: vec![GearRule {
                     min_substats: Some(3),
                     ..GearRule::default()
                 }],
@@ -1655,6 +1670,7 @@ mod tests {
                 substat_match: SubstatMatch::All,
                 sets: vec!["set_speed".to_owned()],
                 slots: vec!["helm".to_owned()],
+                mains: vec!["speed".to_owned()],
                 required_substats: vec![SubstatReq {
                     name: "speed".to_owned(),
                     min: None,
