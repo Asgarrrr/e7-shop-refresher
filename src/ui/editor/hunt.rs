@@ -639,12 +639,12 @@ pub(super) fn substat_chips(
     // the same defect and was NOT merely at risk of it — eleven realistic
     // substat labels reached x=608 at the window's fixed 440px, against 414 once
     // the salt moved. It shows less than the sets row only because it is
-    // shorter; a ticked chip unfolding its `≥` box and stepper adds width again.
+    // shorter; a ticked chip unfolding its threshold adds width again.
     //
-    // Those two now sit directly in the row rather than in a `push_id` of their
-    // own, so a wrap can fall between them. That is the cost of the fix here and
-    // it is the cheap side of the trade: the pair is ~64px, and grouping them
-    // was what put the stepper past the edge in the first place.
+    // The threshold's own two cells sit directly in the row for the same reason
+    // — see [`theme::joined_pair`], which is where a grouping `Ui` would have
+    // reintroduced exactly this — and [`threshold_control`] asks the row for
+    // their width before drawing so a wrap cannot fall between them.
     ui.push_id("required substats", |ui| {
         ui.horizontal_wrapped(|ui| {
             for entry in choices {
@@ -657,17 +657,23 @@ pub(super) fn substat_chips(
                 // it applies to and nowhere else.
                 if let Some(index) = held {
                     let req = &mut reqs[index];
-                    let mut has_min = req.min.is_some();
-                    // A chip and not a checkbox: it rides in the same wrapped
-                    // row as the values above, where it would otherwise be the
-                    // one tick box left among pills.
-                    text_chip(ui, "≥", &mut has_min);
-                    if has_min {
-                        let min = req.min.get_or_insert(seed_for(entry.percent));
-                        threshold_field(ui, min, entry.percent);
-                    } else {
-                        req.min = None;
+                    let mut armed = req.min.is_some();
+                    match req.min.as_mut() {
+                        // Armed: the sign and its value are one control.
+                        Some(min) => {
+                            if threshold_control(ui, min, entry.percent) {
+                                armed = false;
+                            }
+                        }
+                        // Unarmed: the sign alone, and a chip rather than a
+                        // checkbox — it rides in the same wrapped row as the
+                        // values above, where it would otherwise be the one tick
+                        // box left among pills.
+                        None => {
+                            text_chip(ui, "≥", &mut armed);
+                        }
                     }
+                    arm_optional(armed, &mut req.min, seed_for(entry.percent));
                 }
             }
         });
@@ -689,6 +695,57 @@ pub(super) fn substat_chips(
         |req: &SubstatReq| req.name.as_str(),
         |id| choices.iter().any(|entry| entry.id == id),
     );
+}
+
+/// The width [`threshold_control`] reserves before it draws.
+///
+/// The pair goes into the caller's own wrapped row rather than into a child
+/// `Ui` — [`theme::joined_pair`] gives the reason at length — so nothing stops
+/// `horizontal_wrapped` breaking the line between the two cells and leaving half
+/// a box on each. The control asks the row for this much in one piece first.
+///
+/// Measured rather than chosen: the pair lays out at 68px on the live substat
+/// vocabulary, and this is spelled with headroom because the two failures are
+/// not symmetric — too small splits the control, too large only wraps one chip
+/// early. `the_joined_threshold_fits_the_width_it_reserves` holds the number to
+/// what the control actually takes.
+const THRESHOLD_WIDTH: f32 = 88.0;
+
+/// The `≥` and the value it applies to, as one control.
+///
+/// They were two neighbours: a `≥` pill, eight pixels of nothing, and a stepper
+/// eight pixels taller than every chip on the row. Three boxes for two facts,
+/// and nothing on screen said the sign governed the number rather than the chip
+/// before it. Joined, the sign is the lit left cap of the box the value sits in.
+///
+/// **The arming stays on the `≥`**, where a player already finds it, and it is
+/// still the only way in or out: clicking the cap while armed takes the
+/// threshold away. The value cell cannot double as the switch — a
+/// [`egui::DragValue`] spends its own click opening text entry, so arming on it
+/// would be a gesture fighting the widget's.
+///
+/// Answers whether the cap was clicked, i.e. whether the threshold should go.
+fn threshold_control(ui: &mut egui::Ui, stored: &mut f64, percent: bool) -> bool {
+    if ui.available_width() < THRESHOLD_WIDTH {
+        ui.end_row();
+    }
+    let enabled = ui.is_enabled();
+    let (cap, ()) = theme::joined_pair(
+        ui,
+        |ui| ui.add(egui::Button::new("≥")),
+        |ui| threshold_field(ui, stored, percent),
+    );
+    // The name `arm_threshold` and every player looking for the sign asks by.
+    // A bare `Button` states a `WidgetType::Button`, and this one toggles, so it
+    // is restated as the checkbox it behaves like — the contract [`text_chip`]
+    // carries, for the same reason and with the same duplicate event.
+    //
+    // `!clicked()` because a click here DISARMS: the value the click produced is
+    // "off", though the cap is drawn on for the frame it happens in.
+    cap.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, !cap.clicked(), "≥")
+    });
+    cap.clicked()
 }
 
 /// The `≥` stepper for one required substat, in the unit a player reads.
@@ -745,8 +802,149 @@ pub(super) fn optional_value<T: egui::emath::Numeric>(
 
 #[cfg(test)]
 mod tests {
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT as _, Queryable as _},
+    };
+
     use super::*;
     use crate::domain::shop::{Gold, ItemKind};
+
+    /// The eleven substats the game rolls, at their real label lengths and with
+    /// their real families — the row the threshold control has to fit into.
+    ///
+    /// Spelled here rather than taken from a fixture because what these pin is
+    /// WIDTH: a shorter stand-in row would pass a layout the live vocabulary
+    /// pushes off the window.
+    const LIVE_SUBSTATS: [(&str, &str, bool); 11] = [
+        ("att", "Attack", false),
+        ("att_rate", "Attack(%)", true),
+        ("def", "Defense", false),
+        ("def_rate", "Defense(%)", true),
+        ("max_hp", "Health", false),
+        ("max_hp_rate", "Health(%)", true),
+        ("speed", "Speed", false),
+        ("cri", "Critical Hit Chance", true),
+        ("cri_dmg", "Critical Hit Damage", true),
+        ("acc", "Effectiveness", true),
+        ("res", "Effect Resistance", true),
+    ];
+
+    fn live_choices() -> Vec<VocabularyEntry> {
+        LIVE_SUBSTATS
+            .into_iter()
+            .map(|(id, label, percent)| VocabularyEntry {
+                id: id.to_owned(),
+                label: label.to_owned(),
+                percent,
+            })
+            .collect()
+    }
+
+    /// The substat row at the window's own width, which `main.rs` pins as both
+    /// the minimum and the maximum inner size — a control laid out with room to
+    /// spare here would wrap on the player's screen.
+    fn substat_row<'a>(
+        reqs: &'a mut Vec<SubstatReq>,
+        choices: &'a [VocabularyEntry],
+    ) -> Harness<'a> {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(crate::ui::WINDOW_WIDTH, 600.0))
+            .build_ui(|ui| substat_chips(ui, reqs, choices));
+        harness.run();
+        harness
+    }
+
+    /// The accessibility box of the node a label names.
+    fn node_box(harness: &Harness<'_>, label: &str) -> egui::accesskit::Rect {
+        harness
+            .get_by_label(label)
+            .accesskit_node()
+            .bounding_box()
+            .expect("egui gives every node its bounds")
+    }
+
+    /// The sign and its value are ONE control: the two cells touch, and the
+    /// whole box fits the width the row was asked to reserve for it.
+    ///
+    /// Both halves matter. A gap between the cells is the old three-box reading
+    /// coming back with rounder corners; a box wider than [`THRESHOLD_WIDTH`]
+    /// means the reservation no longer covers what it reserves for, and the
+    /// wrap it exists to prevent can fall through the middle of the control
+    /// again.
+    #[test]
+    fn the_joined_threshold_fits_the_width_it_reserves() {
+        let choices = live_choices();
+        let mut reqs = vec![SubstatReq {
+            name: "speed".to_owned(),
+            min: Some(3.0),
+        }];
+        let harness = substat_row(&mut reqs, &choices);
+        let cap = node_box(&harness, "≥");
+        let value = harness
+            .get_by_role(egui::accesskit::Role::SpinButton)
+            .accesskit_node()
+            .bounding_box()
+            .expect("egui gives every node its bounds");
+        assert!(
+            (value.x0 - cap.x1).abs() < 1.0,
+            "the two cells should share an edge: cap ends at {:.1}, value starts at {:.1}",
+            cap.x1,
+            value.x0
+        );
+        let width = value.x1 - cap.x0;
+        assert!(
+            width <= f64::from(THRESHOLD_WIDTH),
+            "the control takes {width:.0}px and reserves {THRESHOLD_WIDTH}"
+        );
+    }
+
+    /// And the joined pair never lands past the window, on the worst row there
+    /// is: every one of the game's eleven substats required, every one of them
+    /// with a threshold armed.
+    ///
+    /// It is the armed twin of `every_substat_chip_stays_inside_the_window`,
+    /// which draws the same row with no requirement in it and so measures none
+    /// of this. The window is pinned at `WINDOW_WIDTH` and cannot be widened,
+    /// so a pair that overflows is a pair to make narrower.
+    #[test]
+    fn an_armed_threshold_never_lands_past_the_window() {
+        let choices = live_choices();
+        let mut reqs: Vec<SubstatReq> = LIVE_SUBSTATS
+            .into_iter()
+            .map(|(id, _, percent)| SubstatReq {
+                name: id.to_owned(),
+                min: Some(seed_for(percent)),
+            })
+            .collect();
+        let harness = substat_row(&mut reqs, &choices);
+        let edge = f64::from(crate::ui::WINDOW_WIDTH);
+        let mut overflowing: Vec<String> = Vec::new();
+        for (_, label, _) in LIVE_SUBSTATS {
+            let chip = node_box(&harness, label);
+            if chip.x1 > edge {
+                overflowing.push(format!("{label} ends at {:.0}", chip.x1));
+            }
+        }
+        for (index, cell) in harness
+            .query_all_by_label("≥")
+            .chain(harness.query_all_by_role(egui::accesskit::Role::SpinButton))
+            .enumerate()
+        {
+            let right = cell
+                .accesskit_node()
+                .bounding_box()
+                .expect("egui gives every node its bounds")
+                .x1;
+            if right > edge {
+                overflowing.push(format!("threshold cell {index} ends at {right:.0}"));
+            }
+        }
+        assert!(
+            overflowing.is_empty(),
+            "the armed substat row laid out past the window: {overflowing:?}"
+        );
+    }
 
     #[test]
     fn hunt_summary_names_the_hunted_tokens() {
