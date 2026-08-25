@@ -65,8 +65,18 @@ names = ["ticketrare_name", "ticketspecial_name"]
 # min_grade = 4                         # rarity floor: 2 Good, 3 Rare, 4 Heroic, 5 Epic; unknown grade fails it
 # include_sold_out = false              # keep sold-out items (default drops them)
 
-# Substats that must all be present; `min` is an inclusive threshold,
-# omit it for presence alone.
+# Substats the piece must carry; `min` is an inclusive threshold, omit it for
+# presence alone. Thresholds are in the unit the WIRE sends: whole numbers for
+# speed / att / def / max_hp, fractions for the percent-bearing ones (`0.03` is
+# the 3% the game shows). The game rolls whole values in the unit it shows, so
+# `0.035` is a threshold no piece can be told apart by.
+#
+# What the shop was measured to sell, low to high (7,941 pieces of gear over
+# 2,428 captured rolls at shop level 13): speed 1-8, att 18-100, def 15-60,
+# max_hp 88-540, cri 2-11%, cri_dmg 3-13%, every other percent 3-12%. A `min`
+# above its top matches nothing; the window's own control stops there.
+# substat_match = "all"                 # "all": every requirement below holds.
+#                                       # "any": one of them is enough.
 # [[filter.required_substats]]
 # name = "speed"
 # min = 8.0

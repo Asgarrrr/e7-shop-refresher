@@ -378,30 +378,45 @@ pub(super) fn segmented_strip<R>(
         .inner
 }
 
-/// The corners of a joined pair: rounded on the outside, square where the two
-/// cells meet. Split off the [`CHIP_RADIUS`] a lone pill takes, so a cap and a
-/// chip on the same row curve identically.
-const CAP_CORNERS: CornerRadius = CornerRadius {
-    nw: CHIP_RADIUS,
-    ne: 0,
-    sw: CHIP_RADIUS,
-    se: 0,
-};
-const VALUE_CORNERS: CornerRadius = CornerRadius {
-    nw: 0,
-    ne: CHIP_RADIUS,
-    sw: 0,
-    se: CHIP_RADIUS,
-};
-
-/// One cell of a [`joined_pair`]: its corners, and the fill it takes inactive /
-/// hovered / active.
+/// The corners of one cell in a joined run: rounded where the run ends, square
+/// where two cells meet. Split off the [`CHIP_RADIUS`] a lone pill takes, so a
+/// run and a chip on the same row curve identically.
 ///
-/// Unstroked, both of them. Two 1px edges meeting at the seam draw a divider
+/// Taken as a position rather than as a constant per role because a run is not
+/// always the same length: [`super::editor::hunt`] draws a substat as two cells
+/// or three depending on whether its threshold is armed, and the middle cell of
+/// the long form is the last cell of the short one.
+pub(super) const fn joint(first: bool, last: bool) -> CornerRadius {
+    let left = if first { CHIP_RADIUS } else { 0 };
+    let right = if last { CHIP_RADIUS } else { 0 };
+    CornerRadius {
+        nw: left,
+        ne: right,
+        sw: left,
+        se: right,
+    }
+}
+
+/// The fills a joined cell takes inactive / hovered / active, in the two tones a
+/// run is built from.
+///
+/// [`CELL_LIT`] carries [`ACCENT`], the theme's own selection fill and what
+/// every toggled surface here already wears ([`toggle_skin`]); [`CELL_GROUND`]
+/// carries [`STRIPE`], the same ground [`segmented_strip`] fills its frame with.
+/// So a run reads as one box whose lit cells are the choice and whose ground
+/// cells are what the choice is about.
+pub(super) const CELL_LIT: [Color32; 3] = [ACCENT, ACCENT_HOVER, ACCENT_PRESSED];
+pub(super) const CELL_GROUND: [Color32; 3] = [STRIPE, SLAB_HOVER, STRIPE];
+
+/// One cell of a [`joined_run`]: its corners, and the fill it takes inactive /
+/// hovered / active. Called immediately before the widget it dresses, since it
+/// styles the `Ui` that widget is about to be added to.
+///
+/// Unstroked, every one of them. Two 1px edges meeting at a seam draw a divider
 /// through the middle of a control that is meant to read as one box, and an
-/// outer edge around the pair would then have to be painted separately to avoid
+/// outer edge around the run would then have to be painted separately to avoid
 /// it — a fill and a shared corner say "one control" without either.
-fn joined_cell(ui: &mut egui::Ui, corners: CornerRadius, fills: [Color32; 3]) {
+pub(super) fn joined_cell(ui: &mut egui::Ui, corners: CornerRadius, fills: [Color32; 3]) {
     let widgets = &mut ui.style_mut().visuals.widgets;
     for (state, fill) in [
         (&mut widgets.inactive, fills[0]),
@@ -418,57 +433,46 @@ fn joined_cell(ui: &mut egui::Ui, corners: CornerRadius, fills: [Color32; 3]) {
     }
 }
 
-/// Two cells sharing one box: a cap and the value it applies to.
+/// Several cells sharing one box: a name, the sign that qualifies it, the value
+/// the sign applies to.
 ///
-/// The joined grammar for a pair that is NOT a choice — a toggle capping a
-/// number — where [`segmented_strip`] is the one for exclusive cells. The
-/// reason it is a second recipe rather than that one is LAYOUT, not semantics:
+/// The joined grammar for cells that are NOT a choice between one another —
+/// where [`segmented_strip`] is the one for exclusive cells. The reason it is a
+/// second recipe rather than that one is LAYOUT, not semantics:
 /// `segmented_strip` wraps its cells in an [`egui::Frame`], which builds a child
 /// `Ui` off `available_rect_before_wrap`, and a child never reaches
 /// `Layout::next_frame` — where `main_wrap` lives. A strip drawn inside
 /// `horizontal_wrapped` therefore takes whatever the cursor has left and runs
 /// off the row instead of wrapping, which is the defect [`chip`]'s own doc
-/// measures at length. This one adds both cells to the CALLER's `Ui` and styles
+/// measures at length. This one adds every cell to the CALLER's `Ui` and styles
 /// that `Ui` in place, exactly as [`chip`] does and for exactly that reason.
 ///
-/// The cap carries [`ACCENT`], the theme's own selection fill and what every
-/// toggled surface here already wears ([`toggle_skin`]); the value cell carries
-/// [`STRIPE`], the same ground `segmented_strip` fills its frame with. So the
-/// pair reads as one box with a lit left end.
+/// It owns the run's spacing and padding; the cells themselves are the caller's,
+/// each dressed by a [`joined_cell`] call with its [`joint`] and its tone. That
+/// split is what lets one run be two cells or three without a second recipe.
 ///
 /// **Two things the caller still owes it.** The row space to hold it in one
 /// piece — nothing here can stop `horizontal_wrapped` breaking the line between
-/// the cells, so a wrapped caller has to ask for the width first. And the
+/// two cells, so a wrapped caller has to ask for the width first. And the
 /// accessible name on whichever cell carries it: a bare [`egui::Button`] states
 /// `WidgetType::Button` and a [`egui::DragValue`] states no label at all.
-pub(super) fn joined_pair<C, V>(
-    ui: &mut egui::Ui,
-    cap: impl FnOnce(&mut egui::Ui) -> C,
-    value: impl FnOnce(&mut egui::Ui) -> V,
-) -> (C, V) {
+pub(super) fn joined_run<R>(ui: &mut egui::Ui, cells: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let saved = ui.style().clone();
-    // Zeroed BEFORE the cap and not between the two cells:
+    // Zeroed BEFORE the first cell and not between two of them:
     // `Layout::advance_after_rects` reads `item_spacing` when a widget is ADDED,
-    // so the gap the cap leaves behind it is settled here and nothing set later
+    // so the gap a cell leaves behind it is settled here and nothing set later
     // can close it.
     ui.spacing_mut().item_spacing.x = 0.0;
     // The chip box and not the theme's `SP_MD`/`SP_SM` one, which is sized for a
-    // standalone command: a pair riding in a chip row has to stand as tall as
-    // the pills beside it.
+    // standalone command: a run riding in a chip row has to stand as tall as the
+    // pills beside it.
     ui.spacing_mut().button_padding = egui::vec2(SP_SM, SP_XS);
-    let cap = {
-        joined_cell(ui, CAP_CORNERS, [ACCENT, ACCENT_HOVER, ACCENT_PRESSED]);
-        cap(ui)
-    };
-    let value = {
-        joined_cell(ui, VALUE_CORNERS, [STRIPE, SLAB_HOVER, STRIPE]);
-        value(ui)
-    };
+    let out = cells(ui);
     ui.set_style(saved);
     // The gap the zeroed spacing owes whatever comes next: the cursor was
-    // advanced past the value cell with none at all.
+    // advanced past the last cell with none at all.
     ui.add_space(SP_SM);
-    (cap, value)
+    out
 }
 
 /// A full-width collapsible section header. Painted, not nested widgets, so

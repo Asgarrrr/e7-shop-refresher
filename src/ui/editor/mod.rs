@@ -309,6 +309,7 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
     substat_chips(
         ui,
         &mut editor.filter.required_substats,
+        &mut editor.filter.substat_match,
         &editor.vocabulary.substats,
     );
     gear_rule(ui);
@@ -1318,29 +1319,33 @@ mod tests {
 
     /// The seed a player is left with has to be one the game can actually
     /// produce, or the first thing the control does is ask to be dragged away
-    /// from. Measured on 59 real gear pieces: a percent-bearing substat never
-    /// leaves `0.02..=0.12` on the wire, and a whole one runs `1..=472`.
+    /// from.
+    ///
+    /// Both are the lowest roll of their own substat, measured on the wire —
+    /// `hunt::SUBSTAT_RANGE` carries the sample and the numbers. Pinned here as
+    /// well because this is the whole path: the click, the chip, the lookup and
+    /// the write into the filter, where `hunt`'s own test walks the table alone.
     #[test]
     fn both_seeds_are_inside_the_range_the_game_rolls() {
         let mut editor = stocked_editor();
         let percent = arm_threshold(&mut editor, "att_rate");
         assert!(
-            (0.02..=0.12).contains(&percent),
-            "a percent seed outside the measured wire domain: {percent}"
+            (percent - 0.03).abs() < f64::EPSILON,
+            "the lowest attack% the shop sells is 3%: {percent}"
         );
         let whole = arm_threshold(&mut editor, "speed");
         assert!(
-            (1.0..=472.0).contains(&whole),
-            "a whole seed outside the measured wire domain: {whole}"
+            (whole - 1.0).abs() < f64::EPSILON,
+            "the lowest speed roll is 1: {whole}"
         );
     }
 
-    /// The two halves of one threshold, side by side: the field reads `2` and
-    /// the filter stores `0.02`.
+    /// The two halves of one threshold, side by side: the field reads `3` and
+    /// the filter stores `0.03`.
     ///
     /// It is also what says the unit out loud. Nothing else can — a `DragValue`
-    /// publishes its value and no label at all — so without the suffix `2` and
-    /// `2%` are the same three pixels over numbers a hundredfold apart.
+    /// publishes its value and no label at all — so without the suffix `3` and
+    /// `3%` are the same three pixels over numbers a hundredfold apart.
     #[test]
     fn a_percent_threshold_reads_in_percent_and_stores_the_fraction() {
         let mut editor = stocked_editor();
@@ -1351,13 +1356,13 @@ mod tests {
         let field = harness
             .get_by_role(egui::accesskit::Role::SpinButton)
             .accesskit_node();
-        assert_eq!(field.numeric_value(), Some(2.0), "what the player reads");
+        assert_eq!(field.numeric_value(), Some(3.0), "what the player reads");
         assert!(
             field.value().is_some_and(|shown| shown.ends_with('%')),
             "and the unit it is read in: {:?}",
             field.value()
         );
-        assert!((min - 0.02).abs() < f64::EPSILON, "what is stored: {min}");
+        assert!((min - 0.03).abs() < f64::EPSILON, "what is stored: {min}");
     }
 
     /// A substat chip states its name; ticked it unfolds a threshold in place,
@@ -1374,6 +1379,37 @@ mod tests {
         assert_eq!(editor.filter.required_substats.len(), 1);
         assert_eq!(editor.filter.required_substats[0].name, "speed");
         assert_eq!(editor.filter.required_substats[0].min, None);
+    }
+
+    /// The Hunt body wires the mode strip to the filter's own field, and a
+    /// requirement already held keeps its threshold across the switch.
+    ///
+    /// `substat_chips` is where the strip is drawn and `hunt::tests` is where it
+    /// is exercised; what this adds is the wiring — the control reaches
+    /// `filter.substat_match` and not a draft of its own, which is the failure a
+    /// unit test of the widget cannot see.
+    #[test]
+    fn the_substat_mode_reaches_the_filter_from_the_hunt_body() {
+        let mut editor = stocked_editor();
+        editor.filter.required_substats = vec![SubstatReq {
+            name: "speed".to_owned(),
+            min: Some(8.0),
+        }];
+        let mut harness = setup_harness(|ui| {
+            let _ = edit_setup(ui, &mut editor);
+        });
+        harness.get_by_label("any").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(
+            editor.filter.substat_match,
+            crate::domain::filter::SubstatMatch::Any
+        );
+        assert_eq!(
+            editor.filter.required_substats[0].min,
+            Some(8.0),
+            "switching how requirements combine must not touch one"
+        );
     }
 
     /// And unticking removes it, rather than leaving a chip that lies.
@@ -2143,6 +2179,60 @@ mod tests {
         let path = std::env::var_os("ARKYVE_RENDER_DIR")
             .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
             .join("stop.png");
+        image.save(&path).expect("save png");
+        eprintln!("rendered {}", path.display());
+    }
+
+    /// The substat block, in the three states one row can hold at once: a
+    /// requirement with a threshold, one without, and the values nobody asked
+    /// for. The `≥` and its number ride INSIDE the requirement's own box, and a
+    /// picture is the only thing that can say whether they read as one object.
+    #[test]
+    #[cfg(feature = "render-png")]
+    #[ignore = "renders the substat block to a PNG for visual iteration; run with --ignored"]
+    fn render_substat_block_png() {
+        let mut reqs = vec![
+            SubstatReq {
+                name: "att_rate".to_owned(),
+                min: Some(0.05),
+            },
+            SubstatReq {
+                name: "speed".to_owned(),
+                min: None,
+            },
+        ];
+        let mut mode = crate::domain::filter::SubstatMatch::Any;
+        let choices: Vec<VocabularyEntry> = [
+            ("att", "Attack", false),
+            ("att_rate", "Attack(%)", true),
+            ("max_hp", "Health", false),
+            ("speed", "Speed", false),
+            ("cri", "Critical Hit Chance", true),
+            ("cri_dmg", "Critical Hit Damage", true),
+        ]
+        .into_iter()
+        .map(|(id, label, percent)| VocabularyEntry {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            percent,
+        })
+        .collect();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(430.0, 160.0))
+            .with_pixels_per_point(2.0)
+            .wgpu()
+            .build_ui(move |ui| {
+                theme::apply(ui.ctx());
+                let bg = ui.visuals().panel_fill;
+                ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, bg);
+                ui.add_space(theme::SP_SM);
+                substat_chips(ui, &mut reqs, &mut mode, &choices);
+            });
+        harness.run();
+        let image = harness.render().expect("wgpu render");
+        let path = std::env::var_os("ARKYVE_RENDER_DIR")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
+            .join("substats.png");
         image.save(&path).expect("save png");
         eprintln!("rendered {}", path.display());
     }

@@ -639,11 +639,17 @@ backend = \"input\"
     #[test]
     fn inert_filter_keys_are_not_written() {
         // The `Timings` twin: one item name typed would otherwise write
-        // `kinds = []`, `sets = []`, `required_substats = []` and
-        // `include_sold_out = false` too.
+        // `kinds = []`, `sets = []`, `required_substats = []`,
+        // `include_sold_out = false` and `substat_match = "all"` too.
         let out = write_sections("", &[Section::Filter(hunt_filter())]).expect("write");
         assert!(out.contains("names = [\"ticketrare_name\"]"));
-        for inert in ["kinds", "sets", "required_substats", "include_sold_out"] {
+        for inert in [
+            "kinds",
+            "sets",
+            "required_substats",
+            "include_sold_out",
+            "substat_match",
+        ] {
             assert!(!out.contains(inert), "{inert} is inert and must be omitted");
         }
         // The omission still round-trips: `#[serde(default)]` restores them.

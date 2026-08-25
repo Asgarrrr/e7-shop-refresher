@@ -72,9 +72,23 @@ pub struct Filter {
     /// `sub_stat_count` 4..4. So "at least 4 substats" is Heroic-or-Epic, where
     /// `min_grade = 5` is Epic alone, and neither can be spelled with the other.
     pub min_substats: Option<u8>,
-    /// Substats that must all be present, each above its optional threshold.
+    /// Substats the item must carry, each above its optional threshold. How
+    /// several of them combine is [`Self::substat_match`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub required_substats: Vec<SubstatReq>,
+    /// Whether [`Self::required_substats`] must ALL hold or any ONE of them.
+    ///
+    /// A mode and not a criterion: it says how a list combines and cannot
+    /// restrict on its own, which is why [`Self::has_gear_criteria`] does not
+    /// read it and [`Self::is_unrestricted`] does not count it. `include_sold_out`
+    /// is the other field of that shape.
+    ///
+    /// Defaults to [`SubstatMatch::All`], which is what every filter did before
+    /// the mode existed, and is skipped when it holds — so a `config.toml`
+    /// written by an older build reloads unchanged and Apply never adds a line
+    /// saying what was already true.
+    #[serde(skip_serializing_if = "SubstatMatch::is_all")]
+    pub substat_match: SubstatMatch,
     /// Inclusive gold cap; an unknown price fails it.
     ///
     /// Belongs to the GEAR branch, so it is **not** a global cap: beside a
@@ -163,6 +177,41 @@ where
     Ok(kinds)
 }
 
+/// How the entries of [`Filter::required_substats`] combine.
+///
+/// `All` is a piece carrying every substat named — the shape of a hunt for one
+/// specific build. `Any` is a piece carrying at least one of them, which is what
+/// a player watching for "speed OR crit" is after and what a single conjunction
+/// could not spell: with two entries joined by AND, a roll satisfying one is
+/// refused, and the shop rolls four substats out of eleven.
+///
+/// An unspelled variant is refused at parse time rather than folded into a
+/// catch-all, for the reason [`hunt_kinds`] gives at length: as text, a typo and
+/// a deliberate choice are the same bytes, and the wrong fold here silently
+/// widens or narrows what the loop buys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubstatMatch {
+    /// Every requirement holds. The behaviour of every filter written before
+    /// this mode existed, and the default.
+    #[default]
+    All,
+    /// At least one requirement holds.
+    Any,
+}
+
+impl SubstatMatch {
+    /// Whether this is the default mode. Written for `skip_serializing_if`,
+    /// which hands it a reference.
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's skip_serializing_if takes &Self"
+    )]
+    fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
 /// One required substat, by exact internal name (`speed`, `cri`, ...). `min` is
 /// an inclusive threshold; `None` means presence is enough. `name` is
 /// deliberately required: a nameless requirement would match nothing.
@@ -223,6 +272,10 @@ impl Filter {
             // Applied to every item by `matches` before either branch.
             kinds: _,
             include_sold_out: _,
+            // A mode, not a criterion: it says how `required_substats`
+            // combine, so an empty list stays an empty list under either
+            // value and cannot arm this branch. See its own doc.
+            substat_match: _,
             // The other branch.
             names: _,
         } = self;
@@ -281,9 +334,23 @@ impl Filter {
         {
             return false;
         }
-        self.required_substats
-            .iter()
-            .all(|req| req.satisfied_by(item))
+        match self.substat_match {
+            SubstatMatch::All => self
+                .required_substats
+                .iter()
+                .all(|req| req.satisfied_by(item)),
+            // The emptiness test leads, and it is not a shortcut: `any` over
+            // nothing is `false`, so without it a mode a player switched with
+            // no requirement listed would refuse every piece of gear — the one
+            // asymmetry between the two variants, and the whole of it.
+            SubstatMatch::Any => {
+                self.required_substats.is_empty()
+                    || self
+                        .required_substats
+                        .iter()
+                        .any(|req| req.satisfied_by(item))
+            }
+        }
     }
 
     /// `true` when this filter names a slot and the snapshot answered none —
@@ -335,6 +402,15 @@ impl Filter {
 impl SubstatReq {
     /// Scans *all* substats of the matching name: an item may list the same
     /// stat twice (a blank entry, then the rolled value).
+    ///
+    /// **The list's first entry is the piece's MAIN stat**, so a requirement is
+    /// satisfied by either — measured on 7,941 captured shop items, where the
+    /// wire's `op[0]` is the part's own stat every time and takes one of three
+    /// fixed values per part (a weapon's attack reads 66, 88 or 100, one per
+    /// item level). Deliberately not separated: `speed ≥ 6` is a hunt for speed
+    /// BOOTS, whose speed is a main stat and never a roll, and it is the hunt
+    /// this window exists for. `ui::editor::hunt::SUBSTAT_RANGE` sizes its
+    /// threshold field off the same whole list, for the same reason.
     fn satisfied_by(&self, item: &ShopItem) -> bool {
         item.substats.iter().any(|stat| {
             stat.name == self.name
@@ -691,6 +767,117 @@ mod tests {
         let mut item = equip();
         item.substats = vec![substat("speed", None), substat("speed", Some(30.0))];
         assert!(filter.matches(&item));
+    }
+
+    /// Two requirements, and the mode is the whole difference: a piece with one
+    /// of them is a hit under `Any` and a miss under `All`.
+    ///
+    /// The shop rolls four substats out of eleven, so a two-entry conjunction is
+    /// a hunt that almost never fires — which is what `Any` exists for.
+    #[test]
+    fn the_substat_mode_decides_whether_one_hit_is_enough() {
+        let speed_and_crit = vec![
+            SubstatReq {
+                name: "speed".to_owned(),
+                min: None,
+            },
+            SubstatReq {
+                name: "cri_dmg".to_owned(),
+                min: None,
+            },
+        ];
+        // `equip()` carries speed and cri, never cri_dmg.
+        let all = Filter {
+            required_substats: speed_and_crit.clone(),
+            ..Filter::default()
+        };
+        assert_eq!(all.substat_match, SubstatMatch::All, "the default");
+        assert!(!all.matches(&equip()), "one of two is not both");
+        let any = Filter {
+            substat_match: SubstatMatch::Any,
+            required_substats: speed_and_crit,
+            ..Filter::default()
+        };
+        assert!(any.matches(&equip()), "one of two is enough");
+        // And `Any` still refuses a piece answering neither, or it would be no
+        // criterion at all.
+        let neither = ShopItem {
+            substats: vec![substat("def", Some(30.0))],
+            ..equip()
+        };
+        assert!(!any.matches(&neither));
+    }
+
+    /// Each entry's own threshold survives the mode: `Any` asks for one
+    /// requirement SATISFIED, not one substat merely present.
+    #[test]
+    fn the_any_mode_still_applies_each_threshold() {
+        let filter = Filter {
+            substat_match: SubstatMatch::Any,
+            required_substats: vec![SubstatReq {
+                name: "speed".to_owned(),
+                min: Some(20.0),
+            }],
+            ..Filter::default()
+        };
+        // `equip()` rolls speed 15, under the floor.
+        assert!(!filter.matches(&equip()));
+    }
+
+    /// An empty list does not constrain under EITHER mode — `any` over nothing
+    /// is `false`, so a mode switched with no requirement listed would otherwise
+    /// refuse every piece of gear the rest of the filter accepted.
+    #[test]
+    fn switching_the_mode_with_no_requirement_refuses_nothing() {
+        let any = Filter {
+            substat_match: SubstatMatch::Any,
+            sets: vec!["set_speed".to_owned()],
+            ..Filter::default()
+        };
+        assert!(any.matches(&equip()));
+        // And it is not a criterion of its own: alone it still matches
+        // everything, so the loop must keep refusing to arm on it.
+        let alone = Filter {
+            substat_match: SubstatMatch::Any,
+            ..Filter::default()
+        };
+        assert!(alone.is_unrestricted());
+        assert!(alone.matches(&token("ticketrare_name")));
+    }
+
+    /// The mode round-trips, an unspelled one is refused, and a file that never
+    /// mentions it keeps the behaviour every filter had before it existed.
+    #[test]
+    fn the_substat_mode_is_a_closed_spelling_that_defaults_to_all() {
+        assert_eq!(
+            toml::from_str::<Filter>("")
+                .expect("empty parses")
+                .substat_match,
+            SubstatMatch::All
+        );
+        for (text, mode) in [("all", SubstatMatch::All), ("any", SubstatMatch::Any)] {
+            let filter: Filter = toml::from_str(&format!("substat_match = {text:?}"))
+                .expect("a spelled mode parses");
+            assert_eq!(filter.substat_match, mode);
+            let back: Filter =
+                toml::from_str(&toml::to_string(&filter).expect("serialize")).expect("deserialize");
+            assert_eq!(back.substat_match, mode);
+        }
+        assert!(
+            toml::from_str::<Filter>("substat_match = \"either\"").is_err(),
+            "a typo must not fold into a mode nobody chose"
+        );
+        // The default writes no key: an older `config.toml` must not grow a
+        // line on the first Apply saying what was already true.
+        let text = toml::to_string(&Filter {
+            required_substats: vec![SubstatReq {
+                name: "speed".to_owned(),
+                min: None,
+            }],
+            ..Filter::default()
+        })
+        .expect("serialize");
+        assert!(!text.contains("substat_match"), "{text}");
     }
 
     #[test]

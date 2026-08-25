@@ -6,7 +6,7 @@ use eframe::egui;
 
 use super::super::theme;
 use super::{arm_optional, count_label, optional_field};
-use crate::domain::filter::{Filter, SubstatReq};
+use crate::domain::filter::{Filter, SubstatMatch, SubstatReq};
 use crate::domain::shop::Gold;
 use crate::render::kind_label;
 use crate::ui::icons::SetIcons;
@@ -49,32 +49,123 @@ const HUNT_TOKENS: [(&str, &str, u32); 3] = [
 /// are 44px, so this is a downscale and never an upscale.
 const SET_ICON: f32 = 32.0;
 
-/// The threshold a freshly armed `≥` starts at, one per substat family.
+/// What the shop rolls for each substat: the lowest and the highest value it
+/// has been seen to sell, in the unit the WIRE sends — a fraction for the
+/// percent-bearing ones, a whole number for the rest.
 ///
-/// Measured on 59 real gear pieces: a percent-bearing substat arrives as a
-/// fraction and never leaves `0.02..=0.12`, while `att`, `def`, `max_hp` and
-/// `speed` are whole and run `1..=472`. Both seeds are the FLOOR of their own
-/// domain, which is one policy and not two — a freshly armed threshold excludes
-/// nothing the game can produce, and every drag from there restricts.
+/// The low end is where a freshly armed `≥` starts, so arming a requirement
+/// excludes nothing and every step from there restricts. The high end is where
+/// its field stops: a threshold above the top roll is a hunt that cannot fire,
+/// and a drag that can reach one is a trap the control need not offer.
 ///
-/// Both families used to seed at `1.0`. On a percent substat that is one
-/// hundred percent, eight times the largest roll in the game, so ticking `≥`
-/// emptied the hunt silently and the first drag step crossed the whole real
-/// domain.
-const PERCENT_SEED: f64 = 0.02;
-const WHOLE_SEED: f64 = 1.0;
+/// **Measured on the wire, on 7,941 pieces of gear across 2,428 captured
+/// `random_shop` responses** (`E7_Datamine/mitm_tcp3333_live/by_cmd`, all four
+/// grades, Epic included). Every one of the 19,628 values is a **whole number in
+/// the unit the game shows** — 0 exceptions, and no zeroes either. That is what
+/// [`threshold_field`] rests on: a substat is not a continuous quantity, and a
+/// control that steps it in tenths offers two thresholds out of three that no
+/// roll can tell apart.
+///
+/// **The range spans the piece's MAIN stat as well, because the list does.** The
+/// wire's `data.op` leads with the main stat — it is `op[0]` on all 7,941 items,
+/// it is the part's own stat every time (`att` on a weapon, `max_hp` on a helm),
+/// and it takes one of exactly three values per part, one per item level the
+/// shop sells: 66/88/100 for a weapon's attack, 352/472/540 for a helm's health.
+/// `data.g` counts it too, which is why grade 2/3/4/5 gives `op` lengths
+/// 2/3/4/5 for 1/2/3/4 rolled substats. The rolled substats alone stop far
+/// lower — `att` at 45, `max_hp` at 190, `speed` at 4 — so a ceiling taken from
+/// them would refuse `speed ≥ 6`, which is a hunt for speed boots and the one
+/// most players open this window to set up. [`crate::domain::filter::SubstatReq`]
+/// scans the whole list, so the field's domain is the whole list's.
+///
+/// **Not read off `db_equip_stat`, and that is a correction rather than a
+/// preference.** Joining that table's `val_min`/`val_max` through
+/// `db_equip_item.sub_stat` gives a domain three to five times too small — `att`
+/// to 32 where a weapon's own attack reads 100 — so whatever those rows
+/// describe, it is not what a shop piece carries on the wire. The wire is the
+/// authority here; the DB was the plausible-looking wrong source.
+///
+/// **One shop level, and that is the caveat.** All 2,428 rolls were taken at
+/// `rshop_level` 13, where the shop sells gear of level 55, 70 and 85. The
+/// ceilings above are that level-85 top row; a shop level the player has not
+/// reached could sell higher. Which is why the CEILING is a convenience the
+/// field clamps to and never a filtering rule, and why [`SHOWN_FLOOR`] rather
+/// than this table's low end is what a field floors at.
+///
+/// Ids and not labels, because a label is a translation — the same reason
+/// [`VocabularyEntry::percent`] is a flag on the wire rather than a "(%)" read
+/// off the words.
+const SUBSTAT_RANGE: [(&str, f64, f64); 11] = [
+    ("att", 18.0, 100.0),
+    ("att_rate", 0.03, 0.12),
+    ("def", 15.0, 60.0),
+    ("def_rate", 0.03, 0.12),
+    ("max_hp", 88.0, 540.0),
+    ("max_hp_rate", 0.03, 0.12),
+    ("speed", 1.0, 8.0),
+    ("cri", 0.02, 0.11),
+    ("cri_dmg", 0.03, 0.13),
+    ("acc", 0.03, 0.12),
+    ("res", 0.03, 0.12),
+];
 
-/// Drag steps, in the unit the field SHOWS. The percent domain is ten points
-/// wide, so the whole field's `0.5` would cross all of it in twenty pixels.
-const PERCENT_STEP: f64 = 0.1;
-const WHOLE_STEP: f64 = 0.5;
+/// The range for a substat [`SUBSTAT_RANGE`] does not name: one unit up from
+/// nothing, and open to the top of its family's unit.
+///
+/// Reachable from a `config.toml` naming a stat the game has since renamed, and
+/// from a catalog that offers one. Deliberately the widest range rather than a
+/// guessed one — this end cannot know what such a stat rolls, and a seed or a
+/// cap invented for it would be a number with nothing behind it.
+const UNNAMED_SEED_PERCENT: f64 = 0.01;
+const UNNAMED_SEED_WHOLE: f64 = 1.0;
 
-/// The seed for a substat, given whether the vocabulary flagged it percent.
+/// The floor of every threshold field, in the unit it SHOWS.
+///
+/// One and not the substat's own lowest roll, though that number is right
+/// there in [`SUBSTAT_RANGE`]: the shop's gear scales with the player's shop
+/// level and every captured roll comes from one level, so flooring at the
+/// measured minimum would forbid exactly the thresholds a weaker shop needs —
+/// `max_hp ≥ 40` is meaningless at level 13 and is the whole useful range
+/// somewhere below it. What this rules out is what the player asked it to: a
+/// threshold of zero, or of less.
+const SHOWN_FLOOR: i32 = 1;
+
+/// The top of a percent field with no measured ceiling. Not a roll and not a
+/// measurement: a rate is a fraction of a whole, and no piece of gear can carry
+/// more than the whole of one.
+const PERCENT_CEILING: f64 = 1.0;
+
+/// The range for one substat: [`SUBSTAT_RANGE`]'s, else its family's widest.
+///
 /// One spelling, called from the chip (which holds the entry) and from the
 /// normalising pass (which has to look the entry up).
-const fn seed_for(percent: bool) -> f64 {
-    if percent { PERCENT_SEED } else { WHOLE_SEED }
+fn range_for(id: &str, percent: bool) -> (f64, f64) {
+    SUBSTAT_RANGE
+        .iter()
+        .find(|(name, _, _)| *name == id)
+        .map_or_else(
+            || {
+                if percent {
+                    (UNNAMED_SEED_PERCENT, PERCENT_CEILING)
+                } else {
+                    (UNNAMED_SEED_WHOLE, f64::from(i32::MAX))
+                }
+            },
+            |(_, seed, ceiling)| (*seed, *ceiling),
+        )
 }
+
+/// Where a freshly armed `≥` starts: the lowest roll the shop sells for that
+/// substat.
+fn seed_for(id: &str, percent: bool) -> f64 {
+    range_for(id, percent).0
+}
+
+/// Drag steps, in the unit the field SHOWS. Both cross their domain in a few
+/// hundred pixels: the percent one is ten points wide, the whole one runs to
+/// the hundreds.
+const PERCENT_STEP: f64 = 0.1;
+const WHOLE_STEP: f64 = 0.5;
 
 /// One-line recap of the hunt draft for the folded Hunt bar. If a filter
 /// restricts, the summary must say so: every field [`Filter::is_unrestricted`]
@@ -106,11 +197,17 @@ pub(in crate::ui) fn hunt_summary(filter: &Filter) -> String {
         parts.push(count_label(filter.slots.len(), "slot", "slots"));
     }
     if !filter.required_substats.is_empty() {
-        parts.push(count_label(
-            filter.required_substats.len(),
-            "substat",
-            "substats",
-        ));
+        let tally = count_label(filter.required_substats.len(), "substat", "substats");
+        // The mode is named only where it changes the predicate. Over one
+        // requirement `all` and `any` are the same question, and "any of 1
+        // substat" would be a distinction the engine does not make.
+        parts.push(
+            if filter.substat_match == SubstatMatch::Any && filter.required_substats.len() > 1 {
+                format!("any of {tally}")
+            } else {
+                tally
+            },
+        );
     }
     // `Some(0)` constrains nothing and `is_unrestricted` refuses to count it,
     // so naming it would be the mirror-image lie.
@@ -590,14 +687,16 @@ pub(super) fn string_list(
     });
 }
 
-/// Required substats: one chip per offered substat, ticked to require it, with
-/// its threshold unfolded in place.
+/// Required substats: how the list combines, then one chip per offered substat
+/// — a pill while it is not asked for, and a box holding its name, its `≥` and
+/// its threshold once it is ([`required_substat`]).
 ///
 /// The threshold is the number the WIRE sends, which is not the number a player
 /// thinks in: a percent-bearing substat arrives as a fraction (`att_rate` is
 /// `0.03` for 3%). The vocabulary states which are which — `VocabularyEntry`'s
-/// `percent` — so such a chip is shown and stepped in whole percent and stores
-/// the fraction [`Filter::matches`] compares against; see [`threshold_field`].
+/// `percent` — so such a requirement is shown and stepped in whole percent and
+/// stores the fraction [`Filter::matches`] compares against; see
+/// [`threshold_field`].
 ///
 /// A requirement the vocabulary cannot name gets a removable row instead of a
 /// chip, for the reason [`unoffered_rows`] gives — and, unlike the other two
@@ -606,6 +705,7 @@ pub(super) fn string_list(
 pub(super) fn substat_chips(
     ui: &mut egui::Ui,
     reqs: &mut Vec<SubstatReq>,
+    mode: &mut SubstatMatch,
     choices: &[VocabularyEntry],
 ) {
     // Over the WHOLE list and ahead of every widget, because both sources of a
@@ -620,18 +720,18 @@ pub(super) fn substat_chips(
     for req in reqs.iter_mut() {
         if req.min.is_some_and(|min| !min.is_finite()) {
             // The same seed a freshly armed chip gets, so a NaN on a
-            // percent-bearing substat lands on 2% rather than on `1.0` — which
-            // is 100%, the very threshold nothing in the game satisfies. A
-            // requirement the vocabulary cannot name states no family and takes
-            // the whole-number seed, which is what every requirement had here
-            // before the flag was read at all.
+            // percent-bearing substat lands on its lowest roll rather than on
+            // `1.0` — which is 100%, the very threshold nothing in the game
+            // satisfies. A requirement the vocabulary cannot name states no
+            // family and takes the whole-number fallback, which is what every
+            // requirement had here before the flag was read at all.
             let percent = choices
                 .iter()
                 .any(|entry| entry.id == req.name && entry.percent);
-            req.min = Some(seed_for(percent));
+            req.min = Some(seed_for(&req.name, percent));
         }
     }
-    ui.label(theme::section("required substats"));
+    substat_header(ui, mode);
     let mut toggled = None;
     // Salted on the row and not per chip, for the reason `choice_list` states:
     // a `push_id` child never reaches `Layout::next_frame`, so anything drawn
@@ -641,39 +741,30 @@ pub(super) fn substat_chips(
     // the salt moved. It shows less than the sets row only because it is
     // shorter; a ticked chip unfolding its threshold adds width again.
     //
-    // The threshold's own two cells sit directly in the row for the same reason
-    // — see [`theme::joined_pair`], which is where a grouping `Ui` would have
-    // reintroduced exactly this — and [`threshold_control`] asks the row for
+    // A requirement's own cells sit directly in the row for the same reason —
+    // see [`theme::joined_run`], which is where a grouping `Ui` would have
+    // reintroduced exactly this — and [`required_substat`] asks the row for
     // their width before drawing so a wrap cannot fall between them.
     ui.push_id("required substats", |ui| {
         ui.horizontal_wrapped(|ui| {
             for entry in choices {
-                let held = reqs.iter().position(|req| req.name == entry.id);
-                let mut on = held.is_some();
-                if text_chip(ui, &entry.label, &mut on) {
-                    toggled = Some(entry.id.clone());
-                }
-                // The threshold belongs to the chip, so it appears beside the one
-                // it applies to and nowhere else.
-                if let Some(index) = held {
-                    let req = &mut reqs[index];
-                    let mut armed = req.min.is_some();
-                    match req.min.as_mut() {
-                        // Armed: the sign and its value are one control.
-                        Some(min) => {
-                            if threshold_control(ui, min, entry.percent) {
-                                armed = false;
-                            }
-                        }
-                        // Unarmed: the sign alone, and a chip rather than a
-                        // checkbox — it rides in the same wrapped row as the
-                        // values above, where it would otherwise be the one tick
-                        // box left among pills.
-                        None => {
-                            text_chip(ui, "≥", &mut armed);
+                match reqs.iter().position(|req| req.name == entry.id) {
+                    // Not asked for: a lone pill, like every other offered
+                    // value on this screen.
+                    None => {
+                        let mut on = false;
+                        if text_chip(ui, &entry.label, &mut on) {
+                            toggled = Some(entry.id.clone());
                         }
                     }
-                    arm_optional(armed, &mut req.min, seed_for(entry.percent));
+                    // Asked for: the name, the sign and the number as one box,
+                    // so the threshold appears on the requirement it applies to
+                    // and can be read as belonging to it.
+                    Some(index) => {
+                        if required_substat(ui, &entry.label, &mut reqs[index].min, entry) {
+                            toggled = Some(entry.id.clone());
+                        }
+                    }
                 }
             }
         });
@@ -697,55 +788,162 @@ pub(super) fn substat_chips(
     );
 }
 
-/// The width [`threshold_control`] reserves before it draws.
+/// The width the value cell takes, and the only part of a run that cannot be
+/// measured off its text: a [`egui::DragValue`] is sized by the number it
+/// currently holds, and the number a drag is about to produce is wider.
 ///
-/// The pair goes into the caller's own wrapped row rather than into a child
-/// `Ui` — [`theme::joined_pair`] gives the reason at length — so nothing stops
-/// `horizontal_wrapped` breaking the line between the two cells and leaving half
-/// a box on each. The control asks the row for this much in one piece first.
-///
-/// Measured rather than chosen: the pair lays out at 68px on the live substat
-/// vocabulary, and this is spelled with headroom because the two failures are
-/// not symmetric — too small splits the control, too large only wraps one chip
-/// early. `the_joined_threshold_fits_the_width_it_reserves` holds the number to
-/// what the control actually takes.
-const THRESHOLD_WIDTH: f32 = 88.0;
+/// Measured at 49px on the widest text the field can be asked to render — four
+/// whole digits, against the `100%` a percent one tops out at — and spelled with
+/// headroom over it, because the two failures are not symmetric: too small
+/// splits the control across a wrap, too large only breaks the line one chip
+/// early. `the_value_cell_fits_the_width_it_reserves` holds it to what the field
+/// actually takes.
+const VALUE_CELL: f32 = 56.0;
 
-/// The `≥` and the value it applies to, as one control.
+/// The horizontal room one required substat needs, in one piece.
 ///
-/// They were two neighbours: a `≥` pill, eight pixels of nothing, and a stepper
-/// eight pixels taller than every chip on the row. Three boxes for two facts,
-/// and nothing on screen said the sign governed the number rather than the chip
-/// before it. Joined, the sign is the lit left cap of the box the value sits in.
+/// The run goes into the caller's own wrapped row rather than into a child `Ui`
+/// — [`theme::joined_run`] gives the reason at length — so nothing stops
+/// `horizontal_wrapped` breaking the line between two cells and leaving a
+/// fragment of the box on each. The control asks the row for this much first.
 ///
-/// **The arming stays on the `≥`**, where a player already finds it, and it is
-/// still the only way in or out: clicking the cap while armed takes the
-/// threshold away. The value cell cannot double as the switch — a
-/// [`egui::DragValue`] spends its own click opening text entry, so arming on it
-/// would be a gesture fighting the widget's.
+/// Computed rather than spelled, because the first cell is a NAME: the eleven
+/// the game rolls run from "Speed" to "Critical Hit Damage", and one constant
+/// wide enough for the longest would wrap the row several chips early.
+fn run_width(ui: &egui::Ui, label: &str, armed: bool) -> f32 {
+    cell_width(ui, label) + cell_width(ui, "≥") + if armed { VALUE_CELL } else { 0.0 }
+}
+
+/// One text cell's width: its galley, plus the padding [`theme::joined_run`]
+/// puts either side of it.
 ///
-/// Answers whether the cap was clicked, i.e. whether the threshold should go.
-fn threshold_control(ui: &mut egui::Ui, stored: &mut f64, percent: bool) -> bool {
-    if ui.available_width() < THRESHOLD_WIDTH {
+/// The chip box and not the caller's own: the run restyles the `Ui` it draws
+/// into, so measuring against `ui.spacing()` here would read a padding this cell
+/// never wears.
+fn cell_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, theme::INK);
+    galley.size().x + 2.0 * theme::SP_SM
+}
+
+/// One required substat: its name, the `≥` that qualifies it and the value the
+/// sign applies to, as ONE box.
+///
+/// They were three neighbours — a pill, eight pixels of nothing, a `≥` pill,
+/// eight more, a stepper — for two facts about one substat, and nothing on
+/// screen said which chip the number belonged to. A row of several requirements
+/// read as a list of six or nine loose controls. Joined, the run is one object
+/// per requirement: the lit cells are what is being asked for, the ground cell
+/// is the number being asked.
+///
+/// **Each cell keeps the click it always had.** The name drops the requirement,
+/// the sign arms and disarms the threshold. The value cell cannot double as the
+/// switch — a [`egui::DragValue`] spends its own click opening text entry, so
+/// arming on it would be a gesture fighting the widget's.
+///
+/// Answers whether the NAME was clicked, i.e. whether the requirement should go.
+fn required_substat(
+    ui: &mut egui::Ui,
+    label: &str,
+    min: &mut Option<f64>,
+    entry: &VocabularyEntry,
+) -> bool {
+    let armed = min.is_some();
+    if ui.available_width() < run_width(ui, label, armed) {
         ui.end_row();
     }
     let enabled = ui.is_enabled();
-    let (cap, ()) = theme::joined_pair(
-        ui,
-        |ui| ui.add(egui::Button::new("≥")),
-        |ui| threshold_field(ui, stored, percent),
-    );
-    // The name `arm_threshold` and every player looking for the sign asks by.
-    // A bare `Button` states a `WidgetType::Button`, and this one toggles, so it
-    // is restated as the checkbox it behaves like — the contract [`text_chip`]
-    // carries, for the same reason and with the same duplicate event.
-    //
-    // `!clicked()` because a click here DISARMS: the value the click produced is
-    // "off", though the cap is drawn on for the frame it happens in.
-    cap.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, !cap.clicked(), "≥")
+    let (seed, ceiling) = range_for(&entry.id, entry.percent);
+    let (name, sign) = theme::joined_run(ui, |ui| {
+        theme::joined_cell(ui, theme::joint(true, false), theme::CELL_LIT);
+        let name = ui.add(egui::Button::new(label));
+        // The sign is lit only while it holds a threshold, so an unarmed run
+        // reads as a name with a dim invitation on its end rather than as two
+        // things equally chosen.
+        theme::joined_cell(
+            ui,
+            theme::joint(false, !armed),
+            if armed {
+                theme::CELL_LIT
+            } else {
+                theme::CELL_GROUND
+            },
+        );
+        let sign = ui.add(egui::Button::new("≥"));
+        if let Some(stored) = min.as_mut() {
+            theme::joined_cell(ui, theme::joint(false, true), theme::CELL_GROUND);
+            threshold_field(ui, stored, entry.percent, ceiling);
+        }
+        (name, sign)
     });
-    cap.clicked()
+    // Both names are written back for the reason [`text_chip`] carries: a bare
+    // `Button` states a `WidgetType::Button`, and these two toggle, so each is
+    // restated as the checkbox it behaves like — with the same duplicate event.
+    //
+    // The name cell is drawn only while the requirement is held, so it is
+    // selected unless this very click is the one taking it away.
+    name.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, !name.clicked(), label)
+    });
+    // And the sign states the value its own click produced, not the one it
+    // replaced: `!=` on two bools is the flip.
+    sign.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            enabled,
+            armed != sign.clicked(),
+            "≥",
+        )
+    });
+    if sign.clicked() {
+        *min = if armed { None } else { Some(seed) };
+    }
+    name.clicked()
+}
+
+/// The header of the substat block: what the criterion is, and how its entries
+/// combine.
+///
+/// The mode belongs on the header rather than beside the chips, because it is
+/// the one control here that is about the LIST and not about a substat. It is
+/// drawn whether or not anything is required: it says what a second chip would
+/// mean before there is a second chip, and a control that appears halfway
+/// through picking moves the row under the pointer.
+///
+/// [`theme::segmented_strip`] for the reason the rarity ladder takes it — the
+/// choice is exclusive, and this window has one grammar for that. There is no
+/// way back OUT of a mode, unlike the ladder: `all` is a value and not the
+/// absence of one, and the filter is in one of the two at all times.
+///
+/// **Its words are `.small()`, where the ladder's are body text.** At the body
+/// size the strip stood taller than the block's own header and read as the
+/// title of it — an object announcing the section rather than a modifier on the
+/// list below. The rarity ladder is a criterion in its own right and keeps the
+/// larger type; this one qualifies a list that is already on screen.
+fn substat_header(ui: &mut egui::Ui, mode: &mut SubstatMatch) {
+    ui.horizontal(|ui| {
+        ui.label(theme::section("required substats"));
+        theme::segmented_strip(ui, |ui| {
+            for (value, label, hint) in [
+                (
+                    SubstatMatch::All,
+                    "all",
+                    "every substat ticked has to be on the piece",
+                ),
+                (SubstatMatch::Any, "any", "one of them is enough"),
+            ] {
+                if ui
+                    .selectable_label(*mode == value, egui::RichText::new(label).small())
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    *mode = value;
+                }
+            }
+        });
+    });
 }
 
 /// The `≥` stepper for one required substat, in the unit a player reads.
@@ -755,32 +953,60 @@ fn threshold_control(ui: &mut egui::Ui, stored: &mut f64, percent: bool) -> bool
 /// `config.toml` and `0.03` on the wire. A whole one is its own unit and passes
 /// through.
 ///
+/// **The value is an integer, and that is a fact about the game and not a
+/// rounding taste.** Every one of the 19,628 rolls measured on the wire is a
+/// whole number in the unit shown — see [`SUBSTAT_RANGE`] — so on an `f64` field
+/// two thirds of the values a drag lands on are thresholds no roll can be told
+/// apart by, and `2.7%` reads as a precision the shop does not have. The stepper
+/// is therefore typed `i32`: egui rounds a drag over an integer, where
+/// `fixed_decimals` would only have hidden the fraction it kept storing.
+///
+/// **It is bounded at both ends, asymmetrically.** The floor is
+/// [`SHOWN_FLOOR`] — a threshold of zero is not one — and the ceiling is the
+/// highest roll the shop has been seen to sell for THIS substat, above which no
+/// piece can ever match. Neither bound filters anything: they are where the drag
+/// stops, and a value a `config.toml` already carries outside them survives
+/// untouched (`clamp_existing_to_range(false)`).
+///
 /// The conversion sits on a local shown value rather than in `custom_formatter`
 /// / `custom_parser`, and that is the point of the split: those two convert the
-/// TEXT while leaving `speed` — and any future `range` — in wire units, so the
-/// unit would be spelled in two places and only one of them would move in a
-/// diff. Here every number the widget touches is in percent and the two lines
-/// that cross the boundary sit next to each other. `currency_row` lends an
-/// optional currency field its raw number the same way, for the same reason.
+/// TEXT while leaving `speed` — and the range below — in wire units, so the unit
+/// would be spelled in two places and only one of them would move in a diff.
+/// Here every number the widget touches is in percent and the two lines that
+/// cross the boundary sit next to each other. `currency_row` lends an optional
+/// currency field its raw number the same way, for the same reason.
 ///
-/// The write-back is gated on `is_finite` so this branch can never be the SOURCE
-/// of a non-finite threshold: `DragValue` parses typed text with
-/// `f64::from_str`, which takes "nan"/"inf", and the `/ 100.0` would carry
-/// either straight through to the stored value. The normalising pass leading
-/// [`substat_chips`] still owns the ones that arrive from `config.toml`, and
-/// still owns the whole list — including the requirements no chip is drawn for.
-fn threshold_field(ui: &mut egui::Ui, stored: &mut f64, percent: bool) {
-    let mut shown = if percent { *stored * 100.0 } else { *stored };
-    let field = egui::DragValue::new(&mut shown);
-    let response = ui.add(if percent {
-        field.speed(PERCENT_STEP).suffix("%")
-    } else {
-        field.speed(WHOLE_STEP)
-    });
+/// **A value already stored is shown rounded and left alone.** `config.toml` can
+/// carry `min = 0.027`, which this field reads as `3%`; the write-back only
+/// fires on a change, so nothing rewrites a player's file behind them — the rule
+/// `seeded_zero_limit_is_not_silently_clamped` states for every bounded field in
+/// this window. It costs nothing in accuracy: no roll sits between 2% and 3%, so
+/// the number on screen and the number in the file accept exactly the same
+/// pieces.
+///
+/// It also cannot be the SOURCE of a non-finite threshold — an `i32` has no NaN
+/// — which is what the `f64` field before it needed an `is_finite` guard for.
+/// The normalising pass leading [`substat_chips`] still owns the ones that
+/// arrive from `config.toml`, and still owns the whole list, including the
+/// requirements no chip is drawn for.
+fn threshold_field(ui: &mut egui::Ui, stored: &mut f64, percent: bool, ceiling: f64) {
+    let scale = if percent { 100.0 } else { 1.0 };
+    // Saturating on the way in, so a threshold from a file no field can hold
+    // still draws something a player can drag out of.
+    let mut shown = (*stored * scale).round() as i32;
+    let response = ui.add(
+        egui::DragValue::new(&mut shown)
+            .speed(if percent { PERCENT_STEP } else { WHOLE_STEP })
+            .range(SHOWN_FLOOR..=(ceiling * scale).round() as i32)
+            // The pair every bounded field here takes: a value the file already
+            // carried is not clamped, a dragged or typed one is.
+            .clamp_existing_to_range(false)
+            .suffix(if percent { "%" } else { "" }),
+    );
     // Only on a change, so an untouched threshold is never round-tripped
-    // through the multiply and back.
-    if response.changed() && shown.is_finite() {
-        *stored = if percent { shown / 100.0 } else { shown };
+    // through the scale and back.
+    if response.changed() {
+        *stored = f64::from(shown) / scale;
     }
 }
 
@@ -848,9 +1074,10 @@ mod tests {
         reqs: &'a mut Vec<SubstatReq>,
         choices: &'a [VocabularyEntry],
     ) -> Harness<'a> {
+        let mut mode = SubstatMatch::default();
         let mut harness = Harness::builder()
             .with_size(egui::vec2(crate::ui::WINDOW_WIDTH, 600.0))
-            .build_ui(|ui| substat_chips(ui, reqs, choices));
+            .build_ui(move |ui| substat_chips(ui, reqs, &mut mode, choices));
         harness.run();
         harness
     }
@@ -864,42 +1091,126 @@ mod tests {
             .expect("egui gives every node its bounds")
     }
 
-    /// The sign and its value are ONE control: the two cells touch, and the
-    /// whole box fits the width the row was asked to reserve for it.
+    /// The name, the sign and the value are ONE control: all three cells touch.
     ///
-    /// Both halves matter. A gap between the cells is the old three-box reading
-    /// coming back with rounder corners; a box wider than [`THRESHOLD_WIDTH`]
-    /// means the reservation no longer covers what it reserves for, and the
-    /// wrap it exists to prevent can fall through the middle of the control
-    /// again.
+    /// A gap anywhere in the run is the old loose-controls reading coming back
+    /// with rounder corners — and it is also how a wrap gets in, since the run
+    /// is reserved as one width and only a run that is actually contiguous is
+    /// covered by it.
     #[test]
-    fn the_joined_threshold_fits_the_width_it_reserves() {
+    fn a_required_substat_is_one_box_from_its_name_to_its_value() {
         let choices = live_choices();
         let mut reqs = vec![SubstatReq {
             name: "speed".to_owned(),
             min: Some(3.0),
         }];
         let harness = substat_row(&mut reqs, &choices);
-        let cap = node_box(&harness, "≥");
+        let name = node_box(&harness, "Speed");
+        let sign = node_box(&harness, "≥");
         let value = harness
             .get_by_role(egui::accesskit::Role::SpinButton)
             .accesskit_node()
             .bounding_box()
             .expect("egui gives every node its bounds");
-        assert!(
-            (value.x0 - cap.x1).abs() < 1.0,
-            "the two cells should share an edge: cap ends at {:.1}, value starts at {:.1}",
-            cap.x1,
-            value.x0
-        );
-        let width = value.x1 - cap.x0;
-        assert!(
-            width <= f64::from(THRESHOLD_WIDTH),
-            "the control takes {width:.0}px and reserves {THRESHOLD_WIDTH}"
-        );
+        for (left, right, seam) in [(name, sign, "name/sign"), (sign, value, "sign/value")] {
+            assert!(
+                (right.x0 - left.x1).abs() < 1.0,
+                "the {seam} cells should share an edge: {:.1} then {:.1}",
+                left.x1,
+                right.x0
+            );
+        }
     }
 
-    /// And the joined pair never lands past the window, on the worst row there
+    /// The one cell of a run whose width cannot be measured off its text fits
+    /// what [`VALUE_CELL`] reserves for it — at the widest threshold the field
+    /// can hold, not at the seeded one.
+    ///
+    /// A value cell wider than its reservation is a run wider than the row was
+    /// asked for, which is the wrap [`run_width`] exists to prevent falling
+    /// through the middle of the control.
+    #[test]
+    fn the_value_cell_fits_the_width_it_reserves() {
+        let choices = live_choices();
+        // 100% on a percent stat and a four-digit whole one: the widest text a
+        // `DragValue` here can be asked to render, well past any real roll.
+        let mut reqs = vec![
+            SubstatReq {
+                name: "cri_dmg".to_owned(),
+                min: Some(1.0),
+            },
+            SubstatReq {
+                name: "max_hp".to_owned(),
+                min: Some(9999.0),
+            },
+        ];
+        let harness = substat_row(&mut reqs, &choices);
+        for field in harness.query_all_by_role(egui::accesskit::Role::SpinButton) {
+            let cell = field
+                .accesskit_node()
+                .bounding_box()
+                .expect("egui gives every node its bounds");
+            let width = cell.x1 - cell.x0;
+            assert!(
+                width <= f64::from(VALUE_CELL),
+                "a value cell takes {width:.0}px and reserves {VALUE_CELL}"
+            );
+        }
+    }
+
+    /// And a run never wraps between its own cells, on the worst row there is:
+    /// every one of the game's eleven substats required, every one of them with
+    /// a threshold armed.
+    ///
+    /// The window is pinned at `WINDOW_WIDTH`, so this row DOES wrap — several
+    /// times. What must not happen is a break inside a run, which
+    /// [`run_width`]'s reservation is the only thing preventing: three cells on
+    /// one line is what says the reservation still covers what it reserves for.
+    #[test]
+    fn a_required_substat_never_wraps_between_its_cells() {
+        let choices = live_choices();
+        let mut reqs: Vec<SubstatReq> = LIVE_SUBSTATS
+            .into_iter()
+            .map(|(id, _, percent)| SubstatReq {
+                name: id.to_owned(),
+                min: Some(seed_for(id, percent)),
+            })
+            .collect();
+        let harness = substat_row(&mut reqs, &choices);
+        let signs: Vec<egui::accesskit::Rect> = harness
+            .query_all_by_label("≥")
+            .map(|cell| {
+                cell.accesskit_node()
+                    .bounding_box()
+                    .expect("egui gives every node its bounds")
+            })
+            .collect();
+        let values: Vec<egui::accesskit::Rect> = harness
+            .query_all_by_role(egui::accesskit::Role::SpinButton)
+            .map(|cell| {
+                cell.accesskit_node()
+                    .bounding_box()
+                    .expect("egui gives every node its bounds")
+            })
+            .collect();
+        assert_eq!(signs.len(), LIVE_SUBSTATS.len(), "one sign per requirement");
+        assert_eq!(values.len(), LIVE_SUBSTATS.len(), "one value per armed one");
+        for (index, (_, label, _)) in LIVE_SUBSTATS.into_iter().enumerate() {
+            let name = node_box(&harness, label);
+            // The vocabulary's order is the draw order, so the nth sign and the
+            // nth value belong to the nth name.
+            for (cell, part) in [(signs[index], "sign"), (values[index], "value")] {
+                assert!(
+                    (cell.y0 - name.y0).abs() < 1.0,
+                    "{label}'s {part} wrapped onto another line: name at y={:.0}, {part} at y={:.0}",
+                    name.y0,
+                    cell.y0
+                );
+            }
+        }
+    }
+
+    /// And the run never lands past the window, on the worst row there
     /// is: every one of the game's eleven substats required, every one of them
     /// with a threshold armed.
     ///
@@ -914,7 +1225,7 @@ mod tests {
             .into_iter()
             .map(|(id, _, percent)| SubstatReq {
                 name: id.to_owned(),
-                min: Some(seed_for(percent)),
+                min: Some(seed_for(id, percent)),
             })
             .collect();
         let harness = substat_row(&mut reqs, &choices);
@@ -944,6 +1255,208 @@ mod tests {
             overflowing.is_empty(),
             "the armed substat row laid out past the window: {overflowing:?}"
         );
+    }
+
+    /// Every substat the game rolls has a range of its OWN, both ends whole in
+    /// the unit shown, positive, and the right way round.
+    ///
+    /// Four claims, one table. The completeness is the tripwire: a substat
+    /// missing from [`SUBSTAT_RANGE`] still works — it falls back to its
+    /// family's widest — so nothing else would notice `max_hp` arming at 1,
+    /// an eighty-eighth of the smallest roll the shop sells, or its field
+    /// letting a drag reach a threshold no piece can meet. The rest is what the
+    /// field's shape rests on: a fractional bound would put the integer stepper
+    /// on a value it cannot reach, and an inverted pair would give
+    /// `DragValue::range` an empty domain to clamp into.
+    #[test]
+    fn every_substat_the_game_rolls_has_a_whole_positive_range_of_its_own() {
+        for (id, label, percent) in LIVE_SUBSTATS {
+            assert!(
+                SUBSTAT_RANGE.iter().any(|(name, _, _)| *name == id),
+                "{label} would fall back to its family's widest range"
+            );
+            let (seed, ceiling) = range_for(id, percent);
+            assert!(seed > 0.0, "{label} seeds at {seed}");
+            assert!(seed <= ceiling, "{label} ranges {seed}..={ceiling}");
+            let scale = if percent { 100.0 } else { 1.0 };
+            for (value, end) in [(seed, "seed"), (ceiling, "ceiling")] {
+                let shown = value * scale;
+                assert!(
+                    (shown - shown.round()).abs() < 1e-9,
+                    "{label}'s {end} is {shown} in the unit a player reads"
+                );
+            }
+        }
+        assert_eq!(
+            SUBSTAT_RANGE.len(),
+            LIVE_SUBSTATS.len(),
+            "the table names exactly the substats the game rolls"
+        );
+    }
+
+    /// The substat row with one requirement in it, ready to be clicked.
+    fn one_requirement<'a>(
+        reqs: &'a mut Vec<SubstatReq>,
+        mode: &'a mut SubstatMatch,
+        choices: &'a [VocabularyEntry],
+    ) -> Harness<'a> {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(crate::ui::WINDOW_WIDTH, 600.0))
+            .build_ui(|ui| substat_chips(ui, reqs, mode, choices));
+        harness.run();
+        harness
+    }
+
+    /// Arming `≥` seeds the lowest roll of THAT substat, not of its family.
+    ///
+    /// `max_hp` is the case that separates them: the family seed was 1, and the
+    /// smallest health roll the shop sells is 88 — so a freshly armed threshold
+    /// sat eighty-seven points below anything it could ever exclude, and the
+    /// whole first half of the drag did nothing at all.
+    #[test]
+    fn arming_a_threshold_seeds_the_lowest_roll_of_that_substat() {
+        let choices = live_choices();
+        for (id, floor) in [("max_hp", 88.0), ("att", 18.0), ("cri", 0.02)] {
+            let mut reqs = vec![SubstatReq {
+                name: id.to_owned(),
+                min: None,
+            }];
+            let mut mode = SubstatMatch::default();
+            let mut harness = one_requirement(&mut reqs, &mut mode, &choices);
+            harness.get_by_label("≥").click();
+            harness.run();
+            drop(harness);
+            assert_eq!(reqs[0].min, Some(floor), "{id}");
+        }
+    }
+
+    /// The field a player drags stops one unit above nothing and at the highest
+    /// roll the shop sells for THAT substat.
+    ///
+    /// Read off the widget's own published bounds rather than off
+    /// [`SUBSTAT_RANGE`], so what this pins is the WIRING: the table can hold
+    /// the right numbers while the field is built with a family default, and
+    /// only the node the player actually drags can tell the two apart. The two
+    /// ends are asymmetric on purpose — see [`SHOWN_FLOOR`].
+    #[test]
+    fn the_field_stops_at_one_and_at_the_highest_roll_the_shop_sells() {
+        let choices = live_choices();
+        // In the unit the field SHOWS: 13 for a 13% ceiling, 540 for 540 health.
+        for (id, ceiling) in [("speed", 8.0), ("max_hp", 540.0), ("cri_dmg", 13.0)] {
+            let percent = LIVE_SUBSTATS
+                .into_iter()
+                .find_map(|(name, _, percent)| (name == id).then_some(percent))
+                .expect("the fixture names every substat");
+            let mut reqs = vec![SubstatReq {
+                name: id.to_owned(),
+                min: Some(seed_for(id, percent)),
+            }];
+            let harness = substat_row(&mut reqs, &choices);
+            let field = harness
+                .get_by_role(egui::accesskit::Role::SpinButton)
+                .accesskit_node();
+            assert_eq!(
+                field.min_numeric_value(),
+                Some(f64::from(SHOWN_FLOOR)),
+                "{id} floors below one"
+            );
+            assert_eq!(field.max_numeric_value(), Some(ceiling), "{id}");
+        }
+    }
+
+    /// A threshold reads as a whole number, and a finer one already in the file
+    /// is rounded on screen without being rewritten underneath the player.
+    ///
+    /// The two halves are one policy. The game rolls whole percents, so `2.7%`
+    /// on screen offers a precision the shop does not have; and `0.027` accepts
+    /// exactly the pieces `0.03` does, so showing the round number tells the
+    /// truth about what the filter DOES while leaving `config.toml` as it was
+    /// written.
+    #[test]
+    fn a_threshold_reads_as_a_whole_number_without_rewriting_the_file() {
+        let choices = live_choices();
+        let mut reqs = vec![SubstatReq {
+            name: "att_rate".to_owned(),
+            min: Some(0.027),
+        }];
+        let harness = substat_row(&mut reqs, &choices);
+        let field = harness
+            .get_by_role(egui::accesskit::Role::SpinButton)
+            .accesskit_node();
+        assert_eq!(field.numeric_value(), Some(3.0), "what the player reads");
+        assert_eq!(
+            field.value().as_deref(),
+            Some("3%"),
+            "and how it is written"
+        );
+        drop(harness);
+        assert_eq!(
+            reqs[0].min,
+            Some(0.027),
+            "a render must not rewrite a threshold the player did not touch"
+        );
+    }
+
+    /// The mode strip writes the filter's own mode, and starts on the value the
+    /// filter holds.
+    #[test]
+    fn the_mode_strip_writes_how_the_requirements_combine() {
+        let choices = live_choices();
+        let mut reqs = vec![SubstatReq {
+            name: "speed".to_owned(),
+            min: None,
+        }];
+        let mut mode = SubstatMatch::All;
+        let mut harness = one_requirement(&mut reqs, &mut mode, &choices);
+        harness.get_by_label("any").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(mode, SubstatMatch::Any);
+        // And back, so every state the control reaches is reachable out of.
+        let mut harness = one_requirement(&mut reqs, &mut mode, &choices);
+        harness.get_by_label("all").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(mode, SubstatMatch::All);
+    }
+
+    /// The folded bar says the mode where the mode decides anything.
+    ///
+    /// A hunt that changed from "both of these" to "either of these" and folded
+    /// up reading the same words would be the summary lying about the criterion
+    /// the loop spends crystals against — the defect `min_grade` and `slots`
+    /// each shipped once already.
+    #[test]
+    fn the_summary_names_the_substat_mode_where_it_changes_the_hunt() {
+        let two = vec![
+            SubstatReq {
+                name: "speed".to_owned(),
+                min: None,
+            },
+            SubstatReq {
+                name: "cri".to_owned(),
+                min: None,
+            },
+        ];
+        let all = Filter {
+            required_substats: two.clone(),
+            ..Filter::default()
+        };
+        assert_eq!(hunt_summary(&all), "2 substats");
+        let any = Filter {
+            substat_match: SubstatMatch::Any,
+            ..all
+        };
+        assert_eq!(hunt_summary(&any), "any of 2 substats");
+        // Over one requirement the two modes are the same predicate, so the bar
+        // states the tally alone rather than a distinction the engine does not
+        // make.
+        let lone = Filter {
+            substat_match: SubstatMatch::Any,
+            required_substats: two[..1].to_vec(),
+            ..Filter::default()
+        };
+        assert_eq!(hunt_summary(&lone), "1 substat");
     }
 
     #[test]
@@ -1050,12 +1563,16 @@ mod tests {
     /// count and lands the author in the list above before the summary can
     /// silently omit it.
     ///
-    /// `include_sold_out` is the one field with no case: it widens rather than
-    /// restricts, `is_unrestricted` ignores it, and so must the summary. It is
-    /// skipped when false, so a filter that leaves it off writes no key.
+    /// Two fields have no case, and both are MODES rather than criteria:
+    /// `include_sold_out` widens rather than restricts, and `substat_match` says
+    /// how a list combines. `is_unrestricted` ignores both, and so must the
+    /// summary — neither can turn an empty hunt into a real one. Each is skipped
+    /// at its default, so a filter carrying neither writes no key and the count
+    /// below still enumerates exactly the criteria.
     #[test]
     fn every_criterion_has_a_case_here() {
         let all = Filter {
+            substat_match: SubstatMatch::All,
             kinds: vec![ItemKind::Equipment],
             names: vec!["ticketrare_name".to_owned()],
             sets: vec!["set_speed".to_owned()],
