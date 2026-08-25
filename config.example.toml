@@ -62,15 +62,24 @@ names = ["ticketrare_name", "ticketspecial_name"]
 
 # One rule per piece of gear worth stopping for. Every criterion inside a rule
 # has to hold; an item satisfying ANY rule is a hit. Two rules are how "a speed
-# boot OR a crit-damage necklace" is spelled — one rule listing both slots and
+# boot OR a crit-damage necklace" is spelled — one rule naming both parts and
 # both stats would also buy a necklace that merely rolled speed.
 #
-# The gear keys used to sit loose in [filter]. A file that still spells them
-# there keeps loading — they are read as one rule — and the next Apply rewrites
-# the section in this shape. Setting both is refused rather than merged.
+# A rule names ONE part, where every other criterion is an any-of list. That
+# asymmetry is the same defect one level down: a piece carries one slot, one set
+# and one main stat, so two sets on a rule is an honest "either set", while
+# slots = ["ring", "neck"] beside mains = ["att_rate", "cri_dmg"] is four
+# combinations where you meant two.
+#
+# The gear keys used to sit loose in [filter], and a rule used to take a plural
+# `slots`. A file spelling either keeps loading: the flat keys are read as one
+# rule, and a rule naming n slots becomes n rules — which buys exactly what it
+# always bought, since a hit only ever needed ONE rule to accept it. The next
+# Apply rewrites the section in this shape. Spelling both `slot` and `slots`, or
+# both the flat keys and rules, is refused rather than merged.
 #
 # [[filter.gear]]
-# slots = ["boot"]                      # any-of: weapon, helm, armor, neck, ring, boot
+# slot = "boot"                         # one of: weapon, helm, armor, neck, ring, boot
 # mains = ["speed"]                     # any-of, by stat id: the piece's MAIN stat, the one its
 #                                       # part decides. A type and never a threshold — its value
 #                                       # is fixed by the part and the item level. It implies the

@@ -220,8 +220,15 @@ fn rule_parts(rule: &GearRule) -> Vec<String> {
     if !rule.sets.is_empty() {
         parts.push(count_label(rule.sets.len(), "set", "sets"));
     }
-    if !rule.slots.is_empty() {
-        parts.push(count_label(rule.slots.len(), "slot", "slots"));
+    if let Some(slot) = &rule.slot {
+        // NAMED and not counted, unlike the sets and stats around it, because
+        // there is exactly one of it — "1 slot" would spend a summary line
+        // saying only that a part was chosen. The words are the wire's own id
+        // (`boot`, `neck`), since this takes the filter and nothing else and the
+        // game's word for a part is the server's to send; the ids are short and
+        // read as the part, where `acc` reads "Effectiveness". A reader who
+        // wants the game's word opens the section, where the strip paints it.
+        parts.push(slot.clone());
     }
     if !rule.mains.is_empty() {
         // Counted and not named, like the sets and slots above it: the words
@@ -647,6 +654,197 @@ fn token_card(ui: &mut egui::Ui, label: &str, price: Gold, on: &mut bool) -> boo
         },
     );
     response.clicked()
+}
+
+/// The word a piece that names no part wears.
+///
+/// It needs one at all because the cell has to say something, and "any part" is
+/// what an unset [`GearRule::slot`] means: the rule's other criteria apply to
+/// every piece of gear on the board.
+const ANY_PART: &str = "Any part";
+
+/// The strip cell that drafts a piece nobody has committed to yet.
+///
+/// The `+` alone was mute beside cells that now carry words, and the verb is
+/// what tells a reader the cell adds rather than selects — the second half of
+/// the same defect the numbered cells had.
+const ADD_PIECE: &str = "+ add";
+
+/// The word for the part a piece names: the game's own where the server sent
+/// one, the raw id where it did not, [`ANY_PART`] where no part is named.
+///
+/// The id is the fallback for the reason [`token_label`]'s is — a criterion the
+/// vocabulary cannot place has to stay readable as the thing it is, and a word
+/// invented for it would hide which part is being hunted. That case is also the
+/// whole of what a Catalog-less server can show, since the words for the six
+/// parts are the server's and not this end's (see [`HUNT_TOKENS`] on which two
+/// families are spelled here and why the slots are not among them).
+pub(super) fn part_label(slot: Option<&str>, parts: &[VocabularyEntry]) -> String {
+    let Some(id) = slot else {
+        return ANY_PART.to_owned();
+    };
+    parts
+        .iter()
+        .find(|entry| entry.id == id)
+        .map_or_else(|| id.to_owned(), |entry| entry.label.clone())
+}
+
+/// The pieces being hunted, as one segmented strip: a cell per rule wearing the
+/// name of its part, a `+ add` cell to draft one, and a `remove` verb acting on
+/// the one on screen.
+///
+/// A strip and not a stack of cards, because the window is pinned at
+/// [`crate::ui::WINDOW_WIDTH`] and one rule's criteria already fill a panel:
+/// three rules unfolded at once would be three screens of scrolling to compare
+/// two chips. The strip is the same grammar the rarity ladder and the timing
+/// presets wear, so an exclusive choice looks like every other one here.
+///
+/// **The cells carry their part's name, where they used to carry `1` and `2`.**
+/// A number says nothing about what the cell holds, so clicking through was the
+/// only way to learn which piece was which — and a strip reading `[Ring]
+/// [Necklace]` needs no legend at all. It is the same criterion the slot ladder
+/// one block down writes, which is what makes the strip a readout of the choice
+/// rather than a second one.
+///
+/// **Every cell's accessible name carries its POSITION, and the painted words
+/// never do.** Two pieces may legitimately name the same part — a ring of one
+/// set beside a ring of another — and two may name none, so the words alone are
+/// not unique on a surface where `get_by_label` answers a duplicate by panicking
+/// rather than by picking. The main-stat row answered its own collision the same
+/// way, with a qualifier on the name and not on the chip ([`choice_list`]); here
+/// the qualifier has to be the position, because that is the only thing that
+/// tells two cells of one part apart. It also settles the collision with the
+/// slot ladder below, whose cells wear exactly these words unqualified.
+///
+/// The `+ add` cell only moves the index past the last rule — see
+/// `EditorState::gear_index` — and `remove` is a [`theme::bare_verb`] rather
+/// than a cell, because it acts on the selection instead of being one.
+///
+/// **The verb sits on the header line and the strip takes a row of its own, and
+/// that is the width decision.** A cell wearing "Necklace" is four times the
+/// width of `1`, and the number of cells is unbounded — two rules may name one
+/// part, so a hunt is not capped at the six the game wears. Sharing one line,
+/// the row went past the window at EIGHT pieces of the longest part name
+/// (`remove` ending at 447px against 440) and the strip's own cells at nine. On
+/// its own row the strip wraps inside its frame instead
+/// ([`theme::segmented_strip`]), so no count can push anything out, and the verb
+/// stops sliding rightwards as pieces are added.
+/// `the_piece_strip_stays_inside_the_window` pins both halves. Measured at three
+/// pieces, which is what a real hunt looks like: the strip ends at 176px of the
+/// 440 and the verb sits at 388..432; the strip breaks its line at nine cells.
+pub(super) fn piece_strip(
+    ui: &mut egui::Ui,
+    rules: &mut Vec<GearRule>,
+    index: &mut usize,
+    parts: &[VocabularyEntry],
+) {
+    // A rule a config file holds and the window cannot reach would filter while
+    // being invisible and unremovable — the defect `unoffered_rows` exists to
+    // close for a value the vocabulary cannot name. Clamped rather than
+    // asserted: the count changes under the index whenever a rule is removed.
+    *index = (*index).min(rules.len());
+    ui.horizontal(|ui| {
+        ui.label(theme::section("pieces"));
+        // Only over a rule that exists: the draft cell has nothing to remove,
+        // and a disabled verb beside it would be a control that never acts.
+        if *index < rules.len() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::bare_verb(ui, "remove").clicked() {
+                    rules.remove(*index);
+                    *index = (*index).min(rules.len());
+                }
+            });
+        }
+    });
+    theme::segmented_strip(ui, |ui| {
+        // One cell per rule, then the one being drafted — `None` is the cell
+        // past the last rule, and the only one with no position to be named by.
+        for (cell, rule) in rules.iter().map(Some).chain([None]).enumerate() {
+            let label = rule.map_or_else(
+                || ADD_PIECE.to_owned(),
+                |rule| part_label(rule.slot.as_deref(), parts),
+            );
+            let on = *index == cell;
+            let enabled = ui.is_enabled();
+            let response = ui.selectable_label(on, egui::RichText::new(&label).small());
+            // Restated for the reason [`text_chip`] carries, with the position
+            // folded in: a `selectable_label` names itself after the words it
+            // paints, and those are not unique here.
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::SelectableLabel,
+                    enabled,
+                    on,
+                    piece_name(&label, rule.is_some().then_some(cell + 1)),
+                )
+            });
+            if response.clicked() {
+                *index = cell;
+            }
+        }
+    });
+    ui.add_space(theme::SP_SM);
+}
+
+/// One strip cell's accessible name: its own words, then its position — the
+/// order [`chip_name`] states, so the name still opens with what the cell
+/// paints. The draft cell has no position, because it is not a piece yet.
+fn piece_name(label: &str, ordinal: Option<usize>) -> String {
+    ordinal.map_or_else(
+        || label.to_owned(),
+        |position| format!("{label} piece {position}"),
+    )
+}
+
+/// The part a piece is, as one exclusive strip: a cell per wearable slot the
+/// server named, in the game's own words.
+///
+/// [`theme::segmented_strip`] and not a chip row, because a piece has exactly
+/// one part. A chip row says "any of these", and that reading is the defect
+/// [`GearRule::slot`] closed — ticking two slots beside two main stats bought
+/// four combinations where the player meant two. The rarity ladder one block
+/// down already wears this grammar, and clicking the active cell clears the
+/// part, so every state the control reaches is reachable back out of.
+///
+/// **A slot the vocabulary cannot name gets a cell of its own, spelled as the
+/// raw id.** [`unoffered_rows`] is what does that everywhere else on this
+/// surface and cannot do it here: those rows edit a `Vec`, and this criterion is
+/// one value. Folding the stray into the strip answers the same need with no
+/// second widget — the criterion is visible, and the click that clears it is the
+/// way out.
+///
+/// Against a server with no Catalog and no part held there is nothing to offer,
+/// so the strip is skipped rather than painted as an empty box. That withdraws
+/// the typed entry the free-text fallback used to give this criterion; the piece
+/// strip above is what keeps a config-set part visible and removable in that
+/// state, since its cells fall back to the same raw id.
+pub(super) fn slot_ladder(
+    ui: &mut egui::Ui,
+    value: &mut Option<String>,
+    choices: &[VocabularyEntry],
+) {
+    let stray = value
+        .clone()
+        .filter(|id| !choices.iter().any(|entry| entry.id == *id));
+    if choices.is_empty() && stray.is_none() {
+        return;
+    }
+    theme::segmented_strip(ui, |ui| {
+        for (id, label) in choices
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.label.as_str()))
+            .chain(stray.as_deref().map(|id| (id, id)))
+        {
+            let on = value.as_deref() == Some(id);
+            // The accessible name comes from the label like any
+            // `selectable_label`, as on the rarity ladder: the words a cell
+            // paints are unique across the vocabulary, and the piece strip above
+            // is the one that has to qualify.
+            if ui.selectable_label(on, label).clicked() {
+                *value = if on { None } else { Some(id.to_owned()) };
+            }
+        }
+    });
 }
 
 /// The lowest rarity the ladder offers.
@@ -1558,20 +1756,306 @@ mod tests {
     #[test]
     fn several_pieces_fold_up_as_a_tally() {
         let piece = |slot: &str| GearRule {
-            slots: vec![slot.to_owned()],
+            slot: Some(slot.to_owned()),
             ..GearRule::default()
         };
         let one = Filter {
             gear: vec![piece("boot")],
             ..Filter::default()
         };
-        assert_eq!(hunt_summary(&one), "1 slot");
+        // The part is NAMED where a lone piece folds up as itself: a rule holds
+        // one, so a tally could only ever read "1 slot". The words are the
+        // wire's id — see `rule_parts`.
+        assert_eq!(hunt_summary(&one), "boot");
         let two = Filter {
             gear: vec![piece("boot"), piece("neck")],
             ..Filter::default()
         };
         assert_eq!(hunt_summary(&two), "2 pieces");
         assert!(!two.is_unrestricted());
+    }
+
+    /// The six parts the game wears, at their real label lengths — the strip
+    /// and the ladder both have to fit them at the window's fixed width, and a
+    /// shorter stand-in would pass a layout the live vocabulary pushes off it.
+    const LIVE_PARTS: [(&str, &str); 6] = [
+        ("weapon", "Weapon"),
+        ("helm", "Helmet"),
+        ("armor", "Armor"),
+        ("neck", "Necklace"),
+        ("ring", "Ring"),
+        ("boot", "Boots"),
+    ];
+
+    fn live_parts() -> Vec<VocabularyEntry> {
+        LIVE_PARTS
+            .into_iter()
+            .map(|(id, label)| VocabularyEntry {
+                id: id.to_owned(),
+                label: label.to_owned(),
+                percent: false,
+            })
+            .collect()
+    }
+
+    fn piece_of(slot: Option<&str>) -> GearRule {
+        GearRule {
+            slot: slot.map(str::to_owned),
+            ..GearRule::default()
+        }
+    }
+
+    /// The piece strip at the window's own width, which `main.rs` pins as both
+    /// the minimum and the maximum inner size.
+    fn strip<'a>(
+        rules: &'a mut Vec<GearRule>,
+        index: &'a mut usize,
+        parts: &'a [VocabularyEntry],
+    ) -> Harness<'a> {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(crate::ui::WINDOW_WIDTH, 600.0))
+            .build_ui(move |ui| piece_strip(ui, rules, index, parts));
+        harness.run();
+        harness
+    }
+
+    /// Each cell wears the name of its part, so the strip reads without a
+    /// legend — the numbers it drew before said nothing about what a cell held,
+    /// and clicking through was the only way to find out.
+    #[test]
+    fn every_piece_cell_wears_the_name_of_its_part() {
+        let parts = live_parts();
+        let mut rules = vec![piece_of(Some("ring")), piece_of(Some("neck"))];
+        let mut index = 0;
+        let harness = strip(&mut rules, &mut index, &parts);
+        for (label, position) in [("Ring", 1), ("Necklace", 2)] {
+            assert_eq!(
+                harness
+                    .get_all_by_label(&format!("{label} piece {position}"))
+                    .count(),
+                1,
+                "{label} should name its own cell"
+            );
+        }
+        // And the draft cell says what it does, where a bare `+` did not.
+        assert_eq!(harness.get_all_by_label(ADD_PIECE).count(), 1);
+    }
+
+    /// A piece naming no part still needs a word, and two of them are legal —
+    /// so the position is what tells the cells apart.
+    ///
+    /// `get_by_label` answers a duplicate by panicking rather than by picking,
+    /// and a screen reader announces two identical names as one repeated
+    /// control. The main-stat row hit exactly this and answered it with a
+    /// qualifier on the NAME, never on the painted words
+    /// (`the_two_rows_over_one_vocabulary_name_their_chips_apart`); here the
+    /// qualifier has to be the position, because two pieces may also name the
+    /// SAME part — a ring of one set beside a ring of another — which no other
+    /// qualifier separates.
+    #[test]
+    fn two_pieces_wearing_one_word_are_still_two_named_cells() {
+        let parts = live_parts();
+        for pair in [
+            [piece_of(None), piece_of(None)],
+            [piece_of(Some("ring")), piece_of(Some("ring"))],
+        ] {
+            let word = part_label(pair[0].slot.as_deref(), &parts);
+            let mut rules = pair.to_vec();
+            let mut index = 0;
+            let harness = strip(&mut rules, &mut index, &parts);
+            for position in [1, 2] {
+                assert_eq!(
+                    harness
+                        .get_all_by_label(&format!("{word} piece {position}"))
+                        .count(),
+                    1,
+                    "{word} #{position} should be one named cell of its own"
+                );
+            }
+            // The words themselves are what the cell PAINTS, and they are the
+            // same on both — which is why the name cannot be them alone.
+            assert_eq!(word, part_label(pair[1].slot.as_deref(), &parts));
+        }
+    }
+
+    /// Clicking a cell selects that piece; clicking `remove` drops the selected
+    /// one and leaves the rest.
+    #[test]
+    fn the_strip_selects_a_piece_and_removes_the_selected_one() {
+        let parts = live_parts();
+        let mut rules = vec![piece_of(Some("ring")), piece_of(Some("neck"))];
+        let mut index = 0;
+        let mut harness = strip(&mut rules, &mut index, &parts);
+        harness.get_by_label("Necklace piece 2").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(index, 1);
+        let mut harness = strip(&mut rules, &mut index, &parts);
+        harness.get_by_label("remove").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].slot.as_deref(), Some("ring"), "the other one");
+        assert_eq!(index, 1, "and the draft cell is what is left selected");
+    }
+
+    /// The draft cell has nothing to remove, so the verb is not drawn over it.
+    #[test]
+    fn the_draft_cell_offers_no_remove() {
+        let parts = live_parts();
+        let mut rules = vec![piece_of(Some("ring"))];
+        let mut index = 1;
+        let harness = strip(&mut rules, &mut index, &parts);
+        assert_eq!(harness.query_all_by_label("remove").count(), 0);
+    }
+
+    /// Neither the strip nor its verb may land past the window, at any number
+    /// of pieces.
+    ///
+    /// The window is pinned at `WINDOW_WIDTH` and cannot be widened. Sharing one
+    /// line with the strip, `remove` measured 447px at eight pieces of the
+    /// longest part name — which is why it has a fixed home on the header line
+    /// and the strip wraps inside its own frame ([`theme::segmented_strip`]).
+    /// Twelve is past anything a hunt reaches and is the point: the count is
+    /// unbounded, since two rules may name one part.
+    #[test]
+    fn the_piece_strip_stays_inside_the_window() {
+        let parts = live_parts();
+        for count in [3_usize, 12] {
+            let mut rules: Vec<GearRule> = (0..count).map(|_| piece_of(Some("neck"))).collect();
+            let mut index = 0;
+            let harness = strip(&mut rules, &mut index, &parts);
+            let edge = f64::from(crate::ui::WINDOW_WIDTH);
+            let mut overflowing: Vec<String> = Vec::new();
+            let mut names: Vec<String> = (1..=count)
+                .map(|position| format!("Necklace piece {position}"))
+                .collect();
+            names.push(ADD_PIECE.to_owned());
+            names.push("remove".to_owned());
+            for name in &names {
+                let cell = node_box(&harness, name);
+                if cell.x1 > edge {
+                    overflowing.push(format!("{name} ends at {:.0}", cell.x1));
+                }
+            }
+            assert!(
+                overflowing.is_empty(),
+                "the strip laid out past the window at {count} pieces: {overflowing:?}"
+            );
+        }
+    }
+
+    /// The slot picker is exclusive, writes the wire id, and every state it
+    /// reaches is reachable back out of.
+    #[test]
+    fn the_slot_ladder_names_one_part_and_writes_its_id() {
+        let parts = live_parts();
+        let mut value: Option<String> = None;
+        let harness = ladder(&mut value, &parts);
+        // Every offered part is a named cell — the whole reason this is not an
+        // `egui::ComboBox`, which contributes no accessibility node at all.
+        for (_, label) in LIVE_PARTS {
+            assert_eq!(harness.get_all_by_label(label).count(), 1, "{label}");
+        }
+        drop(harness);
+        click_cell(&mut value, &parts, "Necklace");
+        assert_eq!(value.as_deref(), Some("neck"), "the id, never the word");
+        // A second part replaces the first rather than joining it: a piece has
+        // one part, which is the whole of what `GearRule::slot` says.
+        click_cell(&mut value, &parts, "Ring");
+        assert_eq!(value.as_deref(), Some("ring"));
+        // And the active cell clears it.
+        click_cell(&mut value, &parts, "Ring");
+        assert_eq!(value, None);
+    }
+
+    /// The slot picker at the window's own width.
+    fn ladder<'a>(value: &'a mut Option<String>, parts: &'a [VocabularyEntry]) -> Harness<'a> {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(crate::ui::WINDOW_WIDTH, 600.0))
+            .build_ui(move |ui| slot_ladder(ui, value, parts));
+        harness.run();
+        harness
+    }
+
+    /// Click one of its cells and let the write land, harness dropped so the
+    /// value can be read back.
+    fn click_cell(value: &mut Option<String>, parts: &[VocabularyEntry], label: &str) {
+        let mut harness = ladder(value, parts);
+        harness.get_by_label(label).click();
+        harness.run();
+        drop(harness);
+    }
+
+    /// The ladder holds the six parts the game wears inside the window.
+    #[test]
+    fn every_slot_cell_stays_inside_the_window() {
+        let parts = live_parts();
+        let mut value: Option<String> = None;
+        let harness = ladder(&mut value, &parts);
+        let overflowing: Vec<String> = LIVE_PARTS
+            .into_iter()
+            .map(|(_, label)| (label, node_box(&harness, label).x1))
+            .filter(|(_, right)| *right > f64::from(crate::ui::WINDOW_WIDTH))
+            .map(|(label, right)| format!("{label} ends at {right:.0}"))
+            .collect();
+        assert!(
+            overflowing.is_empty(),
+            "the slot ladder laid out past the window: {overflowing:?}"
+        );
+    }
+
+    /// A part the vocabulary cannot name keeps a cell of its own, spelled as
+    /// the raw id, and the click that clears it is the way out.
+    ///
+    /// It is the `unoffered_rows` promise for a criterion that holds ONE value:
+    /// a part written into `config.toml` before the catalog arrived, or one the
+    /// game has since renamed, must not filter while being invisible and
+    /// unremovable. With no catalog at all it is the whole control.
+    #[test]
+    fn a_part_the_catalog_cannot_name_keeps_a_cell_of_its_own() {
+        for choices in [Vec::new(), live_parts()] {
+            let mut value = Some("gauntlet".to_owned());
+            let harness = ladder(&mut value, &choices);
+            assert_eq!(harness.get_all_by_label("gauntlet").count(), 1);
+            drop(harness);
+            click_cell(&mut value, &choices, "gauntlet");
+            assert_eq!(value, None, "clearing it is the way out");
+        }
+    }
+
+    /// With nothing offered and nothing held there is no strip at all, rather
+    /// than an empty box. The piece strip above is what still names a part in
+    /// that state — see `part_label`'s fallback.
+    #[test]
+    fn a_ladder_with_nothing_to_offer_draws_nothing() {
+        let mut value: Option<String> = None;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(crate::ui::WINDOW_WIDTH, 600.0))
+            .build_ui(|ui| {
+                slot_ladder(ui, &mut value, &[]);
+                ui.label("after");
+            });
+        harness.run();
+        let after = node_box(&harness, "after");
+        assert!(
+            after.y0 < 12.0,
+            "an empty ladder should take no room: the next widget starts at {:.0}",
+            after.y0
+        );
+    }
+
+    /// The words a cell paints are the game's where the server sent them, the
+    /// raw id where it did not, and a word of their own where no part is named.
+    #[test]
+    fn a_part_reads_as_the_game_names_it_then_as_its_id() {
+        let parts = live_parts();
+        assert_eq!(part_label(Some("neck"), &parts), "Necklace");
+        assert_eq!(part_label(Some("gauntlet"), &parts), "gauntlet");
+        assert_eq!(part_label(None, &parts), ANY_PART);
+        // With no catalog every part falls back to its id, which is the whole
+        // of what a Catalog-less server can show.
+        assert_eq!(part_label(Some("neck"), &[]), "neck");
     }
 
     #[test]
@@ -1633,7 +2117,7 @@ mod tests {
             },
             Filter {
                 gear: vec![GearRule {
-                    slots: vec!["helm".to_owned()],
+                    slot: Some("helm".to_owned()),
                     ..GearRule::default()
                 }],
                 ..Filter::default()
@@ -1724,7 +2208,7 @@ mod tests {
             gear: vec![GearRule {
                 substat_match: SubstatMatch::All,
                 sets: vec!["set_speed".to_owned()],
-                slots: vec!["helm".to_owned()],
+                slot: Some("helm".to_owned()),
                 mains: vec!["speed".to_owned()],
                 required_substats: vec![SubstatReq {
                     name: "speed".to_owned(),

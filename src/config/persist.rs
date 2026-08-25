@@ -679,6 +679,52 @@ backend = \"input\"
         assert_eq!(config.filter, filter);
     }
 
+    /// **What the first Apply after a fan-out writes.** A file spelling one
+    /// rule over two slots loads as two pieces, and this section is replaced
+    /// whole — so the player's single `[[filter.gear]]` block comes back as two
+    /// rules, each naming one part.
+    ///
+    /// That is a visible change to a file they wrote, and it is the honest
+    /// representation of what the rule always meant: `(ring ∨ neck) ∧ X` is two
+    /// pieces, and the window now says so on its strip. What must not happen is
+    /// the retired plural surviving the rewrite — a file holding both spellings
+    /// is refused at the next launch (`a_gear_rule_naming_both_spellings_is_refused`
+    /// in `domain::filter`), so a half-migrated section would be a file the app
+    /// cannot start from.
+    ///
+    /// `toml_edit` spells the pair as one inline `gear = [{ .. }, { .. }]` and
+    /// not as two `[[filter.gear]]` headers, exactly as it does for
+    /// `required_substats` above: the same document to any parser, a house-style
+    /// divergence from `config.example.toml` and not a defect.
+    #[test]
+    fn a_fanned_out_rule_is_written_back_as_one_block_per_piece() {
+        let text = "\
+# what we hunt
+[filter]
+names = [\"ticketrare_name\"]
+
+[[filter.gear]]
+slots = [\"ring\", \"neck\"]
+mains = [\"cri_dmg\"]
+";
+        let loaded: crate::config::Config = toml::from_str(text).expect("the retired plural loads");
+        assert_eq!(loaded.filter.gear.len(), 2, "one piece per slot named");
+        let out = write_sections(text, &[Section::Filter(loaded.filter.clone())]).expect("write");
+        assert!(out.contains("slot = \"ring\""), "{out}");
+        assert!(out.contains("slot = \"neck\""), "{out}");
+        assert!(
+            !out.contains("slots"),
+            "the retired plural must not survive the rewrite: {out}"
+        );
+        assert!(out.contains("# what we hunt"), "above-header comment kept");
+        // And it reloads as exactly what was written, which is what makes the
+        // migration a one-way trip with no verdict change.
+        let back: crate::config::Config = toml::from_str(&out).expect("reload");
+        assert_eq!(back.filter, loaded.filter);
+        assert_eq!(back.filter.gear.len(), 2);
+        back.validate().expect("what we write must also validate");
+    }
+
     #[test]
     fn the_widest_writable_timings_reload_through_the_loader() {
         // An unclamped `Timings` used to reach disk here and break the *next*

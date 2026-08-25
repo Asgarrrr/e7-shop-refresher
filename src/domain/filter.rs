@@ -52,6 +52,9 @@ pub struct Filter {
     /// piece — and described it as a product rather than a piece: "boots or
     /// necklace" beside "speed or crit damage" bought a necklace that rolled
     /// speed. A player hunts particular pieces, and each is its own conjunction.
+    ///
+    /// The list moved that product out of the whole filter; [`GearRule::slot`]
+    /// is what finished taking it out of a rule.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gear: Vec<GearRule>,
     /// Keep sold-out items (default drops them).
@@ -66,14 +69,33 @@ pub struct Filter {
 /// cap, an unknown grade never clears a floor, an unanswered slot matches no
 /// slot criterion. Fail-OPEN would buy across every slot the moment a lookup
 /// went missing.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+///
+/// Deserialization is [`RawGearRule`]'s, one level up, because a rule that
+/// names several slots becomes several rules — see [`Self::slot`]. A second
+/// `Deserialize` here would be a path that silently refuses the retired
+/// spelling this one still has to read.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct GearRule {
     /// Kept sets (any-of), by exact internal id; empty keeps all.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sets: Vec<String>,
-    /// Kept wearable slots (any-of), by exact internal id (`helm`, `boot`, ...);
-    /// empty keeps all.
+    /// The ONE wearable part this piece is, by exact internal id (`helm`,
+    /// `boot`, ...); `None` matches any part.
+    ///
+    /// **Singular, where every other criterion of a rule is a list, and the
+    /// asymmetry is the point.** A piece carries exactly one slot, one set, one
+    /// main stat, so several values on any single axis is an honest "any of
+    /// these" — `sets = [speed, crit]` on a ring is a ring of either set. What
+    /// misleads is two axes multiple at once: `slots = [ring, neck]` beside
+    /// `mains = [att_rate, cri_dmg]` is FOUR combinations where the player meant
+    /// two, and it buys a necklace rolling attack% on the strength of a pairing
+    /// nobody asked for. Slot is the axis a player uses to mean "this piece
+    /// rather than that one", so it is the one that had to stop being a list.
+    ///
+    /// A rule naming several fans out into one rule per slot when the file is
+    /// read ([`RawGearRule::fan_out`]), which is meaning-preserving: the gear
+    /// branch is already an `any` over rules, so `(ring ∨ neck) ∧ X` and
+    /// `(ring ∧ X) ∨ (neck ∧ X)` accept the same items.
     ///
     /// Fail-closed like [`Self::sets`], and that has a sharper edge here: the
     /// slot is resolved server-side, so a server that could not read its Catalog
@@ -81,8 +103,7 @@ pub struct GearRule {
     /// matches nothing at all. The loop keeps refreshing until one of the
     /// player's own stop limits fires — hence the journal line
     /// [`Filter::slots_unanswerable`] backs.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub slots: Vec<String>,
+    pub slot: Option<String>,
     /// Kept MAIN stats (any-of), by exact internal stat id (`speed`, `cri_dmg`,
     /// ...); empty keeps all. Fail-closed: a piece whose main stat the server
     /// did not name answers no criterion here.
@@ -154,7 +175,7 @@ pub struct GearRule {
 ///
 /// **Folded, not ignored.** A retired key here still decides what the loop
 /// buys, so it cannot go the way of `capture.filter` — dropping it would empty
-/// a hunt in silence. The flat keys become one [`GearRule`], which is exactly
+/// a hunt in silence. The flat keys become one [`RawGearRule`], which is exactly
 /// what they always were, and the next Apply rewrites the section in the new
 /// shape (`config/persist.rs` replaces `[filter]` whole).
 ///
@@ -167,9 +188,11 @@ struct RawFilter {
     #[serde(deserialize_with = "hunt_kinds")]
     kinds: Vec<ItemKind>,
     names: Vec<String>,
-    gear: Vec<GearRule>,
+    gear: Vec<RawGearRule>,
     include_sold_out: bool,
     // The retired flat gear keys, in the spelling `[filter]` used to hold.
+    // `slots` and never `slot`: the singular arrived with the rules, so no file
+    // predating them can hold it.
     sets: Vec<String>,
     slots: Vec<String>,
     min_substats: Option<u8>,
@@ -180,26 +203,117 @@ struct RawFilter {
     min_grade: Option<u8>,
 }
 
+/// One `[[filter.gear]]` block as a file may spell it: a [`GearRule`] plus the
+/// retired plural `slots`, which a file written before [`GearRule::slot`] still
+/// carries.
+///
+/// **This is where the fan-out lives, and it is the only place it can.** One
+/// block may become SEVERAL rules, so no `Deserialize` on [`GearRule`] itself
+/// could do it; and [`Filter`] already reads its gear criteria through
+/// [`RawFilter`], which is the seam the flat keys were folded at. Doing it in
+/// the window instead would leave the console build — which never opens an
+/// editor — reading the old shape.
+///
+/// The duplication of the eight criteria is deliberate and self-checking in
+/// both directions: [`Self::fan_out`] destructures this struct exhaustively and
+/// builds a [`GearRule`] literal with no `..default()`, so a field added to
+/// either struct and forgotten in the other fails to compile.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawGearRule {
+    sets: Vec<String>,
+    slot: Option<String>,
+    /// The retired spelling. `n` slots here are `n` pieces, not one piece of
+    /// `n` parts — see [`GearRule::slot`].
+    slots: Vec<String>,
+    mains: Vec<String>,
+    min_substats: Option<u8>,
+    required_substats: Vec<SubstatReq>,
+    substat_match: SubstatMatch,
+    max_price: Option<Gold>,
+    #[serde(deserialize_with = "grade_floor")]
+    min_grade: Option<u8>,
+}
+
+impl RawGearRule {
+    /// One rule per slot named, or one rule when none is.
+    ///
+    /// Meaning-preserving, and the reason is one line of algebra:
+    /// [`Filter::gear_branch`] is an `any` over rules, so the rules this yields
+    /// accept exactly `(slot₁ ∨ … ∨ slotₙ) ∧ everything-else` — the conjunction
+    /// the retired spelling always meant. The proof is not left as an assertion:
+    /// `a_multi_slot_rule_fans_out_without_changing_a_single_verdict` states it
+    /// item by item.
+    ///
+    /// Both spellings at once is refused rather than merged, for the reason
+    /// [`RawFilter`] gives one level up: two answers to "which part" in one
+    /// block are two pieces, and picking one silently is how a player buys
+    /// against a rule they cannot see.
+    fn fan_out(self) -> Result<Vec<GearRule>, String> {
+        let Self {
+            sets,
+            slot,
+            slots,
+            mains,
+            min_substats,
+            required_substats,
+            substat_match,
+            max_price,
+            min_grade,
+        } = self;
+        if slot.is_some() && !slots.is_empty() {
+            return Err(
+                "a gear rule names both `slot` and the retired `slots` — keep one of them"
+                    .to_owned(),
+            );
+        }
+        let piece = |slot: Option<String>| GearRule {
+            sets: sets.clone(),
+            slot,
+            mains: mains.clone(),
+            min_substats,
+            required_substats: required_substats.clone(),
+            substat_match,
+            max_price,
+            min_grade,
+        };
+        Ok(if slots.is_empty() {
+            vec![piece(slot)]
+        } else {
+            slots.into_iter().map(|part| piece(Some(part))).collect()
+        })
+    }
+}
+
 impl TryFrom<RawFilter> for Filter {
     type Error = String;
 
     fn try_from(raw: RawFilter) -> Result<Self, Self::Error> {
-        let flat = GearRule {
+        let flat = RawGearRule {
             sets: raw.sets,
+            // Never spelled flat, in either number: `mains` and `slot` both
+            // arrived with the rules.
+            slot: None,
             slots: raw.slots,
-            // Never spelled flat: the criterion arrived with the rules.
             mains: Vec::new(),
             min_substats: raw.min_substats,
             required_substats: raw.required_substats,
             substat_match: raw.substat_match,
             max_price: raw.max_price,
             min_grade: raw.min_grade,
-        };
+        }
+        .fan_out()?;
+        let mut listed = Vec::with_capacity(raw.gear.len());
+        for rule in raw.gear {
+            listed.extend(rule.fan_out()?);
+        }
         // `restricts` and not `!= default`: `min_substats = 0` and
         // `substat_match = "all"` say nothing, and a file setting only those has
-        // no gear criteria to fold.
-        let gear = match (flat.restricts(), raw.gear.is_empty()) {
-            (true, true) => vec![flat],
+        // no gear criteria to fold. Asked of the fanned rules rather than of the
+        // raw block, because a flat `slots` list is a criterion spread over
+        // several of them.
+        let gear = match (flat.iter().any(GearRule::restricts), listed.is_empty()) {
+            (true, true) => flat,
             (true, false) => {
                 return Err(
                     "[filter] holds gear criteria of its own beside [[filter.gear]] — move them \
@@ -207,7 +321,7 @@ impl TryFrom<RawFilter> for Filter {
                         .to_owned(),
                 );
             }
-            (false, _) => raw.gear,
+            (false, _) => listed,
         };
         Ok(Self {
             kinds: raw.kinds,
@@ -391,7 +505,7 @@ impl Filter {
     /// and even then the first reading stays possible — hence a journal line
     /// rather than a refusal to arm.
     pub fn slots_unanswerable(&self, snapshot: &ShopSnapshot) -> bool {
-        self.gear.iter().any(|rule| !rule.slots.is_empty())
+        self.gear.iter().any(|rule| rule.slot.is_some())
             && !snapshot.slots.is_empty()
             && snapshot.slots.iter().all(|item| item.gear_slot.is_none())
     }
@@ -419,7 +533,7 @@ impl GearRule {
     pub fn restricts(&self) -> bool {
         let Self {
             sets,
-            slots,
+            slot,
             mains,
             required_substats,
             min_substats,
@@ -431,7 +545,7 @@ impl GearRule {
             substat_match: _,
         } = self;
         !sets.is_empty()
-            || !slots.is_empty()
+            || slot.is_some()
             || !mains.is_empty()
             || !required_substats.is_empty()
             || substat_floor_is_real(*min_substats)
@@ -464,11 +578,8 @@ impl GearRule {
         if !self.sets.is_empty() && !item.set.as_ref().is_some_and(|set| self.sets.contains(set)) {
             return false;
         }
-        if !self.slots.is_empty()
-            && !item
-                .gear_slot
-                .as_ref()
-                .is_some_and(|slot| self.slots.contains(slot))
+        if let Some(part) = self.slot.as_ref()
+            && item.gear_slot.as_ref().is_none_or(|worn| worn != part)
         {
             return false;
         }
@@ -1135,7 +1246,7 @@ mod tests {
             // only this would fold away before it could be read back.
             let filter: Filter = toml::from_str(&format!(
                 "[[gear]]
-slots = [\"boot\"]
+slot = \"boot\"
 substat_match = {text:?}
 "
             ))
@@ -1381,7 +1492,7 @@ substat_match = {text:?}
     #[test]
     fn two_rules_hunt_two_pieces_rather_than_their_product() {
         let piece = |slot: &str, stat: &str| GearRule {
-            slots: vec![slot.to_owned()],
+            slot: Some(slot.to_owned()),
             required_substats: vec![SubstatReq {
                 name: stat.to_owned(),
                 min: None,
@@ -1551,27 +1662,43 @@ substat_match = {text:?}
         assert!(filter.matches(&token("ticketrare_name")));
     }
 
-    fn slot_filter(slots: &[&str]) -> Filter {
+    /// A one-piece hunt for `slot`, or for any part when `slot` is `None`.
+    fn slot_filter(slot: Option<&str>) -> Filter {
         Filter {
             gear: vec![GearRule {
-                slots: slots.iter().map(|s| (*s).to_owned()).collect(),
+                slot: slot.map(str::to_owned),
                 ..GearRule::default()
             }],
             ..Filter::default()
         }
     }
 
+    /// A rule names ONE part. "Either of these two" is two rules, which is what
+    /// the fan-out below turns the retired plural into.
     #[test]
-    fn a_slot_criterion_is_any_of() {
+    fn a_slot_criterion_names_one_part() {
         // `equip()` is a helm.
-        assert!(slot_filter(&["helm"]).matches(&equip()));
-        assert!(slot_filter(&["boot", "helm"]).matches(&equip()));
-        assert!(!slot_filter(&["boot"]).matches(&equip()));
+        assert!(slot_filter(Some("helm")).matches(&equip()));
+        assert!(!slot_filter(Some("boot")).matches(&equip()));
+        let either = Filter {
+            gear: vec![
+                GearRule {
+                    slot: Some("boot".to_owned()),
+                    ..GearRule::default()
+                },
+                GearRule {
+                    slot: Some("helm".to_owned()),
+                    ..GearRule::default()
+                },
+            ],
+            ..Filter::default()
+        };
+        assert!(either.matches(&equip()));
     }
 
     #[test]
-    fn an_empty_slot_list_does_not_constrain() {
-        assert!(slot_filter(&[]).matches(&equip()));
+    fn an_unset_slot_does_not_constrain() {
+        assert!(slot_filter(None).matches(&equip()));
     }
 
     #[test]
@@ -1582,13 +1709,164 @@ substat_match = {text:?}
             gear_slot: None,
             ..equip()
         };
-        assert!(!slot_filter(&["helm"]).matches(&slotless));
+        assert!(!slot_filter(Some("helm")).matches(&slotless));
     }
 
     #[test]
     fn naming_a_slot_is_a_criterion() {
-        assert!(!slot_filter(&["helm"]).is_unrestricted());
+        assert!(!slot_filter(Some("helm")).is_unrestricted());
         assert!(Filter::default().is_unrestricted());
+    }
+
+    /// **The equivalence proof, verdict by verdict.**
+    ///
+    /// A rule that named several slots meant `(ring ∨ neck) ∧ X`, and the fan-out
+    /// answers with `(ring ∧ X) ∨ (neck ∧ X)`. The two are the same predicate,
+    /// so no `config.toml` on any disk can change what it buys — and that claim
+    /// is worth more than an assertion, because the migration is silent and the
+    /// miss direction spends the player's gold.
+    ///
+    /// The reference verdict is built from parts the type still has rather than
+    /// re-implemented: `X` is the very same rule with NO slot, run through the
+    /// real [`Filter::matches`], and the slot half is read straight off the item.
+    /// The fanned filter comes out of the real loader, so the read path is under
+    /// test beside the algebra.
+    ///
+    /// The item set crosses every slot the game wears — plus the slotless case a
+    /// token or a Catalog-less server produces — with each of the other criteria
+    /// in the rule met and unmet, so every branch of `X` is exercised at every
+    /// slot.
+    #[test]
+    fn a_multi_slot_rule_fans_out_without_changing_a_single_verdict() {
+        const NAMED: [&str; 2] = ["ring", "neck"];
+        // Every criterion a rule can hold beside the slot, so the conjunction
+        // under test is the whole of one.
+        let criteria = "\
+sets = [\"set_speed\"]
+mains = [\"speed\"]
+min_substats = 1
+max_price = 240000
+min_grade = 3
+required_substats = [{ name = \"cri\", min = 0.03 }]
+";
+        let fanned: Filter = toml::from_str(&format!(
+            "[[gear]]\nslots = [\"ring\", \"neck\"]\n{criteria}"
+        ))
+        .expect("the retired spelling must keep loading");
+        assert_eq!(fanned.gear.len(), NAMED.len(), "one rule per slot named");
+        // `X` alone: the same conjunction with the slot question removed.
+        let rest: Filter =
+            toml::from_str(&format!("[[gear]]\n{criteria}")).expect("the same rule without a slot");
+
+        let mut checked = 0_u32;
+        for part in ["weapon", "helm", "armor", "neck", "ring", "boot"]
+            .map(Some)
+            .into_iter()
+            .chain([None])
+        {
+            for set in [Some("set_speed"), Some("set_counter"), None] {
+                for main in [Some("speed"), Some("cri_dmg"), None] {
+                    for grade in [Some(2), Some(3), None] {
+                        for price in [Some(240_000), Some(240_001), None] {
+                            for roll in [Some(0.03), Some(0.02), None] {
+                                let item = ShopItem {
+                                    gear_slot: part.map(str::to_owned),
+                                    set: set.map(str::to_owned),
+                                    main_stat: main.map(|id| substat(id, Some(8.0))),
+                                    grade,
+                                    price: price.map(Gold::new),
+                                    substats: roll
+                                        .map(|value| vec![substat("cri", Some(value))])
+                                        .unwrap_or_default(),
+                                    ..equip()
+                                };
+                                // `(ring ∨ neck) ∧ X`, stated independently of
+                                // the rules under test.
+                                let expected = rest.matches(&item)
+                                    && item
+                                        .gear_slot
+                                        .as_deref()
+                                        .is_some_and(|worn| NAMED.contains(&worn));
+                                assert_eq!(
+                                    fanned.matches(&item),
+                                    expected,
+                                    "the fan-out changed a verdict: {item:?}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Seven slots (six worn, plus none) by five criteria at three values
+        // each: 1,701 verdicts, and the count is here so a loop that stopped
+        // crossing something fails rather than passes quietly.
+        assert_eq!(checked, 1_701, "the whole cross was walked");
+        // And the two halves really do disagree somewhere, or the loop above
+        // would be satisfied by a filter that matches nothing at all.
+        let ring = ShopItem {
+            gear_slot: Some("ring".to_owned()),
+            main_stat: Some(substat("speed", Some(8.0))),
+            substats: vec![substat("cri", Some(0.03))],
+            ..equip()
+        };
+        assert!(fanned.matches(&ring), "the hunted piece");
+        assert!(
+            !fanned.matches(&ShopItem {
+                gear_slot: Some("boot".to_owned()),
+                ..ring
+            }),
+            "and a part it never named"
+        );
+    }
+
+    /// The retired plural loads from BOTH spellings a file can carry it in —
+    /// flat in `[filter]`, and inside a `[[gear]]` block — and each fans out.
+    #[test]
+    fn a_config_naming_several_slots_still_loads_as_several_pieces() {
+        for text in [
+            "slots = [\"ring\", \"neck\"]\n",
+            "[[gear]]\nslots = [\"ring\", \"neck\"]\n",
+        ] {
+            let filter: Filter =
+                toml::from_str(text).unwrap_or_else(|err| panic!("{text:?} must load: {err}"));
+            let parts: Vec<Option<&str>> = filter
+                .gear
+                .iter()
+                .map(|rule| rule.slot.as_deref())
+                .collect();
+            assert_eq!(parts, vec![Some("ring"), Some("neck")], "{text:?}");
+        }
+    }
+
+    /// A rule may answer "which part" once. Both spellings in one block is the
+    /// [`RawFilter`] ambiguity again, one level down.
+    #[test]
+    fn a_gear_rule_naming_both_spellings_is_refused() {
+        let error = toml::from_str::<Filter>("[[gear]]\nslot = \"ring\"\nslots = [\"neck\"]\n")
+            .expect_err("two answers to which part are two pieces");
+        assert!(error.to_string().contains("`slots`"), "{error}");
+    }
+
+    /// The fanned rules survive a save and reload in the new spelling, which is
+    /// what the first Apply after a migration writes: two `[[gear]]` blocks
+    /// where the player had one.
+    #[test]
+    fn a_fanned_rule_round_trips_in_the_new_spelling() {
+        let filter: Filter = toml::from_str(
+            "[[gear]]\nslots = [\"ring\", \"neck\"]\nmains = \
+                                             [\"cri_dmg\"]\n",
+        )
+        .expect("loads");
+        let text = toml::to_string(&filter).expect("serialize");
+        assert_eq!(text.matches("[[gear]]").count(), 2, "{text}");
+        assert!(
+            !text.contains("slots"),
+            "the retired plural is not rewritten: {text}"
+        );
+        let back: Filter = toml::from_str(&text).expect("the new shape reloads");
+        assert_eq!(back, filter);
     }
 
     /// The journal's cue for the fail-closed edge above. It asks about a ROLL
@@ -1608,14 +1886,14 @@ substat_match = {text:?}
         #[test]
         fn fires_when_the_whole_roll_came_back_slotless() {
             let snapshot = roll(r#"{"slots":[{"name":"a"},{"name":"b"}]}"#);
-            assert!(slot_filter(&["helm"]).slots_unanswerable(&snapshot));
+            assert!(slot_filter(Some("helm")).slots_unanswerable(&snapshot));
         }
 
         #[test]
         fn stays_quiet_when_any_item_answered() {
             // Five heroes and one helm is a normal roll, not a failure.
             let snapshot = roll(r#"{"slots":[{"name":"a"},{"gear_slot":"helm"}]}"#);
-            assert!(!slot_filter(&["helm"]).slots_unanswerable(&snapshot));
+            assert!(!slot_filter(Some("helm")).slots_unanswerable(&snapshot));
         }
 
         #[test]
@@ -1628,7 +1906,7 @@ substat_match = {text:?}
         fn stays_quiet_on_an_empty_roll() {
             // Nothing to be unable to answer about; a slotless roll of nothing
             // is a degraded snapshot and a different diagnosis.
-            assert!(!slot_filter(&["helm"]).slots_unanswerable(&roll(r#"{"slots":[]}"#)));
+            assert!(!slot_filter(Some("helm")).slots_unanswerable(&roll(r#"{"slots":[]}"#)));
         }
     }
 }
