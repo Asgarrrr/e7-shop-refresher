@@ -162,6 +162,14 @@ fn token_label(name: &str) -> &str {
 /// unreachable from a config file and exists only to keep this total. A floor it
 /// cannot name reads as its own ordinal — the criterion is named and the floor
 /// is exact, with no word invented for a rarity the game has not published.
+///
+/// **It answers for the floors the ladder does not offer, and that is the point
+/// of naming being wider than offering.** `min_grade = 2` still loads (see
+/// [`HUNTED_FLOOR`]) and still drops every gradeless item, so the folded bar has
+/// to say `Good+` — the game's own word — rather than `grade 2+`, which is a
+/// number a player sees nowhere in the game, or worse "nothing selected" over a
+/// hunt that restricts. Narrowing [`theme::RARITIES`] to the two rungs on
+/// screen would have bought exactly that regression.
 fn grade_label(min: u8) -> String {
     theme::rarity_label(min).map_or_else(|| format!("grade {min}+"), |label| format!("{label}+"))
 }
@@ -472,9 +480,23 @@ fn token_card(ui: &mut egui::Ui, label: &str, price: Gold, on: &mut bool) -> boo
     response.clicked()
 }
 
-/// The rarity floor, as one segmented control: the four grades of
-/// [`theme::RARITIES`], low to high, in the game's own words and the game's own
-/// colours.
+/// The lowest rarity the ladder offers.
+///
+/// **The two rungs are Heroic and Epic, and `min_grade` is a FLOOR.** Heroic
+/// writes 4 and Epic writes 5, so Heroic already admits every Epic piece — the
+/// ladder is "this good or better" and never "exactly this". The rungs are not
+/// a pair of buckets and nothing here is missing a third one for "either".
+///
+/// Good (2) and Rare (3) are dropped because nobody hunts them out of the refresh
+/// shop: a paid re-roll spent on a blue piece is a re-roll wasted, so a control
+/// offering that floor invites a hunt the player did not mean. They are still
+/// FLOORS the loader takes and [`theme::RARITIES`] still names them — a
+/// `config.toml` carrying one keeps filtering and keeps being named in the folded
+/// bar, see [`grade_label`]. What went is the control, not the criterion.
+const HUNTED_FLOOR: u8 = 4;
+
+/// The rarity floor, as one segmented control: the rungs of [`theme::RARITIES`]
+/// worth hunting, low to high, in the game's own words.
 ///
 /// Buttons rather than a `ComboBox` for the reason `choice_list` gives: a combo
 /// contributes no accessibility node. Clicking the active segment clears the
@@ -483,6 +505,14 @@ fn token_card(ui: &mut egui::Ui, label: &str, price: Gold, on: &mut bool) -> boo
 /// [`theme::segmented_strip`] and not a bare row: the choice is exclusive, and
 /// the Click-timing mode row one section down already says so with a shared
 /// ground. One grammar for one kind of control.
+///
+/// **Plain text, no per-rarity ink.** The words used to be painted in the
+/// game's own blue, purple and red (see [`theme::RARITIES`], which records the
+/// measured values and where they came from). Two rungs do not need three hues
+/// to be told apart, and every other control on this screen is one ink — a
+/// coloured word here read as an alarm rather than as a rarity. The chosen cell
+/// takes the strip's own selection fill, which is the only colour the control
+/// carries and the same one every chip in the section uses.
 ///
 /// **It writes `min_grade`, where this control used to write `min_substats`.**
 /// The two were taken for one axis on shop gear, measured at 59 of 59 real
@@ -495,43 +525,24 @@ fn token_card(ui: &mut egui::Ui, label: &str, price: Gold, on: &mut bool) -> boo
 ///
 /// **The cells are spelled at this end, and so the ladder draws in every
 /// session.** They used to come off the catalog's rarity family, which meant no
-/// control at all until a `catalog` message landed — a criterion whose four
-/// values are ordinals a player must not have to type, reachable only by editing
-/// `config.toml`. Four names and four ordinals are not worth that, and
-/// [`theme::RARITIES`] already held the colours beside them.
+/// control at all until a `catalog` message landed — a criterion whose values
+/// are ordinals a player must not have to type, reachable only by editing
+/// `config.toml`.
 pub(super) fn rarity_ladder(ui: &mut egui::Ui, value: &mut Option<u8>) {
     theme::segmented_strip(ui, |ui| {
-        for (grade, label, _) in theme::RARITIES {
+        for (grade, label) in theme::RARITIES {
+            if grade < HUNTED_FLOOR {
+                continue;
+            }
             let on = *value == Some(grade);
-            if rarity_cell(ui, label, grade, on).clicked() {
+            // The accessible name comes from the label like any
+            // `selectable_label`, so nothing has to be restated — unlike
+            // [`icon_chip`], whose picture publishes none.
+            if ui.selectable_label(on, label).clicked() {
                 *value = if on { None } else { Some(grade) };
             }
         }
     });
-}
-
-/// One rarity as a segment: its name in the game's ink for that grade.
-///
-/// The colour is dropped while the cell is CHOSEN, and that is not a detail. A
-/// chosen segment takes the strip's selection fill — this theme's accent — and
-/// an explicit `RichText` colour outlives that fill, so Epic's red would be
-/// painted over the blue instead of the fill's own legible ink. Unchosen is
-/// where the hue carries information anyway: it says which rarity a word names
-/// before the player has clicked anything.
-///
-/// The accessible name comes from the label like any `selectable_label`, so
-/// nothing has to be restated here — unlike [`icon_chip`], whose picture
-/// publishes none.
-fn rarity_cell(ui: &mut egui::Ui, label: &str, grade: u8, on: bool) -> egui::Response {
-    let text = egui::RichText::new(label);
-    ui.selectable_label(
-        on,
-        if on {
-            text
-        } else {
-            text.color(theme::rarity_ink(grade))
-        },
-    )
 }
 
 /// One editable any-of list entered as free text: entries with a remove cross
@@ -628,12 +639,12 @@ pub(super) fn substat_chips(
     // the same defect and was NOT merely at risk of it — eleven realistic
     // substat labels reached x=608 at the window's fixed 440px, against 414 once
     // the salt moved. It shows less than the sets row only because it is
-    // shorter; a ticked chip unfolding its `≥` box and stepper adds width again.
+    // shorter; a ticked chip unfolding its threshold adds width again.
     //
-    // Those two now sit directly in the row rather than in a `push_id` of their
-    // own, so a wrap can fall between them. That is the cost of the fix here and
-    // it is the cheap side of the trade: the pair is ~64px, and grouping them
-    // was what put the stepper past the edge in the first place.
+    // The threshold's own two cells sit directly in the row for the same reason
+    // — see [`theme::joined_pair`], which is where a grouping `Ui` would have
+    // reintroduced exactly this — and [`threshold_control`] asks the row for
+    // their width before drawing so a wrap cannot fall between them.
     ui.push_id("required substats", |ui| {
         ui.horizontal_wrapped(|ui| {
             for entry in choices {
@@ -646,17 +657,23 @@ pub(super) fn substat_chips(
                 // it applies to and nowhere else.
                 if let Some(index) = held {
                     let req = &mut reqs[index];
-                    let mut has_min = req.min.is_some();
-                    // A chip and not a checkbox: it rides in the same wrapped
-                    // row as the values above, where it would otherwise be the
-                    // one tick box left among pills.
-                    text_chip(ui, "≥", &mut has_min);
-                    if has_min {
-                        let min = req.min.get_or_insert(seed_for(entry.percent));
-                        threshold_field(ui, min, entry.percent);
-                    } else {
-                        req.min = None;
+                    let mut armed = req.min.is_some();
+                    match req.min.as_mut() {
+                        // Armed: the sign and its value are one control.
+                        Some(min) => {
+                            if threshold_control(ui, min, entry.percent) {
+                                armed = false;
+                            }
+                        }
+                        // Unarmed: the sign alone, and a chip rather than a
+                        // checkbox — it rides in the same wrapped row as the
+                        // values above, where it would otherwise be the one tick
+                        // box left among pills.
+                        None => {
+                            text_chip(ui, "≥", &mut armed);
+                        }
                     }
+                    arm_optional(armed, &mut req.min, seed_for(entry.percent));
                 }
             }
         });
@@ -678,6 +695,57 @@ pub(super) fn substat_chips(
         |req: &SubstatReq| req.name.as_str(),
         |id| choices.iter().any(|entry| entry.id == id),
     );
+}
+
+/// The width [`threshold_control`] reserves before it draws.
+///
+/// The pair goes into the caller's own wrapped row rather than into a child
+/// `Ui` — [`theme::joined_pair`] gives the reason at length — so nothing stops
+/// `horizontal_wrapped` breaking the line between the two cells and leaving half
+/// a box on each. The control asks the row for this much in one piece first.
+///
+/// Measured rather than chosen: the pair lays out at 68px on the live substat
+/// vocabulary, and this is spelled with headroom because the two failures are
+/// not symmetric — too small splits the control, too large only wraps one chip
+/// early. `the_joined_threshold_fits_the_width_it_reserves` holds the number to
+/// what the control actually takes.
+const THRESHOLD_WIDTH: f32 = 88.0;
+
+/// The `≥` and the value it applies to, as one control.
+///
+/// They were two neighbours: a `≥` pill, eight pixels of nothing, and a stepper
+/// eight pixels taller than every chip on the row. Three boxes for two facts,
+/// and nothing on screen said the sign governed the number rather than the chip
+/// before it. Joined, the sign is the lit left cap of the box the value sits in.
+///
+/// **The arming stays on the `≥`**, where a player already finds it, and it is
+/// still the only way in or out: clicking the cap while armed takes the
+/// threshold away. The value cell cannot double as the switch — a
+/// [`egui::DragValue`] spends its own click opening text entry, so arming on it
+/// would be a gesture fighting the widget's.
+///
+/// Answers whether the cap was clicked, i.e. whether the threshold should go.
+fn threshold_control(ui: &mut egui::Ui, stored: &mut f64, percent: bool) -> bool {
+    if ui.available_width() < THRESHOLD_WIDTH {
+        ui.end_row();
+    }
+    let enabled = ui.is_enabled();
+    let (cap, ()) = theme::joined_pair(
+        ui,
+        |ui| ui.add(egui::Button::new("≥")),
+        |ui| threshold_field(ui, stored, percent),
+    );
+    // The name `arm_threshold` and every player looking for the sign asks by.
+    // A bare `Button` states a `WidgetType::Button`, and this one toggles, so it
+    // is restated as the checkbox it behaves like — the contract [`text_chip`]
+    // carries, for the same reason and with the same duplicate event.
+    //
+    // `!clicked()` because a click here DISARMS: the value the click produced is
+    // "off", though the cap is drawn on for the frame it happens in.
+    cap.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, !cap.clicked(), "≥")
+    });
+    cap.clicked()
 }
 
 /// The `≥` stepper for one required substat, in the unit a player reads.
@@ -734,8 +802,149 @@ pub(super) fn optional_value<T: egui::emath::Numeric>(
 
 #[cfg(test)]
 mod tests {
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT as _, Queryable as _},
+    };
+
     use super::*;
     use crate::domain::shop::{Gold, ItemKind};
+
+    /// The eleven substats the game rolls, at their real label lengths and with
+    /// their real families — the row the threshold control has to fit into.
+    ///
+    /// Spelled here rather than taken from a fixture because what these pin is
+    /// WIDTH: a shorter stand-in row would pass a layout the live vocabulary
+    /// pushes off the window.
+    const LIVE_SUBSTATS: [(&str, &str, bool); 11] = [
+        ("att", "Attack", false),
+        ("att_rate", "Attack(%)", true),
+        ("def", "Defense", false),
+        ("def_rate", "Defense(%)", true),
+        ("max_hp", "Health", false),
+        ("max_hp_rate", "Health(%)", true),
+        ("speed", "Speed", false),
+        ("cri", "Critical Hit Chance", true),
+        ("cri_dmg", "Critical Hit Damage", true),
+        ("acc", "Effectiveness", true),
+        ("res", "Effect Resistance", true),
+    ];
+
+    fn live_choices() -> Vec<VocabularyEntry> {
+        LIVE_SUBSTATS
+            .into_iter()
+            .map(|(id, label, percent)| VocabularyEntry {
+                id: id.to_owned(),
+                label: label.to_owned(),
+                percent,
+            })
+            .collect()
+    }
+
+    /// The substat row at the window's own width, which `main.rs` pins as both
+    /// the minimum and the maximum inner size — a control laid out with room to
+    /// spare here would wrap on the player's screen.
+    fn substat_row<'a>(
+        reqs: &'a mut Vec<SubstatReq>,
+        choices: &'a [VocabularyEntry],
+    ) -> Harness<'a> {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(crate::ui::WINDOW_WIDTH, 600.0))
+            .build_ui(|ui| substat_chips(ui, reqs, choices));
+        harness.run();
+        harness
+    }
+
+    /// The accessibility box of the node a label names.
+    fn node_box(harness: &Harness<'_>, label: &str) -> egui::accesskit::Rect {
+        harness
+            .get_by_label(label)
+            .accesskit_node()
+            .bounding_box()
+            .expect("egui gives every node its bounds")
+    }
+
+    /// The sign and its value are ONE control: the two cells touch, and the
+    /// whole box fits the width the row was asked to reserve for it.
+    ///
+    /// Both halves matter. A gap between the cells is the old three-box reading
+    /// coming back with rounder corners; a box wider than [`THRESHOLD_WIDTH`]
+    /// means the reservation no longer covers what it reserves for, and the
+    /// wrap it exists to prevent can fall through the middle of the control
+    /// again.
+    #[test]
+    fn the_joined_threshold_fits_the_width_it_reserves() {
+        let choices = live_choices();
+        let mut reqs = vec![SubstatReq {
+            name: "speed".to_owned(),
+            min: Some(3.0),
+        }];
+        let harness = substat_row(&mut reqs, &choices);
+        let cap = node_box(&harness, "≥");
+        let value = harness
+            .get_by_role(egui::accesskit::Role::SpinButton)
+            .accesskit_node()
+            .bounding_box()
+            .expect("egui gives every node its bounds");
+        assert!(
+            (value.x0 - cap.x1).abs() < 1.0,
+            "the two cells should share an edge: cap ends at {:.1}, value starts at {:.1}",
+            cap.x1,
+            value.x0
+        );
+        let width = value.x1 - cap.x0;
+        assert!(
+            width <= f64::from(THRESHOLD_WIDTH),
+            "the control takes {width:.0}px and reserves {THRESHOLD_WIDTH}"
+        );
+    }
+
+    /// And the joined pair never lands past the window, on the worst row there
+    /// is: every one of the game's eleven substats required, every one of them
+    /// with a threshold armed.
+    ///
+    /// It is the armed twin of `every_substat_chip_stays_inside_the_window`,
+    /// which draws the same row with no requirement in it and so measures none
+    /// of this. The window is pinned at `WINDOW_WIDTH` and cannot be widened,
+    /// so a pair that overflows is a pair to make narrower.
+    #[test]
+    fn an_armed_threshold_never_lands_past_the_window() {
+        let choices = live_choices();
+        let mut reqs: Vec<SubstatReq> = LIVE_SUBSTATS
+            .into_iter()
+            .map(|(id, _, percent)| SubstatReq {
+                name: id.to_owned(),
+                min: Some(seed_for(percent)),
+            })
+            .collect();
+        let harness = substat_row(&mut reqs, &choices);
+        let edge = f64::from(crate::ui::WINDOW_WIDTH);
+        let mut overflowing: Vec<String> = Vec::new();
+        for (_, label, _) in LIVE_SUBSTATS {
+            let chip = node_box(&harness, label);
+            if chip.x1 > edge {
+                overflowing.push(format!("{label} ends at {:.0}", chip.x1));
+            }
+        }
+        for (index, cell) in harness
+            .query_all_by_label("≥")
+            .chain(harness.query_all_by_role(egui::accesskit::Role::SpinButton))
+            .enumerate()
+        {
+            let right = cell
+                .accesskit_node()
+                .bounding_box()
+                .expect("egui gives every node its bounds")
+                .x1;
+            if right > edge {
+                overflowing.push(format!("threshold cell {index} ends at {right:.0}"));
+            }
+        }
+        assert!(
+            overflowing.is_empty(),
+            "the armed substat row laid out past the window: {overflowing:?}"
+        );
+    }
 
     #[test]
     fn hunt_summary_names_the_hunted_tokens() {
@@ -900,6 +1109,11 @@ mod tests {
     /// The folded Hunt bar said `grade 5+` over a control spelling Good / Rare /
     /// Heroic / Epic, so the same floor carried two names on one screen — and
     /// the number was the one nobody sees anywhere else in the game.
+    ///
+    /// All four, though the ladder offers two: `Good+` and `Rare+` are what a
+    /// `config.toml` floor below [`HUNTED_FLOOR`] reads as, and they are the
+    /// case that would have gone back to an ordinal if the naming table had been
+    /// cut down to the control.
     #[test]
     fn a_rarity_floor_reads_in_the_words_the_ladder_offers() {
         for (id, label) in [(2, "Good+"), (3, "Rare+"), (4, "Heroic+"), (5, "Epic+")] {
@@ -930,21 +1144,19 @@ mod tests {
         );
     }
 
-    /// The rarities the window can paint are exactly the floors the loader
+    /// The rarities the window can NAME are exactly the floors the loader
     /// accepts, and this is the UI half of that pairing — the domain half is
     /// `min_grade_outside_the_game_domain_is_refused` in `domain::filter`.
     ///
-    /// The two must move together in both directions. A grade the ladder offers
-    /// and the loader refuses is a click that writes a `config.toml` the app
-    /// cannot start from; a grade the loader accepts and the ladder cannot ink
-    /// is a rarity the player can only reach by editing the file.
-    /// [`theme::RARITIES`] is both the cells the ladder draws and the ink they
-    /// take, so walking it is walking the control itself.
+    /// The two must move together in both directions. A grade the window names
+    /// and the loader refuses is a word for a `config.toml` the app cannot start
+    /// from; a grade the loader accepts and the table cannot name is a floor the
+    /// folded bar can only spell as an ordinal.
     #[test]
-    fn the_offered_rarities_are_the_grades_the_loader_accepts() {
-        for (grade, _, _) in theme::RARITIES {
+    fn the_named_rarities_are_the_grades_the_loader_accepts() {
+        for (grade, _) in theme::RARITIES {
             let filter: Filter = toml::from_str(&format!("min_grade = {grade}"))
-                .expect("a rarity the ladder paints must be a grade the game has");
+                .expect("a rarity the window names must be a grade the game has");
             assert_eq!(filter.min_grade, Some(grade));
         }
         let lowest = theme::RARITIES[0].0;
@@ -952,8 +1164,39 @@ mod tests {
         for outside in [lowest - 1, highest + 1] {
             assert!(
                 toml::from_str::<Filter>(&format!("min_grade = {outside}")).is_err(),
-                "the ladder must not stop one short of the domain: {outside}"
+                "the table must not stop one short of the domain: {outside}"
             );
+        }
+    }
+
+    /// The ladder offers the top of that domain and stops short of its bottom,
+    /// on purpose — and the floors it drops are still floors.
+    ///
+    /// Offering is narrower than naming, which is the whole shape of this
+    /// change: a rung the ladder draws has to be a grade the file accepts, while
+    /// a grade the file accepts need not be a rung. What must NOT drift is the
+    /// top — a rarity the game publishes above Epic that the ladder cannot ask
+    /// for is a hunt only reachable by editing the file, which is what put this
+    /// control on screen in the first place.
+    #[test]
+    fn the_ladder_offers_the_top_of_the_domain_and_stops_short_of_its_bottom() {
+        let offered: Vec<(u8, &str)> = theme::RARITIES
+            .into_iter()
+            .filter(|(grade, _)| *grade >= HUNTED_FLOOR)
+            .collect();
+        assert_eq!(offered, vec![(4, "Heroic"), (5, "Epic")]);
+        let highest = theme::RARITIES[theme::RARITIES.len() - 1].0;
+        assert_eq!(
+            offered[offered.len() - 1].0,
+            highest,
+            "the ladder must reach the top rarity the game has"
+        );
+        // And the two rungs it dropped still load, so the criterion survives the
+        // control leaving.
+        for dropped in [2, 3] {
+            let filter: Filter = toml::from_str(&format!("min_grade = {dropped}"))
+                .expect("a floor the ladder stopped offering is still a floor");
+            assert_eq!(filter.min_grade, Some(dropped));
         }
     }
 
@@ -963,11 +1206,31 @@ mod tests {
     /// has.
     #[test]
     fn the_top_rarity_is_epic_and_it_loads() {
-        let (top, label, ink) = theme::RARITIES[theme::RARITIES.len() - 1];
+        let (top, label) = theme::RARITIES[theme::RARITIES.len() - 1];
         assert_eq!(top, 5);
         assert_eq!(label, "Epic");
-        assert_ne!(ink, theme::INK_MUTED, "Epic has a colour of its own");
         let filter: Filter = toml::from_str("min_grade = 5").expect("Epic is a floor");
         assert_eq!(filter.min_grade, Some(5));
+    }
+
+    /// Heroic is a FLOOR and not a bucket: it admits Epic pieces too, which is
+    /// why two rungs need no third cell for "either".
+    ///
+    /// Stated here because the ladder writes the ordinal and nothing on screen
+    /// says what the ordinal means — a reader looking at two cells could take
+    /// them for two disjoint choices and "fix" the inclusion.
+    #[test]
+    fn the_lower_rung_admits_the_higher_ones_pieces() {
+        use crate::domain::shop::ShopItem;
+        let heroic_or_better = Filter {
+            min_grade: Some(HUNTED_FLOOR),
+            ..Filter::default()
+        };
+        let epic = ShopItem {
+            kind: ItemKind::Equipment,
+            grade: Some(5),
+            ..ShopItem::default()
+        };
+        assert!(heroic_or_better.matches(&epic));
     }
 }

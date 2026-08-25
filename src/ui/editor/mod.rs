@@ -841,7 +841,7 @@ mod tests {
         );
         assert_eq!(harness.query_all_by_label("Speed").count(), 0);
         // While the two the relay spells itself are on screen regardless.
-        for rarity in ["Good", "Rare", "Heroic", "Epic"] {
+        for rarity in ["Heroic", "Epic"] {
             assert_eq!(harness.get_all_by_label(rarity).count(), 1);
         }
         assert_eq!(harness.get_all_by_label("Covenant Bookmarks").count(), 1);
@@ -1428,24 +1428,24 @@ mod tests {
     #[test]
     fn clicking_the_active_rarity_clears_the_floor() {
         let mut editor = stocked_editor();
-        editor.filter.min_grade = Some(3);
+        editor.filter.min_grade = Some(4);
         let mut harness = setup_harness(|ui| {
             let _ = edit_setup(ui, &mut editor);
         });
-        harness.get_by_label("Rare").click();
+        harness.get_by_label("Heroic").click();
         harness.run();
         drop(harness);
         assert_eq!(editor.filter.min_grade, None);
     }
 
-    /// Every rarity is a NAMED node, which is what a `ComboBox` here would not
-    /// be — and the four have to be findable one by one, since each writes a
+    /// Every rung is a NAMED node, which is what a `ComboBox` here would not be
+    /// — and the two have to be findable one by one, since each writes a
     /// different floor.
     #[test]
     fn every_rarity_is_named_and_stays_inside_the_window() {
         let mut editor = stocked_editor();
         let harness = draw_setup(&mut editor);
-        for label in ["Good", "Rare", "Heroic", "Epic"] {
+        for label in ["Heroic", "Epic"] {
             assert_eq!(
                 harness.get_all_by_label(label).count(),
                 1,
@@ -1457,6 +1457,27 @@ mod tests {
             assert!(
                 right <= f64::from(crate::ui::WINDOW_WIDTH),
                 "{label} ends at {right:.0}, past the window"
+            );
+        }
+    }
+
+    /// The two rungs nobody hunts have no cell at all.
+    ///
+    /// Stated on the RENDER rather than on the table, because the table still
+    /// names them — `hunt::grade_label` answers for a `config.toml` floor of 2
+    /// or 3, and `a_config_set_grade_floor_still_names_itself_in_the_folded_bar`
+    /// is the other half of that. What must be gone is the control: a paid
+    /// re-roll spent on a blue piece is a re-roll wasted, so offering that floor
+    /// invites a hunt the player did not mean.
+    #[test]
+    fn the_ladder_offers_no_rung_below_heroic() {
+        let mut editor = stocked_editor();
+        let harness = draw_setup(&mut editor);
+        for gone in ["Good", "Rare"] {
+            assert_eq!(
+                harness.query_all_by_label(gone).count(),
+                0,
+                "{gone} should have no cell on the ladder"
             );
         }
     }
