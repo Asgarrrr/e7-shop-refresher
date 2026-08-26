@@ -10,7 +10,7 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
-use tracing::{Instrument as _, error, warn};
+use tracing::{Instrument as _, error};
 
 use crate::Result;
 use crate::actuator::ActuatorHandle;
@@ -205,6 +205,10 @@ fn report_join(
 /// it actually holds a core are short, not sustained.
 #[cfg(windows)]
 fn raise_capture_thread_priority() {
+    // Imported here and not at the top of the module: this is the only `warn!`
+    // in the file and it is Windows-only, so a module-level import is an unused
+    // one on every dev lane.
+    use tracing::warn;
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
     };

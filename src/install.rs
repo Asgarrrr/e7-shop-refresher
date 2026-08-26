@@ -675,14 +675,6 @@ fn lock_down(dir: &Path, sddl: &str) -> std::io::Result<()> {
     outcome
 }
 
-/// Dev-machine stub; nothing off Windows reaches the fetcher. `#[cfg(test)]`
-/// for the same reason as the Windows version above: no production caller.
-#[cfg(test)]
-#[cfg(not(windows))]
-fn lock_down(_dir: &Path, _sddl: &str) -> std::io::Result<()> {
-    Ok(())
-}
-
 /// Creates `dir` with `sddl` already its DACL — `CreateDirectoryW` takes a
 /// `SECURITY_ATTRIBUTES` directly, so the object exists and is clamped in the
 /// one call. No `std::fs` API passes a `SECURITY_ATTRIBUTES` through, which is

@@ -579,6 +579,10 @@ mod tests {
             self.0.join(name)
         }
 
+        /// Windows-only: its two callers are the junction tests, which need a
+        /// reparse target and so cannot run anywhere else. Ungated it is dead
+        /// code on every dev lane.
+        #[cfg(windows)]
         fn path(&self) -> &Path {
             &self.0
         }
