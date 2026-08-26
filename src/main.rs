@@ -315,10 +315,23 @@ fn run_mode(
             // measure. Height stays free — the journal is the one surface that
             // benefits from more room — and opens at the height the layout was
             // tuned at rather than at the minimum.
+            //
+            // **`with_max_inner_size` alone does NOT pin it, and every width
+            // decision in `src/ui/` rests on that pin.** Windows honours the max
+            // for a DRAG of the frame and ignores it for a maximize: seen at
+            // ~2000pt with the button, which stretches the token cards into
+            // banners and parks an open row's verbs a screen away from the
+            // criteria they act on. The button is withdrawn rather than the
+            // layout being made fluid — a second width is a second set of
+            // measurements for a single-user tool that sits beside the game.
+            //
+            // This does not close every route (`Win`+`Up` and a title-bar
+            // double-click remain); it closes the one a player finds.
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_inner_size([ui::WINDOW_WIDTH, 824.0])
                 .with_min_inner_size([ui::WINDOW_WIDTH, 460.0])
-                .with_max_inner_size([ui::WINDOW_WIDTH, 10_000.0]),
+                .with_max_inner_size([ui::WINDOW_WIDTH, 10_000.0])
+                .with_maximize_button(false),
             ..Default::default()
         },
         Box::new(move |cc| {
