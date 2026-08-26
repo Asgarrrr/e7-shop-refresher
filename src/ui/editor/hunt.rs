@@ -95,6 +95,178 @@ const SET_ICON: f32 = 32.0;
 /// Ids and not labels, because a label is a translation — the same reason
 /// [`VocabularyEntry::percent`] is a flag on the wire rather than a "(%)" read
 /// off the words.
+/// The main stat each wearable part can carry — the game's own *Applicable Main
+/// Stats* table, transcribed.
+///
+/// **A relay constant and not a wire family**, for exactly the reason
+/// [`HUNT_TOKENS`] and [`theme::RARITIES`] are: it invents no words. Every id
+/// here already travels on the catalog message, in `substats` and in `slots`,
+/// so this table is a RELATION between two vocabularies the server sends rather
+/// than a fourth vocabulary of its own — no label to translate, no fallback for
+/// the session where the message never lands. That is what separates it from
+/// the sets, which grow with the game, and from `acc` → "Effectiveness", which
+/// is a translation nobody can write.
+///
+/// Weapon, helm and armor carry ONE, and that is not a choice a player makes.
+/// Boots 7, necklace 8, ring 8 — twenty-six pairs in all, where a free slot row
+/// beside a free main row offers sixty-six.
+///
+/// It moves with [`SUBSTAT_POOL`] or not at all: the two are halves of one fact
+/// (a piece allocates its stats to roles) and one sent while the other is
+/// transcribed is how they drift apart.
+const MAIN_POOL: [(&str, &[&str]); 6] = [
+    ("weapon", &["att"]),
+    ("helm", &["max_hp"]),
+    ("armor", &["def"]),
+    (
+        "boot",
+        &[
+            "max_hp",
+            "max_hp_rate",
+            "att",
+            "att_rate",
+            "def",
+            "def_rate",
+            "speed",
+        ],
+    ),
+    (
+        "neck",
+        &[
+            "max_hp",
+            "max_hp_rate",
+            "att",
+            "att_rate",
+            "def",
+            "def_rate",
+            "cri",
+            "cri_dmg",
+        ],
+    ),
+    (
+        "ring",
+        &[
+            "max_hp",
+            "max_hp_rate",
+            "att",
+            "att_rate",
+            "def",
+            "def_rate",
+            "acc",
+            "res",
+        ],
+    ),
+];
+
+/// The substats each wearable part can roll — the official notice's *Substat
+/// Types according to Equipment Part*, transcribed. Held here for the reason
+/// [`MAIN_POOL`] is, and never without it.
+///
+/// Weapon and armor are the genuinely narrow ones, and not merely by their own
+/// main: a weapon never rolls `def` or `def_rate`, an armor never rolls `att` or
+/// `att_rate`. The helm drops only its own main. Boot, neck and ring roll all
+/// eleven — for those three the only reduction is the piece's own main stat,
+/// which is a fact about the PIECE and so cannot live in a table about parts
+/// (see [`unpickable_substat`]).
+const SUBSTAT_POOL: [(&str, &[&str]); 6] = [
+    (
+        "weapon",
+        &[
+            "max_hp",
+            "max_hp_rate",
+            "att_rate",
+            "speed",
+            "cri",
+            "cri_dmg",
+            "res",
+            "acc",
+        ],
+    ),
+    (
+        "helm",
+        &[
+            "max_hp_rate",
+            "att",
+            "att_rate",
+            "def",
+            "def_rate",
+            "speed",
+            "cri",
+            "cri_dmg",
+            "res",
+            "acc",
+        ],
+    ),
+    (
+        "armor",
+        &[
+            "max_hp",
+            "max_hp_rate",
+            "def_rate",
+            "speed",
+            "cri",
+            "cri_dmg",
+            "res",
+            "acc",
+        ],
+    ),
+    ("boot", &ALL_SUBSTATS),
+    ("neck", &ALL_SUBSTATS),
+    ("ring", &ALL_SUBSTATS),
+];
+
+/// The eleven, in the order the wire sends them. Spelled once so the three parts
+/// that roll all of them cannot disagree with each other by a typo.
+const ALL_SUBSTATS: [&str; 11] = [
+    "att",
+    "att_rate",
+    "def",
+    "def_rate",
+    "max_hp",
+    "max_hp_rate",
+    "speed",
+    "cri",
+    "cri_dmg",
+    "acc",
+    "res",
+];
+
+/// The mains a part can carry, or `None` for a part no table names — which is
+/// every answer against a server whose Catalog named a slot this end has not
+/// heard of. `None` means "do not narrow", never "nothing is possible": a
+/// criterion the relay cannot place must stay reachable.
+fn main_pool(slot: Option<&str>) -> Option<&'static [&'static str]> {
+    let slot = slot?;
+    MAIN_POOL
+        .iter()
+        .find(|(part, _)| *part == slot)
+        .map(|(_, pool)| *pool)
+}
+
+/// The substats a part can roll, `None` for an unplaced part. See [`main_pool`].
+fn substat_pool(slot: Option<&str>) -> Option<&'static [&'static str]> {
+    let slot = slot?;
+    SUBSTAT_POOL
+        .iter()
+        .find(|(part, _)| *part == slot)
+        .map(|(_, pool)| *pool)
+}
+
+/// The one main a rule names, when it names exactly one.
+///
+/// **Exactly one, and the arithmetic is the point.** A piece never rolls its own
+/// main stat as a substat, so a rule fixing `mains = ["speed"]` can never be
+/// satisfied by an item carrying a speed substat. With `mains = [speed,
+/// att_rate]` the same requirement is not impossible but merely narrowing — it
+/// rules out the speed-main branch and leaves the `att_rate` one — and refusing it
+/// would refuse a legal hunt.
+fn sole_main(mains: &[String]) -> Option<&str> {
+    match mains {
+        [only] => Some(only.as_str()),
+        _ => None,
+    }
+}
+
 const SUBSTAT_RANGE: [(&str, f64, f64); 11] = [
     ("att", 18.0, 45.0),
     ("att_rate", 0.03, 0.08),
@@ -382,9 +554,13 @@ pub(super) fn choice_list(
         });
     });
     unoffered_rows(ui, label, values, String::as_str, |id| {
-        choices.iter().any(|entry| entry.id == id)
+        (!choices.iter().any(|entry| entry.id == id)).then(|| NOT_OFFERED.to_owned())
     });
 }
+
+/// The reason a value has no control because the CATALOG does not name it —
+/// the only one of the three that is about the vocabulary rather than the game.
+const NOT_OFFERED: &str = "not offered";
 
 /// One offered value drawn as its name: a toggling pill.
 ///
@@ -487,6 +663,16 @@ fn chip_name(label: &str, qualifier: Option<&str>) -> String {
 /// has since dropped. Every picker owes that, whatever it offers, so the three
 /// share this rather than the pattern being re-derived per criterion.
 ///
+/// **The reason is the caller's to word, and that is why it is a closure rather
+/// than the fixed "not offered" it used to be.** There are three ways a value
+/// can have no control: the vocabulary does not name it, the piece's PART never
+/// rolls it, or it is that piece's own main stat. Only the first is a statement
+/// about the catalog; the other two are statements about the game, and a row
+/// saying "not offered" about a speed substat under a speed main would name the
+/// wrong culprit. `None` means the value is pickable and gets no row at all —
+/// so widening what a picker draws and widening what falls through to here are
+/// the same edit, and cannot be made out of step.
+///
 /// Generic over the element because one of those lists is not a `Vec<String>`:
 /// a required substat carries a threshold beside its id. `id` projects an entry
 /// down to the one thing a row needs, and the removal below reads the value
@@ -497,20 +683,19 @@ fn unoffered_rows<T>(
     label: &str,
     values: &mut Vec<T>,
     id: impl Fn(&T) -> &str,
-    offered: impl Fn(&str) -> bool,
+    reason: impl Fn(&str) -> Option<String>,
 ) {
-    let unknown: Vec<String> = values
+    let unknown: Vec<(String, String)> = values
         .iter()
         .map(&id)
-        .filter(|value| !offered(value))
-        .map(str::to_owned)
+        .filter_map(|value| reason(value).map(|why| (value.to_owned(), why)))
         .collect();
     let mut dropped = None;
-    for value in &unknown {
+    for (value, why) in &unknown {
         ui.push_id(egui::Id::new((label, "unknown", value)), |ui| {
             ui.horizontal(|ui| {
                 ui.monospace(value);
-                ui.weak("not offered");
+                ui.weak(why);
                 if remove_button(ui).clicked() {
                     dropped = Some(value.clone());
                 }
@@ -559,7 +744,7 @@ pub(super) fn token_cards(ui: &mut egui::Ui, names: &mut Vec<String>) {
         }
     }
     unoffered_rows(ui, "tokens", names, String::as_str, |name| {
-        HUNT_TOKENS.iter().any(|(id, _, _)| *id == name)
+        (!HUNT_TOKENS.iter().any(|(id, _, _)| *id == name)).then(|| NOT_OFFERED.to_owned())
     });
 }
 
@@ -972,11 +1157,80 @@ pub(super) fn string_list(
 /// chip, for the reason [`unoffered_rows`] gives — and, unlike the other two
 /// lists, it also needs its threshold normalised, which is why that pass leads
 /// the function rather than living in the chip.
+/// What a piece IS, for the rows that have to narrow to it.
+///
+/// A struct and not three parameters because the three are one question — which
+/// part this piece wears — asked of a row that already takes four arguments, and
+/// because the two readers ([`substat_chips`] and the main-stat row in
+/// `hunt_body`) must narrow off the SAME answer or offer two different pieces.
+pub(super) struct PieceStats<'a> {
+    /// The part, by wire id. `None` narrows nothing.
+    pub(super) slot: Option<&'a str>,
+    /// The mains the rule hunts — a substat is refused only against a sole one,
+    /// see [`sole_main`].
+    pub(super) mains: &'a [String],
+    /// The slots vocabulary, for the words a reason is said in.
+    pub(super) parts: &'a [VocabularyEntry],
+}
+
+impl PieceStats<'_> {
+    /// Why this piece cannot roll `id` as a substat, worded for the row that
+    /// says it — `None` when it can.
+    ///
+    /// The main stat is tested FIRST, and the order is not arbitrary: on a boot
+    /// both tests can name `speed`, and "same as the main stat" is the reason a
+    /// player can act on where "not rolled on Boots" would be a lie about the
+    /// part.
+    fn unpickable_substat(&self, id: &str) -> Option<String> {
+        if sole_main(self.mains) == Some(id) {
+            return Some("same as the main stat".to_owned());
+        }
+        let pool = substat_pool(self.slot)?;
+        (!pool.contains(&id)).then(|| self.not_rolled())
+    }
+
+    /// Why this piece cannot carry `id` as its MAIN stat, `None` when it can.
+    fn unpickable_main(&self, id: &str) -> Option<String> {
+        let pool = main_pool(self.slot)?;
+        (!pool.contains(&id)).then(|| self.not_rolled())
+    }
+
+    /// The words a part-based refusal is said in.
+    ///
+    /// Phrased around the label rather than in front of it — "not rolled on
+    /// Boots" and never "a boots never rolls it". The game's own words for the
+    /// parts are already plural where it pleases (`Boots` beside `Ring`), so any
+    /// wording that puts an article or a conjugated verb against them is wrong
+    /// on one part or the other, and the label is the server's to choose.
+    fn not_rolled(&self) -> String {
+        format!("not rolled on {}", part_label(self.slot, self.parts))
+    }
+
+    /// The subset of `choices` this piece can actually roll as a substat.
+    fn pickable_substats(&self, choices: &[VocabularyEntry]) -> Vec<VocabularyEntry> {
+        choices
+            .iter()
+            .filter(|entry| self.unpickable_substat(&entry.id).is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// The subset of `choices` this piece can carry as its main stat.
+    pub(super) fn pickable_mains(&self, choices: &[VocabularyEntry]) -> Vec<VocabularyEntry> {
+        choices
+            .iter()
+            .filter(|entry| self.unpickable_main(&entry.id).is_none())
+            .cloned()
+            .collect()
+    }
+}
+
 pub(super) fn substat_chips(
     ui: &mut egui::Ui,
     reqs: &mut Vec<SubstatReq>,
     mode: &mut SubstatMatch,
     choices: &[VocabularyEntry],
+    piece: &PieceStats<'_>,
 ) {
     // Over the WHOLE list and ahead of every widget, because both sources of a
     // non-finite threshold reach entries that get no stepper. `DragValue` parses
@@ -1002,6 +1256,16 @@ pub(super) fn substat_chips(
         }
     }
     substat_header(ui, mode);
+    // The row offers what this PIECE can roll, not what the game has. Narrowed
+    // here and not by the caller so the chips and the rows below them read the
+    // same predicate — a value dropped from one and not the other is either an
+    // invisible criterion or a chip that can only ever match nothing.
+    //
+    // Nothing is removed from `reqs` by drawing. A requirement a config file
+    // already carries that this piece cannot use falls through to
+    // `unoffered_rows` with its reason, stays removable, and survives the Apply
+    // that rewrites `[filter]` whole.
+    let pickable = piece.pickable_substats(choices);
     let mut toggled = None;
     // Salted on the row and not per chip, for the reason `choice_list` states:
     // a `push_id` child never reaches `Layout::next_frame`, so anything drawn
@@ -1017,7 +1281,7 @@ pub(super) fn substat_chips(
     // their width before drawing so a wrap cannot fall between them.
     ui.push_id("required substats", |ui| {
         ui.horizontal_wrapped(|ui| {
-            for entry in choices {
+            for entry in &pickable {
                 match reqs.iter().position(|req| req.name == entry.id) {
                     // Not asked for: a lone pill, like every other offered
                     // value on this screen.
@@ -1056,13 +1320,61 @@ pub(super) fn substat_chips(
             });
         }
     }
+    narrowing_hint(ui, piece, choices);
     unoffered_rows(
         ui,
         "required substats",
         reqs,
         |req: &SubstatReq| req.name.as_str(),
-        |id| choices.iter().any(|entry| entry.id == id),
+        |id| {
+            if !choices.iter().any(|entry| entry.id == id) {
+                return Some(NOT_OFFERED.to_owned());
+            }
+            piece.unpickable_substat(id)
+        },
     );
+}
+
+/// The one muted line saying why the row above is short.
+///
+/// **What removal costs, bought back as a sentence rather than a count.** A
+/// value this piece cannot roll is not drawn at all — it is not a choice the
+/// player declined, it is not a choice, and the main-stat row draws its own pool
+/// and nothing else. The price is that a short row looks accidental, and
+/// `theme::section` is a bare uppercase label everywhere on this surface, with
+/// this one already sharing its line with the all/any strip. So it is said the
+/// way the Click-timing section says `mode_hint`: one muted sentence under the
+/// control, which teaches the rule where a number would only report it.
+///
+/// Silent when nothing narrows — against a server whose slots this end cannot
+/// place, and on a piece naming no part at all.
+fn narrowing_hint(ui: &mut egui::Ui, piece: &PieceStats<'_>, choices: &[VocabularyEntry]) {
+    let mut said = Vec::new();
+    // Named off `choices` and not off the pool, so a stat the catalog stopped
+    // sending is not announced as one the part refuses.
+    let refused: Vec<&str> = choices
+        .iter()
+        .filter(|entry| {
+            substat_pool(piece.slot).is_some_and(|pool| !pool.contains(&entry.id.as_str()))
+        })
+        .map(|entry| entry.label.as_str())
+        .collect();
+    if !refused.is_empty() {
+        said.push(format!("{}: {}.", piece.not_rolled(), refused.join(", ")));
+    }
+    if let Some(main) = sole_main(piece.mains) {
+        let label = choices
+            .iter()
+            .find(|entry| entry.id == main)
+            .map_or(main, |entry| entry.label.as_str());
+        said.push(format!(
+            "{label} is the main stat here, so it is never also a substat."
+        ));
+    }
+    if !said.is_empty() {
+        ui.add_space(theme::SP_XS);
+        ui.label(egui::RichText::new(said.join(" ")).small().weak());
+    }
 }
 
 /// The width the value cell takes, and the only part of a run that cannot be
@@ -1344,6 +1656,20 @@ mod tests {
             .collect()
     }
 
+    /// A piece that narrows nothing: no part named, no main hunted.
+    ///
+    /// What the layout tests below are about is the WIDTH of the row and the
+    /// arithmetic of a threshold, neither of which the narrowing touches — and
+    /// they want the widest row the control can be asked to draw, which is the
+    /// unnarrowed one. The narrowing has its own tests, which state their part.
+    fn any_piece() -> PieceStats<'static> {
+        PieceStats {
+            slot: None,
+            mains: &[],
+            parts: &[],
+        }
+    }
+
     /// The substat row at the window's own width, which `main.rs` pins as both
     /// the minimum and the maximum inner size — a control laid out with room to
     /// spare here would wrap on the player's screen.
@@ -1354,9 +1680,217 @@ mod tests {
         let mut mode = SubstatMatch::default();
         let mut harness = Harness::builder()
             .with_size(egui::vec2(crate::ui::WINDOW_WIDTH, 600.0))
-            .build_ui(move |ui| substat_chips(ui, reqs, &mut mode, choices));
+            .build_ui(move |ui| substat_chips(ui, reqs, &mut mode, choices, &any_piece()));
         harness.run();
         harness
+    }
+
+    /// The substat row narrowed to one piece — the same control as
+    /// [`substat_row`], asked what a given part can roll.
+    fn narrowed_row<'a>(
+        reqs: &'a mut Vec<SubstatReq>,
+        choices: &'a [VocabularyEntry],
+        piece: &'a PieceStats<'a>,
+    ) -> Harness<'a> {
+        let mut mode = SubstatMatch::default();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(crate::ui::WINDOW_WIDTH, 600.0))
+            .build_ui(move |ui| substat_chips(ui, reqs, &mut mode, choices, piece));
+        harness.run();
+        harness
+    }
+
+    fn part_entry(id: &str, label: &str) -> Vec<VocabularyEntry> {
+        vec![VocabularyEntry {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            percent: false,
+        }]
+    }
+
+    /// The two transcribed tables are checked against EACH OTHER, which is the
+    /// only check this end can make without the game in front of it.
+    ///
+    /// A part whose main is fixed must not list that main among the substats it
+    /// rolls — the game's rule is that a substat never duplicates the main, so
+    /// the three one-main parts are exactly the three whose substat pool is
+    /// short of their own. A typo in either table breaks the agreement, which is
+    /// what makes this a tripwire rather than a restatement.
+    #[test]
+    fn a_part_with_a_fixed_main_never_rolls_that_main_as_a_substat() {
+        for (part, mains) in MAIN_POOL {
+            let [only] = mains else { continue };
+            let pool = substat_pool(Some(part)).expect("both tables name the same six parts");
+            assert!(
+                !pool.contains(only),
+                "{part} is said to roll its own main stat {only}"
+            );
+        }
+    }
+
+    /// Both tables name the same six parts, and no part is named twice.
+    #[test]
+    fn the_two_tables_cover_the_same_parts() {
+        let mains: Vec<&str> = MAIN_POOL.iter().map(|(part, _)| *part).collect();
+        let subs: Vec<&str> = SUBSTAT_POOL.iter().map(|(part, _)| *part).collect();
+        assert_eq!(mains, subs);
+        for part in &mains {
+            assert_eq!(mains.iter().filter(|other| *other == part).count(), 1);
+        }
+    }
+
+    /// Every id either table names is one the wire actually sends.
+    #[test]
+    fn the_tables_name_no_stat_the_game_does_not_roll() {
+        let known: Vec<&str> = LIVE_SUBSTATS.iter().map(|(id, _, _)| *id).collect();
+        for (part, pool) in MAIN_POOL.iter().chain(SUBSTAT_POOL.iter()) {
+            for id in *pool {
+                assert!(known.contains(id), "{part} names an unknown stat {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_part_offers_exactly_the_substats_the_game_rolls_on_it() {
+        let choices = live_choices();
+        for (part, pool) in SUBSTAT_POOL {
+            let parts = part_entry(part, part);
+            let piece = PieceStats {
+                slot: Some(part),
+                mains: &[],
+                parts: &parts,
+            };
+            let mut reqs = Vec::new();
+            let harness = narrowed_row(&mut reqs, &choices, &piece);
+            for (id, label, _) in LIVE_SUBSTATS {
+                assert_eq!(
+                    harness.query_by_label(label).is_some(),
+                    pool.contains(&id),
+                    "{part} / {label}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_part_carries_exactly_the_main_stats_the_game_allows() {
+        let choices = live_choices();
+        for (part, pool) in MAIN_POOL {
+            let piece = PieceStats {
+                slot: Some(part),
+                mains: &[],
+                parts: &[],
+            };
+            // Compared as sets. The row draws in the WIRE's order, like the
+            // substat row beside it; the table is written in the notice's. What
+            // is pinned here is which stats a part carries, not in which order
+            // a server chose to send them.
+            let mut offered: Vec<String> = piece
+                .pickable_mains(&choices)
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect();
+            let mut expected: Vec<String> = pool.iter().map(|id| (*id).to_owned()).collect();
+            offered.sort();
+            expected.sort();
+            assert_eq!(offered, expected, "{part}");
+        }
+    }
+
+    /// A part this end cannot place narrows NOTHING, which is the fail-open half
+    /// of the table: a server whose Catalog names a slot the relay has not heard
+    /// of must not have every criterion withdrawn from under it.
+    #[test]
+    fn a_part_no_table_names_offers_the_whole_vocabulary() {
+        let choices = live_choices();
+        let parts = part_entry("wing", "Wing");
+        let piece = PieceStats {
+            slot: Some("wing"),
+            mains: &[],
+            parts: &parts,
+        };
+        let mut reqs = Vec::new();
+        let harness = narrowed_row(&mut reqs, &choices, &piece);
+        for (_, label, _) in LIVE_SUBSTATS {
+            assert!(harness.query_by_label(label).is_some(), "{label}");
+        }
+        assert_eq!(piece.pickable_mains(&choices).len(), choices.len());
+    }
+
+    /// The chip goes, the criterion does not.
+    ///
+    /// A `config.toml` can already ask for a speed substat under a speed main —
+    /// no item can satisfy it, but withdrawing the chip AND the requirement
+    /// would make a criterion that still filters invisible and unremovable, and
+    /// `config::persist` rewrites `[filter]` whole, so the next Apply would erase
+    /// it. It falls through to an unoffered row instead, naming the main stat and
+    /// not the part.
+    #[test]
+    fn a_requirement_the_main_stat_forbids_keeps_its_row_and_its_place_in_the_draft() {
+        let choices = live_choices();
+        let mains = vec!["speed".to_owned()];
+        let parts = part_entry("boot", "Boots");
+        let piece = PieceStats {
+            slot: Some("boot"),
+            mains: &mains,
+            parts: &parts,
+        };
+        let mut reqs = vec![SubstatReq {
+            name: "speed".to_owned(),
+            min: None,
+        }];
+        {
+            let harness = narrowed_row(&mut reqs, &choices, &piece);
+            assert!(
+                harness.query_by_label("Speed").is_none(),
+                "the chip is withdrawn"
+            );
+            assert!(
+                harness.query_by_label("same as the main stat").is_some(),
+                "and the reason names the main stat, not the part"
+            );
+        }
+        assert_eq!(reqs.len(), 1, "drawing never drops a criterion");
+    }
+
+    /// A requirement the PART forbids says so in the part's own words, and the
+    /// wording puts the label after the verb — the game's names are plural where
+    /// it pleases (`Boots` beside `Ring`), so nothing may precede them.
+    #[test]
+    fn a_requirement_the_part_forbids_names_the_part() {
+        let choices = live_choices();
+        let parts = part_entry("weapon", "Weapon");
+        let piece = PieceStats {
+            slot: Some("weapon"),
+            mains: &[],
+            parts: &parts,
+        };
+        let mut reqs = vec![SubstatReq {
+            name: "def".to_owned(),
+            min: None,
+        }];
+        let harness = narrowed_row(&mut reqs, &choices, &piece);
+        assert!(harness.query_by_label("Defense").is_none());
+        assert!(harness.query_by_label("not rolled on Weapon").is_some());
+    }
+
+    /// Several mains is a NARROWING and not a contradiction, so nothing is
+    /// withdrawn: with `[speed, att_rate]` a speed substat merely rules out the
+    /// speed-main branch and leaves the `att_rate` one, which is a legal hunt.
+    #[test]
+    fn two_mains_withdraw_no_chip_because_the_other_branch_can_still_roll_it() {
+        let choices = live_choices();
+        let mains = vec!["speed".to_owned(), "att_rate".to_owned()];
+        let parts = part_entry("boot", "Boots");
+        let piece = PieceStats {
+            slot: Some("boot"),
+            mains: &mains,
+            parts: &parts,
+        };
+        let mut reqs = Vec::new();
+        let harness = narrowed_row(&mut reqs, &choices, &piece);
+        assert!(harness.query_by_label("Speed").is_some());
+        assert!(harness.query_by_label("Attack(%)").is_some());
     }
 
     /// The accessibility box of the node a label names.
@@ -1579,7 +2113,7 @@ mod tests {
     ) -> Harness<'a> {
         let mut harness = Harness::builder()
             .with_size(egui::vec2(crate::ui::WINDOW_WIDTH, 600.0))
-            .build_ui(|ui| substat_chips(ui, reqs, mode, choices));
+            .build_ui(|ui| substat_chips(ui, reqs, mode, choices, &any_piece()));
         harness.run();
         harness
     }

@@ -264,6 +264,50 @@ fn offered_list(
     }
 }
 
+/// The piece's main stat: the pool its PART can carry, and nothing else.
+///
+/// **Three parts get a sentence instead of a picker.** A weapon's main is
+/// Attack, a helm's is Health, an armor's is Defense — the game leaves no choice
+/// there, and a one-value picker is a question that is not one. The other three
+/// draw 7 or 8 chips where the row used to draw all eleven, four of which could
+/// only ever match nothing (`GearRule::matches` is fail-closed on `main_stat`).
+///
+/// **`choice_list` in both branches, and that is not redundant.** It is what
+/// draws the unoffered rows, so a `mains` a config file already carries that
+/// this part cannot wear stays visible and removable rather than vanishing with
+/// the chip that used to hold it — the same rule the substat row obeys, for the
+/// same reason: `config::persist` rewrites `[filter]` whole. On the three fixed
+/// parts the pool is one value, so the picker has exactly one chip; the sentence
+/// above it is what says the choice is not real.
+fn main_stat_row(
+    ui: &mut egui::Ui,
+    mains: &mut Vec<String>,
+    choices: &[VocabularyEntry],
+    piece: &hunt::PieceStats<'_>,
+) {
+    let pickable = piece.pickable_mains(choices);
+    if let [only] = pickable.as_slice() {
+        ui.label(theme::section("main stat"));
+        ui.label(
+            egui::RichText::new(format!(
+                "Always {} on this part — nothing to choose.",
+                only.label
+            ))
+            .small()
+            .weak(),
+        );
+        ui.add_space(theme::SP_XS);
+    }
+    choice_list(
+        ui,
+        "main stat",
+        mains,
+        &pickable,
+        &SetIcons::default(),
+        Some("main stat"),
+    );
+}
+
 /// One collapsible section bar plus the breathing room its open body needs.
 fn section(ui: &mut egui::Ui, title: &str, summary: Option<&str>, open: &mut bool) {
     if theme::collapsing_section(ui, title, summary, *open) {
@@ -358,20 +402,25 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
         // derivation. It is spelled out because it is the name a screen reader
         // says, where the header is a `theme::section` this row uppercases; a
         // layout rewording of one must not silently move the other.
-        choice_list(
-            ui,
-            "main stat",
-            &mut rule.mains,
-            &editor.vocabulary.substats,
-            &SetIcons::default(),
-            Some("main stat"),
-        );
+        // Cloned before the mutable borrows below, and it is two small
+        // allocations a frame against a closure fight: every row past this point
+        // narrows to the SAME piece, so the answer is computed once here rather
+        // than re-derived per row out of fields that are then borrowed mutably.
+        let part = rule.slot.clone();
+        let mains = rule.mains.clone();
+        let piece = hunt::PieceStats {
+            slot: part.as_deref(),
+            mains: &mains,
+            parts: &editor.vocabulary.slots,
+        };
+        main_stat_row(ui, &mut rule.mains, &editor.vocabulary.substats, &piece);
         gear_rule(ui);
         substat_chips(
             ui,
             &mut rule.required_substats,
             &mut rule.substat_match,
             &editor.vocabulary.substats,
+            &piece,
         );
         gear_rule(ui);
         // No space between the header and its control: the item spacing already
