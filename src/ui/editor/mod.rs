@@ -2634,7 +2634,22 @@ mod tests {
                 let bg = ui.visuals().panel_fill;
                 ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, bg);
                 ui.add_space(theme::SP_SM);
-                substat_chips(ui, &mut reqs, &mut mode, &choices);
+                // Unnarrowed on purpose: what this picture is for is whether the
+                // `≥` and its number read as ONE object, and that wants the
+                // widest row the control can draw. A piece that withdraws chips
+                // would answer a different question — see `hunt::tests` for the
+                // narrowing, which is pinned by assertion rather than by eye.
+                substat_chips(
+                    ui,
+                    &mut reqs,
+                    &mut mode,
+                    &choices,
+                    &hunt::PieceStats {
+                        slot: None,
+                        mains: &[],
+                        parts: &[],
+                    },
+                );
             });
         harness.run();
         let image = harness.render().expect("wgpu render");
