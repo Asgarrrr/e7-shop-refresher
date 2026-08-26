@@ -14,7 +14,7 @@ mod timing_meter;
 
 use clicking::{backend_row, clicking_summary, dry_run_row, timing_notice};
 use hunt::{
-    choice_list, piece_strip, rarity_ladder, slot_ladder, string_list, substat_chips, token_cards,
+    choice_list, piece_list, rarity_ladder, slot_ladder, string_list, substat_chips, token_cards,
 };
 use stop::{duration_row, limit_row};
 // Re-exported one level up: the idle status band describes the plan with the
@@ -345,106 +345,107 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
 
     branch_separator(ui, "— or gear —", "or gear");
 
-    piece_strip(
+    piece_list(
         ui,
         &mut editor.filter.gear,
         &mut editor.gear_index,
         &editor.vocabulary.slots,
+        &editor.vocabulary.substats,
+        |ui, rule| {
+            offered_list(
+                ui,
+                "sets",
+                &mut rule.sets,
+                &mut editor.set_input,
+                &editor.vocabulary.sets,
+                icons,
+            );
+            gear_rule(ui);
+            // No icons and no free-text fallback, unlike the sets above: the
+            // catalog's icon table is keyed by set id and carries no gear-slot
+            // picture, and a criterion holding ONE value has no `Vec` for
+            // `string_list` to edit. `slot_ladder` carries what the fallback used to
+            // buy — a part the vocabulary cannot name still gets a cell, and
+            // clearing it is the way out.
+            ui.label(theme::section("gear slot"));
+            slot_ladder(ui, &mut rule.slot, &editor.vocabulary.slots);
+            gear_rule(ui);
+            // Directly under the slot, and above the rolls, because that is the
+            // order the criteria are read in: the slot and the main stat together
+            // are what piece this IS — "a speed boot" — while the substats below
+            // are what it happens to have ROLLED. `GearRule` declares its fields in
+            // the same order, and `filter.rs` states the same split on `mains`.
+            //
+            // **The whole substat vocabulary, unfiltered by slot**, though the
+            // game's own pool is per part: read off `equip_item.main_stat` →
+            // `equip_stat.stat_type`, a weapon offers `att` alone, a helm `max_hp`
+            // or `def`, and only neck (8), ring (9) and boot (7) hold a real
+            // choice — the union is exactly the eleven the wire already sends.
+            // Narrowing to the ticked slots would put that table on the wire, three
+            // repositories of work for a choice the criterion already refuses on
+            // its own: `GearRule::matches` is fail-closed on `main_stat`, so a crit
+            // damage main on a boots hunt matches nothing. The cost of not
+            // narrowing is real and is this — on a boots hunt, "Critical Hit
+            // Damage" is offered and can only ever match nothing.
+            //
+            // `choice_list` and not `offered_list`: this criterion shares its
+            // vocabulary with the required substats, and that row has no free-text
+            // fallback either. A main stat the catalog cannot name is still drawn,
+            // and still removable, by `choice_list`'s own unoffered rows — what a
+            // fallback would add is TYPING a stat id against a server with no
+            // Catalog, which is the one thing a closed eleven-value vocabulary does
+            // not need. `SetIcons::default()` for the reason the gear slots hand in
+            // one: the wire's icon table is keyed by set id and holds no stats.
+            //
+            // The qualifier repeats the header's word by coincidence, not by
+            // derivation. It is spelled out because it is the name a screen reader
+            // says, where the header is a `theme::section` this row uppercases; a
+            // layout rewording of one must not silently move the other.
+            // Cloned before the mutable borrows below, and it is two small
+            // allocations a frame against a closure fight: every row past this point
+            // narrows to the SAME piece, so the answer is computed once here rather
+            // than re-derived per row out of fields that are then borrowed mutably.
+            let part = rule.slot.clone();
+            let mains = rule.mains.clone();
+            let piece = hunt::PieceStats {
+                slot: part.as_deref(),
+                mains: &mains,
+                parts: &editor.vocabulary.slots,
+            };
+            main_stat_row(ui, &mut rule.mains, &editor.vocabulary.substats, &piece);
+            gear_rule(ui);
+            substat_chips(
+                ui,
+                &mut rule.required_substats,
+                &mut rule.substat_match,
+                &editor.vocabulary.substats,
+                &piece,
+            );
+            gear_rule(ui);
+            // No space between the header and its control: the item spacing already
+            // puts one there, and the two blocks above take exactly that — a header
+            // that sits further from its own control than from the block before it
+            // is the reading this section had.
+            //
+            // Unconditional, where it used to wait on the catalog's rarity family:
+            // the cells are `theme::RARITIES` now, so there is no session in which
+            // the ladder cannot be drawn. See [`rarity_ladder`].
+            ui.label(theme::section("rarity"));
+            rarity_ladder(ui, &mut rule.min_grade);
+            // `max_price` has no control here any more, and the CRITERION is
+            // untouched: it still loads from `config.toml`, still filters, and still
+            // shows in the folded bar through `rule_parts`. Only the question leaves
+            // the window — the regime `min_substats` already lives under.
+            //
+            // Dropping a control is not dropping a value, and this surface is where
+            // the two can be confused: `config::persist` rewrites `[filter]` WHOLE,
+            // so a criterion no widget touches must still ride the draft or the
+            // first Apply erases a cap the player set by hand. It does, because the
+            // draft is a whole `Filter`; `a_config_set_price_cap_survives_a_window_
+            // with_no_control_for_it` is what stops that from silently ceasing to be
+            // true, exactly as its `min_substats` twin does.
+        },
     );
-    with_rule(&mut editor.filter.gear, editor.gear_index, |rule| {
-        offered_list(
-            ui,
-            "sets",
-            &mut rule.sets,
-            &mut editor.set_input,
-            &editor.vocabulary.sets,
-            icons,
-        );
-        gear_rule(ui);
-        // No icons and no free-text fallback, unlike the sets above: the
-        // catalog's icon table is keyed by set id and carries no gear-slot
-        // picture, and a criterion holding ONE value has no `Vec` for
-        // `string_list` to edit. `slot_ladder` carries what the fallback used to
-        // buy — a part the vocabulary cannot name still gets a cell, and
-        // clearing it is the way out.
-        ui.label(theme::section("gear slot"));
-        slot_ladder(ui, &mut rule.slot, &editor.vocabulary.slots);
-        gear_rule(ui);
-        // Directly under the slot, and above the rolls, because that is the
-        // order the criteria are read in: the slot and the main stat together
-        // are what piece this IS — "a speed boot" — while the substats below
-        // are what it happens to have ROLLED. `GearRule` declares its fields in
-        // the same order, and `filter.rs` states the same split on `mains`.
-        //
-        // **The whole substat vocabulary, unfiltered by slot**, though the
-        // game's own pool is per part: read off `equip_item.main_stat` →
-        // `equip_stat.stat_type`, a weapon offers `att` alone, a helm `max_hp`
-        // or `def`, and only neck (8), ring (9) and boot (7) hold a real
-        // choice — the union is exactly the eleven the wire already sends.
-        // Narrowing to the ticked slots would put that table on the wire, three
-        // repositories of work for a choice the criterion already refuses on
-        // its own: `GearRule::matches` is fail-closed on `main_stat`, so a crit
-        // damage main on a boots hunt matches nothing. The cost of not
-        // narrowing is real and is this — on a boots hunt, "Critical Hit
-        // Damage" is offered and can only ever match nothing.
-        //
-        // `choice_list` and not `offered_list`: this criterion shares its
-        // vocabulary with the required substats, and that row has no free-text
-        // fallback either. A main stat the catalog cannot name is still drawn,
-        // and still removable, by `choice_list`'s own unoffered rows — what a
-        // fallback would add is TYPING a stat id against a server with no
-        // Catalog, which is the one thing a closed eleven-value vocabulary does
-        // not need. `SetIcons::default()` for the reason the gear slots hand in
-        // one: the wire's icon table is keyed by set id and holds no stats.
-        //
-        // The qualifier repeats the header's word by coincidence, not by
-        // derivation. It is spelled out because it is the name a screen reader
-        // says, where the header is a `theme::section` this row uppercases; a
-        // layout rewording of one must not silently move the other.
-        // Cloned before the mutable borrows below, and it is two small
-        // allocations a frame against a closure fight: every row past this point
-        // narrows to the SAME piece, so the answer is computed once here rather
-        // than re-derived per row out of fields that are then borrowed mutably.
-        let part = rule.slot.clone();
-        let mains = rule.mains.clone();
-        let piece = hunt::PieceStats {
-            slot: part.as_deref(),
-            mains: &mains,
-            parts: &editor.vocabulary.slots,
-        };
-        main_stat_row(ui, &mut rule.mains, &editor.vocabulary.substats, &piece);
-        gear_rule(ui);
-        substat_chips(
-            ui,
-            &mut rule.required_substats,
-            &mut rule.substat_match,
-            &editor.vocabulary.substats,
-            &piece,
-        );
-        gear_rule(ui);
-        // No space between the header and its control: the item spacing already
-        // puts one there, and the two blocks above take exactly that — a header
-        // that sits further from its own control than from the block before it
-        // is the reading this section had.
-        //
-        // Unconditional, where it used to wait on the catalog's rarity family:
-        // the cells are `theme::RARITIES` now, so there is no session in which
-        // the ladder cannot be drawn. See [`rarity_ladder`].
-        ui.label(theme::section("rarity"));
-        rarity_ladder(ui, &mut rule.min_grade);
-        // `max_price` has no control here any more, and the CRITERION is
-        // untouched: it still loads from `config.toml`, still filters, and still
-        // shows in the folded bar through `rule_parts`. Only the question leaves
-        // the window — the regime `min_substats` already lives under.
-        //
-        // Dropping a control is not dropping a value, and this surface is where
-        // the two can be confused: `config::persist` rewrites `[filter]` WHOLE,
-        // so a criterion no widget touches must still ride the draft or the
-        // first Apply erases a cap the player set by hand. It does, because the
-        // draft is a whole `Filter`; `a_config_set_price_cap_survives_a_window_
-        // with_no_control_for_it` is what stops that from silently ceasing to be
-        // true, exactly as its `min_substats` twin does.
-    });
     // Outside both blocks, and last because of it: `matches` applies this
     // before either branch, so it widens the name hunt exactly as it widens the
     // gear one.
@@ -551,9 +552,20 @@ fn branch_separator(ui: &mut egui::Ui, name: &str, word: &str) {
 /// its own chips sat below — so the header read as a caption on the block it
 /// followed instead of a title for the one it opens. The air under the rule is
 /// what attaches it downwards.
+/// **Bounded to the `Ui` it is given, where it used to bleed to the window.**
+/// These rules now separate blocks INSIDE a piece row, and `theme::rule` paints
+/// past the side margin by design — so each one crossed the row's frame and ran
+/// out the right-hand side, destroying the containment the frame exists to give.
+/// Rendered and seen; no assertion catches a line that leaves a box.
 fn gear_rule(ui: &mut egui::Ui) {
     ui.add_space(theme::SP_SM);
-    theme::rule(ui, theme::HAIRLINE);
+    let width = ui.available_width();
+    let (row, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+    ui.painter().hline(
+        row.x_range(),
+        row.center().y,
+        egui::Stroke::new(1.0, theme::HAIRLINE),
+    );
     ui.add_space(theme::SP_LG);
 }
 
@@ -2696,13 +2708,14 @@ mod tests {
         eprintln!("rendered {}", path.display());
     }
 
-    /// The piece strip over the top of one rule's criteria: two pieces hunted
-    /// under the names of their parts, the second on screen, the draft cell
-    /// waiting past it.
+    /// The piece list: two pieces hunted, the second open over its own
+    /// criteria and its own verbs, the draft row waiting past it. A picture is
+    /// the only thing that can say whether an open row reads as BOUNDED — the
+    /// defect that sent the bare bar back (see `theme::collapsing_row`).
     #[test]
     #[cfg(feature = "render-png")]
-    #[ignore = "renders the piece strip to a PNG for visual iteration; run with --ignored"]
-    fn render_piece_strip_png() {
+    #[ignore = "renders the piece list to a PNG for visual iteration; run with --ignored"]
+    fn render_piece_list_png() {
         let mut editor = stocked_editor_with(Filter {
             names: Vec::new(),
             gear: vec![
@@ -2720,7 +2733,7 @@ mod tests {
         });
         editor.gear_index = 1;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(430.0, 200.0))
+            .with_size(egui::vec2(430.0, 470.0))
             .with_pixels_per_point(2.0)
             .wgpu()
             .build_ui(move |ui| {
@@ -2728,19 +2741,20 @@ mod tests {
                 let bg = ui.visuals().panel_fill;
                 ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, bg);
                 ui.add_space(theme::SP_SM);
-                piece_strip(
+                piece_list(
                     ui,
                     &mut editor.filter.gear,
                     &mut editor.gear_index,
                     &editor.vocabulary.slots,
+                    &editor.vocabulary.substats,
+                    |ui, rule| {
+                        ui.label(theme::section("gear slot"));
+                        slot_ladder(ui, &mut rule.slot, &editor.vocabulary.slots);
+                        gear_rule(ui);
+                        ui.label(theme::section("rarity"));
+                        rarity_ladder(ui, &mut rule.min_grade);
+                    },
                 );
-                with_rule(&mut editor.filter.gear, editor.gear_index, |rule| {
-                    ui.label(theme::section("gear slot"));
-                    slot_ladder(ui, &mut rule.slot, &editor.vocabulary.slots);
-                    gear_rule(ui);
-                    ui.label(theme::section("rarity"));
-                    rarity_ladder(ui, &mut rule.min_grade);
-                });
             });
         harness.run();
         let image = harness.render().expect("wgpu render");

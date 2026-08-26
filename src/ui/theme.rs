@@ -566,6 +566,97 @@ pub(super) fn collapsing_section(
     response.clicked()
 }
 
+/// [`collapsing_section`]'s grammar one rank down: a row inside a section that
+/// opens in place, for a LIST whose items expand.
+///
+/// Same caret, same title-then-summary, same summary-only-when-closed, same
+/// click-anywhere — shared so an opening row and an opening section cannot drift
+/// into two different gestures. What differs is rank, and every difference is
+/// that one decision:
+///
+/// - the title keeps its own case and normal ink, where a section shouts it in
+///   small caps. Everywhere on this surface a block INSIDE a section is a
+///   [`section`] label; this is that label given a caret, not a second kind of
+///   panel;
+/// - the fill stops at the row instead of bleeding to the clip edges, because
+///   the row sits in a caller's box and a full-bleed hover would cross it;
+/// - no seam hairline. Sections tile against each other and need one; a row is
+///   bounded by the frame its caller draws.
+///
+/// **The caller draws that frame, and it is not decoration.** A bare bar was
+/// tried: with no boundary an open item's body runs straight into the next row
+/// and any footer under it reads as belonging to the list rather than to the
+/// item. Sections need no box because they are siblings at panel width with
+/// nothing nested; a list whose item expands in place has a containment problem
+/// they do not have.
+///
+/// `name` is the accessible name and is taken rather than derived, because two
+/// rows of one list may legitimately paint the same words — `get_by_label`
+/// answers a duplicate by panicking rather than by picking, so only the caller
+/// knows what tells its rows apart.
+pub(super) fn collapsing_row(
+    ui: &mut egui::Ui,
+    title: &str,
+    summary: Option<&str>,
+    name: &str,
+    open: bool,
+) -> bool {
+    let (bar, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click());
+    let enabled = ui.is_enabled();
+    let peek = (!open).then_some(()).and(summary);
+    // Built inside the closure for the reason `collapsing_section` states: egui
+    // calls this only when something is listening.
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, name));
+
+    let hovered = response.hovered();
+    // An OPEN row is lifted a step, and by `STRIPE` rather than the accent:
+    // `toggle_skin` says "chosen among peers", and an opened row is not a
+    // selection — the criteria under it say which piece is being edited.
+    if hovered || open {
+        ui.painter().rect_filled(bar, CornerRadius::ZERO, STRIPE);
+    }
+    let (title_color, caret_color) = if hovered || open {
+        (INK, INK_MUTED)
+    } else {
+        (INK_MUTED, INK_FAINT)
+    };
+    let painter = ui.painter().with_clip_rect(bar);
+    caret(&painter, bar, open, caret_color);
+    let title_rect = painter.text(
+        egui::pos2(bar.left() + 22.0, bar.center().y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        FontId::new(13.0, FontFamily::Proportional),
+        title_color,
+    );
+    // Clipped left of the title, so a long summary never crosses it — the same
+    // elision `collapsing_section` gives its own peek.
+    if let Some(summary) = peek {
+        let region = egui::Rect::from_min_max(
+            egui::pos2(title_rect.right() + SP_SM, bar.top()),
+            egui::pos2(bar.right() - SP_SM, bar.bottom()),
+        );
+        ui.painter().with_clip_rect(region).text(
+            egui::pos2(region.right(), bar.center().y),
+            egui::Align2::RIGHT_CENTER,
+            summary,
+            FontId::new(12.0, FontFamily::Proportional),
+            INK_FAINT,
+        );
+    }
+    response.clicked()
+}
+
+/// The box a [`collapsing_row`] sits in — see that function on why it is not
+/// decoration. Edged brighter while open, so the item being edited is bounded
+/// visibly and not only by the fill under its bar.
+pub(super) fn row_frame(open: bool) -> egui::Frame {
+    egui::Frame::new()
+        .stroke(Stroke::new(1.0, if open { VERB_RULE } else { HAIRLINE }))
+        .corner_radius(CornerRadius::same(5))
+}
+
 /// A small painted disclosure caret at the left of `row` (right = closed,
 /// down = open), not a `▸` glyph, so it never depends on the stock font
 /// carrying the symbol.
