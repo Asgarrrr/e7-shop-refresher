@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use super::super::theme;
-use super::{arm_optional, count_label, optional_field};
+use super::count_label;
 use crate::domain::filter::{Filter, GearRule, SubstatMatch, SubstatReq};
 use crate::domain::shop::Gold;
 use crate::render::kind_label;
@@ -1596,22 +1596,6 @@ fn threshold_field(ui: &mut egui::Ui, stored: &mut f64, percent: bool, ceiling: 
     // through the scale and back.
     if response.changed() {
         *stored = f64::from(shown) / scale;
-    }
-}
-
-/// Checkbox-gated numeric criterion, laid as two grid cells (label, value).
-/// Unchecked means "no constraint" — never a 0.
-pub(super) fn optional_value<T: egui::emath::Numeric>(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: &mut Option<T>,
-    seed: T,
-) {
-    let mut on = value.is_some();
-    ui.checkbox(&mut on, label);
-    arm_optional(on, value, seed);
-    if let Some(current) = value.as_mut() {
-        optional_field(ui, current);
     }
 }
 

@@ -14,8 +14,7 @@ mod timing_meter;
 
 use clicking::{backend_row, clicking_summary, dry_run_row, timing_notice};
 use hunt::{
-    choice_list, optional_value, piece_strip, rarity_ladder, slot_ladder, string_list,
-    substat_chips, token_cards,
+    choice_list, piece_strip, rarity_ladder, slot_ladder, string_list, substat_chips, token_cards,
 };
 use stop::{duration_row, limit_row};
 // Re-exported one level up: the idle status band describes the plan with the
@@ -41,7 +40,7 @@ use crate::domain::filter::{Filter, GearRule};
 use crate::uplink::VocabularyCell;
 use crate::uplink::protocol::{FilterVocabulary, VocabularyEntry};
 // `currency_row` lends each cap its raw number for the frame the drag needs it.
-use crate::domain::shop::{Crystals, Gold};
+use crate::domain::shop::Crystals;
 // `kinds` has no control in the window any more, so only a test still names a
 // kind — the one pinning that a config-set one survives a render.
 #[cfg(test)]
@@ -433,18 +432,18 @@ fn hunt_body(ui: &mut egui::Ui, editor: &mut EditorState, icons: &SetIcons) {
         // the ladder cannot be drawn. See [`rarity_ladder`].
         ui.label(theme::section("rarity"));
         rarity_ladder(ui, &mut rule.min_grade);
-        ui.add_space(theme::SP_XS);
-        egui::Grid::new("hunt-numerics")
-            .num_columns(2)
-            .spacing([theme::SP_SM, theme::SP_XS])
-            .show(ui, |ui| {
-                // Seeded above the covenant-bookmark price, so a fresh cap still
-                // matches the default hunt targets.
-                currency_row(&mut rule.max_price, Gold::get, Gold::new, |cap| {
-                    optional_value(ui, "max price (gold)", cap, 300_000)
-                });
-                ui.end_row();
-            });
+        // `max_price` has no control here any more, and the CRITERION is
+        // untouched: it still loads from `config.toml`, still filters, and still
+        // shows in the folded bar through `rule_parts`. Only the question leaves
+        // the window — the regime `min_substats` already lives under.
+        //
+        // Dropping a control is not dropping a value, and this surface is where
+        // the two can be confused: `config::persist` rewrites `[filter]` WHOLE,
+        // so a criterion no widget touches must still ride the draft or the
+        // first Apply erases a cap the player set by hand. It does, because the
+        // draft is a whole `Filter`; `a_config_set_price_cap_survives_a_window_
+        // with_no_control_for_it` is what stops that from silently ceasing to be
+        // true, exactly as its `min_substats` twin does.
     });
     // Outside both blocks, and last because of it: `matches` applies this
     // before either branch, so it widens the name hunt exactly as it widens the
@@ -584,7 +583,7 @@ fn arm_optional<T>(armed: bool, value: &mut Option<T>, seed: T) {
 }
 
 /// Lends an optional *currency* field its raw number for one frame, so it can
-/// use the same widget as every other criterion. Neither [`Gold`] nor
+/// use the same widget as every other criterion. Neither [`crate::domain::shop::Gold`] nor
 /// [`Crystals`] implements `egui::emath::Numeric` deliberately: `src/domain/`
 /// compiles under `--no-default-features`, and the impl would pull egui into
 /// the ledger types. The round-trip is exact, so [`commit_row`]'s bit-exact
@@ -839,6 +838,10 @@ mod tests {
     };
 
     use super::*;
+    // Here and not beside `Crystals` at the top of the module: the window has no
+    // gold control any more, so the only `Gold` this file names is the price cap
+    // a test asserts survives without one.
+    use crate::domain::shop::Gold;
 
     fn named_filter() -> Filter {
         Filter {
@@ -1930,6 +1933,39 @@ mod tests {
         }
         drop(harness);
         assert_eq!(editor.filter.only_rule().min_substats, Some(3));
+        // And Apply stays dark: a render that changed nothing is not an edit.
+        assert!(run_setup(&mut editor).is_empty());
+    }
+
+    /// A `max_price` a config file already carries survives a render, for the
+    /// reason its `min_substats` twin above does — and with a sharper edge, since
+    /// this one used to HAVE a control here. Removing the widget must not remove
+    /// the criterion: `config::persist` replaces `[filter]` whole, so a value the
+    /// window forgets is a cap the next Apply deletes.
+    #[test]
+    fn a_config_set_price_cap_survives_a_window_with_no_control_for_it() {
+        let mut editor = stocked_editor_with(Filter {
+            gear: vec![GearRule {
+                max_price: Some(Gold::new(250_000)),
+                ..GearRule::default()
+            }],
+            ..named_filter()
+        });
+        let harness = draw_setup(&mut editor);
+        // The control is gone, under either spelling it ever wore.
+        for gone in ["max price (gold)", "250000", "250,000"] {
+            assert_eq!(
+                harness.query_all_by_label(gone).count(),
+                0,
+                "{gone} should have no control"
+            );
+        }
+        drop(harness);
+        assert_eq!(
+            editor.filter.only_rule().max_price,
+            Some(Gold::new(250_000)),
+            "the criterion outlives its widget"
+        );
         // And Apply stays dark: a render that changed nothing is not an edit.
         assert!(run_setup(&mut editor).is_empty());
     }
